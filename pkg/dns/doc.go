@@ -50,4 +50,29 @@
 //     dylib, DYLD_INSERT_LIBRARIES-injects it into a plain probe process, and
 //     resolves a name through a local stub DNS server — proving the interpose
 //     path works in isolation without needing runtimed or a real CoreDNS binary.
+//
+// # In-pod kube-apiserver resolution (M2.2)
+//
+// In-pod kubectl / client-go reach the apiserver via kubernetes.default.svc — a
+// Service the apiserver auto-creates (its ClusterIP, e.g. 10.43.0.1). It needs NO
+// special-casing here: it is just a Service name, so the same ndots/search
+// expansion resolves it. From a pod in any namespace, the partial form
+// "kubernetes.default.svc" expands through the search list to the canonical
+// kubernetes.default.svc.cluster.local (the third candidate under the default
+// ndots:5), and the bare/FQDN forms work the same way. Cross-namespace access
+// follows the standard contract: a "<svc>.<ns>" form resolves to
+// <svc>.<ns>.svc.cluster.local, while a BARE name expands only within the pod's
+// OWN namespace and never crosses namespaces. This is exercised by
+// resolution_test.go (TestInPodKubernetesAndCrossNamespaceResolution,
+// TestCandidateNamesCrossNamespaceContract).
+//
+// Decision (M2.2): because resolution rides the getaddrinfo shim and Apple's
+// sandbox-exec strips DYLD_* from the child environment, the in-pod-API path
+// REQUIRES runtimed's NON-platform exec-shim backend — the one backend under
+// which DYLD_INSERT_LIBRARIES survives into the pod. The runtime pins that
+// backend for pods that need in-pod API access (coordinated with runtimed:M2);
+// there is no new darwin-net component. The documented ALTERNATIVE, for a future
+// platform/confined backend where DYLD_* cannot survive, is a machine-wide DNS
+// proxy (an mDNSResponder resolver scoped to the cluster domain) injected via
+// /etc/resolver — out of scope for M2.2, which pins the exec-shim backend.
 package dns
