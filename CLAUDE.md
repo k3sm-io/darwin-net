@@ -4,6 +4,8 @@ Module **`k3sm.io/darwin-net`** (≈ flannel + kube-proxy + CNI): `netd` (lo0 al
 `utun`), a userspace Service proxy, a `wireguard-go` mesh, a `getaddrinfo` DNS shim, and the
 `PodNetwork` interface the runtime calls during pod setup.
 
+> Roadmap & current phase: `docs/PHASES.md` (workspace matrix: `../ROADMAP.md`).
+
 ## Build / test (pure Go for now)
 ```sh
 gofmt -l .
