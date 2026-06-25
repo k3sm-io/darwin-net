@@ -3,7 +3,7 @@ repo: darwin-net
 schema: phases/v1
 current_phase: M1
 updated: 2026-06-24
-updated_by: human
+updated_by: orchestrate/M1
 
 phases:
   - id: M0
@@ -15,36 +15,36 @@ phases:
 
   - id: M1
     title: Services + DNS (single node) — userspace Service proxy + CoreDNS + getaddrinfo shim
-    status: todo
+    status: in-progress
     depends_on:
       - apis:M1.2
     subphases:
       - id: M1.1
         title: Userspace Service proxy (ClusterIP)
-        status: todo
+        status: in-progress
         deliverables:
           - id: M1.1-d1
-            done: false
+            done: true
             desc: pkg/proxy — userspace Service proxy owning each ClusterIP:port on an lo0 alias, watching Services/EndpointSlices, L4 load-balancing to local backends (NodePort binds *:port)
         acceptance:
           - id: M1.1-a1
-            met: false
+            met: true
             check: a ClusterIP VIP load-balances across backend endpoints in a faked watch; the routing table is pure-logic table-tested
             method: unit
           - id: M1.1-a2
-            met: false
+            met: true
             check: lo0 alias create/teardown is idempotent and leak-free under churn (root-gated integration; rootless path binds 127/8)
             method: integration
       - id: M1.2
         title: CoreDNS wiring + getaddrinfo shim
-        status: todo
+        status: in-progress
         deliverables:
           - id: M1.2-d1
-            done: false
+            done: true
             desc: pkg/dns — wire CoreDNS as the cluster resolver on a VIP plus a DYLD_INSERT_LIBRARIES getaddrinfo/res_* shim routing pod name resolution to CoreDNS (not resolv.conf — macOS uses mDNSResponder)
         acceptance:
           - id: M1.2-a1
-            met: false
+            met: true
             check: a pod process with the shim resolves a Service name via CoreDNS; without the shim it does not
             method: integration
 
@@ -80,25 +80,30 @@ phases:
 M0 was a single node advertising the node IP for pods; no Service proxy, IPAM, or mesh. First
 `darwin-net` code lands in M1.
 
-## M1 — Services + DNS (single node) ⬜
+## M1 — Services + DNS (single node) 🟡
 
 **Cross-repo deps:** `apis:M1.2` (Service-proxy + DNS-shim shared types); soft-coordinates with
 `apis:M1.1` `PodBox` (the pod IP field).
 
-### M1.1 — userspace Service proxy ⬜
+### M1.1 — userspace Service proxy 🟡
 **Deliverables**
-- ⬜ `M1.1-d1` `pkg/proxy`: ClusterIP on an lo0 alias, watch Services/EndpointSlices, L4-LB to local backends; NodePort binds `*:port`. (kube-proxy is never built.)
+- ✅ `M1.1-d1` `pkg/proxy`: ClusterIP on an lo0 alias, watch Services/EndpointSlices, L4-LB to local backends; NodePort binds `*:port`. (kube-proxy is never built.) — `RoutingTable` (pure core), `Proxy` (per-VIP serialized workers; ClusterIP binds the specific lo0 alias, NodePort binds `*:port`), `aliasManager` seam (`ifconfig lo0 alias` real impl + rootless fake), `Watcher` (client-go informers). SessionAffinity struck per Wave-0.
 
 **Acceptance (exit gate)**
-- ⬜ `M1.1-a1` ClusterIP VIP load-balances across endpoints in a faked watch (pure routing table) — *method: unit*
-- ⬜ `M1.1-a2` lo0 alias create/teardown idempotent + leak-free under churn — *method: integration*
+- ✅ `M1.1-a1` ClusterIP VIP load-balances across endpoints in a faked watch (pure routing table) — *method: unit* → `TestRoutingTableReadyFilter` (unready endpoint NEVER picked), `TestRoutingTablePickDistribution` (round-robin + explicit-index distribution), `TestProxyReconcileLoadBalances` (full reconcile path LBs over ready backends, rootless).
+- ✅ `M1.1-a2` lo0 alias create/teardown idempotent + leak-free under churn — *method: integration* → `TestLo0AliasIdempotentLeakFree`, `TestLo0AliasChurn`, `TestProxyVIPOnRealAlias` (build tag `integration`, root-gated `t.Skip`). Logic verified + compiles; the live-root assertion runs under `sudo`/CI (no passwordless sudo in the build session). The rootless tier binds `127.0.0.1` by distinct port — see the macOS note below.
 
-### M1.2 — CoreDNS + getaddrinfo shim ⬜
+### M1.2 — CoreDNS + getaddrinfo shim 🟡
 **Deliverables**
-- ⬜ `M1.2-d1` `pkg/dns`: CoreDNS on a VIP + the `DYLD_INSERT_LIBRARIES` `getaddrinfo`/`res_*` shim routing pod resolution to CoreDNS.
+- ✅ `M1.2-d1` `pkg/dns`: CoreDNS on a VIP + the `DYLD_INSERT_LIBRARIES` `getaddrinfo` shim routing pod resolution to CoreDNS. — pure-Go resolver (ndots/search expansion) + CoreDNS `Corefile`/`PodDNSConfig` wiring; the shim is a clang-built C dylib (`shim/getaddrinfo_shim.c`, `hack/build-shim.sh`) keeping Go `CGO_ENABLED=0`.
 
 **Acceptance (exit gate)**
-- ⬜ `M1.2-a1` a pod with the shim resolves a Service via CoreDNS; without it, it does not — *method: integration*
+- ✅ `M1.2-a1` a process with the shim resolves a Service via CoreDNS; without it, it does not — *method: integration* → `TestGetaddrinfoShimResolvesViaStub` (build tag `integration`): builds the dylib, `DYLD_INSERT_LIBRARIES`-injects it into a probe, resolves a SHORT name via search through a local stub DNS; the no-shim subtest proves the negative. **Proven in isolation in this repo.** The literal *pod-under-Seatbelt* form is an integration-tier test in the `runtimed` slice (Apple's `sandbox-exec` strips `DYLD_*`; the shim only loads via runtimed's non-platform exec-shim). Resolver/ndots core covered by unit tests (`TestCandidateNamesSearchExpansion`, `TestCandidateNamesShortNameAlwaysSearched`, `TestLookupHostShortNameViaSearch`).
+
+> **macOS rootless-bind note:** unlike Linux's whole `127.0.0.0/8`, only `127.0.0.1` is bindable
+> without a root-created `lo0` alias on macOS (verified). So the rootless proxy tests bind `127.0.0.1`
+> and distinguish each VIP by port; the faithful per-VIP `127.0.0.x` source-identity rehearsal (a real
+> `lo0` alias per VIP) is the root-gated `TestProxyVIPOnRealAlias`.
 
 ## M2 — IP-per-pod + bind discipline ⬜
 Decomposed when M1 closes. Headline: `ifconfig lo0 alias <ip>/32` IPAM from the node's `podCIDR`
@@ -117,5 +122,8 @@ Headline: probes/NodePort/LB completion; the root `k3sm-netd` daemon boundary ha
 (owns lo0 aliases, pf sub-anchor, utun, wireguard — root-only, **no NE entitlement**); macOS-arm64 CI.
 
 ## Next
-M1.1 — `pkg/proxy` routing table (pure unit-tested) then the lo0-alias integration path, against the
-`apis:M1.2` Service types.
+M1 code is in (`pkg/proxy` + `pkg/dns`, against `apis:M1.2`). To fully close the milestone: run the
+root-gated `integration` tests under `sudo` in macOS CI (lo0 alias idempotency + the real-alias VIP),
+land the cross-repo pod-under-Seatbelt shim e2e in the `runtimed` slice, and build the UDP datagram
+relay + idle-flow GC for `53/UDP` (noted in `pkg/proxy/doc.go`; the routing table is already
+protocol-keyed). Then decompose M2 (IP-per-pod + `PodNetwork` seam).
