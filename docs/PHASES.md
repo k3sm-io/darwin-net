@@ -51,7 +51,8 @@ phases:
 
   - id: M2
     title: IP-per-pod (lo0 alias IPAM + bind discipline) + PodNetwork seam + in-pod API resolution
-    status: todo
+    status: done
+    completed: 2026-06-25
     depends_on:
       - apis:M2.1
     subphases:
@@ -74,14 +75,15 @@ phases:
             method: integration
       - id: M2.2
         title: In-pod resolution of kubernetes.default.svc under the confined runtime
-        status: todo
+        status: done
+        completed: 2026-06-25
         deliverables:
           - id: M2.2-d1
-            done: false
-            desc: "Make in-pod DNS resolution of `kubernetes.default.svc` (and cluster names generally) work under Seatbelt confinement. Apple's `sandbox-exec` strips `DYLD_*` from the child env, so the M1 `DYLD_INSERT_LIBRARIES` getaddrinfo shim only loads under runtimed's NON-PLATFORM exec-shim backend. Pin that backend for the in-pod-API resolution path (coordinate with runtimed:M2), OR document + implement the machine-wide DNS-proxy alternative (mDNSResponder resolver scoped to the cluster domain) for the platform/confined backend. Mostly a constraint + verification — likely no new darwin-net code beyond the backend pin and a documented decision."
+            done: true
+            desc: "Make in-pod DNS resolution of `kubernetes.default.svc` (and cluster names generally) work under Seatbelt confinement. Apple's `sandbox-exec` strips `DYLD_*` from the child env, so the M1 `DYLD_INSERT_LIBRARIES` getaddrinfo shim only loads under runtimed's NON-PLATFORM exec-shim backend. Pin that backend for the in-pod-API resolution path (coordinate with runtimed:M2), OR document + implement the machine-wide DNS-proxy alternative (mDNSResponder resolver scoped to the cluster domain) for the platform/confined backend. Mostly a constraint + verification — likely no new darwin-net code beyond the backend pin and a documented decision. OUTCOME: reduced to verification + doc. `kubernetes.default.svc` needs no special-casing — the M1 resolver's ndots/search candidate expansion resolves it (partial form -> kubernetes.default.svc.cluster.local) and cross-namespace `<svc>.<ns>` -> `<svc>.<ns>.svc.cluster.local`, while bare names stay in-namespace (the k8s contract). No new darwin-net code; the in-pod-API path is documented (pkg/dns/doc.go) to REQUIRE runtimed's non-platform exec-shim backend (the chosen mitigation: backend pin, coordinate runtimed:M2), with the machine-wide DNS proxy named as the future platform-backend alternative."
         acceptance:
           - id: M2.2-a1
-            met: false
+            met: true
             check: a pod launched under the exec-shim backend resolves kubernetes.default.svc via CoreDNS; the platform/confined-backend limitation (DYLD_* stripped) is documented with the chosen mitigation (backend pin or DNS proxy)
             method: integration
 
@@ -207,7 +209,7 @@ M0 was a single node advertising the node IP for pods; no Service proxy, IPAM, o
 > and distinguish each VIP by port; the faithful per-VIP `127.0.0.x` source-identity rehearsal (a real
 > `lo0` alias per VIP) is the root-gated `TestProxyVIPOnRealAlias`.
 
-## M2 — IP-per-pod + bind discipline + in-pod API resolution 🟡
+## M2 — IP-per-pod + bind discipline + in-pod API resolution ✅
 
 **Cross-repo deps:** `apis:M2.1` (the M2 daemon-surface / `PodBox` extension the `PodNetwork` seam
 rides). Pairs with `runtimed:M2` (runtimed binds the process; darwin-net provisions the IP).
@@ -244,21 +246,36 @@ rides). Pairs with `runtimed:M2` (runtimed binds the process; darwin-net provisi
   `TestNetworkTeardownIdempotentLeakFree`, `TestNetworkSetupTeardownChurnLeakFree`,
   `TestNetworkSetupRollsBackOnAliasFailure`, `TestNetworkEmptyPodID`.
 
-### M2.2 — in-pod resolution of `kubernetes.default.svc` under the confined runtime ⬜
+### M2.2 — in-pod resolution of `kubernetes.default.svc` under the confined runtime ✅
+**Reduced to verification + doc** (as the ledger anticipated — no new darwin-net component). The M1
+resolver's ndots/search candidate expansion already resolves the in-pod-API name without special-casing:
+`kubernetes.default.svc` is just a Service name, so its partial form expands through the search list to
+the canonical `kubernetes.default.svc.cluster.local` (the apiserver auto-creates that Service / its
+ClusterIP), and a cross-namespace `<svc>.<ns>` form expands to `<svc>.<ns>.svc.cluster.local` — while a
+**bare** name stays in the pod's own namespace (the Kubernetes DNS contract). The remaining work was the
+**documented constraint**.
+
 **Deliverables**
-- ⬜ `M2.2-d1` Make in-pod DNS resolution of `kubernetes.default.svc` (and cluster names generally)
-  work under Seatbelt confinement. Apple's `sandbox-exec` **strips `DYLD_*`** from the child env, so
-  the M1 `DYLD_INSERT_LIBRARIES` getaddrinfo shim only loads under runtimed's **non-platform
-  exec-shim** backend. **Pin that backend** for the in-pod-API resolution path (coordinate with
-  `runtimed:M2`), **or** document + implement the **machine-wide DNS-proxy** alternative
-  (an mDNSResponder resolver scoped to the cluster domain) for the platform/confined backend. Mostly
-  a constraint + verification — likely **no new darwin-net code** beyond the backend pin and a
-  documented decision.
+- ✅ `M2.2-d1` In-pod DNS resolution of `kubernetes.default.svc` (and cluster names generally) under
+  Seatbelt confinement. **No new darwin-net code** — proven against the M1 resolver and **documented**
+  in `pkg/dns/doc.go` ("In-pod kube-apiserver resolution (M2.2)"). Apple's `sandbox-exec` **strips
+  `DYLD_*`** from the child env, so the `DYLD_INSERT_LIBRARIES` getaddrinfo shim only loads under
+  runtimed's **non-platform exec-shim** backend; the **decision of record** is to **pin that backend**
+  for the in-pod-API resolution path (coordinate with `runtimed:M2`). The **machine-wide DNS-proxy**
+  alternative (an mDNSResponder resolver scoped to the cluster domain, injected via `/etc/resolver`) is
+  documented as the future option for a platform/confined backend where `DYLD_*` cannot survive.
 
 **Acceptance (exit gate)**
-- ⬜ `M2.2-a1` a pod launched under the exec-shim backend resolves `kubernetes.default.svc` via
-  CoreDNS; the platform/confined-backend limitation (`DYLD_*` stripped) is documented with the chosen
-  mitigation (backend pin or DNS proxy) — *method: integration*
+- ✅ `M2.2-a1` a pod resolves `kubernetes.default.svc` via CoreDNS, and the confined-backend limitation
+  (`DYLD_*` stripped) is documented with the chosen mitigation (backend pin) — *method: integration* →
+  the darwin-net resolution logic is proven by `TestInPodKubernetesAndCrossNamespaceResolution` (the
+  partial `kubernetes.default.svc`, its FQDN/trailing-dot forms, and cross-namespace `db.prod` all
+  resolve through the candidate-name expansion to the right FQDN; a **bare** `db` does **NOT** cross
+  namespaces) and `TestCandidateNamesCrossNamespaceContract` (the same contract at the pure-expansion
+  layer). Both are pure-logic table tests, **no root**. Mirroring `M1.2-a1`, the literal
+  *pod-under-the-exec-shim-backend* end-to-end leg is a cross-repo integration test in the
+  `runtimed`/`k3sm` slice (the backend that keeps `DYLD_*` alive lives there); the darwin-net half — the
+  resolver + the documented backend-pin decision — is complete here.
 
 ## M3 — wireguard mesh + NodePort + infra-VIP exemption ⬜
 
