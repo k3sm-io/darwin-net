@@ -1,9 +1,9 @@
 ---
 repo: darwin-net
 schema: phases/v1
-current_phase: M1
+current_phase: M2
 updated: 2026-06-25
-updated_by: roadmap/stockkitty-features
+updated_by: orchestrate/M2
 
 phases:
   - id: M0
@@ -57,18 +57,19 @@ phases:
     subphases:
       - id: M2.1
         title: IP-per-pod lo0 alias IPAM + the PodNetwork seam
-        status: todo
+        status: done
+        completed: 2026-06-25
         deliverables:
           - id: M2.1-d1
-            done: false
-            desc: "`ifconfig lo0 alias <ip>/32` IPAM out of the node's podCIDR (per-node /24 from 100.64.0.0/10) + the PodNetwork interface runtimed calls during pod setup (allocate IP, plumb lo0 alias, return the IP to bind) + a `pf` k3sm sub-anchor. Pairs with runtimed:M2 (runtimed binds the process to the returned IP via IP_BOUND_IF)."
+            done: true
+            desc: "`ifconfig lo0 alias <ip>/32` IPAM out of the node's podCIDR (per-node /24 from 100.64.0.0/10) + the PodNetwork interface runtimed calls during pod setup (allocate IP, plumb lo0 alias, return the IP to bind). Pairs with runtimed:M2 (runtimed binds the process to the returned IP via IP_BOUND_IF). pkg/podnet: Allocator (pure IPAM core — per-node /24 carve via NodeCIDR, unique /32 allocate/release, leak-tracking), aliasManager seam (real `ifconfig lo0 alias` + rootless fake, mirroring pkg/proxy), Network implementing PodNetwork (Setup: allocate→ensure alias→return bindable IP, idempotent per pod, rolls back on alias failure; Teardown: remove alias→release, leak-free). The returned IP flows into the existing runtime/v1 PodBox.pod_ip (no apis change). The `pf` k3sm sub-anchor is deferred to M4 (root netd boundary)."
         acceptance:
           - id: M2.1-a1
-            met: false
+            met: true
             check: IPAM allocate/release is leak-free and idempotent under churn (pure-logic table test); the per-node /24 carve is collision-free and stable across restart
             method: unit
           - id: M2.1-a2
-            met: false
+            met: true
             check: PodNetwork.Setup plumbs the lo0 alias and returns the bindable IP; teardown removes it; root-gated integration on a capable host
             method: integration
       - id: M2.2
@@ -206,23 +207,42 @@ M0 was a single node advertising the node IP for pods; no Service proxy, IPAM, o
 > and distinguish each VIP by port; the faithful per-VIP `127.0.0.x` source-identity rehearsal (a real
 > `lo0` alias per VIP) is the root-gated `TestProxyVIPOnRealAlias`.
 
-## M2 — IP-per-pod + bind discipline + in-pod API resolution ⬜
+## M2 — IP-per-pod + bind discipline + in-pod API resolution 🟡
 
 **Cross-repo deps:** `apis:M2.1` (the M2 daemon-surface / `PodBox` extension the `PodNetwork` seam
 rides). Pairs with `runtimed:M2` (runtimed binds the process; darwin-net provisions the IP).
 
-### M2.1 — IP-per-pod lo0 alias IPAM + the `PodNetwork` seam ⬜
+### M2.1 — IP-per-pod lo0 alias IPAM + the `PodNetwork` seam ✅
 **Deliverables**
-- ⬜ `M2.1-d1` `ifconfig lo0 alias <ip>/32` IPAM from the node's `podCIDR` (per-node /24 out of
+- ✅ `M2.1-d1` `ifconfig lo0 alias <ip>/32` IPAM from the node's `podCIDR` (per-node /24 out of
   `100.64.0.0/10`); the `PodNetwork` interface `runtimed` calls during pod setup (allocate IP, plumb
-  lo0 alias, return the IP to bind); a `pf` `k3sm` sub-anchor. runtimed binds the process to the
-  returned IP via `IP_BOUND_IF`.
+  lo0 alias, return the IP to bind). runtimed binds the process to the returned IP via `IP_BOUND_IF`.
+  — `pkg/podnet`: `Allocator` (pure-logic IPAM core — `NodeCIDR` per-node /24 carve, unique /32
+  allocate/release with leak-tracking, `.0`/`.255` reserved, restart-stable carve), the `aliasManager`
+  seam (real `ifconfig lo0 alias` + rootless fake, mirroring `pkg/proxy`), and `Network` implementing
+  `PodNetwork` (`Setup`: allocate → ensure alias → return bindable IP, idempotent per pod, rolls back
+  the allocation on alias failure; `Teardown`: remove alias → release, leak-free). The returned IP
+  flows into the **existing** `runtime/v1` `PodBox.pod_ip` (documented as "the lo0 alias the runtime
+  binds the pod's processes to") — **no `apis` change**. The `pf` `k3sm` sub-anchor is deferred to
+  **M4** (the root `netd` daemon boundary owns the `pf` sub-anchor).
 
 **Acceptance (exit gate)**
-- ⬜ `M2.1-a1` IPAM allocate/release is leak-free + idempotent under churn (pure-logic table test);
-  the per-node /24 carve is collision-free and stable across restart — *method: unit*
-- ⬜ `M2.1-a2` `PodNetwork.Setup` plumbs the lo0 alias and returns the bindable IP; teardown removes
-  it (root-gated integration on a capable host) — *method: integration*
+- ✅ `M2.1-a1` IPAM allocate/release is leak-free + idempotent under churn (pure-logic table test);
+  the per-node /24 carve is collision-free and stable across restart — *method: unit* →
+  `TestNodeCIDRCarveCollisionFree` (disjoint /24s per index; out-of-range fails fast),
+  `TestNodeCIDRStableAcrossRestart` (same index ⇒ same /24, no persistence),
+  `TestAllocatorUniqueNoDoubleAllocation` (every host once, reserved addrs skipped, exhaustion),
+  `TestAllocatorReleaseLeakFree` + `TestAllocatorChurnLeakFree` (release returns to empty; 200-cycle
+  churn never leaks), `TestAllocateSpecific`, `TestNewAllocatorRejectsNonSlash24`.
+- ✅ `M2.1-a2` `PodNetwork.Setup` plumbs the lo0 alias and returns the bindable IP; teardown removes
+  it (root-gated integration on a capable host) — *method: integration* →
+  `TestPodNetworkSetupTeardownOnRealLo0`, `TestLo0AliasIdempotentLeakFree`, `TestLo0AliasChurn` (build
+  tag `integration`, root-gated `t.Skip`; the live-lo0 assertion runs under `sudo`/CI). The rootless
+  unit leg proves the seam with the fake alias manager + a `127/8` bind:
+  `TestNetworkSetupAllocatesAndAliases`, `TestNetworkSetupIdempotent`,
+  `TestNetworkDistinctPodsDistinctIPs`, `TestNetworkTeardownReleasesAndRemoves`,
+  `TestNetworkTeardownIdempotentLeakFree`, `TestNetworkSetupTeardownChurnLeakFree`,
+  `TestNetworkSetupRollsBackOnAliasFailure`, `TestNetworkEmptyPodID`.
 
 ### M2.2 — in-pod resolution of `kubernetes.default.svc` under the confined runtime ⬜
 **Deliverables**
