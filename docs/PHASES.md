@@ -15,13 +15,14 @@ phases:
 
   - id: M1
     title: Services + DNS (single node) — userspace Service proxy + CoreDNS + getaddrinfo shim
-    status: in-progress
+    status: done
+    completed: 2026-06-25
     depends_on:
       - apis:M1.2
     subphases:
       - id: M1.1
         title: Userspace Service proxy (ClusterIP)
-        status: in-progress
+        status: done
         deliverables:
           - id: M1.1-d1
             done: true
@@ -37,7 +38,7 @@ phases:
             method: integration
       - id: M1.2
         title: CoreDNS wiring + getaddrinfo shim
-        status: in-progress
+        status: done
         deliverables:
           - id: M1.2-d1
             done: true
