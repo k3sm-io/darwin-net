@@ -180,7 +180,7 @@ func TestMeshConstantsAndMSSClamp(t *testing.T) {
 // egress and clamps the MSS, and is NOT applied to lo0 (clamping loopback would
 // needlessly shrink same-node segments).
 func TestMeshPFClampScopedToUTUN(t *testing.T) {
-	rule := pfMSSClampRule("utun4", MSSClamp)
+	rule := PFMSSClampRule("utun4", MSSClamp)
 	for _, want := range []string{"scrub out", "on utun4", "proto tcp", "max-mss 1340"} {
 		if !strings.Contains(rule, want) {
 			t.Fatalf("pf rule %q missing %q", rule, want)
