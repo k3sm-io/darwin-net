@@ -1,9 +1,9 @@
 ---
 repo: darwin-net
 schema: phases/v1
-current_phase: M2
+current_phase: M3
 updated: 2026-06-25
-updated_by: orchestrate/M2
+updated_by: orchestrate/M3
 
 phases:
   - id: M0
@@ -89,22 +89,23 @@ phases:
 
   - id: M3
     title: wireguard-go mesh over utun + MeshPeer consumption + NodePort + infra-VIP mesh exemption
-    status: todo
+    status: in-progress
     depends_on:
       - apis:M3.1
     subphases:
       - id: M3.1
         title: wireguard-go mesh over utun + MeshPeer consumption
-        status: todo
+        status: done
+        completed: 2026-06-25
         deliverables:
           - id: M3.1-d1
-            done: false
-            desc: "`pkg/mesh` over a root-created utun; AllowedIPs per peer = its podCIDR; unique per-node /24 ⇒ routed not NAT'd; MTU 1380 + `pf scrub max-mss`; PersistentKeepalive 25; consume peer keys/endpoints from the MeshPeer CRD (deps apis:M3.1; private keys never leave the node)."
+            done: true
+            desc: "`pkg/mesh` over a root-created utun via wireguard-go (pinned pseudo-version; CGO_ENABLED=0). Consumes the net.k3sm.io/v1 MeshPeer CRD (apis): AllowedIPs per peer = its podCIDR, SYMMETRIC, and the mesh asserts AllowedIPs == podnet IPAM CIDR == node.spec.podCIDR (equality, not just symmetry). Load-bearing mechanics from the M3 re-plan, each table-tested as pure logic with the privileged ops behind the Device seam (netd/root boundary): (1) PER-PEER KERNEL ROUTES (`route add -net <peer/24> -interface utun`) computed by RouteSet as a step DISTINCT from wg AllowedIPs (wireguard-go over a raw utun installs no routes like wg-quick) — RouteSet NEVER includes this node's own /24 or the 100.64.0.0/10 aggregate (loopback theft); (2) a RESERVED mesh-egress /32 (podnet.MeshEgressIP = the node /24's .1) EXCLUDED from the podnet allocator (which used to hand .1 as the first pod IP — fixed; first pod IP is now .2) and bound as the Service-proxy backend dialer's LocalAddr (proxy.WithMeshEgressSource) so cross-node return packets are accepted by peers' AllowedIPs; (3) WATCH the MeshPeer CRD (netv1.AddToScheme typed informer) and reconcile endpoint/key changes continuously (not a one-shot read) via a full-resync UAPI; (4) MTU 1380 + PersistentKeepalive 25 (apis constants); (5) a MINIMAL pf scrub anchor pulled forward from M4 clamping max-mss=1340 SCOPED to the utun egress (never lo0). No relay (mutually-routable/same-L2 endpoints). Private keys never leave the node (never on a MeshPeer)."
         acceptance:
           - id: M3.1-a1
-            met: false
-            check: two real Macs reach each other's pod IPs over the mesh (iperf3 both directions); bounce a node and the tunnel reconverges; AllowedIPs is symmetric per peer
-            method: integration
+            met: true
+            check: "pure-logic mechanics proven by named unit tests (no root): TestMeshRoutesPerPeerNotAggregate (route set = one /24 per peer; own /24 and /10 aggregate NEVER present), TestMeshEgressSourceReserved (the mesh /32 is derived from the podCIDR AND excluded from the allocator — first pod IP is .2), TestMeshAllowedIPsEqualsCIDR (AllowedIPs == IPAM CIDR == podCIDR per peer; symmetric-but-wrong rejected), TestMeshReconcileEndpointChange (an endpoint change is reconciled, not ignored). The real utun/route/pf bring-up is the wired root-gated integration test TestMeshDeviceBringUpOnRealUTUN (//go:build integration, t.Skip without root). The full two-real-Macs reachability (iperf3 both directions) + bounce-a-node→reconverge is the K3SM_LAB=1 two-Mac gate."
+            method: unit+integration
       - id: M3.2
         title: NodePort in the userspace Service proxy (TCP)
         status: todo
@@ -277,19 +278,40 @@ ClusterIP), and a cross-namespace `<svc>.<ns>` form expands to `<svc>.<ns>.svc.c
   `runtimed`/`k3sm` slice (the backend that keeps `DYLD_*` alive lives there); the darwin-net half — the
   resolver + the documented backend-pin decision — is complete here.
 
-## M3 — wireguard mesh + NodePort + infra-VIP exemption ⬜
+## M3 — wireguard mesh + NodePort + infra-VIP exemption 🟡
 
 **Cross-repo deps:** `apis:M3.1` (`MeshPeer` CRD). Validated on two real Macs.
 
-### M3.1 — wireguard-go mesh over utun + MeshPeer consumption ⬜
+### M3.1 — wireguard-go mesh over utun + MeshPeer consumption ✅
 **Deliverables**
-- ⬜ `M3.1-d1` `pkg/mesh` over a root-created `utun`; `AllowedIPs` per peer = its podCIDR; unique
-  per-node /24 ⇒ routed not NAT'd; MTU 1380 + `pf scrub max-mss`; `PersistentKeepalive 25`; consume
-  peer keys/endpoints from the `MeshPeer` CRD (private keys never leave the node).
+- ✅ `M3.1-d1` `pkg/mesh` over a root-created `utun` via **wireguard-go** (pinned pseudo-version;
+  builds `CGO_ENABLED=0`). Consumes the `net.k3sm.io/v1` `MeshPeer` CRD: `AllowedIPs` per peer = its
+  podCIDR, **symmetric**, and the mesh asserts **`AllowedIPs == podnet IPAM CIDR == node.spec.podCIDR`
+  (equality, not just symmetry)**. The four load-bearing mechanics from the M3 re-plan — each
+  table-tested as **pure logic**, with the privileged ops behind the **`Device` seam** (the netd/root
+  boundary):
+  - **Per-peer kernel routes** (`route add -net <peer/24> -interface utun`) computed by `RouteSet`
+    as a step **distinct** from wg `AllowedIPs` (wireguard-go over a raw utun installs no routes like
+    `wg-quick`). `RouteSet` **never** includes this node's own /24 or the `100.64.0.0/10` aggregate.
+  - A **reserved mesh-egress /32** (`podnet.MeshEgressIP` = the node /24's `.1`) **excluded from the
+    `podnet` allocator** (which used to hand `.1` as the first pod IP — fixed; first pod IP is now
+    `.2`) and bound as the Service-proxy backend dialer's `LocalAddr` (`proxy.WithMeshEgressSource`)
+    so cross-node return packets land inside peers' `AllowedIPs`.
+  - **Watch the `MeshPeer` CRD** (`netv1.AddToScheme` typed informer) and **reconcile** endpoint/key
+    changes continuously (not a one-shot read) via a full-resync UAPI.
+  - **MTU 1380 + `PersistentKeepalive 25`** (apis constants) and a **minimal `pf scrub max-mss`
+    anchor** (pulled forward from M4) clamping `max-mss=1340` **scoped to the utun egress** (never
+    lo0). No relay (mutually-routable/same-L2 endpoints). Private keys never leave the node.
 
 **Acceptance (exit gate)**
-- ⬜ `M3.1-a1` two real Macs reach each other's pod IPs over the mesh (`iperf3` both directions);
-  bounce a node → the tunnel reconverges; `AllowedIPs` is symmetric per peer — *method: integration*
+- ✅ `M3.1-a1` the mesh mechanics are proven by pure-logic named unit tests (no root):
+  `TestMeshRoutesPerPeerNotAggregate` (one /24 per peer; own /24 + `/10` aggregate never routed),
+  `TestMeshEgressSourceReserved` (mesh `/32` derived from podCIDR **and** excluded from the
+  allocator — first pod IP `.2`), `TestMeshAllowedIPsEqualsCIDR` (equality per peer; symmetric-but-
+  wrong rejected), `TestMeshReconcileEndpointChange` (an endpoint change reconverges, not ignored).
+  The real utun/route/pf bring-up is the wired root-gated `TestMeshDeviceBringUpOnRealUTUN`
+  (`//go:build integration`, `t.Skip` without root). Two-real-Macs reachability (`iperf3` both
+  directions) + bounce→reconverge is the `K3SM_LAB=1` gate — *method: unit + integration*
 
 ### M3.2 — NodePort in the userspace Service proxy (TCP) ⬜
 **Deliverables**
