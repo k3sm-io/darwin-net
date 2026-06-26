@@ -56,6 +56,26 @@ func WithLogger(l *slog.Logger) Option {
 	return func(p *Proxy) { p.log = l }
 }
 
+// WithMeshEgressSource binds the backend dialer's source address (LocalAddr) to
+// the node's reserved mesh-egress /32 (podnet.MeshEgressIP). It is REQUIRED on a
+// multi-node mesh and MUST be left unset on a single node:
+//
+// wireguard accepts an inbound packet only when its source falls within some
+// peer's AllowedIPs (= the sending node's podCIDR). A backend on another node is
+// reached by a dial that egresses the utun, so that dial must be sourced from this
+// node's mesh-egress address (which is inside this node's podCIDR by construction)
+// or the peer drops the return packet — a one-way blackhole. Same-node backends
+// stay on loopback and are unaffected because the mesh-egress address is a local
+// lo0 alias. When src is the zero Addr the dialer keeps the kernel's default
+// source selection (the single-node path, where no utun exists to bind to).
+func WithMeshEgressSource(src netip.Addr) Option {
+	return func(p *Proxy) {
+		if src.IsValid() {
+			p.dialer.LocalAddr = &net.TCPAddr{IP: src.AsSlice()}
+		}
+	}
+}
+
 // withAliasManager overrides the alias manager (tests inject the rootless fake).
 func withAliasManager(a aliasManager) Option {
 	return func(p *Proxy) { p.alias = a }

@@ -4,6 +4,11 @@ go 1.25.8
 
 require (
 	golang.org/x/net v0.51.0
+	// golang.zx2c4.com/wireguard is userspace WireGuard — the M3 mesh datapath over
+	// a root-created utun (pkg/mesh). It publishes no semver tags, so it is pinned to
+	// a commit pseudo-version (never @latest); it transitively pulls the pure-Go
+	// golang.org/x/crypto (AEAD/curve25519). Builds CGO_ENABLED=0 on darwin/arm64.
+	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 	k3sm.io/apis v0.0.0-00010101000000-000000000000
 	k8s.io/api v0.35.0
 	k8s.io/apimachinery v0.35.0
@@ -31,11 +36,13 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/term v0.40.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
