@@ -24,7 +24,8 @@
 //     in lockstep and lets the hard part (ndots/search) be tested in Go.
 //   - coredns.go — CorefileOptions / PodDNSConfig: the wiring the server uses to
 //     run CoreDNS on the DNS VIP and to hand each pod the DNSConfig the shim
-//     consumes.
+//     consumes. PerNodeDNS renders the per-node resolver bound to the kube-dns
+//     VIP (DefaultDNSVIP); see the M3.3 section below.
 //
 // # The C shim (built with clang, not cgo)
 //
@@ -75,4 +76,27 @@
 // platform/confined backend where DYLD_* cannot survive, is a machine-wide DNS
 // proxy (an mDNSResponder resolver scoped to the cluster domain) injected via
 // /etc/resolver — out of scope for M2.2, which pins the exec-shim backend.
+//
+// # Per-node CoreDNS and the infra-VIP exemption (M3.3)
+//
+// On a multi-node mesh the kube-dns VIP (10.43.0.10) is NOT in any pod's podCIDR,
+// so a podCIDR classifier would call it remote and a podCIDR router would steer
+// it over the wireguard mesh — where no peer's symmetric AllowedIPs (= podCIDR)
+// cover it, blackholing in-pod DNS. The fix is to keep DNS node-local: k3sm runs
+// CoreDNS on every node bound directly to the DNS VIP (PerNodeDNS sets BindIP =
+// DefaultDNSVIP), so a pod's query resolves over loopback and never crosses the
+// mesh. The mesh routes only peer pod /24s to the utun (pkg/mesh, M3.1), so the
+// DNS VIP is never steered there — locality stays a hint, not a routing input.
+//
+// Because CoreDNS binds 10.43.0.10:53 (TCP and UDP) directly, the Service proxy
+// must NOT also try to own that VIP, or the two collide (EADDRINUSE). The proxy
+// exempts the kube-dns VIP via proxy.WithInfraVIPExemptions; the per-node CoreDNS
+// launch (k3sm, root-gated netd boundary) ensures the 10.43.0.10/32 lo0 alias the
+// proxy no longer creates for it.
+//
+// The sibling infra VIP, the kubernetes endpoint (10.43.0.1), is fixed the same
+// way in spirit but is k3sm-owned (k3sm:M3.3): k3sm rewrites the kubernetes
+// Service endpoint to a node-local apiserver/proxy address per node. darwin-net
+// provides this half — per-node CoreDNS (PerNodeDNS) + the proxy exemption seam —
+// and depends on k3sm:M3.3 for the kubernetes-endpoint half.
 package dns

@@ -213,43 +213,107 @@ func TestProxyPerVIPSerialization(t *testing.T) {
 	waitClosed(t, vip, port)
 }
 
-// TestProxyNodePortBindsWildcard asserts a port with a NodePort opens a
-// node-wide *:NodePort listener (reachable via 127.0.0.1) in addition to the
-// ClusterIP listener, and tears both down on delete.
-func TestProxyNodePortBindsWildcard(t *testing.T) {
+// TestNodePortBindsWildcard is the M3.2 acceptance: a NodePort Service yields a
+// node-wide *:NodePort TCP listener (bound to the wildcard so every interface
+// answers — dialed here via loopback) that load-balances to the same ready
+// backends as the ClusterIP, and a UDP NodePort opens NO listener (the datagram
+// relay — ClusterIP and NodePort alike — is deferred, so UDP NodePort is not
+// claimed). The externalTrafficPolicy: Cluster semantics — the userspace L4
+// splice opens a fresh backend connection and so does NOT preserve the client
+// source IP, hence Local is not honored — are documented in doc.go and the
+// openListener comment; this test pins the wildcard bind, the LB, and the UDP
+// deferral.
+func TestNodePortBindsWildcard(t *testing.T) {
 	t.Parallel()
-	const vip = "127.0.0.1"
 
-	be := newEchoBackend(t, "np-be", "127.0.0.1")
-	defer be.close()
-	bip, bport := be.addrPort()
+	t.Run("tcp NodePort yields a wildcard listener and load-balances", func(t *testing.T) {
+		t.Parallel()
+		const vip = "127.0.0.1"
 
-	clusterPort := freePort(t, vip)
-	nodePort := freePort(t, "0.0.0.0")
-	alias := newNoopAliasManager()
-	p := New(NewRoutingTable(netip.Prefix{}), withAliasManager(alias))
+		be1 := newEchoBackend(t, "np-1", "127.0.0.1")
+		be2 := newEchoBackend(t, "np-2", "127.0.0.1")
+		defer be1.close()
+		defer be2.close()
+		ip1, p1 := be1.addrPort()
+		ip2, p2 := be2.addrPort()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	runDone := make(chan struct{})
-	go func() { defer close(runDone); _ = p.Run(ctx) }()
+		clusterPort := freePort(t, vip)
+		nodePort := freePort(t, "0.0.0.0")
+		alias := newNoopAliasManager()
+		p := New(NewRoutingTable(netip.Prefix{}), withAliasManager(alias))
 
-	sp := &netv1.ServicePort{Port: clusterPort, TargetPort: 0, Protocol: netv1.ProtocolTCP, NodePort: nodePort}
-	eps := []netv1.Endpoint{{IP: bip, Port: bport, Ready: true}}
-	if err := p.Reconcile(vip, sp, eps); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
+		ctx, cancel := context.WithCancel(context.Background())
+		runDone := make(chan struct{})
+		go func() { defer close(runDone); _ = p.Run(ctx) }()
 
-	// The NodePort must answer on the wildcard (dial via loopback).
-	waitListen(t, "127.0.0.1", nodePort)
-	if got := readID(t, "127.0.0.1", nodePort); got != "np-be" {
-		t.Fatalf("NodePort served %q, want np-be", got)
-	}
+		sp := &netv1.ServicePort{Port: clusterPort, TargetPort: 0, Protocol: netv1.ProtocolTCP, NodePort: nodePort}
+		eps := []netv1.Endpoint{
+			{IP: ip1, Port: p1, Ready: true},
+			{IP: ip2, Port: p2, Ready: true},
+		}
+		if err := p.Reconcile(vip, sp, eps); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
 
-	p.ReconcileDelete(PortKey{ClusterIP: vip, Port: clusterPort, Protocol: netv1.ProtocolTCP})
-	waitClosed(t, "127.0.0.1", nodePort)
+		// The *:NodePort listener answers on the wildcard (dialed via loopback) and
+		// fans out across both ready backends.
+		waitListen(t, "127.0.0.1", nodePort)
+		counts := map[string]int{}
+		for i := 0; i < 20; i++ {
+			counts[readID(t, "127.0.0.1", nodePort)]++
+		}
+		if counts["np-1"] == 0 || counts["np-2"] == 0 {
+			t.Fatalf("NodePort did not load-balance across ready backends: %v", counts)
+		}
+		if counts["np-1"]+counts["np-2"] != 20 {
+			t.Fatalf("NodePort connections lost: %v", counts)
+		}
 
-	cancel()
-	<-runDone
+		// Delete tears the *:NodePort listener down with the ClusterIP.
+		p.ReconcileDelete(PortKey{ClusterIP: vip, Port: clusterPort, Protocol: netv1.ProtocolTCP})
+		waitClosed(t, "127.0.0.1", nodePort)
+
+		cancel()
+		<-runDone
+	})
+
+	t.Run("udp NodePort opens no listener (relay deferred, not claimed)", func(t *testing.T) {
+		t.Parallel()
+		const vip = "127.0.0.1"
+
+		clusterPort := freePort(t, vip)
+		nodePort := freePort(t, "0.0.0.0")
+		alias := newNoopAliasManager()
+		tbl := NewRoutingTable(netip.Prefix{})
+		p := New(tbl, withAliasManager(alias))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		runDone := make(chan struct{})
+		go func() { defer close(runDone); _ = p.Run(ctx) }()
+
+		sp := &netv1.ServicePort{Port: clusterPort, TargetPort: 53, Protocol: netv1.ProtocolUDP, NodePort: nodePort}
+		eps := []netv1.Endpoint{{IP: "10.42.0.9", Port: 53, Ready: true}}
+		if err := p.Reconcile(vip, sp, eps); err != nil {
+			t.Fatalf("reconcile udp nodeport: %v", err)
+		}
+
+		// Let the worker process the event (the UDP key lands in the table).
+		key := PortKey{ClusterIP: vip, Port: clusterPort, Protocol: netv1.ProtocolUDP}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) && tbl.Len(key) == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// No TCP stream listener was opened on the UDP NodePort — UDP NodePort is
+		// deferred with the datagram relay, so it is not claimed.
+		if c, err := net.DialTimeout("tcp", hostPort("127.0.0.1", nodePort), 200*time.Millisecond); err == nil {
+			_ = c.Close()
+			t.Fatalf("a TCP listener was opened for a UDP NodePort (relay should be deferred)")
+		}
+
+		cancel()
+		<-runDone
+	})
 }
 
 // TestProxyUDPPortDefersRelay asserts the documented UDP decision: a UDP Service

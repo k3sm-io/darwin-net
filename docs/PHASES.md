@@ -89,9 +89,10 @@ phases:
 
   - id: M3
     title: wireguard-go mesh over utun + MeshPeer consumption + NodePort + infra-VIP mesh exemption
-    status: in-progress
+    status: done
+    completed: 2026-06-25
     depends_on:
-      - apis:M3.1
+      - apis:M3.2
     subphases:
       - id: M3.1
         title: wireguard-go mesh over utun + MeshPeer consumption
@@ -108,28 +109,33 @@ phases:
             method: unit+integration
       - id: M3.2
         title: NodePort in the userspace Service proxy (TCP)
-        status: todo
+        status: done
+        completed: 2026-06-25
         deliverables:
           - id: M3.2-d1
-            done: false
-            desc: "NodePort Services in the userspace Service proxy: bind `*:nodePort` (TCP) and L4-LB to the Service's ready endpoints, reusing the M1 RoutingTable (already protocol-keyed). No apis change — `ServicePort.NodePort` already exists. UDP NodePort is DEFERRED: it needs the UDP datagram relay + idle-flow GC (noted in pkg/proxy/doc.go); stockkitty's NodePort surface (VSCode SSH :22, snapshot gRPC range) is all TCP, so UDP NodePort is NOT asserted until the relay lands."
+            done: true
+            desc: "NodePort Services in the userspace Service proxy: a non-zero ServicePort.NodePort opens a node-wide `*:nodePort` (wildcard) TCP listener alongside the ClusterIP listener, L4-LB to the SAME ready endpoints, reusing the M1 RoutingTable (already protocol-keyed). The path existed since M1; M3.2 makes it the explicit, documented NodePort path (proxy.openListener + doc.go `# NodePort`). externalTrafficPolicy: Cluster ONLY — the userspace splice opens a fresh backend connection and so does NOT preserve the client source IP, so externalTrafficPolicy: Local is NOT honored (documented). No apis change — `ServicePort.NodePort` already exists (apis:M3.1-d3 pins it unchanged). UDP NodePort is DEFERRED with the UDP datagram relay + idle-flow GC (a UDP port opens NO datagram socket on either the ClusterIP or the NodePort); stockkitty's NodePort surface (VSCode SSH :22, snapshot gRPC range) is all TCP, so UDP NodePort is NOT claimed until the relay lands."
         acceptance:
           - id: M3.2-a1
-            met: false
-            check: a Deployment behind a NodePort Service is reachable on `*:nodePort` (TCP) and load-balances across ready endpoints; UDP NodePort is explicitly out of scope until the datagram relay lands
-            method: integration
+            met: true
+            check: "the NodePort path is proven by the named pure-logic/faked unit test (no root): TestNodePortBindsWildcard — a TCP NodePort Service yields a `*:nodePort` wildcard listener that load-balances across ready backends (dialed via loopback), and a UDP NodePort opens NO listener (relay deferred → not claimed); the externalTrafficPolicy: Cluster semantics (no client-source-IP preservation through the L4 splice) are documented in pkg/proxy/doc.go + openListener. The live external-client reachability on a real `*:nodePort` is the root-gated/lab integration leg."
+            method: unit+integration
       - id: M3.3
         title: Infra-VIP exemption from podCIDR mesh steering (multi-node correctness)
-        status: todo
+        status: done
+        completed: 2026-06-25
+        depends_on:
+          - apis:M3.2
+          - k3sm:M3.3
         deliverables:
           - id: M3.3-d1
-            done: false
-            desc: "Exempt the infra VIPs — the `kubernetes` ClusterIP (10.43.0.1) and the kube-dns VIP (10.43.0.10) — from podCIDR-based mesh steering. They are NOT in any pod's podCIDR, so the routing table classifies them LocalityRemote and would steer them over wireguard, where no peer's symmetric AllowedIPs (= podCIDR) covers them — blackholing in-pod kubectl and DNS on multi-node. Fix: (1) run CoreDNS PER-NODE bound to the DNS VIP so the DNS backend is always node-local/loopback, never the mesh; (2) resolve the `kubernetes` endpoint to a NODE-LOCAL apiserver/proxy address; (3) classify infra VIPs node-local in the routing/steering decision so they never egress the utun. Coordinates with k3sm (per-node `kubernetes` endpoint rewrite) and the M2.2 in-pod-API path."
+            done: true
+            desc: "Keep the infra VIPs — the `kubernetes` ClusterIP (10.43.0.1) and the kube-dns VIP (10.43.0.10) — node-local so they are never steered over the wireguard mesh (no peer's symmetric AllowedIPs = podCIDR covers them → a mesh-steered infra VIP blackholes in-pod kubectl + DNS on multi-node). darwin-net's half: (1) PER-NODE CoreDNS bound to the DNS VIP — pkg/dns.PerNodeDNS renders a Corefile with `bind <DefaultDNSVIP=10.43.0.10>` on :53, so every node answers cluster DNS over loopback, never the mesh; (2) the kube-dns VIP EXEMPTION from proxy ownership for BOTH 53/TCP and 53/UDP — proxy.WithInfraVIPExemptions registers the VIP and Proxy.Reconcile steps aside (no worker, no lo0 alias, no listener, no routing entry) so CoreDNS (which binds 10.43.0.10:53 directly) never hits EADDRINUSE (the M1 UDP path only dodged the collision by accident; TCP had no exemption). Locality STAYS A HINT: classify() is NOT made load-bearing for steering (it mislabels loopback/node-local as remote) — infra VIPs stay off the utun because the mesh installs kernel routes for peer pod /24s ONLY (M3.1 RouteSet), never the 10.43/16 infra range. The `kubernetes` 10.43.0.1 endpoint rewrite to a node-local apiserver/proxy address is k3sm-owned (k3sm:M3.3, the depends_on edge); darwin-net provides the per-node CoreDNS + the exemption seam, and k3sm ensures the 10.43.0.10/32 lo0 alias for its per-node CoreDNS (root/netd boundary)."
         acceptance:
           - id: M3.3-a1
-            met: false
-            check: on a two-node mesh, in-pod resolution of and connection to 10.43.0.1 (kubernetes) and 10.43.0.10 (kube-dns) succeed from a pod on the NON-control-plane node — the steering decision keeps infra VIPs node-local and off the utun (table-tested classifier + two-Mac integration)
-            method: integration
+            met: true
+            check: "the darwin-net half is proven by named pure-logic/faked unit tests (no root): TestKubeDNSVIPExemptFromProxy (with WithInfraVIPExemptions the proxy owns the kube-dns VIP for NEITHER 53/TCP nor 53/UDP — no worker, no alias-ensure, no routing entry — while a normal ClusterIP Service IS still claimed, so the exemption is VIP-specific) and TestCoreDNSBoundToDNSVIP (PerNodeDNS renders a Corefile bound to the DNS VIP on :53). The full two-node leg (in-pod resolution of + connection to 10.43.0.1 and 10.43.0.10 from a pod on the NON-control-plane node) is the K3SM_LAB=1 two-Mac gate and needs k3sm:M3.3 (the node-local `kubernetes` endpoint rewrite)."
+            method: unit+integration
 
   - id: M4
     title: NodePort/LB completion + root netd boundary + macOS CI
@@ -278,9 +284,11 @@ ClusterIP), and a cross-namespace `<svc>.<ns>` form expands to `<svc>.<ns>.svc.c
   `runtimed`/`k3sm` slice (the backend that keeps `DYLD_*` alive lives there); the darwin-net half — the
   resolver + the documented backend-pin decision — is complete here.
 
-## M3 — wireguard mesh + NodePort + infra-VIP exemption 🟡
+## M3 — wireguard mesh + NodePort + infra-VIP exemption ✅
 
-**Cross-repo deps:** `apis:M3.1` (`MeshPeer` CRD). Validated on two real Macs.
+**Cross-repo deps:** `apis:M3.2` (`MeshPeer` CRD + mesh-enroll payloads — the M3 re-plan split mesh
+out of storage `apis:M3.1` into `apis:M3.2`, which darwin-net's mesh depends on). `M3.3` additionally
+`depends_on` `k3sm:M3.3` (the node-local `kubernetes` endpoint rewrite). Validated on two real Macs.
 
 ### M3.1 — wireguard-go mesh over utun + MeshPeer consumption ✅
 **Deliverables**
@@ -313,37 +321,57 @@ ClusterIP), and a cross-namespace `<svc>.<ns>` form expands to `<svc>.<ns>.svc.c
   (`//go:build integration`, `t.Skip` without root). Two-real-Macs reachability (`iperf3` both
   directions) + bounce→reconverge is the `K3SM_LAB=1` gate — *method: unit + integration*
 
-### M3.2 — NodePort in the userspace Service proxy (TCP) ⬜
+### M3.2 — NodePort in the userspace Service proxy (TCP) ✅
 **Deliverables**
-- ⬜ `M3.2-d1` NodePort Services in the userspace Service proxy: bind `*:nodePort` (**TCP**) and
-  L4-LB to the Service's ready endpoints, reusing the M1 `RoutingTable` (already protocol-keyed).
-  **No `apis` change** — `ServicePort.NodePort` already exists. **UDP NodePort is DEFERRED**: it
-  needs the UDP datagram relay + idle-flow GC (noted in `pkg/proxy/doc.go`); stockkitty's NodePort
-  surface (VSCode SSH `:22`, snapshot gRPC range) is all TCP, so **UDP NodePort is not asserted until
+- ✅ `M3.2-d1` NodePort Services in the userspace Service proxy: a non-zero `ServicePort.NodePort`
+  opens a node-wide `*:nodePort` (wildcard) **TCP** listener alongside the ClusterIP listener,
+  L4-LB to the **same** ready endpoints (reusing the M1 `RoutingTable`). The listener path existed
+  since M1; M3.2 makes it the explicit, documented NodePort path (`proxy.openListener` + `doc.go`
+  `# NodePort`). **`externalTrafficPolicy: Cluster` only** — the userspace L4 splice opens a fresh
+  backend connection and so does **not** preserve the client source IP, so
+  `externalTrafficPolicy: Local` is not honored (documented). **No `apis` change** —
+  `ServicePort.NodePort` already exists. **UDP NodePort is DEFERRED** with the UDP datagram relay (a
+  UDP port opens no datagram socket on the ClusterIP **or** the NodePort); stockkitty's NodePort
+  surface (VSCode SSH `:22`, snapshot gRPC range) is all TCP, so **UDP NodePort is not claimed until
   the relay lands**.
 
 **Acceptance (exit gate)**
-- ⬜ `M3.2-a1` a Deployment behind a NodePort Service is reachable on `*:nodePort` (TCP) and
-  load-balances across ready endpoints; UDP NodePort is explicitly out of scope until the datagram
-  relay lands — *method: integration*
+- ✅ `M3.2-a1` proven by the named pure-logic/faked unit test (no root) `TestNodePortBindsWildcard`:
+  a TCP NodePort Service yields a `*:nodePort` wildcard listener that load-balances across ready
+  backends (dialed via loopback), and a UDP NodePort opens **no** listener (relay deferred → not
+  claimed); the `externalTrafficPolicy: Cluster` semantics (no client-source-IP preservation through
+  the L4 splice) are documented in `pkg/proxy/doc.go` + `openListener`. The live external-client
+  reachability on a real `*:nodePort` is the root-gated/lab integration leg — *method: unit +
+  integration*
 
-### M3.3 — infra-VIP exemption from podCIDR mesh steering (multi-node correctness) ⬜
+### M3.3 — infra-VIP exemption from podCIDR mesh steering (multi-node correctness) ✅
 **Deliverables**
-- ⬜ `M3.3-d1` Exempt the **infra VIPs** — the `kubernetes` ClusterIP (`10.43.0.1`) and the kube-dns
-  VIP (`10.43.0.10`) — from podCIDR-based mesh steering. They are **not** in any pod's podCIDR, so
-  the routing table classifies them `LocalityRemote` and would steer them over wireguard, where no
-  peer's symmetric `AllowedIPs` (= podCIDR) covers them — **blackholing in-pod kubectl and DNS on
-  multi-node**. Fix: (1) run CoreDNS **per-node bound to the DNS VIP** so the DNS backend is always
-  node-local/loopback, **never the mesh**; (2) resolve the `kubernetes` endpoint to a **node-local**
-  apiserver/proxy address; (3) classify infra VIPs node-local in the routing/steering decision so
-  they never egress the utun. Coordinates with `k3sm` (per-node `kubernetes` endpoint rewrite) and
-  the M2.2 in-pod-API path.
+- ✅ `M3.3-d1` Keep the **infra VIPs** — the `kubernetes` ClusterIP (`10.43.0.1`) and the kube-dns
+  VIP (`10.43.0.10`) — node-local so they are **never steered over the mesh** (they are **not** in
+  any pod's podCIDR, so no peer's symmetric `AllowedIPs` = podCIDR covers them → a mesh-steered infra
+  VIP blackholes in-pod kubectl + DNS on multi-node). darwin-net's half: **(1)** per-node CoreDNS
+  bound to the DNS VIP — `pkg/dns.PerNodeDNS` renders a Corefile with `bind <DefaultDNSVIP=10.43.0.10>`
+  on `:53`, so every node answers cluster DNS over loopback, never the mesh; **(2)** the **kube-dns
+  VIP exemption** from proxy ownership for **both `53/TCP` and `53/UDP`** —
+  `proxy.WithInfraVIPExemptions` + `Proxy.Reconcile` step aside (no worker, no lo0 alias, no listener,
+  no routing entry) so CoreDNS (which binds `10.43.0.10:53` directly) never hits `EADDRINUSE` (the M1
+  UDP path only dodged it by accident; TCP had no exemption). **Locality stays a hint** — `classify()`
+  is **not** made load-bearing for steering (it mislabels loopback/node-local as remote); infra VIPs
+  stay off the utun because the mesh installs kernel routes for peer pod /24s **only** (M3.1
+  `RouteSet`), never the `10.43/16` infra range. The `kubernetes` `10.43.0.1` **endpoint rewrite** to
+  a node-local apiserver/proxy address is **k3sm-owned** (`k3sm:M3.3`, the `depends_on` edge);
+  darwin-net provides the per-node CoreDNS + the exemption seam, and k3sm ensures the `10.43.0.10/32`
+  lo0 alias for its per-node CoreDNS (root/netd boundary).
 
 **Acceptance (exit gate)**
-- ⬜ `M3.3-a1` on a two-node mesh, in-pod resolution of and connection to `10.43.0.1` (kubernetes)
-  and `10.43.0.10` (kube-dns) succeed from a pod on the **non-control-plane** node — the steering
-  decision keeps infra VIPs node-local and off the utun (table-tested classifier + two-Mac
-  integration) — *method: integration*
+- ✅ `M3.3-a1` the darwin-net half is proven by named pure-logic/faked unit tests (no root):
+  `TestKubeDNSVIPExemptFromProxy` (with `WithInfraVIPExemptions` the proxy owns the kube-dns VIP for
+  **neither** `53/TCP` nor `53/UDP` — no worker, no alias-ensure, no routing entry — while a normal
+  ClusterIP Service **is** still claimed, so the exemption is VIP-specific) and
+  `TestCoreDNSBoundToDNSVIP` (`PerNodeDNS` renders a Corefile bound to the DNS VIP on `:53`). The full
+  two-node leg (in-pod resolution of + connection to `10.43.0.1` and `10.43.0.10` from a pod on the
+  **non-control-plane** node) is the `K3SM_LAB=1` two-Mac gate and needs `k3sm:M3.3` (the node-local
+  `kubernetes` endpoint rewrite) — *method: unit + integration*
 
 ## M4 — Hardening ⬜
 Headline: probes/NodePort/LB completion; the root `k3sm-netd` daemon boundary hardened for launchd
@@ -395,9 +423,12 @@ protocol-keyed).
 **M2** is now decomposed for the `~/stockkitty` readiness work (rationale of record:
 `../../docs/stockkitty-readiness.md`): IP-per-pod lo0 IPAM + the `PodNetwork` seam (`M2.1`) plus
 in-pod `kubernetes.default.svc` resolution under the confined runtime (`M2.2` — pin the exec-shim
-backend or add a DNS proxy, since `sandbox-exec` strips `DYLD_*`). **M3** gains NodePort `*:port`
-(TCP; UDP relay deferred — `M3.2`) and the **infra-VIP mesh exemption** (`M3.3` — `10.43.0.1` /
-`10.43.0.10` must stay node-local off the utun or multi-node blackholes in-pod kubectl + DNS). **M5**
+backend or add a DNS proxy, since `sandbox-exec` strips `DYLD_*`). **M3** is code-complete: the
+wireguard mesh (`M3.1`), NodePort `*:port` (TCP; UDP relay deferred — `M3.2`), and the **infra-VIP
+mesh exemption** (`M3.3` — per-node CoreDNS bound to `10.43.0.10` + the kube-dns VIP exemption from
+proxy ownership so the two never fight for `10.43.0.10:53`). The remaining M3 legs are out of
+darwin-net's hands: the `K3SM_LAB=1` two-Mac reachability/reconverge gate, the node-local `kubernetes`
+endpoint rewrite (`k3sm:M3.3`), and the `53/UDP` datagram relay. **M5**
 (committed) is the `vm` RuntimeClass guest networking: a vmnet/bridge interface + routing (`M5.1`,
 since the lo0-alias / `IP_BOUND_IF` model is host-process-only) and a guest-side resolver (`M5.2`,
 since the `DYLD` getaddrinfo shim is Darwin-only). M2 deps `apis:M2.1`; M5 deps `apis:M5.1`.

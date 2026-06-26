@@ -55,6 +55,40 @@ func TestCorefile(t *testing.T) {
 	})
 }
 
+// TestCoreDNSBoundToDNSVIP is the M3.3 acceptance for per-node CoreDNS: PerNodeDNS
+// renders a Corefile bound to the DNS VIP on :53 so each node answers cluster DNS
+// locally over loopback (never over the mesh, which carries only pod /24s). It
+// defaults the DNS VIP to DefaultDNSVIP and honors an explicit override.
+func TestCoreDNSBoundToDNSVIP(t *testing.T) {
+	t.Parallel()
+
+	t.Run("defaults to the kube-dns VIP on :53", func(t *testing.T) {
+		t.Parallel()
+		cf := PerNodeDNS("", "cluster.local", []string{"1.1.1.1"}).Corefile()
+		for _, want := range []string{
+			".:53 {",
+			"bind " + DefaultDNSVIP,
+			"kubernetes cluster.local",
+			"forward . 1.1.1.1",
+		} {
+			if !strings.Contains(cf, want) {
+				t.Fatalf("per-node Corefile missing %q:\n%s", want, cf)
+			}
+		}
+	})
+
+	t.Run("honors an explicit DNS VIP", func(t *testing.T) {
+		t.Parallel()
+		cf := PerNodeDNS("10.96.0.10", "cluster.local", nil).Corefile()
+		if !strings.Contains(cf, "bind 10.96.0.10") {
+			t.Fatalf("explicit DNS VIP not bound:\n%s", cf)
+		}
+		if strings.Contains(cf, "bind "+DefaultDNSVIP) {
+			t.Fatalf("default VIP leaked when an explicit one was given:\n%s", cf)
+		}
+	})
+}
+
 // TestPodDNSConfig asserts the per-pod DNSConfig carries the cluster VIP, the
 // standard Kubernetes search list for the namespace, the default ndots, and
 // validates and round-trips through the resolver expander to resolve a short
