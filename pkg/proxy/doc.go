@@ -32,12 +32,44 @@
 //   - Watcher (watch.go) is the production seam: client-go shared informers feed
 //     Service/EndpointSlice events into Proxy.Reconcile.
 //
-// # Locality
+// # NodePort (M3.2)
+//
+// A Service port with a non-zero NodePort additionally opens a node-wide
+// *:NodePort TCP listener (bound to the wildcard so every node interface answers)
+// that L4-load-balances to the SAME Ready backend set as the ClusterIP. This is
+// externalTrafficPolicy: Cluster — externalTrafficPolicy: Local is NOT honored,
+// because the userspace splice opens a fresh backend connection and so does not
+// preserve the external client's source IP (the precondition Local relies on).
+// NodePort is TCP only; the UDP NodePort relay is deferred together with the UDP
+// datagram relay below (a UDP port opens no datagram socket on either the
+// ClusterIP or the NodePort). stockkitty's NodePort surface (VSCode SSH :22, the
+// snapshot gRPC range) is all TCP, so UDP NodePort is not claimed until the relay
+// lands.
+//
+// # Locality (a hint, not load-bearing)
 //
 // Backend locality (local lo0 pod IP vs remote pod over the wireguard mesh) is
 // computed proxy-side from the node podCIDR with a cheap netip.Prefix.Contains —
-// no getifaddrs scan per connection. It is a hint/metric in M1 (steering does not
-// depend on it); the mesh data path lands in M3.
+// no getifaddrs scan per connection. It is deliberately a hint/metric only:
+// cross-node steering is done by the per-peer kernel routes the mesh installs on
+// the utun (pkg/mesh, M3.1), not by this classifier. classify must stay
+// non-load-bearing because it mislabels any address outside the node podCIDR —
+// including loopback and node-local infra VIPs — as remote; routing on it would
+// blackhole them. Infra VIPs stay node-local for free: the mesh routes only peer
+// pod /24s to the utun, so 10.43.0.10 / 10.43.0.1 are never steered over it.
+//
+// # Infra-VIP exemption (per-node CoreDNS) — M3.3
+//
+// k3sm runs CoreDNS on every node bound directly to the kube-dns VIP (10.43.0.10,
+// pkg/dns.PerNodeDNS) for 53/TCP and 53/UDP, so cluster DNS is always answered
+// node-locally over loopback and never crosses the mesh. WithInfraVIPExemptions
+// registers that VIP so the proxy yields ownership of it entirely — no lo0 alias,
+// no socket, no routing entry — which is what keeps the proxy from colliding with
+// CoreDNS on 10.43.0.10:53 (EADDRINUSE). The exemption is keyed on the VIP
+// address, so it covers both 53/TCP and 53/UDP; a normal ClusterIP Service is
+// unaffected. The node-local kubernetes (10.43.0.1) endpoint uses the same
+// step-aside mechanism, but its endpoint rewrite is k3sm-owned (k3sm:M3.3) —
+// darwin-net supplies the per-node CoreDNS and this exemption seam.
 //
 // # UDP flow timeout (noted, not built in M1)
 //

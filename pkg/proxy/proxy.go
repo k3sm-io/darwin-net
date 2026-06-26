@@ -25,6 +25,11 @@ const dialTimeout = 5 * time.Second
 // L4-load-balances accepted connections to the Ready backends in its
 // RoutingTable.
 //
+// It yields ownership of infra VIPs registered via WithInfraVIPExemptions (the
+// kube-dns VIP, which per-node CoreDNS binds directly): for an exempt VIP the
+// proxy creates no worker, no lo0 alias, and no listener, so it never contends
+// with CoreDNS for 10.43.0.10:53 (EADDRINUSE).
+//
 // Concurrency / locking discipline:
 //   - Each ClusterIP:port (a PortKey) is reconciled by exactly one per-key worker
 //     goroutine, fed by a per-key event channel. Serializing per VIP means a
@@ -41,6 +46,11 @@ type Proxy struct {
 	alias  aliasManager
 	log    *slog.Logger
 	dialer *net.Dialer
+	// exemptVIPs are infra VIPs owned by a node-local binder (per-node CoreDNS on
+	// the kube-dns VIP) rather than by the proxy: the proxy never aliases, binds,
+	// or routes them. It is set once by WithInfraVIPExemptions and read-only
+	// thereafter, so it needs no lock.
+	exemptVIPs map[netip.Addr]struct{}
 
 	mu      sync.Mutex
 	workers map[PortKey]*portWorker
@@ -76,6 +86,34 @@ func WithMeshEgressSource(src netip.Addr) Option {
 	}
 }
 
+// WithInfraVIPExemptions marks one or more infra VIPs as owned by a node-local
+// binder rather than the Service proxy, so the proxy never takes ownership of
+// them: no lo0 alias, no listening socket, no routing-table entry.
+//
+// It is the fix for the per-node CoreDNS collision (M3.3). k3sm runs CoreDNS on
+// every node bound directly to the kube-dns VIP (10.43.0.10) for 53/TCP and
+// 53/UDP, so cluster DNS is always answered node-locally over loopback and never
+// steered over the wireguard mesh (which carries only pod /24s — a mesh-steered
+// DNS VIP would blackhole). Without this exemption the proxy's kube-dns Service
+// reconcile would try to bind 10.43.0.10:53/TCP and fail with EADDRINUSE; the M1
+// UDP path only dodged the collision by accident (it opens no datagram socket).
+// The exemption is keyed on the VIP address, so it covers every port and protocol
+// on that VIP; a normal ClusterIP Service (a different address) is unaffected and
+// still claimed.
+//
+// The node-local kubernetes (10.43.0.1) endpoint uses the same step-aside
+// mechanism, but its endpoint rewrite is k3sm-owned (k3sm:M3.3); darwin-net
+// supplies the per-node CoreDNS (pkg/dns.PerNodeDNS) and this exemption seam.
+func WithInfraVIPExemptions(vips ...netip.Addr) Option {
+	return func(p *Proxy) {
+		for _, v := range vips {
+			if v.IsValid() {
+				p.exemptVIPs[v] = struct{}{}
+			}
+		}
+	}
+}
+
 // withAliasManager overrides the alias manager (tests inject the rootless fake).
 func withAliasManager(a aliasManager) Option {
 	return func(p *Proxy) { p.alias = a }
@@ -85,12 +123,13 @@ func withAliasManager(a aliasManager) Option {
 // the root-gated lo0 alias manager; pass options to override (e.g. a logger).
 func New(table *RoutingTable, opts ...Option) *Proxy {
 	p := &Proxy{
-		table:   table,
-		alias:   newLo0AliasManager(),
-		log:     slog.Default(),
-		dialer:  &net.Dialer{Timeout: dialTimeout},
-		workers: make(map[PortKey]*portWorker),
-		done:    make(chan struct{}),
+		table:      table,
+		alias:      newLo0AliasManager(),
+		log:        slog.Default(),
+		dialer:     &net.Dialer{Timeout: dialTimeout},
+		exemptVIPs: make(map[netip.Addr]struct{}),
+		workers:    make(map[PortKey]*portWorker),
+		done:       make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(p)
@@ -159,10 +198,20 @@ func (p *Proxy) Reconcile(clusterIP string, port *netv1.ServicePort, endpoints [
 	}
 	// Validate the clusterIP early so a malformed VIP fails fast at the caller
 	// rather than later in the worker's openListener.
-	if _, err := netip.ParseAddr(clusterIP); err != nil {
+	addr, err := netip.ParseAddr(clusterIP)
+	if err != nil {
 		return fmt.Errorf("proxy: parse clusterIP %q: %w", clusterIP, err)
 	}
 	key := PortKey{ClusterIP: clusterIP, Port: port.Port, Protocol: defaultProto(port.Protocol)}
+	if p.isExemptVIP(addr) {
+		// An infra VIP a node-local binder owns (per-node CoreDNS on the kube-dns
+		// VIP, the rewritten kubernetes endpoint). Step aside entirely — no worker,
+		// no lo0 alias, no listener, no routing entry — so the proxy never contends
+		// for the socket (EADDRINUSE). The exemption covers every port/protocol on
+		// the VIP, so this fires for both 53/TCP and 53/UDP on the kube-dns VIP.
+		p.log.Debug("infra VIP exempt from proxy ownership (node-local binder owns it)", "vip", key.String())
+		return nil
+	}
 	w := p.worker(key)
 	if w == nil {
 		return errors.New("proxy: shutting down")
@@ -254,13 +303,22 @@ func (p *Proxy) runWorker(w *portWorker) {
 // openListener binds the sockets for one Service port: the ClusterIP listener on
 // the specific lo0 alias address (net.Listen on clusterIP:port, never :port, so
 // the bound source identity is the VIP), and, when NodePort is set, a node-wide
-// *:NodePort listener. It ensures the lo0 alias exists first.
+// *:NodePort listener (TCP). It ensures the lo0 alias exists first.
 //
-// M1 builds the TCP data path end to end. UDP datagram relay (the 53/UDP path)
+// NodePort semantics: the *:NodePort listener accepts on every node interface
+// and L4-load-balances to the SAME Ready backend set as the ClusterIP — i.e.
+// externalTrafficPolicy: Cluster. externalTrafficPolicy: Local is NOT honored,
+// because the userspace splice (see splice) opens a fresh backend connection and
+// therefore does NOT preserve the external client's source IP (the backend sees
+// the proxy/mesh-egress source, not the client) — the precondition Local relies
+// on. NodePort is TCP only here; the UDP NodePort relay is deferred with the UDP
+// datagram relay (below + doc.go).
+//
+// The TCP data path is built end to end. UDP datagram relay (the 53/UDP path)
 // is deferred per the doc.go UDP flow-timeout note: for a UDP port the alias is
 // still ensured (so the VIP is reachable once the relay lands) but no stream
-// listener is opened — the routing table already steers UDP keys, so adding the
-// relay later needs no change here.
+// listener — ClusterIP or NodePort — is opened. The routing table already steers
+// UDP keys, so adding the relay later needs no change here.
 func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
@@ -276,8 +334,10 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	l := &listener{key: key, alias: p.alias, aliasIP: ip, log: p.log}
 
 	if key.Protocol == netv1.ProtocolUDP {
-		// UDP relay deferred (see doc.go). Hold the alias so the VIP resolves.
-		p.log.Info("udp service port: datagram relay deferred to the DNS milestone, alias ensured", "vip", key.String())
+		// UDP relay deferred (see doc.go) — this defers BOTH the ClusterIP and the
+		// NodePort UDP datagram paths (no datagram socket is opened for either).
+		// Hold the alias so the VIP resolves once the relay lands.
+		p.log.Info("udp service port: datagram relay deferred (clusterIP + nodePort), alias ensured", "vip", key.String())
 		return l, nil
 	}
 
@@ -292,7 +352,9 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	l.clusterIP = cl
 	go p.serve(cl, key)
 
-	// NodePort listener: bind the wildcard so every node interface answers.
+	// NodePort listener: bind the wildcard (*:NodePort) so every node interface
+	// answers, load-balancing to the same backends as the ClusterIP
+	// (externalTrafficPolicy: Cluster — the splice does not preserve client src IP).
 	if port.NodePort != 0 {
 		nodeAddr := net.JoinHostPort("", strconv.Itoa(int(port.NodePort)))
 		nl, err := net.Listen("tcp", nodeAddr)
@@ -378,6 +440,14 @@ func (l *listener) Close() {
 	if err := l.alias.Remove(ctx, l.aliasIP); err != nil {
 		l.log.Warn("remove lo0 alias", "vip", l.key.String(), "ip", l.aliasIP.String(), "err", err)
 	}
+}
+
+// isExemptVIP reports whether addr is an infra VIP a node-local binder owns (set
+// via WithInfraVIPExemptions), in which case the proxy yields ownership of every
+// port on it. The map is immutable after construction so this needs no lock.
+func (p *Proxy) isExemptVIP(addr netip.Addr) bool {
+	_, ok := p.exemptVIPs[addr]
+	return ok
 }
 
 // defaultProto returns p, defaulting the empty protocol to TCP (Kubernetes
