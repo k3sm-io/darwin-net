@@ -30,6 +30,37 @@ type CorefileOptions struct {
 // DefaultDNSPort is the standard DNS port.
 const DefaultDNSPort = 53
 
+// DefaultDNSVIP is the conventional kube-dns ClusterIP in k3sm's default
+// 10.43.0.0/16 service CIDR (the .10 of the range, matching k3s). CoreDNS runs
+// per-node bound to this address (see PerNodeDNS) so cluster DNS is always
+// answered node-locally over loopback — never steered over the wireguard mesh,
+// which carries only pod /24s (a mesh-steered DNS VIP would blackhole, since no
+// peer's AllowedIPs cover 10.43.0.10). The Service proxy exempts this VIP from
+// ownership (proxy.WithInfraVIPExemptions) so CoreDNS and the proxy do not fight
+// for 10.43.0.10:53 (EADDRINUSE). It is a darwin-net default; the authoritative
+// value is the server's service-CIDR config (k3sm).
+const DefaultDNSVIP = "10.43.0.10"
+
+// PerNodeDNS returns the CorefileOptions for the per-node cluster resolver:
+// CoreDNS bound to the DNS VIP (dnsVIP, default DefaultDNSVIP) on the standard
+// DNS port, authoritative for clusterDomain, forwarding all other names to
+// upstream. Every node runs its own CoreDNS bound to the same VIP on its own lo0
+// alias, so a pod's DNS query resolves over loopback and never crosses the mesh;
+// the Service proxy must exempt dnsVIP (proxy.WithInfraVIPExemptions) so the two
+// do not contend for dnsVIP:53. An empty dnsVIP defaults to DefaultDNSVIP and an
+// empty clusterDomain defaults to cluster.local (applied by Corefile).
+func PerNodeDNS(dnsVIP, clusterDomain string, upstream []string) CorefileOptions {
+	if dnsVIP == "" {
+		dnsVIP = DefaultDNSVIP
+	}
+	return CorefileOptions{
+		ClusterDomain:     clusterDomain,
+		BindIP:            dnsVIP,
+		Port:              DefaultDNSPort,
+		UpstreamResolvers: upstream,
+	}
+}
+
 // Corefile renders the CoreDNS configuration for the cluster resolver. It serves
 // the cluster domain via the kubernetes plugin, answers pod/Service records,
 // caches, and forwards everything else upstream. The output is a valid Corefile
