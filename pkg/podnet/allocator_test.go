@@ -85,23 +85,24 @@ func TestNodeCIDRStableAcrossRestart(t *testing.T) {
 
 // TestAllocatorUniqueNoDoubleAllocation maps to acceptance M2.1-a1 (allocate
 // unique IPs from the CIDR; no double-allocation): draining the pool yields every
-// usable host exactly once, all inside the /24 and excluding network/broadcast,
-// then the pool is exhausted.
+// usable host exactly once, all inside the /24 and excluding the network,
+// broadcast, and mesh-egress reserved addresses, then the pool is exhausted.
 func TestAllocatorUniqueNoDoubleAllocation(t *testing.T) {
 	cidr := netip.MustParsePrefix("100.64.7.0/24")
 	a, err := NewAllocator(cidr)
 	if err != nil {
 		t.Fatalf("NewAllocator: %v", err)
 	}
-	if got := a.Capacity(); got != 254 {
-		t.Fatalf("Capacity = %d, want 254", got)
+	if got := a.Capacity(); got != 253 {
+		t.Fatalf("Capacity = %d, want 253 (.0/.1/.255 reserved)", got)
 	}
 
 	network := netip.MustParseAddr("100.64.7.0")
+	meshEgress := netip.MustParseAddr("100.64.7.1")
 	broadcast := netip.MustParseAddr("100.64.7.255")
 
 	seen := make(map[netip.Addr]bool)
-	for i := 0; i < 254; i++ {
+	for i := 0; i < 253; i++ {
 		ip, err := a.Allocate()
 		if err != nil {
 			t.Fatalf("Allocate #%d: %v", i, err)
@@ -113,12 +114,12 @@ func TestAllocatorUniqueNoDoubleAllocation(t *testing.T) {
 		if !cidr.Contains(ip) {
 			t.Fatalf("Allocate handed out %s outside %s", ip, cidr)
 		}
-		if ip == network || ip == broadcast {
+		if ip == network || ip == meshEgress || ip == broadcast {
 			t.Fatalf("Allocate handed out reserved address %s", ip)
 		}
 	}
-	if got := a.InUse(); got != 254 {
-		t.Fatalf("InUse = %d, want 254", got)
+	if got := a.InUse(); got != 253 {
+		t.Fatalf("InUse = %d, want 253", got)
 	}
 	if _, err := a.Allocate(); !errors.Is(err, ErrPoolExhausted) {
 		t.Fatalf("Allocate on full pool err = %v, want ErrPoolExhausted", err)
@@ -136,7 +137,7 @@ func TestAllocatorReleaseLeakFree(t *testing.T) {
 	}
 
 	var held []netip.Addr
-	for i := 0; i < 254; i++ {
+	for i := 0; i < 253; i++ {
 		ip, err := a.Allocate()
 		if err != nil {
 			t.Fatalf("Allocate #%d: %v", i, err)
@@ -167,13 +168,13 @@ func TestAllocatorReleaseLeakFree(t *testing.T) {
 	}
 
 	// The whole pool is reusable after release.
-	for i := 0; i < 254; i++ {
+	for i := 0; i < 253; i++ {
 		if _, err := a.Allocate(); err != nil {
 			t.Fatalf("re-Allocate #%d after release: %v", i, err)
 		}
 	}
-	if got := a.InUse(); got != 254 {
-		t.Fatalf("InUse after refill = %d, want 254", got)
+	if got := a.InUse(); got != 253 {
+		t.Fatalf("InUse after refill = %d, want 253", got)
 	}
 }
 
@@ -244,6 +245,7 @@ func TestAllocateSpecific(t *testing.T) {
 
 	for _, bad := range []netip.Addr{
 		netip.MustParseAddr("100.64.5.0"),   // network
+		netip.MustParseAddr("100.64.5.1"),   // mesh-egress reserved
 		netip.MustParseAddr("100.64.5.255"), // broadcast
 		netip.MustParseAddr("10.0.0.1"),     // outside CIDR
 	} {

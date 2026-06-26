@@ -75,18 +75,24 @@ func NodeCIDR(clusterCIDR netip.Prefix, index int) (netip.Prefix, error) {
 
 // Allocator hands out unique host /32 addresses from a single node's pod CIDR (a
 // /24). It is the pure-logic IPAM core: no interface, no syscalls, no privilege,
-// so its allocate/release behavior is fully table-tested. The network address
-// (.0) and the broadcast address (.255) of the /24 are reserved and never handed
-// out, matching conventional IPv4 host allocation.
+// so its allocate/release behavior is fully table-tested. Three addresses in the
+// /24 are reserved and never handed out: the network address (.0), the broadcast
+// address (.255), and the mesh-egress /32 (.1, see MeshEgressIP) the wireguard
+// mesh uses as this node's tunnel-egress source. A /24 therefore yields 253 usable
+// pod addresses (.2 through .254).
 //
 // Locking discipline: all state is guarded by mu. Allocate and Release take the
 // write lock; the read-only accessors take the read lock. The allocator is safe
 // for concurrent use by the pod setup/teardown paths.
 type Allocator struct {
 	cidr netip.Prefix
+	// meshEgress is the .1 /32 reserved as the node's wireguard mesh-egress source
+	// (MeshEgressIP); it is excluded from the usable range so it is never handed to
+	// a pod (a pod IP colliding with the mesh source would break mesh return paths).
+	meshEgress netip.Addr
 	// first and last bound the usable host range [first, last] inside the /24
-	// (network and broadcast excluded). next is the rotating cursor Allocate scans
-	// from so freed-then-reallocated addresses are reused without bias.
+	// (network, mesh-egress, and broadcast excluded). next is the rotating cursor
+	// Allocate scans from so freed-then-reallocated addresses are reused without bias.
 	first, last netip.Addr
 	next        netip.Addr
 
@@ -110,19 +116,26 @@ func NewAllocator(nodeCIDR netip.Prefix) (*Allocator, error) {
 	}
 	nodeCIDR = nodeCIDR.Masked()
 	network := nodeCIDR.Addr()
-	first := network.Next()            // .1 — skip the .0 network address
+	meshEgress := network.Next()       // .1 — reserved as the node's mesh-egress /32 (MeshEgressIP)
+	first := meshEgress.Next()         // .2 — first usable pod IP (.0 network + .1 mesh-egress reserved)
 	last := lastHostInSlash24(network) // .254 — skip the .255 broadcast address
 	return &Allocator{
-		cidr:      nodeCIDR,
-		first:     first,
-		last:      last,
-		next:      first,
-		allocated: make(map[netip.Addr]struct{}),
+		cidr:       nodeCIDR,
+		meshEgress: meshEgress,
+		first:      first,
+		last:       last,
+		next:       first,
+		allocated:  make(map[netip.Addr]struct{}),
 	}, nil
 }
 
 // CIDR returns the node /24 this allocator serves.
 func (a *Allocator) CIDR() netip.Prefix { return a.cidr }
+
+// MeshEgressIP returns the /32 (.1 of the node /24) this allocator reserves as the
+// node's wireguard mesh-egress source. It is never handed out by Allocate; see the
+// package-level MeshEgressIP for the canonical derivation the mesh and proxy share.
+func (a *Allocator) MeshEgressIP() netip.Addr { return a.meshEgress }
 
 // Allocate reserves and returns the next free host address in the node /24. It
 // scans forward from a rotating cursor, wrapping at the broadcast boundary, so a
@@ -196,8 +209,8 @@ func (a *Allocator) InUse() int {
 	return len(a.allocated)
 }
 
-// Capacity returns the number of usable host addresses in the node /24 (254 for a
-// /24: 256 minus the network and broadcast addresses).
+// Capacity returns the number of usable host addresses in the node /24 (253 for a
+// /24: 256 minus the network, broadcast, and mesh-egress reserved addresses).
 func (a *Allocator) Capacity() int {
 	return a.usableCount()
 }
