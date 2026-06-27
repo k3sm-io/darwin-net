@@ -344,22 +344,32 @@ func TestServerBindPortPrivilegedWithoutAuthorizerRejected(t *testing.T) {
 	}
 }
 
-// TestServerBindPortUnauthorizedPortRejected proves a port that is neither in the
-// NodePort range nor privileged is denied (the proxy binds those itself).
-func TestServerBindPortUnauthorizedPortRejected(t *testing.T) {
-	sock, fp := startServer(t, netd.Config{})
+// TestServerBindPortHighVIPPortAllowed pins the corrected port-authorization
+// contract: a SPECIFIC-address non-privileged (>=1024) VIP port is allowed — it
+// grants no more than the unprivileged service uid could bind itself, so the daemon
+// does not gate it (only the escalation-sensitive <1024 binds and the wildcard are
+// gated, and no PortAuthorizer is needed here). There is no NodePort-range carve-out:
+// a NodePort is bound on the wildcard in-process by the proxy, never through this
+// helper.
+func TestServerBindPortHighVIPPortAllowed(t *testing.T) {
+	sock, fp := startServer(t, netd.Config{}) // no PortAuthorizer: >=1024 needs none
 	ctx := context.Background()
-	_, err := wire.NewClient(sock).BindPort(ctx, "tcp", netip.MustParseAddrPort("10.43.0.10:8080"))
-	if err == nil {
-		t.Fatal("BindPort(:8080) succeeded, want rejection (not NodePort range, not privileged)")
+	ap := netip.MustParseAddrPort("10.43.0.10:8080")
+	file, err := wire.NewClient(sock).BindPort(ctx, "tcp", ap)
+	if err != nil {
+		t.Fatalf("BindPort(:8080 specific VIP) rejected, want allowed (>=1024 is no privilege escalation): %v", err)
 	}
-	if got := fp.boundPorts(); len(got) != 0 {
-		t.Fatalf("unauthorized port reached executor: %v", got)
+	_ = file.Close()
+	if got := fp.boundPorts(); len(got) != 1 || got[0] != ap {
+		t.Fatalf("executor bound %v, want [%s]", got, ap)
 	}
 }
 
 // TestServerBindPortWildcardRejected proves the daemon refuses to bind a wildcard
-// address (it binds only a specific NodeAddr, never *).
+// address: it binds only a specific NodeAddr, never *. A NodePort is reached on the
+// wildcard *:nodePort, which the proxy binds in-process (a >=1024 wildcard needs no
+// privilege) — the helper has no NodePort path, so a wildcard bind is always rejected
+// here regardless of port.
 func TestServerBindPortWildcardRejected(t *testing.T) {
 	sock, _ := startServer(t, netd.Config{})
 	ctx := context.Background()
@@ -462,8 +472,8 @@ func TestServerMalformedFrameErrorsNoPanic(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestServerBindPortPassesUsableFD is the SCM_RIGHTS guarantee: a BindPort for a
-// NodePort-range port returns a file descriptor that wraps into a working
-// net.Listener (it accepts a real connection).
+// specific-address >=1024 VIP port returns a file descriptor that wraps into a
+// working net.Listener (it accepts a real connection).
 func TestServerBindPortPassesUsableFD(t *testing.T) {
 	sock, fp := startServer(t, netd.Config{})
 	ctx := context.Background()
