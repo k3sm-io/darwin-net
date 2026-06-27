@@ -72,6 +72,15 @@ func withAliasManager(a aliasManager) Option {
 	return func(n *Network) { n.alias = a }
 }
 
+// WithNetdHelper routes lo0 alias plumbing through the root netd daemon at
+// socketPath (empty uses the default socket) instead of the direct, root-gated
+// ifconfig manager, so an unprivileged process can run the pod network. It is the
+// one construction-time selection of the alias backend; the direct manager remains
+// the default for an explicit run-as-root mode.
+func WithNetdHelper(socketPath string) Option {
+	return func(n *Network) { n.alias = newNetdAliasManager(socketPath) }
+}
+
 // New constructs a Network allocating pod IPs from nodeCIDR (a /24; use NodeCIDR
 // to derive one from the cluster CIDR and the node index). By default it uses the
 // root-gated lo0 alias manager; pass options to override (e.g. a logger). It

@@ -32,6 +32,13 @@ type Mesh struct {
 	listenPort    int
 	privateKeyB64 string
 
+	// netd helper selection (WithNetdHelper). When netdSocket is set, New builds a
+	// netd-backed device that drives the root daemon over the unix socket instead of
+	// the direct wireguard device; netdPrivKeyRef is the opaque reference the daemon
+	// resolves to the private key root-side (the key itself never crosses the socket).
+	netdSocket     string
+	netdPrivKeyRef string
+
 	mu      sync.Mutex
 	started bool
 	applied Plan
@@ -83,6 +90,21 @@ func withDevice(d Device) Option {
 	return func(m *Mesh) { m.dev = d }
 }
 
+// WithNetdHelper routes the privileged mesh datapath through the root netd daemon
+// at socketPath: the device sends ConfigureMesh/RemoveMesh and the daemon (which
+// holds the private key, resolved from privKeyRef) creates the utun, programs
+// wireguard, installs the per-peer routes, and loads the MSS-clamp anchor. It is
+// the one construction-time selection of the mesh backend — the direct wireguard
+// device (WithPrivateKey) remains for an explicit run-as-root mode. The base64
+// private key never crosses the socket; only privKeyRef does, which the daemon
+// resolves root-side. An empty socketPath uses the netd default socket.
+func WithNetdHelper(socketPath, privKeyRef string) Option {
+	return func(m *Mesh) {
+		m.netdSocket = socketPath
+		m.netdPrivKeyRef = privKeyRef
+	}
+}
+
 // New constructs a Mesh for the node whose pod /24 is self. It derives the node's
 // mesh-egress source (podnet.MeshEgressIP) and, unless a device is injected,
 // builds the production wireguard device. It returns ErrSelfCIDR if self is not a
@@ -107,14 +129,18 @@ func New(self netip.Prefix, opts ...Option) (*Mesh, error) {
 		o(m)
 	}
 	if m.dev == nil {
-		m.dev = newWireguardDevice(wgLink{
-			name:          m.utunName,
-			mtu:           MTU,
-			mss:           MSSClamp,
-			meshIP:        meshIP,
-			privateKeyB64: m.privateKeyB64,
-			listenPort:    m.listenPort,
-		}, m.log)
+		if m.netdSocket != "" {
+			m.dev = newNetdDevice(m.netdSocket, m.netdPrivKeyRef, m.listenPort, m.log)
+		} else {
+			m.dev = NewDevice(DeviceConfig{
+				UTUNName:      m.utunName,
+				MTU:           MTU,
+				MSS:           MSSClamp,
+				MeshIP:        meshIP,
+				PrivateKeyB64: m.privateKeyB64,
+				ListenPort:    m.listenPort,
+			}, m.log)
+		}
 	}
 	return m, nil
 }

@@ -36,11 +36,13 @@ const MSSClamp = MTU - tcpIPv4HeaderBytes
 // clamp value is table-tested rather than asserted as a bare literal.
 func MaxMSS(mtu int) int { return mtu - tcpIPv4HeaderBytes }
 
-// pfMSSClampRule renders the minimal pf scrub rule that clamps TCP MSS on the
+// PFMSSClampRule renders the minimal pf scrub rule that clamps TCP MSS on the
 // mesh utun egress. It is scoped `on <utun>` to the tunnel only — clamping lo0
 // (MTU 16384) would needlessly shrink same-node loopback segments. This is the
 // rule text loaded into the io.k3sm.mesh pf anchor; wiring the anchor into the
-// main ruleset is the root netd boundary's job (the full pf sub-anchor is M4).
-func pfMSSClampRule(utun string, mss int) string {
+// main ruleset is the root netd boundary's job (the full pf sub-anchor is M4). It
+// is exported so the netd daemon renders the same rule for the standalone
+// MSS-clamp verb, never accepting pf text over the wire.
+func PFMSSClampRule(utun string, mss int) string {
 	return fmt.Sprintf("scrub out on %s proto tcp from any to any max-mss %d\n", utun, mss)
 }

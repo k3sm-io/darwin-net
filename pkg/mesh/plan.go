@@ -200,6 +200,38 @@ func BuildPlan(self netip.Prefix, peers []netv1.MeshPeerSpec) (Plan, error) {
 	return plan, nil
 }
 
+// ValidatePlan is the strict form of BuildPlan: it returns a Plan only if EVERY
+// peer is programmable, turning a peer BuildPlan would silently skip (bad key,
+// malformed or non-/24 podCIDR, AllowedIPs != podCIDR, unsupported schemaVersion)
+// into an error instead. The netd daemon uses it to REJECT an out-of-policy
+// ConfigureMesh at the privilege boundary, where a skipped peer is a client bug or
+// an attack rather than the benign cluster churn BuildPlan tolerates for the
+// in-process reconcile loop. self must be an IPv4 /24 (ErrSelfCIDR otherwise);
+// per-peer problems wrap ErrPeerConfig.
+func ValidatePlan(self netip.Prefix, peers []netv1.MeshPeerSpec) (Plan, error) {
+	plan, err := BuildPlan(self, peers)
+	if err != nil {
+		return Plan{}, err
+	}
+	if len(plan.Skipped) > 0 {
+		s := plan.Skipped[0]
+		return Plan{}, fmt.Errorf("%w: peer %q (podCIDR %s): %s", ErrPeerConfig, s.NodeName, s.PodCIDR, s.Reason)
+	}
+	// Strict: BuildPlan admits a peer whose AllowedIPs equals its podCIDR even when
+	// that CIDR is not a per-node /24 (RouteSet then drops the non-/24, leaving a
+	// routeless peer). For the privilege boundary that is a misconfiguration to
+	// reject, not silently program — a non-/24 AllowedIPs would also widen the
+	// wireguard cryptokey-routing source range.
+	for _, pc := range plan.Peers {
+		for _, a := range pc.AllowedIPs {
+			if !a.Addr().Is4() || a.Bits() != nodeCIDRBits {
+				return Plan{}, fmt.Errorf("%w: peer %q AllowedIPs %s is not a per-node /%d", ErrPeerConfig, pc.NodeName, a, nodeCIDRBits)
+			}
+		}
+	}
+	return plan, nil
+}
+
 // UAPI renders the wireguard userspace-API configuration that programs this plan's
 // peer set as a FULL replacement (replace_peers=true), the form IpcSet consumes.
 // A full resync is idempotent and naturally handles an endpoint move, a key
