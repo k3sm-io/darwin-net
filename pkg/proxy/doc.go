@@ -37,7 +37,11 @@
 //
 // A Service port with a non-zero NodePort additionally opens a node-wide
 // *:NodePort TCP listener (bound to the wildcard so every node interface answers)
-// that L4-load-balances to the SAME Ready backend set as the ClusterIP. This is
+// that L4-load-balances to the SAME Ready backend set as the ClusterIP. The
+// NodePort listener is bound IN-PROCESS (a plain net.Listen on the wildcard); it
+// never goes through the root netd helper, which binds only specific-address ports
+// and rejects the wildcard — a >=1024 wildcard needs no privilege, so there is no
+// helper NodePort path. This is
 // externalTrafficPolicy: Cluster — externalTrafficPolicy: Local is NOT honored,
 // because the userspace splice opens a fresh backend connection and so does not
 // preserve the external client's source IP (the precondition Local relies on).

@@ -19,13 +19,6 @@ const DefaultSocketPath = "/var/lib/k3sm/run/netd.sock"
 // typed scalars.
 const DefaultMaxRequestBytes = 1 << 16
 
-// NodePort range defaults (the Kubernetes service-node-port-range default). The
-// daemon authorizes a BindPort whose port is in this range; see Config.
-const (
-	DefaultNodePortMin = 30000
-	DefaultNodePortMax = 32767
-)
-
 // DefaultMaxPerConn bounds the aliases, mesh routes, and bound ports a single
 // connection may drive. It is ≈ a node's /24 pod capacity (253 usable hosts), so
 // one connection's blast radius is capped at one node's worth of state.
