@@ -16,11 +16,12 @@
 //     SessionAffinity is intentionally out of scope for M1: this is round-robin
 //     only.
 //   - aliasManager (alias.go) abstracts lo0 alias create/teardown. The production
-//     lo0AliasManager shells out to `ifconfig lo0 alias <ip>/32` (root-gated, run
-//     inside the netd daemon boundary in deployment). Tests use the rootless
-//     noopAliasManager, and the integration path binds a specific 127.0.0.x per
-//     VIP — a faithful per-VIP source-identity rehearsal, since 127.0.0.0/8 is
-//     entirely loopback on Darwin and bindable without an alias.
+//     lo0AliasManager shells out to `ifconfig lo0 alias <ip>/32`; it is root-gated,
+//     so in deployment the proxy plumbs VIP aliases through the root netd daemon
+//     (WithNetdHelper) or runs the manager directly as root. Unit tests use the
+//     rootless noopAliasManager; the root-gated integration test creates real lo0
+//     aliases for 127.0.0.x VIPs (on Darwin only 127.0.0.1 is bindable without an
+//     alias) for a faithful per-VIP source-identity rehearsal.
 //   - Proxy (proxy.go) owns the sockets and enforces per-VIP serialization: each
 //     ClusterIP:port is reconciled by exactly one worker goroutine fed by a
 //     per-key channel, so a Service event and an EndpointSlice event for the same

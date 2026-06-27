@@ -6,7 +6,7 @@ import (
 
 // Device is the privileged, root-only mesh datapath the Mesh controller drives.
 // It is defined here, at the consumer, per the standards: the production
-// wireguardDevice creates a utun, runs userspace wireguard over it, installs the
+// WGDevice creates a utun, runs userspace wireguard over it, installs the
 // per-peer kernel routes, and loads the utun-scoped MSS-clamp pf anchor — all
 // root-only operations that run inside the netd daemon boundary in deployment.
 // Unit tests substitute a fake so the controller's reconcile logic is exercised

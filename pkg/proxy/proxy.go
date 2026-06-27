@@ -13,6 +13,7 @@ import (
 	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/netd/wire"
 )
 
 // dialTimeout bounds how long the proxy waits to connect to a chosen backend
@@ -44,6 +45,7 @@ const dialTimeout = 5 * time.Second
 type Proxy struct {
 	table  *RoutingTable
 	alias  aliasManager
+	binder binder
 	log    *slog.Logger
 	dialer *net.Dialer
 	// exemptVIPs are infra VIPs owned by a node-local binder (per-node CoreDNS on
@@ -119,12 +121,28 @@ func withAliasManager(a aliasManager) Option {
 	return func(p *Proxy) { p.alias = a }
 }
 
+// WithNetdHelper routes both privileged proxy operations — the lo0 VIP alias and
+// the privileged-port (<1024) ClusterIP bind — through the root netd daemon at
+// socketPath (empty uses the default socket), so the Service proxy runs
+// unprivileged. It is the one construction-time selection wiring both seams to the
+// helper; the direct ifconfig/net.Listen path remains the default for an explicit
+// run-as-root mode. The node-wide *:NodePort listener is always bound directly (it
+// is >=1024 and needs no privilege).
+func WithNetdHelper(socketPath string) Option {
+	return func(p *Proxy) {
+		c := wire.NewClient(socketPath)
+		p.alias = &netdAliasManager{client: c}
+		p.binder = &netdBinder{client: c}
+	}
+}
+
 // New constructs a Proxy steering to the backends in table. By default it uses
 // the root-gated lo0 alias manager; pass options to override (e.g. a logger).
 func New(table *RoutingTable, opts ...Option) *Proxy {
 	p := &Proxy{
 		table:      table,
 		alias:      newLo0AliasManager(),
+		binder:     directBinder{},
 		log:        slog.Default(),
 		dialer:     &net.Dialer{Timeout: dialTimeout},
 		exemptVIPs: make(map[netip.Addr]struct{}),
@@ -342,12 +360,14 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	}
 
 	// ClusterIP listener: bind the SPECIFIC alias address, not the wildcard, so
-	// loopback stamps the VIP as the source identity.
-	clusterAddr := net.JoinHostPort(key.ClusterIP, strconv.Itoa(int(port.Port)))
-	cl, err := net.Listen("tcp", clusterAddr)
+	// loopback stamps the VIP as the source identity. The binder is direct by
+	// default; under WithNetdHelper a privileged (<1024) VIP port is bound by the
+	// root daemon and the socket is passed back over SCM_RIGHTS.
+	clusterAP := netip.AddrPortFrom(ip, uint16(port.Port))
+	cl, err := p.binder.Listen(ctx, "tcp", clusterAP)
 	if err != nil {
 		_ = p.alias.Remove(ctx, ip)
-		return nil, fmt.Errorf("listen clusterIP %s: %w", clusterAddr, err)
+		return nil, fmt.Errorf("listen clusterIP %s: %w", clusterAP, err)
 	}
 	l.clusterIP = cl
 	go p.serve(cl, key)
