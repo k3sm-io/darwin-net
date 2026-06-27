@@ -32,8 +32,43 @@
 // podnet only provisions the address; runtimed binds the pod's process to it via
 // IP_BOUND_IF (the returned IP flows into runtime/v1 PodBox.pod_ip, which is
 // documented as "the lo0 alias the runtime binds the pod's processes to"). The
-// lo0-alias + IP_BOUND_IF model is host-process-only; the vm RuntimeClass guest
-// gets a vmnet/bridge interface instead (M5), not handled here.
+// lo0-alias + IP_BOUND_IF model is host-process-only; a vm-RuntimeClass guest gets
+// a NAT attachment instead (see "# Pod backends" below).
+//
+// # Pod backends: the path-selection fork (M5.1)
+//
+// Network serves two backends from one Allocator, chosen by the caller (runtimed,
+// from the pod's RuntimeClass — apis runtimev1.HandlerVM => SANDBOX_BACKEND_VM):
+//
+//   - BackendHostProcess (Setup) — a native Darwin process. It gets a /32 lo0 alias
+//     the host owns and the runtime binds to (IP_BOUND_IF). This path is unchanged.
+//   - BackendVM (SetupGuest) — a Virtualization.framework micro-VM guest. A VZ guest
+//     has its OWN network stack reached over a VZNATNetworkDeviceAttachment, so it
+//     gets NO lo0 alias: aliasing the guest's IP on the host's lo0 would make the
+//     host answer for it and blackhole same-node delivery. SetupGuest allocates the
+//     pod IP (unified, leak-free IPAM) and returns a GuestNetwork (PodIP + NAT
+//     gateway/subnet + cluster DNS VIP) for runtimed's VZ backend to APPLY. darwin-
+//     net decides and allocates; it does NOT perform the live VZ attach (the DAG
+//     keeps the VZ backend and the guest rootfs in runtimed) — the config flows
+//     guest-ward as data. NAT, not bridged: a VZNATNetworkDeviceAttachment needs
+//     only com.apple.security.virtualization, whereas a bridged/raw-vmnet attachment
+//     needs the Apple-restricted com.apple.vm.networking entitlement (unobtainable).
+//
+// Teardown is shared: it releases the pod IP for both backends and removes the lo0
+// alias ONLY for a host-process pod (a guest never had one).
+//
+// Lab-gated open questions (scaffolded, not built — they need a VZ-capable Mac):
+//
+//   - GUEST VIP REACHABILITY: can a guest behind a NAT attachment reach a ClusterIP
+//     VIP that lives on a host lo0 alias? macOS NAT may only expose the gateway to
+//     the guest and not weak-host-deliver a guest datagram to a host lo0-alias VIP.
+//     If it does not, a host-side route or a NEW netd route-verb is needed (the netd
+//     verb set has none today). OPEN — answer empirically on the lab Mac, then design.
+//   - POD-IP vs NAT-IP: the guest's on-the-wire address is macOS-assigned (vmnet
+//     DHCP) and differs from the allocated PodIP; reconciling them (so the guest is
+//     reachable AT its pod IP, and so it can be a Service backend) is unsolved. For
+//     M5 a guest pod is SAME-NODE-SCOPED and is NOT yet a cross-node Service backend
+//     (its NAT-private IP is in no peer's mesh AllowedIPs).
 //
 // # Daemon boundary
 //
