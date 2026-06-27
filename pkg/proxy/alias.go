@@ -12,8 +12,10 @@ import (
 // aliasManager creates and tears down the loopback alias addresses the proxy
 // binds its ClusterIP listeners on. It is defined at the consumer (the proxy)
 // per the standards: the real implementation runs `ifconfig lo0 alias <ip>/32`
-// and is root-gated; tests substitute a rootless fake or the 127.0.0.x rehearsal
-// so unit tests need no privilege.
+// and is root-gated, so in deployment the proxy plumbs VIP aliases for real
+// through the root netd daemon (WithNetdHelper) or runs the manager directly as
+// root. Unit tests substitute the rootless noopAliasManager so they need no
+// privilege.
 //
 // Ensure must be idempotent (aliasing an already-aliased address is a no-op
 // success) and Remove must be leak-free under churn (removing an absent alias is
@@ -101,11 +103,13 @@ func (m *lo0AliasManager) run(ctx context.Context, verb, arg string) error {
 	return nil
 }
 
-// noopAliasManager is the rootless aliasManager used when the proxy binds an
-// address that is already resolvable without an alias (the 127.0.0.x rehearsal
-// path: 127.0.0.0/8 is entirely loopback on Darwin, so any 127.0.0.x is
-// bindable without ifconfig). It records calls so tests can assert reconcile
-// drove the expected Ensure/Remove sequence.
+// noopAliasManager is the rootless aliasManager unit tests inject: it performs no
+// syscalls and records the Ensure/Remove calls so a test can assert the reconcile
+// drove the expected sequence without touching lo0. In production the proxy
+// aliases VIPs for real (the netd daemon under WithNetdHelper, or the direct lo0
+// manager run as root); the rootless tests bind their VIP on 127.0.0.1 — the one
+// loopback address bindable without an alias on Darwin — and distinguish VIPs by
+// port.
 //
 // Locking discipline: ensured is guarded by mu; Ensure/Remove and the test
 // accessors all take it.

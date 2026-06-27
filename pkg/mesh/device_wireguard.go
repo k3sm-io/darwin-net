@@ -14,10 +14,12 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-// pfAnchor is the pf anchor the mesh loads its MSS-clamp rule into. Wiring the
+// PFAnchor is the pf anchor the mesh loads its MSS-clamp rule into. Wiring the
 // anchor into the main ruleset (anchor "io.k3sm.mesh") is the root netd boundary's
-// job — the full pf sub-anchor is M4; M3 pulls only this minimal clamp forward.
-const pfAnchor = "io.k3sm.mesh"
+// job — the full pf sub-anchor is M4; M3 pulls only this minimal clamp forward. It
+// is exported so the netd daemon (k3sm.io/darwin-net/pkg/netd) loads the standalone
+// MSS-clamp verb into the same anchor.
+const PFAnchor = "io.k3sm.mesh"
 
 // wgLink is the immutable configuration of the real wireguard device.
 type wgLink struct {
@@ -29,10 +31,32 @@ type wgLink struct {
 	listenPort    int
 }
 
-// wireguardDevice is the production Device: userspace wireguard (wireguard-go)
-// over a root-created utun. Construction performs no syscalls (mirroring the lo0
-// alias managers); the privileged work happens in Up/Apply/Down and fails without
-// root. In deployment it runs inside the netd daemon boundary.
+// DeviceConfig is the construction config for the production wireguard Device. It
+// is the exported seam the netd daemon (k3sm.io/darwin-net/pkg/netd) uses to build
+// the real datapath after it has authenticated the peer and validated+rendered a
+// Plan; the Mesh controller builds the same device internally from its options.
+// Zero fields take the package defaults (MTU, MSSClamp, DefaultListenPort, "utun").
+type DeviceConfig struct {
+	// UTUNName is the requested utun name; "" or "utun" lets the kernel pick the unit.
+	UTUNName string
+	// MTU is the tunnel MTU; 0 uses MTU.
+	MTU int
+	// MSS is the TCP MSS the pf scrub anchor clamps to on the utun egress; 0 uses MSSClamp.
+	MSS int
+	// MeshIP is the node's reserved mesh-egress /32 (podnet.MeshEgressIP), plumbed as
+	// an lo0 alias so the Service proxy can bind it as the backend dialer source.
+	MeshIP netip.Addr
+	// PrivateKeyB64 is the node's wireguard PRIVATE key (base64). It never leaves the
+	// node; the device fails fast at Up if it is empty.
+	PrivateKeyB64 string
+	// ListenPort is the UDP port wireguard listens on; 0 uses DefaultListenPort.
+	ListenPort int
+}
+
+// WGDevice is the production Device: userspace wireguard (wireguard-go) over a
+// root-created utun. Construction performs no syscalls (mirroring the lo0 alias
+// managers); the privileged work happens in Up/Apply/Down and fails without root.
+// In deployment it runs inside the netd daemon boundary.
 //
 // Datapath design: the mesh-egress source (meshIP, podnet.MeshEgressIP) is plumbed
 // as an lo0 /32 alias — the same proven-bindable mechanism the pod IPs use — so the
@@ -44,7 +68,7 @@ type wgLink struct {
 //
 // Locking discipline: all mutable state (the device handle, the actual interface
 // name, and the installed-route set) is guarded by mu, so Up/Apply/Down serialize.
-type wireguardDevice struct {
+type WGDevice struct {
 	cfg wgLink
 	log *slog.Logger
 
@@ -56,13 +80,51 @@ type wireguardDevice struct {
 	pfApplied bool
 }
 
-// newWireguardDevice constructs the production Device from its link config. It
-// performs no privileged operation; call Up to bring the mesh up.
-func newWireguardDevice(cfg wgLink, log *slog.Logger) *wireguardDevice {
+// NewDevice constructs the production wireguard Device from cfg. It performs no
+// privileged operation; call Up to bring the mesh up. It is the exported entry the
+// netd daemon uses to build the real datapath; the Mesh controller uses it too.
+func NewDevice(cfg DeviceConfig, log *slog.Logger) *WGDevice {
+	name := cfg.UTUNName
+	if name == "" {
+		name = "utun"
+	}
+	mtu := cfg.MTU
+	if mtu == 0 {
+		mtu = MTU
+	}
+	mss := cfg.MSS
+	if mss == 0 {
+		mss = MSSClamp
+	}
+	port := cfg.ListenPort
+	if port == 0 {
+		port = DefaultListenPort
+	}
+	return newWGDevice(wgLink{
+		name:          name,
+		mtu:           mtu,
+		mss:           mss,
+		meshIP:        cfg.MeshIP,
+		privateKeyB64: cfg.PrivateKeyB64,
+		listenPort:    port,
+	}, log)
+}
+
+// newWGDevice constructs the production Device from its internal link config.
+func newWGDevice(cfg wgLink, log *slog.Logger) *WGDevice {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &wireguardDevice{cfg: cfg, log: log, routes: make(map[netip.Prefix]struct{})}
+	return &WGDevice{cfg: cfg, log: log, routes: make(map[netip.Prefix]struct{})}
+}
+
+// Interface returns the resolved utun name (e.g. "utun4") once Up has run, or the
+// empty string before. It lets the netd daemon scope a standalone MSS-clamp pf
+// rule to the live tunnel.
+func (d *WGDevice) Interface() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.iface
 }
 
 // Up creates the utun, starts wireguard with the node's private key + listen port,
@@ -70,7 +132,7 @@ func newWireguardDevice(cfg wgLink, log *slog.Logger) *wireguardDevice {
 // fast if the private key is missing (hard cut — the operator provisions it; no
 // embedded default) and is idempotent (a second Up is a no-op once the device is
 // running).
-func (d *wireguardDevice) Up(ctx context.Context) error {
+func (d *WGDevice) Up(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.dev != nil {
@@ -128,7 +190,7 @@ func (d *wireguardDevice) Up(ctx context.Context) error {
 // Apply sets the wireguard peers (full replacement) and reconciles the kernel
 // routes to exactly plan.Routes, each routed to the utun. It must be called after
 // Up.
-func (d *wireguardDevice) Apply(ctx context.Context, plan Plan) error {
+func (d *WGDevice) Apply(ctx context.Context, plan Plan) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.dev == nil {
@@ -170,7 +232,7 @@ func (d *wireguardDevice) Apply(ctx context.Context, plan Plan) error {
 // Down removes every route the device installed, unloads the pf anchor, removes
 // the mesh-egress alias, and closes the wireguard device. It is leak-free and
 // idempotent.
-func (d *wireguardDevice) Down(ctx context.Context) error {
+func (d *WGDevice) Down(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for r := range d.routes {
@@ -180,8 +242,8 @@ func (d *wireguardDevice) Down(ctx context.Context) error {
 		delete(d.routes, r)
 	}
 	if d.pfApplied {
-		if err := d.run(ctx, "pfctl", "-a", pfAnchor, "-F", "all"); err != nil {
-			d.log.Warn("flush mesh pf anchor", "anchor", pfAnchor, "err", err)
+		if err := d.run(ctx, "pfctl", "-a", PFAnchor, "-F", "all"); err != nil {
+			d.log.Warn("flush mesh pf anchor", "anchor", PFAnchor, "err", err)
 		}
 		d.pfApplied = false
 	}
@@ -198,9 +260,9 @@ func (d *wireguardDevice) Down(ctx context.Context) error {
 }
 
 // loadPF loads the utun-scoped MSS-clamp rule into the mesh pf anchor.
-func (d *wireguardDevice) loadPF(ctx context.Context, iface string) error {
-	cmd := exec.CommandContext(ctx, "pfctl", "-a", pfAnchor, "-f", "-")
-	cmd.Stdin = bytes.NewBufferString(pfMSSClampRule(iface, d.cfg.mss))
+func (d *WGDevice) loadPF(ctx context.Context, iface string) error {
+	cmd := exec.CommandContext(ctx, "pfctl", "-a", PFAnchor, "-f", "-")
+	cmd.Stdin = bytes.NewBufferString(PFMSSClampRule(iface, d.cfg.mss))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
 	}
@@ -208,7 +270,7 @@ func (d *wireguardDevice) loadPF(ctx context.Context, iface string) error {
 }
 
 // run invokes a root-gated command, wrapping any failure with its combined output.
-func (d *wireguardDevice) run(ctx context.Context, name string, args ...string) error {
+func (d *WGDevice) run(ctx context.Context, name string, args ...string) error {
 	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s %v: %w: %s", name, args, err, bytes.TrimSpace(out))
