@@ -99,4 +99,18 @@
 // Service endpoint to a node-local apiserver/proxy address per node. darwin-net
 // provides this half — per-node CoreDNS (PerNodeDNS) + the proxy exemption seam —
 // and depends on k3sm:M3.3 for the kubernetes-endpoint half.
+//
+// # Guest-side resolver for the vm RuntimeClass (M5.2)
+//
+// The DYLD getaddrinfo shim is Darwin-only: inside a Linux micro-VM guest there is
+// no dyld (glibc/musl NSS instead), so cluster names are pointed at the resolver
+// the standard Linux way. GuestResolvConf (resolvconf.go) renders the guest's
+// /etc/resolv.conf content from the SAME netv1.DNSConfig a host-process pod uses
+// (nameserver = the cluster DNS VIP, search + ndots from the config) — only the
+// injection mechanism differs. It returns the content as DATA: darwin-net does not
+// write into runtimed's guest rootfs (the DAG forbids it), so runtimed / the k3sm
+// guest provisioner injects it. Two caveats the injector owns (flagged on
+// GuestResolvConf, not solved here): a Linux guest's DHCP/systemd-resolved will
+// CLOBBER resolv.conf on the NAT interface unless it is pinned static/immutable,
+// and musl (Alpine) largely IGNORES `options ndots:` where glibc honors it.
 package dns
