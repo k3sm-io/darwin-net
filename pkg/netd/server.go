@@ -51,11 +51,11 @@ type MeshKeyResolver interface {
 	Resolve(ctx context.Context, ref string) (privKeyB64 string, err error)
 }
 
-// Config configures a Server. The CIDR aggregate, node podCIDR, service uid, and
-// NodePort range are the policy inputs; the interface fields are seams with safe
-// defaults (a uid PeerVerifier, the production darwin Privileged executor) or
-// fail-safe behavior (a nil PortAuthorizer denies <1024; a nil MeshKeyResolver
-// fails ConfigureMesh).
+// Config configures a Server. The CIDR aggregate, node podCIDR, and service uid
+// are the policy inputs; the interface fields are seams with safe defaults (a uid
+// PeerVerifier, the production darwin Privileged executor) or fail-safe behavior
+// (a nil PortAuthorizer denies every <1024 bind; a nil MeshKeyResolver fails
+// ConfigureMesh).
 type Config struct {
 	// ClusterAggregate is the pinned pod aggregate a pod alias must fall within
 	// (default podnet.ClusterPodCIDR, 100.64.0.0/10).
@@ -68,10 +68,6 @@ type Config struct {
 	// ServiceUID is the authorized unprivileged service uid (the default
 	// PeerVerifier admits only this peer uid).
 	ServiceUID uint32
-	// NodePortMin and NodePortMax bound the NodePort range BindPort authorizes
-	// (defaults 30000–32767).
-	NodePortMin int
-	NodePortMax int
 	// MaxRequestBytes caps a single framed request (default DefaultMaxRequestBytes).
 	MaxRequestBytes int
 	// MaxPerConn caps the live aliases / mesh routes / bound ports one connection
@@ -104,18 +100,12 @@ type Server struct {
 }
 
 // NewServer constructs a Server from cfg, filling defaults: the cluster aggregate
-// (podnet.ClusterPodCIDR), the NodePort range (30000–32767), the request cap and
-// per-connection cap, the uid PeerVerifier (ServiceUID), and the production darwin
-// Privileged executor. It performs no I/O; call Serve to start accepting.
+// (podnet.ClusterPodCIDR), the request cap and per-connection cap, the uid
+// PeerVerifier (ServiceUID), and the production darwin Privileged executor. It
+// performs no I/O; call Serve to start accepting.
 func NewServer(cfg Config) *Server {
 	if !cfg.ClusterAggregate.IsValid() {
 		cfg.ClusterAggregate = podnet.ClusterPodCIDR
-	}
-	if cfg.NodePortMin == 0 {
-		cfg.NodePortMin = wire.DefaultNodePortMin
-	}
-	if cfg.NodePortMax == 0 {
-		cfg.NodePortMax = wire.DefaultNodePortMax
 	}
 	if cfg.MaxRequestBytes <= 0 {
 		cfg.MaxRequestBytes = wire.DefaultMaxRequestBytes
@@ -370,9 +360,11 @@ func (s *Server) handleLoadPFAnchor(ctx context.Context, args *wire.LoadPFAnchor
 	return s.okResp()
 }
 
-// handleBindPort validates the address (specific, never wildcard) and authorizes
-// the port (NodePort range, or the PortAuthorizer for <1024), then binds and
-// returns the listening socket fd for the server to pass over SCM_RIGHTS.
+// handleBindPort validates the address (specific, never wildcard — a wildcard
+// NodePort is bound in-process by the proxy, never here) and authorizes the port
+// (the PortAuthorizer gates a privileged <1024 infra-VIP port; a specific-address
+// >=1024 VIP port is allowed), then binds and returns the listening socket fd for
+// the server to pass over SCM_RIGHTS.
 func (s *Server) handleBindPort(ctx context.Context, st *connState, args *wire.BindPortArgs) (wire.Response, *os.File) {
 	if args == nil {
 		return s.errResp("bindPort: missing args"), nil
@@ -435,15 +427,18 @@ func (s *Server) validateAliasIP(ip netip.Addr) error {
 		ErrPolicy, ip, s.cfg.NodePodCIDR, s.cfg.ClusterAggregate)
 }
 
-// authorizePort applies the BindPort policy: a port in the NodePort range is
-// allowed; a privileged (<1024) port requires the PortAuthorizer to confirm it
-// against the authoritative Service set (a nil authorizer denies it, fail-safe);
-// anything else is denied (the proxy binds non-privileged, non-NodePort ports
-// itself, without the daemon).
+// authorizePort applies the BindPort policy to a SPECIFIC-address bind (handleBindPort
+// has already rejected the wildcard). The contract is self-consistent with the real
+// consumers: a privileged (<1024) port — the infra VIPs 10.43.0.1:443 / 10.43.0.10:53,
+// which are the proxy's ONLY helper-bound ports (pkg/proxy netdBinder routes only
+// <1024 here, binding >=1024 itself) — is the escalation-sensitive case and must be
+// confirmed against the authoritative Service set by the PortAuthorizer (a nil
+// authorizer denies it, fail-safe). A non-privileged (>=1024) specific-address VIP
+// port grants no more than the unprivileged service uid could bind itself, so it is
+// allowed. There is deliberately no NodePort-range branch: a NodePort is reached on
+// the wildcard *:nodePort, which the proxy binds in-process (it needs no privilege)
+// and which this daemon rejects as a wildcard — the helper has no NodePort path.
 func (s *Server) authorizePort(ctx context.Context, port int, nodeAddr string) error {
-	if port >= s.cfg.NodePortMin && port <= s.cfg.NodePortMax {
-		return nil
-	}
 	if port < 1024 {
 		if s.cfg.PortAuthorizer == nil {
 			return fmt.Errorf("%w: privileged port %d denied (no port authorizer configured)", ErrPolicy, port)
@@ -453,8 +448,7 @@ func (s *Server) authorizePort(ctx context.Context, port int, nodeAddr string) e
 		}
 		return nil
 	}
-	return fmt.Errorf("%w: port %d not authorized (outside NodePort range %d-%d and not privileged)",
-		ErrPolicy, port, s.cfg.NodePortMin, s.cfg.NodePortMax)
+	return nil
 }
 
 // validateMSSClamp bounds the clamp to a sane TCP MSS window: at least minMSSClamp
