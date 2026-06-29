@@ -11,6 +11,9 @@ echo "==> [darwin-net] gofmt"
 fmt=$(gofmt -l .) || true
 [ -z "$fmt" ] || { echo "gofmt -w needed:"; echo "$fmt"; exit 1; }
 
+echo "==> [darwin-net] license headers"
+hack/verify-boilerplate.sh
+
 if [ -n "$(CGO_ENABLED=$CGO go list ./... 2>/dev/null)" ]; then
 	echo "==> [darwin-net] go vet";   CGO_ENABLED=$CGO go vet ./...
 	echo "==> [darwin-net] go build"; CGO_ENABLED=$CGO go build ./...
