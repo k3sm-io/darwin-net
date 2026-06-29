@@ -1,0 +1,9 @@
+k3sm — darwin-net
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (see the LICENSE file).
+
+This module's third-party dependencies are obtained via Go modules; no vendored
+third-party source is checked in. The attribution notices and license texts those
+dependencies require are generated from this module's dependency graph with
+`go-licenses` and bundled with the distributed `k3sm` binary at release.
