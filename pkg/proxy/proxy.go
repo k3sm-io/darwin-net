@@ -169,6 +169,13 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 	for _, o := range opts {
 		o(p)
 	}
+	// Propagate the (possibly WithLogger-overridden) logger to the routing table so
+	// its fail-open Warn (internalTrafficPolicy: Local under an unknown podCIDR)
+	// shares the proxy's sink. Set before Run starts any worker, so Pick's read of
+	// table.log is safe under the goroutine-start happens-before.
+	if p.table != nil {
+		p.table.log = p.log
+	}
 	return p
 }
 
@@ -185,9 +192,12 @@ type portWorker struct {
 
 // portEvent is a desired-state update for one ClusterIP:port delivered to its
 // worker. A nil port means the port (or its Service) was deleted and the worker
-// should tear its listeners down.
+// should tear its listeners down. policy is the Service's internalTrafficPolicy,
+// applied to the routing table atomically with endpoints so Pick never observes a
+// stale (policy, backends) pairing.
 type portEvent struct {
 	port      *netv1.ServicePort
+	policy    trafficPolicy
 	endpoints []netv1.Endpoint
 }
 
@@ -221,13 +231,25 @@ func (p *Proxy) shutdown() {
 }
 
 // Reconcile delivers the desired state for one Service port to its dedicated
-// worker, creating the worker on first sight. Passing port == nil signals
-// deletion. Because every event for a given ClusterIP:port routes to the same
-// worker channel, Service and EndpointSlice updates for that port are applied in
-// a single serialized stream — no two goroutines ever touch one listener.
+// worker under the default internalTrafficPolicy: Cluster (round-robin over all
+// backends). It is ReconcilePolicy with trafficCluster; the production watch path
+// calls ReconcilePolicy to carry a Service's actual policy.
 //
 // Reconcile is safe for concurrent callers (the informer event handlers).
 func (p *Proxy) Reconcile(clusterIP string, port *netv1.ServicePort, endpoints []netv1.Endpoint) error {
+	return p.ReconcilePolicy(clusterIP, port, trafficCluster, endpoints)
+}
+
+// ReconcilePolicy delivers the desired state for one Service port — including its
+// internalTrafficPolicy — to its dedicated worker, creating the worker on first
+// sight. Passing port == nil signals deletion. Because every event for a given
+// ClusterIP:port routes to the same worker channel, Service and EndpointSlice
+// updates for that port are applied in a single serialized stream — no two
+// goroutines ever touch one listener, and (policy, endpoints) reach the routing
+// table together.
+//
+// ReconcilePolicy is safe for concurrent callers (the informer event handlers).
+func (p *Proxy) ReconcilePolicy(clusterIP string, port *netv1.ServicePort, policy trafficPolicy, endpoints []netv1.Endpoint) error {
 	if port == nil {
 		return errors.New("proxy: reconcile requires a port (use ReconcileDelete to remove)")
 	}
@@ -252,7 +274,7 @@ func (p *Proxy) Reconcile(clusterIP string, port *netv1.ServicePort, endpoints [
 		return errors.New("proxy: shutting down")
 	}
 	select {
-	case w.ch <- portEvent{port: port, endpoints: endpoints}:
+	case w.ch <- portEvent{port: port, policy: policy, endpoints: endpoints}:
 		return nil
 	case <-w.stop:
 		return errors.New("proxy: worker stopped")
@@ -322,7 +344,7 @@ func (p *Proxy) runWorker(w *portWorker) {
 				p.table.Delete(w.key)
 				return
 			}
-			p.table.SetEndpoints(w.key, ev.endpoints)
+			p.table.SetEndpointsPolicy(w.key, ev.endpoints, ev.policy)
 			if ln == nil {
 				l, err := p.openListener(w.key, ev.port)
 				if err != nil {
