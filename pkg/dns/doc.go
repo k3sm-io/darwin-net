@@ -49,6 +49,10 @@ limitations under the License.
 //     currently UNCONSUMED — an export for the deferred native-CoreDNS follow-up
 //     (DESIGN §5b), not what serves DNS today (the in-process k3sm/pkg/netserve
 //     resolver does). See the M3.3 section below.
+//   - merge.go — MergeDNSConfig / MaxSearchDomains: the pure ClusterFirst additive
+//     dnsConfig merge — a pod's search domains APPEND to the cluster search list
+//     (cluster-first, deduped, capped) and its ndots overrides the cluster
+//     default, never the cluster server. See the B20a section below.
 //
 // # The C shim (built with clang, not cgo)
 //
@@ -138,4 +142,34 @@ limitations under the License.
 // GuestResolvConf, not solved here): a Linux guest's DHCP/systemd-resolved will
 // CLOBBER resolv.conf on the NAT interface unless it is pinned static/immutable,
 // and musl (Alpine) largely IGNORES `options ndots:` where glibc honors it.
+//
+// # Additive dnsConfig merge under ClusterFirst (B20a)
+//
+// A ClusterFirst pod may set spec.dnsConfig to AUGMENT — never replace — the
+// cluster DNS settings: its search domains append to the cluster search list and
+// its ndots overrides the cluster default. MergeDNSConfig (merge.go) is the pure
+// darwin-net primitive for that merge: cluster searches FIRST, the pod's appended,
+// deduped first-seen (the cluster WINS a collision, so a pod search equal to a
+// cluster one is dropped), then capped at MaxSearchDomains. A strictly-positive pod
+// ndots overrides the cluster default; otherwise the cluster default stays.
+//
+// MergeDNSConfig takes DISCRETE searches/ndots rather than a full netv1.DNSConfig
+// "extra" on purpose: a full extra carries ClusterDNSIP, and a later edit that
+// populated it from a pod's nameservers would override the cluster VIP — inverting
+// B18's infra-wins. Discrete params type-enforce "augment search + ndots, never the
+// server." k3sm wave 2 (B20b) extracts the pod-spec dnsConfig fields and calls this;
+// THIS repo owns the merge mechanics and the shared MaxSearchDomains cap.
+//
+// Honest gaps (each deferred to B20b):
+//   - The search list caps at MaxSearchDomains (8), NOT upstream's 32 — a pod's
+//     6th-and-later added search beyond the three cluster defaults is silently
+//     dropped. The cap mirrors the C shim's K3SM_MAX_SEARCH so the emitted env, the
+//     shim's effective list, and the Go resolver agree; TestShimMaxSearchMatchesC
+//     binds the const to the .c.
+//   - An explicit `ndots: 0` is treated as unset (→ cluster default): the int32
+//     NDots field cannot distinguish an explicit 0 from absent. Honoring an explicit
+//     0 is deferred to B20b.
+//   - dnsConfig.nameservers and non-ndots dnsConfig.options are NOT honored under
+//     ClusterFirst: the getaddrinfo shim is single-server (one cluster VIP), so a
+//     pod can neither add nameservers nor set arbitrary resolver options here.
 package dns
