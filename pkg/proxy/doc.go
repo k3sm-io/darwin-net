@@ -67,17 +67,42 @@ limitations under the License.
 // snapshot gRPC range) is all TCP, so UDP NodePort is not claimed until the relay
 // lands.
 //
-// # Locality (a hint, not load-bearing)
+// # Locality (load-bearing only for internalTrafficPolicy: Local)
 //
 // Backend locality (local lo0 pod IP vs remote pod over the wireguard mesh) is
 // computed proxy-side from the node podCIDR with a cheap netip.Prefix.Contains —
-// no getifaddrs scan per connection. It is deliberately a hint/metric only:
-// cross-node steering is done by the per-peer kernel routes the mesh installs on
-// the utun (pkg/mesh, M3.1), not by this classifier. classify must stay
-// non-load-bearing because it mislabels any address outside the node podCIDR —
-// including loopback and node-local infra VIPs — as remote; routing on it would
-// blackhole them. Infra VIPs stay node-local for free: the mesh routes only peer
-// pod /24s to the utun, so 10.43.0.10 / 10.43.0.1 are never steered over it.
+// no getifaddrs scan per connection. For cluster-default Services it is a
+// hint/metric only: cross-node steering is done by the per-peer kernel routes the
+// mesh installs on the utun (pkg/mesh, M3.1), not by this classifier, and Pick
+// round-robins over every Ready backend regardless of locality. classify mislabels
+// any address outside the node podCIDR — including loopback and node-local infra
+// VIPs — as remote, so cluster-default routing never gates on it; infra VIPs stay
+// node-local for free because the mesh routes only peer pod /24s to the utun, so
+// 10.43.0.10 / 10.43.0.1 are never steered over it.
+//
+// Locality becomes load-bearing for exactly ONE decision: internalTrafficPolicy:
+// Local backend selection under a VALID node podCIDR (routing.go Pick). There the
+// table filters to the LocalityLocal subset, dropping (ErrNoLocalBackends → the
+// listener closes the accepted conn) when no backend is node-local — the faithful
+// upstream no-fallback. Under a zero/invalid podCIDR (locality is unknowable) Pick
+// fails open to all backends with a loud Warn rather than blackhole the Service.
+// Two divergences from upstream kube-proxy are deliberate and documented:
+//
+//   - k3sm derives locality from podCIDR.Contains(endpointIP), NOT upstream's
+//     endpoint.nodeName == thisNode. This is faithful for k3sm's pod-backed
+//     Services — every pod is an lo0 alias IP inside the node podCIDR by
+//     construction, so "IP in podCIDR" is equivalent to "on this node" — but it
+//     would misclassify a host-network or otherwise non-pod endpoint, which the
+//     Darwin-process pod path never produces. If such endpoints are ever modeled,
+//     locality must move to a nodeName-equivalent signal.
+//   - On a no-local-backend drop the userspace listener has already accepted the
+//     TCP connection, so the client sees connect-then-RST rather than upstream's
+//     iptables SYN-drop. This is immaterial to conformance: reachability fails
+//     either way, only the L4 shape of the failure differs.
+//
+// internalTrafficPolicy: Local is routing/affinity, NOT a tenancy boundary: a
+// same-node pod can still reach any backend by dialing the pod IP or a NodePort
+// directly. It steers Service-VIP traffic; it does not isolate.
 //
 // # Infra-VIP exemption (per-node resolver) — M3.3
 //

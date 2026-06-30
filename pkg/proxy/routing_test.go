@@ -278,6 +278,137 @@ func TestRoutingTableLocality(t *testing.T) {
 	})
 }
 
+// TestInternalTrafficPolicyLocalFiltersToNodeLocal is the B21 gate: with
+// internalTrafficPolicy: Local the routing table steers only to node-local
+// backends under a valid podCIDR (dropping with ErrNoLocalBackends when none are
+// local), FAILS OPEN to all backends when the podCIDR makes locality unknowable
+// (never a silent blackhole), and leaves trafficCluster unchanged (regression
+// guard). It extends the TestRoutingTableLocality fixture (a 100.64.0.0/24 podCIDR
+// with in-/out-of-CIDR backends).
+//
+// Fails before the change: Pick ignores the policy and round-robins over all
+// backends, so case 1 returns a LocalityRemote backend and case 2 returns a remote
+// backend instead of ErrNoLocalBackends.
+func TestInternalTrafficPolicyLocalFiltersToNodeLocal(t *testing.T) {
+	t.Parallel()
+	key := keyFor("10.43.0.10", 80)
+	const cidr = "100.64.0.0/24"
+
+	t.Run("valid podCIDR, iTP:Local filters to the node-local subset", func(t *testing.T) {
+		t.Parallel()
+		tbl := NewRoutingTable(netip.MustParsePrefix(cidr))
+		tbl.SetEndpointsPolicy(key, []netv1.Endpoint{
+			{IP: "100.64.0.5", Port: 8080, Ready: true}, // in CIDR  -> local
+			{IP: "100.64.0.6", Port: 8080, Ready: true}, // in CIDR  -> local
+			{IP: "100.64.1.5", Port: 8080, Ready: true}, // out /24  -> remote
+			{IP: "100.64.2.9", Port: 8080, Ready: true}, // out /24  -> remote
+		}, trafficLocal)
+
+		locals := map[string]bool{"100.64.0.5": true, "100.64.0.6": true}
+		seen := map[string]int{}
+		for i := 0; i < 200; i++ {
+			be, err := tbl.Pick(key)
+			if err != nil {
+				t.Fatalf("Pick: %v", err)
+			}
+			ip := be.Addr().Addr().String()
+			if !locals[ip] {
+				t.Fatalf("Pick returned non-local backend %q under iTP:Local", ip)
+			}
+			if be.Locality() != LocalityLocal {
+				t.Fatalf("Pick returned backend %q with locality %v, want local", ip, be.Locality())
+			}
+			seen[ip]++
+		}
+		// Round-robin covers the whole local subset, not just one member.
+		for ip := range locals {
+			if seen[ip] == 0 {
+				t.Fatalf("local backend %q was never selected (not round-robining the local subset)", ip)
+			}
+		}
+	})
+
+	t.Run("valid podCIDR, iTP:Local, zero local backends drops (not a remote spill)", func(t *testing.T) {
+		t.Parallel()
+		tbl := NewRoutingTable(netip.MustParsePrefix(cidr))
+		n := tbl.SetEndpointsPolicy(key, []netv1.Endpoint{
+			{IP: "100.64.1.5", Port: 8080, Ready: true}, // out /24 -> remote
+			{IP: "100.64.2.9", Port: 8080, Ready: true}, // out /24 -> remote
+		}, trafficLocal)
+		if n != 2 {
+			t.Fatalf("SetEndpointsPolicy installed %d backends, want 2", n)
+		}
+		// Every Pick DROPS with ErrNoLocalBackends — it never spills to a remote
+		// backend, the faithful upstream no-fallback.
+		for i := 0; i < 64; i++ {
+			be, err := tbl.Pick(key)
+			if !errors.Is(err, ErrNoLocalBackends) {
+				t.Fatalf("Pick = (%v, %v), want ErrNoLocalBackends (drop, not remote spill)", be.Addr(), err)
+			}
+		}
+	})
+
+	t.Run("iTP:Cluster round-robins over ALL backends (regression guard)", func(t *testing.T) {
+		t.Parallel()
+		eps := []netv1.Endpoint{
+			{IP: "100.64.0.5", Port: 8080, Ready: true}, // local
+			{IP: "100.64.1.5", Port: 8080, Ready: true}, // remote
+		}
+		// Explicit trafficCluster and the SetEndpoints default must behave
+		// identically: round-robin over local AND remote.
+		setters := []struct {
+			name string
+			set  func(*RoutingTable)
+		}{
+			{"explicit trafficCluster", func(rt *RoutingTable) { rt.SetEndpointsPolicy(key, eps, trafficCluster) }},
+			{"SetEndpoints default", func(rt *RoutingTable) { rt.SetEndpoints(key, eps) }},
+		}
+		for _, s := range setters {
+			t.Run(s.name, func(t *testing.T) {
+				t.Parallel()
+				rt := NewRoutingTable(netip.MustParsePrefix(cidr))
+				s.set(rt)
+				seen := map[string]int{}
+				for i := 0; i < 100; i++ {
+					be, err := rt.Pick(key)
+					if err != nil {
+						t.Fatalf("Pick: %v", err)
+					}
+					seen[be.Addr().Addr().String()]++
+				}
+				if seen["100.64.0.5"] == 0 || seen["100.64.1.5"] == 0 {
+					t.Fatalf("Cluster policy did not round-robin over ALL backends: %v", seen)
+				}
+			})
+		}
+	})
+
+	t.Run("zero podCIDR, iTP:Local fails open to all backends (no blackhole)", func(t *testing.T) {
+		t.Parallel()
+		tbl := NewRoutingTable(netip.Prefix{}) // locality unknowable -> all LocalityUnknown
+		tbl.SetEndpointsPolicy(key, []netv1.Endpoint{
+			{IP: "100.64.0.5", Port: 8080, Ready: true},
+			{IP: "100.64.1.5", Port: 8080, Ready: true},
+		}, trafficLocal)
+
+		seen := map[string]int{}
+		for i := 0; i < 100; i++ {
+			be, err := tbl.Pick(key)
+			if errors.Is(err, ErrNoLocalBackends) {
+				t.Fatalf("iTP:Local under a zero podCIDR DROPPED (blackhole); want fail-open to all backends")
+			}
+			if err != nil {
+				t.Fatalf("Pick: %v", err)
+			}
+			seen[be.Addr().Addr().String()]++
+		}
+		// Fail-open degrades to Cluster: it routes to ALL backends, not a subset.
+		if seen["100.64.0.5"] == 0 || seen["100.64.1.5"] == 0 {
+			t.Fatalf("fail-open did not round-robin over all backends: %v", seen)
+		}
+	})
+}
+
 func backendIPs(bes []backend) []string {
 	out := make([]string, len(bes))
 	for i, b := range bes {

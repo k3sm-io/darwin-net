@@ -104,7 +104,7 @@ func TestServiceToVIP(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			vip, ok := serviceToVIP(tc.svc)
+			vip, _, ok := serviceToVIP(tc.svc)
 			if ok != tc.wantOK {
 				t.Fatalf("serviceToVIP ok = %v, want %v", ok, tc.wantOK)
 			}
@@ -124,6 +124,49 @@ func TestServiceToVIP(t *testing.T) {
 			}
 			if err := vip.Validate(); err != nil {
 				t.Fatalf("translated VIP fails Validate: %v", err)
+			}
+		})
+	}
+}
+
+// TestServiceToVIPInternalTrafficPolicy asserts serviceToVIP reads
+// svc.Spec.InternalTrafficPolicy and maps it to the proxy-internal trafficPolicy
+// threaded to the routing table: a nil pointer and "Cluster" default to
+// trafficCluster, "Local" becomes trafficLocal.
+func TestServiceToVIPInternalTrafficPolicy(t *testing.T) {
+	t.Parallel()
+	local := corev1.ServiceInternalTrafficPolicyLocal
+	cluster := corev1.ServiceInternalTrafficPolicyCluster
+	mk := func(itp *corev1.ServiceInternalTrafficPolicy) *corev1.Service {
+		return &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"},
+			Spec: corev1.ServiceSpec{
+				Type:                  corev1.ServiceTypeClusterIP,
+				ClusterIP:             "10.43.0.10",
+				Ports:                 []corev1.ServicePort{{Port: 80, TargetPort: intstr.FromInt32(8080), Protocol: corev1.ProtocolTCP}},
+				InternalTrafficPolicy: itp,
+			},
+		}
+	}
+
+	cases := []struct {
+		name string
+		itp  *corev1.ServiceInternalTrafficPolicy
+		want trafficPolicy
+	}{
+		{"nil defaults to cluster", nil, trafficCluster},
+		{"explicit cluster", &cluster, trafficCluster},
+		{"local", &local, trafficLocal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, policy, ok := serviceToVIP(mk(tc.itp))
+			if !ok {
+				t.Fatalf("serviceToVIP ok = false, want true")
+			}
+			if policy != tc.want {
+				t.Fatalf("policy = %d, want %d", policy, tc.want)
 			}
 		})
 	}
