@@ -24,22 +24,26 @@ import (
 )
 
 // serviceToVIP flattens a Kubernetes Service into the netv1.ServiceVIP the proxy
-// owns, or returns (zero, false) when the Service is not one the proxy serves:
-// headless (no/None ClusterIP), ExternalName, or with no ports. It is pure (no
-// I/O), so the watch→proxy translation is table-testable independent of client-go.
-func serviceToVIP(svc *corev1.Service) (netv1.ServiceVIP, bool) {
+// owns plus its internal traffic policy, or returns (zero, trafficCluster, false)
+// when the Service is not one the proxy serves: headless (no/None ClusterIP),
+// ExternalName, or with no ports. The trafficPolicy is read from
+// svc.Spec.InternalTrafficPolicy and threaded to the routing table by the reconcile
+// path — it is NOT carried on the netv1 contract (apis), since only the proxy
+// consumes it. It is pure (no I/O), so the watch→proxy translation is table-testable
+// independent of client-go.
+func serviceToVIP(svc *corev1.Service) (netv1.ServiceVIP, trafficPolicy, bool) {
 	if svc == nil {
-		return netv1.ServiceVIP{}, false
+		return netv1.ServiceVIP{}, trafficCluster, false
 	}
 	if svc.Spec.Type == corev1.ServiceTypeExternalName {
-		return netv1.ServiceVIP{}, false
+		return netv1.ServiceVIP{}, trafficCluster, false
 	}
 	cip := svc.Spec.ClusterIP
 	if cip == "" || cip == corev1.ClusterIPNone {
-		return netv1.ServiceVIP{}, false
+		return netv1.ServiceVIP{}, trafficCluster, false
 	}
 	if len(svc.Spec.Ports) == 0 {
-		return netv1.ServiceVIP{}, false
+		return netv1.ServiceVIP{}, trafficCluster, false
 	}
 	out := netv1.ServiceVIP{
 		Namespace: svc.Namespace,
@@ -65,9 +69,20 @@ func serviceToVIP(svc *corev1.Service) (netv1.ServiceVIP, bool) {
 		})
 	}
 	if len(out.Ports) == 0 {
-		return netv1.ServiceVIP{}, false
+		return netv1.ServiceVIP{}, trafficCluster, false
 	}
-	return out.WithDefaults(), true
+	return out.WithDefaults(), internalPolicy(svc.Spec.InternalTrafficPolicy), true
+}
+
+// internalPolicy maps a corev1 internalTrafficPolicy pointer to the proxy-internal
+// trafficPolicy: a nil pointer or "Cluster" yields trafficCluster (round-robin over
+// all backends), "Local" yields trafficLocal (node-local filtering). Any
+// unrecognized value defaults to trafficCluster, failing safe to the standard path.
+func internalPolicy(p *corev1.ServiceInternalTrafficPolicy) trafficPolicy {
+	if p != nil && *p == corev1.ServiceInternalTrafficPolicyLocal {
+		return trafficLocal
+	}
+	return trafficCluster
 }
 
 // endpointsForPort extracts the netv1.Endpoints backing the named Service port
