@@ -61,6 +61,15 @@ const DefaultDNSPort = 53
 // is the server's service-CIDR config (k3sm).
 const DefaultDNSVIP = "10.43.0.10"
 
+// DefaultClusterDomain is the conventional cluster DNS domain (matching k3s and
+// upstream Kubernetes) that pod Service names expand under, e.g.
+// <svc>.<ns>.svc.cluster.local. It is a darwin-net default; the authoritative
+// value is the server's --cluster-domain config (k3sm). It lives here beside
+// DefaultDNSVIP — rather than in apis — because it is a darwin-net defaulting
+// value, not a shared wire contract (the apis-vs-dns placement was adjudicated to
+// darwin-net, mirroring DefaultDNSVIP).
+const DefaultClusterDomain = "cluster.local"
+
 // PerNodeDNS returns the CorefileOptions for the per-node cluster resolver: a
 // Corefile bound to the DNS VIP (dnsVIP, default DefaultDNSVIP) on the standard
 // DNS port, authoritative for clusterDomain, forwarding all other names to
@@ -97,7 +106,7 @@ func (o CorefileOptions) Corefile() string {
 	}
 	domain := o.ClusterDomain
 	if domain == "" {
-		domain = "cluster.local"
+		domain = DefaultClusterDomain
 	}
 	upstream := "forward . /etc/resolv.conf"
 	if len(o.UpstreamResolvers) > 0 {
@@ -131,7 +140,7 @@ func (o CorefileOptions) Corefile() string {
 // CorefileOptions.BindIP).
 func PodDNSConfig(dnsVIP, clusterDomain, namespace string) netv1.DNSConfig {
 	if clusterDomain == "" {
-		clusterDomain = "cluster.local"
+		clusterDomain = DefaultClusterDomain
 	}
 	search := []string{
 		fmt.Sprintf("%s.svc.%s", namespace, clusterDomain),
