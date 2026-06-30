@@ -138,3 +138,47 @@ func TestPodDNSConfig(t *testing.T) {
 		t.Fatalf("short name did not expand via pod search list: %v", cands)
 	}
 }
+
+// TestDefaultClusterDomain pins the canonical cluster DNS domain default that
+// single-sources the open-coded "cluster.local" literal (B42): the const value
+// itself, plus the two darwin-net defaulting paths that must consume it —
+// PodDNSConfig's empty-clusterDomain branch and the Corefile renderer's
+// empty-domain fallback. It guards the const against drifting from the
+// conventional value k3sm's --cluster-domain config supplies, and either
+// defaulting path against silently diverging from it.
+func TestDefaultClusterDomain(t *testing.T) {
+	t.Parallel()
+
+	t.Run("const pins the conventional cluster domain", func(t *testing.T) {
+		t.Parallel()
+		if DefaultClusterDomain != "cluster.local" {
+			t.Fatalf("DefaultClusterDomain = %q, want %q", DefaultClusterDomain, "cluster.local")
+		}
+	})
+
+	t.Run("PodDNSConfig defaults an empty clusterDomain to the const", func(t *testing.T) {
+		t.Parallel()
+		// Empty dnsVIP + empty clusterDomain exercises the defaulting branch.
+		cfg := PodDNSConfig("", "", "ns1")
+		if cfg.ClusterDomain != DefaultClusterDomain {
+			t.Fatalf("ClusterDomain = %q, want %q", cfg.ClusterDomain, DefaultClusterDomain)
+		}
+		want := []string{"ns1.svc.cluster.local", "svc.cluster.local", "cluster.local"}
+		if len(cfg.SearchDomains) != len(want) {
+			t.Fatalf("search = %v, want %v", cfg.SearchDomains, want)
+		}
+		for i := range want {
+			if cfg.SearchDomains[i] != want[i] {
+				t.Fatalf("search[%d] = %q, want %q", i, cfg.SearchDomains[i], want[i])
+			}
+		}
+	})
+
+	t.Run("Corefile defaults an empty domain to the const", func(t *testing.T) {
+		t.Parallel()
+		cf := CorefileOptions{}.Corefile()
+		if !strings.Contains(cf, "kubernetes "+DefaultClusterDomain) {
+			t.Fatalf("Corefile did not default domain to %q:\n%s", DefaultClusterDomain, cf)
+		}
+	})
+}
