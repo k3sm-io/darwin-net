@@ -23,23 +23,26 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 )
 
-// CorefileOptions parameterizes the CoreDNS configuration k3sm runs as the
-// cluster resolver on the DNS VIP. It is the wiring side of pkg/dns: the server
-// (k3sm) renders a Corefile from it and binds CoreDNS to the VIP; pods are
-// pointed at that VIP via the netv1.DNSConfig the getaddrinfo shim consumes.
+// CorefileOptions parameterizes a CoreDNS Corefile bound to the DNS VIP. NOTE
+// (2026-06 upstream-alignment audit): this renderer is currently UNCONSUMED — the
+// cluster resolver that actually runs is k3sm's in-process A-record resolver
+// (k3sm/pkg/netserve), NOT CoreDNS-the-binary; this Corefile is an export kept for
+// the deferred native-CoreDNS follow-up (DESIGN §5b). Pods are pointed at the DNS
+// VIP via the netv1.DNSConfig the getaddrinfo shim consumes (PodDNSConfig — live).
 type CorefileOptions struct {
 	// ClusterDomain is the zone CoreDNS is authoritative for via the kubernetes
 	// plugin, e.g. "cluster.local".
 	ClusterDomain string
-	// BindIP is the DNS VIP CoreDNS listens on (the lo0 alias the proxy owns for
-	// the kube-dns Service). Empty binds all interfaces.
+	// BindIP is the DNS VIP the rendered Corefile listens on (the lo0 alias the
+	// proxy exempts for the kube-dns Service). Empty binds all interfaces.
 	BindIP string
 	// Port is the DNS port (53 by default).
 	Port int32
-	// UpstreamResolvers are the forwarders for non-cluster names. When empty,
-	// CoreDNS forwards to the host resolver via /etc/resolv.conf — but note macOS
-	// pods never read resolv.conf themselves; this is CoreDNS's own upstream, and
-	// CoreDNS runs in the server process, not under the pod sandbox.
+	// UpstreamResolvers are the forwarders for non-cluster names. When empty, the
+	// rendered Corefile forwards to the host resolver via /etc/resolv.conf — note
+	// macOS pods never read resolv.conf themselves; this would be CoreDNS's own
+	// upstream if the native-CoreDNS follow-up ships (the in-process resolver that
+	// serves DNS today has its own forwarder).
 	UpstreamResolvers []string
 }
 
@@ -47,24 +50,28 @@ type CorefileOptions struct {
 const DefaultDNSPort = 53
 
 // DefaultDNSVIP is the conventional kube-dns ClusterIP in k3sm's default
-// 10.43.0.0/16 service CIDR (the .10 of the range, matching k3s). CoreDNS runs
-// per-node bound to this address (see PerNodeDNS) so cluster DNS is always
-// answered node-locally over loopback — never steered over the wireguard mesh,
-// which carries only pod /24s (a mesh-steered DNS VIP would blackhole, since no
-// peer's AllowedIPs cover 10.43.0.10). The Service proxy exempts this VIP from
-// ownership (proxy.WithInfraVIPExemptions) so CoreDNS and the proxy do not fight
-// for 10.43.0.10:53 (EADDRINUSE). It is a darwin-net default; the authoritative
-// value is the server's service-CIDR config (k3sm).
+// 10.43.0.0/16 service CIDR (the .10 of the range, matching k3s). The per-node
+// resolver runs bound to this address (the in-process k3sm/pkg/netserve resolver;
+// PerNodeDNS renders the equivalent Corefile) so cluster DNS is always answered
+// node-locally over loopback — never steered over the wireguard mesh, which
+// carries only pod /24s (a mesh-steered DNS VIP would blackhole, since no peer's
+// AllowedIPs cover 10.43.0.10). The Service proxy exempts this VIP from ownership
+// (proxy.WithInfraVIPExemptions) so the resolver and the proxy do not fight for
+// 10.43.0.10:53 (EADDRINUSE). It is a darwin-net default; the authoritative value
+// is the server's service-CIDR config (k3sm).
 const DefaultDNSVIP = "10.43.0.10"
 
-// PerNodeDNS returns the CorefileOptions for the per-node cluster resolver:
-// CoreDNS bound to the DNS VIP (dnsVIP, default DefaultDNSVIP) on the standard
+// PerNodeDNS returns the CorefileOptions for the per-node cluster resolver: a
+// Corefile bound to the DNS VIP (dnsVIP, default DefaultDNSVIP) on the standard
 // DNS port, authoritative for clusterDomain, forwarding all other names to
-// upstream. Every node runs its own CoreDNS bound to the same VIP on its own lo0
-// alias, so a pod's DNS query resolves over loopback and never crosses the mesh;
-// the Service proxy must exempt dnsVIP (proxy.WithInfraVIPExemptions) so the two
-// do not contend for dnsVIP:53. An empty dnsVIP defaults to DefaultDNSVIP and an
-// empty clusterDomain defaults to cluster.local (applied by Corefile).
+// upstream. The per-node resolver binds the same VIP on each node's own lo0 alias
+// so a pod's DNS query resolves over loopback and never crosses the mesh; the
+// Service proxy must exempt dnsVIP (proxy.WithInfraVIPExemptions) so the two do
+// not contend for dnsVIP:53. NOTE: the output is currently UNCONSUMED — the
+// in-process k3sm/pkg/netserve resolver serves DNS today; this renders the
+// equivalent Corefile for the deferred native-CoreDNS follow-up (DESIGN §5b). An
+// empty dnsVIP defaults to DefaultDNSVIP and an empty clusterDomain defaults to
+// cluster.local (applied by Corefile).
 func PerNodeDNS(dnsVIP, clusterDomain string, upstream []string) CorefileOptions {
 	if dnsVIP == "" {
 		dnsVIP = DefaultDNSVIP
@@ -77,11 +84,12 @@ func PerNodeDNS(dnsVIP, clusterDomain string, upstream []string) CorefileOptions
 	}
 }
 
-// Corefile renders the CoreDNS configuration for the cluster resolver. It serves
-// the cluster domain via the kubernetes plugin, answers pod/Service records,
-// caches, and forwards everything else upstream. The output is a valid Corefile
-// string the server writes to disk (or passes via -conf) when launching CoreDNS
-// on the DNS VIP.
+// Corefile renders a CoreDNS configuration string for the cluster resolver. It
+// serves the cluster domain via the kubernetes plugin, answers pod/Service
+// records, caches, and forwards everything else upstream. NOTE: the output is
+// currently UNCONSUMED (the in-process k3sm/pkg/netserve resolver serves cluster
+// DNS, not a CoreDNS binary); it is kept as the native-CoreDNS export (DESIGN
+// §5b) — a future supervised CoreDNS would consume it via -conf.
 func (o CorefileOptions) Corefile() string {
 	port := o.Port
 	if port == 0 {

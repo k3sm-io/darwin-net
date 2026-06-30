@@ -14,9 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package dns is k3sm's pod DNS: it wires CoreDNS as the cluster resolver on a
-// VIP and carries the pure-Go reference resolver whose algorithm the
-// getaddrinfo DYLD shim mirrors inside pods.
+// Package dns is k3sm's pod DNS: it carries the pure-Go reference resolver whose
+// algorithm the getaddrinfo DYLD shim mirrors inside pods, plus the per-pod
+// DNSConfig that shim consumes. The cluster resolver that actually RUNS is k3sm's
+// in-process A-record + upstream-forward resolver (k3sm/pkg/netserve), NOT
+// CoreDNS-the-binary; the CoreDNS Corefile this package renders (CorefileOptions /
+// PerNodeDNS) is an UNCONSUMED export kept for the deferred "native CoreDNS"
+// follow-up (DESIGN §5b). (Corrected 2026-06 upstream-alignment audit: earlier
+// prose here wrongly said k3sm runs CoreDNS per-node.)
 //
 // # Why a shim at all
 //
@@ -24,8 +29,8 @@ limitations under the License.
 // /etc/resolv.conf (DESIGN §3), so the usual "write the pod a resolv.conf"
 // approach does nothing on Darwin. k3sm instead injects a DYLD_INSERT_LIBRARIES
 // shim that interposes getaddrinfo / freeaddrinfo / res_* and routes cluster
-// name resolution to CoreDNS over the cluster DNS VIP, applying ndots/search
-// expansion from a netv1.DNSConfig.
+// name resolution to the in-process cluster resolver over the cluster DNS VIP,
+// applying ndots/search expansion from a netv1.DNSConfig.
 //
 // # The pieces
 //
@@ -34,14 +39,16 @@ limitations under the License.
 //     resolves as a Service without the caller qualifying it; an absolute name
 //     (trailing dot) skips the search list. This is unit-tested directly.
 //   - resolver.go — Resolver: the Go reference implementation of pod resolution
-//     (candidateNames + an A-record query to CoreDNS over UDP using
+//     (candidateNames + an A-record query to the cluster resolver over UDP using
 //     golang.org/x/net/dns/dnsmessage, keeping darwin-net pure Go). The C shim
 //     mirrors this algorithm; sharing the expansion semantics here keeps the two
 //     in lockstep and lets the hard part (ndots/search) be tested in Go.
-//   - coredns.go — CorefileOptions / PodDNSConfig: the wiring the server uses to
-//     run CoreDNS on the DNS VIP and to hand each pod the DNSConfig the shim
-//     consumes. PerNodeDNS renders the per-node resolver bound to the kube-dns
-//     VIP (DefaultDNSVIP); see the M3.3 section below.
+//   - coredns.go — CorefileOptions / PodDNSConfig: PodDNSConfig hands each pod the
+//     DNSConfig the shim consumes (LIVE). CorefileOptions / PerNodeDNS RENDER a
+//     CoreDNS Corefile string bound to the DNS VIP (DefaultDNSVIP) that is
+//     currently UNCONSUMED — an export for the deferred native-CoreDNS follow-up
+//     (DESIGN §5b), not what serves DNS today (the in-process k3sm/pkg/netserve
+//     resolver does). See the M3.3 section below.
 //
 // # The C shim (built with clang, not cgo)
 //
@@ -93,28 +100,30 @@ limitations under the License.
 // proxy (an mDNSResponder resolver scoped to the cluster domain) injected via
 // /etc/resolver — out of scope for M2.2, which pins the exec-shim backend.
 //
-// # Per-node CoreDNS and the infra-VIP exemption (M3.3)
+// # Per-node DNS and the infra-VIP exemption (M3.3)
 //
 // On a multi-node mesh the kube-dns VIP (10.43.0.10) is NOT in any pod's podCIDR,
 // so a podCIDR classifier would call it remote and a podCIDR router would steer
 // it over the wireguard mesh — where no peer's symmetric AllowedIPs (= podCIDR)
 // cover it, blackholing in-pod DNS. The fix is to keep DNS node-local: k3sm runs
-// CoreDNS on every node bound directly to the DNS VIP (PerNodeDNS sets BindIP =
-// DefaultDNSVIP), so a pod's query resolves over loopback and never crosses the
-// mesh. The mesh routes only peer pod /24s to the utun (pkg/mesh, M3.1), so the
-// DNS VIP is never steered there — locality stays a hint, not a routing input.
+// a per-node resolver bound directly to the DNS VIP (the in-process resolver in
+// k3sm/pkg/netserve; PerNodeDNS here renders the equivalent Corefile, BindIP =
+// DefaultDNSVIP, for the future native-CoreDNS path), so a pod's query resolves
+// over loopback and never crosses the mesh. The mesh routes only peer pod /24s to
+// the utun (pkg/mesh, M3.1), so the DNS VIP is never steered there — locality
+// stays a hint, not a routing input.
 //
-// Because CoreDNS binds 10.43.0.10:53 (TCP and UDP) directly, the Service proxy
-// must NOT also try to own that VIP, or the two collide (EADDRINUSE). The proxy
-// exempts the kube-dns VIP via proxy.WithInfraVIPExemptions; the per-node CoreDNS
-// launch (k3sm, root-gated netd boundary) ensures the 10.43.0.10/32 lo0 alias the
-// proxy no longer creates for it.
+// Because the per-node resolver binds 10.43.0.10:53 (TCP and UDP) directly, the
+// Service proxy must NOT also try to own that VIP, or the two collide
+// (EADDRINUSE). The proxy exempts the kube-dns VIP via proxy.WithInfraVIPExemptions;
+// the per-node resolver launch (k3sm, root-gated netd boundary) ensures the
+// 10.43.0.10/32 lo0 alias the proxy no longer creates for it.
 //
 // The sibling infra VIP, the kubernetes endpoint (10.43.0.1), is fixed the same
 // way in spirit but is k3sm-owned (k3sm:M3.3): k3sm rewrites the kubernetes
 // Service endpoint to a node-local apiserver/proxy address per node. darwin-net
-// provides this half — per-node CoreDNS (PerNodeDNS) + the proxy exemption seam —
-// and depends on k3sm:M3.3 for the kubernetes-endpoint half.
+// provides this half — the per-node DNS Corefile render (PerNodeDNS) + the proxy
+// exemption seam — and depends on k3sm:M3.3 for the kubernetes-endpoint half.
 //
 // # Guest-side resolver for the vm RuntimeClass (M5.2)
 //

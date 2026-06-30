@@ -43,9 +43,9 @@ const dialTimeout = 5 * time.Second
 // RoutingTable.
 //
 // It yields ownership of infra VIPs registered via WithInfraVIPExemptions (the
-// kube-dns VIP, which per-node CoreDNS binds directly): for an exempt VIP the
+// kube-dns VIP, which per-node resolver binds directly): for an exempt VIP the
 // proxy creates no worker, no lo0 alias, and no listener, so it never contends
-// with CoreDNS for 10.43.0.10:53 (EADDRINUSE).
+// with the per-node resolver for 10.43.0.10:53 (EADDRINUSE).
 //
 // Concurrency / locking discipline:
 //   - Each ClusterIP:port (a PortKey) is reconciled by exactly one per-key worker
@@ -64,7 +64,7 @@ type Proxy struct {
 	binder binder
 	log    *slog.Logger
 	dialer *net.Dialer
-	// exemptVIPs are infra VIPs owned by a node-local binder (per-node CoreDNS on
+	// exemptVIPs are infra VIPs owned by a node-local binder (per-node resolver on
 	// the kube-dns VIP) rather than by the proxy: the proxy never aliases, binds,
 	// or routes them. It is set once by WithInfraVIPExemptions and read-only
 	// thereafter, so it needs no lock.
@@ -108,9 +108,10 @@ func WithMeshEgressSource(src netip.Addr) Option {
 // binder rather than the Service proxy, so the proxy never takes ownership of
 // them: no lo0 alias, no listening socket, no routing-table entry.
 //
-// It is the fix for the per-node CoreDNS collision (M3.3). k3sm runs CoreDNS on
-// every node bound directly to the kube-dns VIP (10.43.0.10) for 53/TCP and
-// 53/UDP, so cluster DNS is always answered node-locally over loopback and never
+// It is the fix for the per-node resolver collision (M3.3). k3sm runs a per-node
+// resolver (the in-process k3sm/pkg/netserve resolver) on every node bound
+// directly to the kube-dns VIP (10.43.0.10) for 53/TCP and 53/UDP, so cluster DNS
+// is always answered node-locally over loopback and never
 // steered over the wireguard mesh (which carries only pod /24s — a mesh-steered
 // DNS VIP would blackhole). Without this exemption the proxy's kube-dns Service
 // reconcile would try to bind 10.43.0.10:53/TCP and fail with EADDRINUSE; the M1
@@ -121,7 +122,7 @@ func WithMeshEgressSource(src netip.Addr) Option {
 //
 // The node-local kubernetes (10.43.0.1) endpoint uses the same step-aside
 // mechanism, but its endpoint rewrite is k3sm-owned (k3sm:M3.3); darwin-net
-// supplies the per-node CoreDNS (pkg/dns.PerNodeDNS) and this exemption seam.
+// supplies the per-node resolver (pkg/dns.PerNodeDNS) and this exemption seam.
 func WithInfraVIPExemptions(vips ...netip.Addr) Option {
 	return func(p *Proxy) {
 		for _, v := range vips {
@@ -238,7 +239,7 @@ func (p *Proxy) Reconcile(clusterIP string, port *netv1.ServicePort, endpoints [
 	}
 	key := PortKey{ClusterIP: clusterIP, Port: port.Port, Protocol: defaultProto(port.Protocol)}
 	if p.isExemptVIP(addr) {
-		// An infra VIP a node-local binder owns (per-node CoreDNS on the kube-dns
+		// An infra VIP a node-local binder owns (per-node resolver on the kube-dns
 		// VIP, the rewritten kubernetes endpoint). Step aside entirely — no worker,
 		// no lo0 alias, no listener, no routing entry — so the proxy never contends
 		// for the socket (EADDRINUSE). The exemption covers every port/protocol on
