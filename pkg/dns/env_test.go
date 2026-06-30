@@ -21,6 +21,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"testing"
 
 	netv1 "k3sm.io/apis/net/v1"
@@ -122,5 +123,33 @@ func TestShimEnvNamesMatchC(t *testing.T) {
 
 	if !slices.Equal(got, want) {
 		t.Errorf("getaddrinfo-shim ABI drift between %s and pkg/dns consts:\n  C shim getenv names: %v\n  Go env-name consts:  %v", shimPath, got, want)
+	}
+}
+
+// TestShimMaxSearchMatchesC is the second C<->Go drift guard, a sibling of
+// TestShimEnvNamesMatchC for the search-list cap. MaxSearchDomains is the Go-side
+// single source of the in-pod search cap (MergeDNSConfig enforces it); the C shim
+// holds the unavoidable copy as `#define K3SM_MAX_SEARCH`. This reads the .c as
+// text, extracts that macro, and asserts it equals MaxSearchDomains — so the
+// emitted K3SM_DNS_SEARCH list, the shim's effective in-pod list, and the Go
+// resolver mirror cannot silently diverge. A future edit to either side fails the
+// build here instead of truncating the search list at a different bound in pods.
+func TestShimMaxSearchMatchesC(t *testing.T) {
+	const shimPath = "../../shim/getaddrinfo_shim.c"
+	src, err := os.ReadFile(shimPath)
+	if err != nil {
+		t.Fatalf("read shim source %s: %v", shimPath, err)
+	}
+	re := regexp.MustCompile(`#define\s+K3SM_MAX_SEARCH\s+(\d+)`)
+	m := re.FindStringSubmatch(string(src))
+	if m == nil {
+		t.Fatalf("no `#define K3SM_MAX_SEARCH <n>` found in %s — regex or shim layout drifted", shimPath)
+	}
+	cMax, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parse K3SM_MAX_SEARCH %q: %v", m[1], err)
+	}
+	if cMax != MaxSearchDomains {
+		t.Errorf("getaddrinfo-shim search-cap drift: %s #define K3SM_MAX_SEARCH = %d, but pkg/dns MaxSearchDomains = %d", shimPath, cMax, MaxSearchDomains)
 	}
 }
