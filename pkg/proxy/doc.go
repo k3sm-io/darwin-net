@@ -79,18 +79,20 @@ limitations under the License.
 // blackhole them. Infra VIPs stay node-local for free: the mesh routes only peer
 // pod /24s to the utun, so 10.43.0.10 / 10.43.0.1 are never steered over it.
 //
-// # Infra-VIP exemption (per-node CoreDNS) — M3.3
+// # Infra-VIP exemption (per-node resolver) — M3.3
 //
-// k3sm runs CoreDNS on every node bound directly to the kube-dns VIP (10.43.0.10,
-// pkg/dns.PerNodeDNS) for 53/TCP and 53/UDP, so cluster DNS is always answered
-// node-locally over loopback and never crosses the mesh. WithInfraVIPExemptions
-// registers that VIP so the proxy yields ownership of it entirely — no lo0 alias,
-// no socket, no routing entry — which is what keeps the proxy from colliding with
-// CoreDNS on 10.43.0.10:53 (EADDRINUSE). The exemption is keyed on the VIP
+// k3sm runs a per-node resolver (the in-process k3sm/pkg/netserve resolver; the
+// pkg/dns.PerNodeDNS Corefile is the unconsumed native-CoreDNS export) on every
+// node bound directly to the kube-dns VIP (10.43.0.10) for 53/TCP and 53/UDP, so
+// cluster DNS is always answered node-locally over loopback and never crosses the
+// mesh. WithInfraVIPExemptions registers that VIP so the proxy yields ownership of
+// it entirely — no lo0 alias, no socket, no routing entry — which is what keeps
+// the proxy from colliding with the resolver on 10.43.0.10:53 (EADDRINUSE). The exemption is keyed on the VIP
 // address, so it covers both 53/TCP and 53/UDP; a normal ClusterIP Service is
 // unaffected. The node-local kubernetes (10.43.0.1) endpoint uses the same
 // step-aside mechanism, but its endpoint rewrite is k3sm-owned (k3sm:M3.3) —
-// darwin-net supplies the per-node CoreDNS and this exemption seam.
+// darwin-net supplies the per-node DNS Corefile render (pkg/dns.PerNodeDNS) and
+// this exemption seam.
 //
 // # UDP flow timeout (noted, not built in M1)
 //
@@ -103,7 +105,7 @@ limitations under the License.
 // idle timeout (Linux conntrack uses 30s for UDP; kube-proxy's userspace proxy
 // used a comparable udpIdleTimeout) so cached sockets and the backend selection
 // do not pin to a dead client. M1 ships the TCP data path end-to-end; the UDP
-// datagram relay + idle-flow GC is deferred (it pairs with CoreDNS on 53/UDP and
-// is tracked for the DNS milestone). The routing table — the part that decides
+// datagram relay + idle-flow GC is deferred (it pairs with the per-node resolver
+// on 53/UDP and is tracked for the DNS milestone — docs/BACKLOG.md B23). The routing table — the part that decides
 // which backend a 53/UDP query goes to — is already protocol-keyed and tested.
 package proxy
