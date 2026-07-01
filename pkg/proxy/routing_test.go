@@ -20,6 +20,7 @@ import (
 	"errors"
 	"net/netip"
 	"testing"
+	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
 )
@@ -405,6 +406,109 @@ func TestInternalTrafficPolicyLocalFiltersToNodeLocal(t *testing.T) {
 		// Fail-open degrades to Cluster: it routes to ALL backends, not a subset.
 		if seen["100.64.0.5"] == 0 || seen["100.64.1.5"] == 0 {
 			t.Fatalf("fail-open did not round-robin over all backends: %v", seen)
+		}
+	})
+}
+
+// TestNodePortIgnoresInternalTrafficPolicy is the B44 gate: internalTrafficPolicy:
+// Local governs the ClusterIP (east-west) path ONLY (KEP-2086), so the *:NodePort
+// (external) selector PickCluster must IGNORE it and route to ALL Ready backends,
+// while the ClusterIP selectors (Pick/PickSticky) still honor it and DROP when no
+// backend is node-local. The fixture mirrors the "zero local backends drops" case: a
+// VALID podCIDR + iTP:Local + all-REMOTE backends (every endpoint is outside the /24,
+// so there is ZERO node-local backend).
+//
+// Non-vacuity: before B44 the *:NodePort listener shared the ClusterIP's key and used
+// PickSticky, so it returned ErrNoLocalBackends and DROPPED the external connection.
+// Asserting PickCluster SUCCEEDS where Pick/PickSticky DROP is red under the old
+// shared-key behavior and green only once the external path selects the Cluster pool.
+func TestNodePortIgnoresInternalTrafficPolicy(t *testing.T) {
+	t.Parallel()
+	key := keyFor("10.43.0.10", 80)
+	const cidr = "100.64.0.0/24"
+	// All-REMOTE backends: every IP is outside the /24, so LocalityRemote — ZERO
+	// node-local backends under a VALID podCIDR (mirrors the B21 drop fixture).
+	remoteEps := []netv1.Endpoint{
+		{IP: "100.64.1.5", Port: 8080, Ready: true}, // out /24 -> remote
+		{IP: "100.64.1.6", Port: 8080, Ready: true}, // out /24 -> remote
+	}
+	remoteSet := map[string]bool{"100.64.1.5": true, "100.64.1.6": true}
+
+	t.Run("ClusterIP path still DROPS (iTP:Local co-gate — the fix did not disable iTP)", func(t *testing.T) {
+		t.Parallel()
+		tbl := NewRoutingTable(netip.MustParsePrefix(cidr))
+		tbl.SetEndpointsPolicy(key, remoteEps, trafficLocal, affinityConfig{})
+		// Pick (round-robin ClusterIP selector) drops with ErrNoLocalBackends.
+		for i := 0; i < 16; i++ {
+			if be, err := tbl.Pick(key); !errors.Is(err, ErrNoLocalBackends) {
+				t.Fatalf("Pick = (%v, %v), want ErrNoLocalBackends (ClusterIP iTP:Local drop)", be.Addr(), err)
+			}
+		}
+		// PickSticky (ClientIP-affinity ClusterIP selector) drops identically — the
+		// external fix must not weaken the internal iTP:Local guarantee.
+		client := netip.MustParseAddr("100.64.9.9")
+		for i := 0; i < 16; i++ {
+			if be, err := tbl.PickSticky(key, client, time.Now()); !errors.Is(err, ErrNoLocalBackends) {
+				t.Fatalf("PickSticky = (%v, %v), want ErrNoLocalBackends (ClusterIP iTP:Local drop)", be.Addr(), err)
+			}
+		}
+	})
+
+	t.Run("NodePort path routes to ALL backends (ignores iTP:Local — the fix)", func(t *testing.T) {
+		t.Parallel()
+		tbl := NewRoutingTable(netip.MustParsePrefix(cidr))
+		tbl.SetEndpointsPolicy(key, remoteEps, trafficLocal, affinityConfig{})
+		seen := map[string]int{}
+		for i := 0; i < 64; i++ {
+			be, err := tbl.PickCluster(key)
+			if err != nil {
+				t.Fatalf("PickCluster = %v, want a remote backend (NodePort ignores iTP:Local)", err)
+			}
+			ip := be.Addr().Addr().String()
+			if !remoteSet[ip] {
+				t.Fatalf("PickCluster returned unexpected backend %q", ip)
+			}
+			seen[ip]++
+		}
+		// eTP:Cluster round-robins over the WHOLE (all-remote) set, not a subset.
+		for ip := range remoteSet {
+			if seen[ip] == 0 {
+				t.Fatalf("NodePort selector never picked remote backend %q (not round-robining the Cluster pool)", ip)
+			}
+		}
+	})
+
+	t.Run("PickCluster on an empty key returns ErrNoBackends", func(t *testing.T) {
+		t.Parallel()
+		tbl := NewRoutingTable(netip.MustParsePrefix(cidr))
+		if be, err := tbl.PickCluster(key); !errors.Is(err, ErrNoBackends) {
+			t.Fatalf("PickCluster on empty table = (%v, %v), want ErrNoBackends", be.Addr(), err)
+		}
+	})
+
+	t.Run("New(WithLogger(nil)) does not panic on the activePool fail-open Warn", func(t *testing.T) {
+		t.Parallel()
+		// A zero podCIDR makes iTP:Local locality unknowable, so activePool takes the
+		// fail-open Warn branch. New copies p.log (nil) to table.log unconditionally,
+		// so the Warn must route through t.logger() (slog.Default) or it nil-derefs.
+		tbl := NewRoutingTable(netip.Prefix{}) // invalid podCIDR -> fail-open path
+		p := New(tbl, WithLogger(nil))         // sets tbl.log = nil AND p.log = nil
+		// Proxy.logger guards handle's per-connection Debug sinks — the sibling nil-log
+		// vector to the table's fail-open Warn. Under WithLogger(nil) it must never be
+		// nil, or handle's drop/dial-fail Debug would nil-deref in a bare goroutine and
+		// crash the daemon on the first no-backend connection.
+		if p.logger() == nil {
+			t.Fatal("Proxy.logger() returned nil under WithLogger(nil) — handle's Debug path would nil-deref")
+		}
+		tbl.SetEndpointsPolicy(key, remoteEps, trafficLocal, affinityConfig{})
+		// Must not panic; fails open to all backends (degrade-to-Cluster).
+		if _, err := tbl.Pick(key); err != nil {
+			t.Fatalf("Pick under fail-open = %v, want a backend (no panic, degrade-to-Cluster)", err)
+		}
+		// PickCluster (external) also drives activePool(external=true) under the nil
+		// logger — no Warn on that branch, no panic.
+		if _, err := tbl.PickCluster(key); err != nil {
+			t.Fatalf("PickCluster under nil logger = %v, want a backend", err)
 		}
 	})
 }

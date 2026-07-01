@@ -479,11 +479,16 @@ func (p *Proxy) runWorker(w *portWorker) {
 // ensures the lo0 alias exists first.
 //
 // NodePort semantics (TCP): the *:NodePort listener accepts on every node interface
-// and L4-load-balances to the SAME Ready backend set as the ClusterIP — i.e.
-// externalTrafficPolicy: Cluster. externalTrafficPolicy: Local is NOT honored,
+// and L4-load-balances to ALL Ready backends (the Cluster pool via PickCluster) —
+// externalTrafficPolicy: Cluster. internalTrafficPolicy:Local is IGNORED on the
+// NodePort path: iTP governs the ClusterIP (east-west) path only (KEP-2086), so an
+// iTP:Local Service still serves its NodePort to every backend rather than dropping
+// when no backend is node-local — the *:NodePort listener no longer shares the
+// ClusterIP's iTP:Local filter. externalTrafficPolicy: Local is NOT honored either,
 // because the userspace splice (see splice) opens a fresh backend connection and
 // therefore does NOT preserve the external client's source IP (the backend sees
-// the proxy/mesh-egress source, not the client) — the precondition Local relies on.
+// the proxy/mesh-egress source, not the client) — the precondition Local relies on —
+// so an eTP:Local Service gets Cluster behavior on its NodePort (a documented divergence).
 //
 // UDP: the ClusterIP datagram relay IS built (connectionless — a dispatcher reads
 // the VIP socket, picks a backend ONCE per client flow, opens a connected upstream
@@ -550,11 +555,12 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 		return nil, fmt.Errorf("listen clusterIP %s: %w", clusterAP, err)
 	}
 	l.clusterIP = cl
-	go p.serve(cl, key)
+	go p.serve(cl, key, internalListener)
 
 	// NodePort listener: bind the wildcard (*:NodePort) so every node interface
-	// answers, load-balancing to the same backends as the ClusterIP
-	// (externalTrafficPolicy: Cluster — the splice does not preserve client src IP).
+	// answers, load-balancing to ALL Ready backends via the external scope
+	// (externalTrafficPolicy: Cluster — PickCluster ignores internalTrafficPolicy:Local;
+	// the splice does not preserve client src IP, so eTP:Local is not honored either).
 	if port.NodePort != 0 {
 		nodeAddr := net.JoinHostPort("", strconv.Itoa(int(port.NodePort)))
 		nl, err := net.Listen("tcp", nodeAddr)
@@ -564,42 +570,90 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 			return nil, fmt.Errorf("listen nodePort %s: %w", nodeAddr, err)
 		}
 		l.nodePort = nl
-		go p.serve(nl, key)
+		go p.serve(nl, key, externalListener)
 	}
 	return l, nil
 }
 
-// serve accepts TCP connections on ln and proxies each to a backend chosen by
-// the routing table. It returns when ln is closed (Accept errors).
-func (p *Proxy) serve(ln net.Listener, key PortKey) {
+// internalListener and externalListener name the accept-path scope threaded through
+// serve/handle, so a call site reads its intent rather than a bare bool (matching the
+// file's Locality/trafficPolicy enum idiom). The ClusterIP (east-west) listener is
+// internal — it honors internalTrafficPolicy:Local and ClientIP affinity (PickSticky);
+// the *:NodePort listener is external — externalTrafficPolicy governs it, so it routes
+// to ALL Ready backends (PickCluster), ignoring iTP:Local.
+const (
+	internalListener = false
+	externalListener = true
+)
+
+// serve accepts TCP connections on ln and proxies each to a backend chosen by the
+// routing table. external selects the accept-path scope: the ClusterIP listener
+// passes internalListener (iTP:Local + ClientIP affinity honored); the *:NodePort
+// listener passes externalListener (externalTrafficPolicy:Cluster — route to ALL
+// Ready backends). It returns when ln is closed (Accept errors).
+func (p *Proxy) serve(ln net.Listener, key PortKey, external bool) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return // listener closed
 		}
-		go p.handle(conn, key)
+		go p.handle(conn, key, external)
 	}
 }
 
-// handle proxies one accepted client connection to a Ready backend, honoring
-// ClientIP session affinity (PickSticky). The client IP is extracted with its
-// ephemeral source port stripped (clientAddr), because affinity keys on the source
-// IP alone; PickSticky degrades to plain round-robin for a non-affinity port, so this
-// path is unconditional.
-func (p *Proxy) handle(client net.Conn, key PortKey) {
+// handle proxies one accepted client connection to a Ready backend. external selects
+// the picker: the external (*:NodePort) path uses PickCluster
+// (externalTrafficPolicy:Cluster — ALL Ready backends, ignoring iTP:Local and without
+// ClientIP affinity, a documented deferral); the internal (ClusterIP) path uses
+// PickSticky, honoring iTP:Local and ClientIP session affinity. For the internal path
+// the client IP is extracted with its ephemeral source port stripped (clientAddr),
+// because affinity keys on the source IP alone; PickSticky degrades to plain
+// round-robin for a non-affinity port, so that path is unconditional.
+func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 	defer client.Close()
-	be, err := p.table.PickSticky(key, clientAddr(client.RemoteAddr()), time.Now())
+	var (
+		be  backend
+		err error
+	)
+	if external {
+		be, err = p.table.PickCluster(key)
+	} else {
+		be, err = p.table.PickSticky(key, clientAddr(client.RemoteAddr()), time.Now())
+	}
 	if err != nil {
-		p.log.Debug("no backend for connection", "vip", key.String(), "err", err)
+		// Distinct messages so the two drop reasons are greppable, but BOTH stay at
+		// Debug: handle logs per-connection, so Info here would FLOOD a steady-state
+		// iTP:Local-starved Service; the throttled activePool Warn (once per backend
+		// set) is the observable signal. The ErrNoLocalBackends arm is ClusterIP-only —
+		// PickCluster (external) forces the Cluster pool and never returns it.
+		if errors.Is(err, ErrNoLocalBackends) {
+			p.logger().Debug("no node-local backend for internalTrafficPolicy:Local connection", "vip", key.String(), "err", err)
+		} else {
+			p.logger().Debug("no backend for connection", "vip", key.String(), "external", external, "err", err)
+		}
 		return
 	}
 	backendConn, err := p.dialer.Dial("tcp", be.Addr().String())
 	if err != nil {
-		p.log.Debug("dial backend", "vip", key.String(), "backend", be.Addr().String(), "err", err)
+		p.logger().Debug("dial backend", "vip", key.String(), "backend", be.Addr().String(), "err", err)
 		return
 	}
 	defer backendConn.Close()
 	splice(client, backendConn)
+}
+
+// logger returns p.log, or slog.Default() when it is nil. New copies the (possibly nil)
+// option-supplied logger into p.log AFTER the options run, so WithLogger(nil) would
+// otherwise nil-deref on the per-connection handle drop/dial-fail path — a bare
+// `go p.handle` goroutine with no recover, i.e. a daemon crash on the exact no-backend
+// input this path handles. Mirrors RoutingTable.logger (the table's fail-open Warn), so
+// BOTH nil-log sinks on the no-backend data path are guarded (go-standards: never panic
+// in library code).
+func (p *Proxy) logger() *slog.Logger {
+	if p.log == nil {
+		return slog.Default()
+	}
+	return p.log
 }
 
 // clientAddr extracts the client's IP — with the ephemeral source port stripped —
