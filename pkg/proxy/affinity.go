@@ -33,9 +33,23 @@ const affinityDefaultTimeout = 3 * time.Hour
 // one trust domain with no per-pod uid isolation, so this is a hard safety bound on
 // top of the TTL sweep. It is generous, and an evicted binding pins NO live resource
 // (unlike B23's per-flow UDP socket), so over-cap eviction only degrades that client
-// to a fresh round-robin pick; on saturation the OLDEST binding is evicted to admit
-// the newest.
+// to a fresh round-robin pick; on saturation ONE existing binding is evicted in O(1)
+// — a pseudo-random victim (Go map iteration is randomized), since a best-effort
+// affinity overlay needs no true-LRU victim and this avoids an O(cap) scan under the
+// table write lock. The relay-GLOBAL aggregate ceiling (maxAffinityBindingsTotal)
+// bounds the sum across ALL ports on top of this per-port cap.
 const maxAffinityBindingsPerPort = 8192
+
+// maxAffinityBindingsTotal is the relay-GLOBAL ceiling on live ClientIP bindings
+// summed across ALL Service ports (RoutingTable.affinityCount). The per-port cap bounds
+// any single port, but a peer fanning source-IP churn across many Services could still
+// grow the aggregate map unbounded; this caps node-wide affinity memory. It is 8x the
+// per-port cap — sized well above a legitimate multi-Service steady state, so only
+// pathological churn reaches it. On saturation PickSticky degrades a NEW client to
+// round-robin (a valid backend, no binding recorded), never rejecting the connection:
+// affinity is a fail-open overlay, so the worst realized effect is loss of stickiness,
+// never a reachability break.
+const maxAffinityBindingsTotal = 8 * maxAffinityBindingsPerPort
 
 // affinityMode is the proxy-internal analog of corev1.ServiceAffinity for the one
 // mode the userspace proxy implements: ClientIP. Like trafficPolicy it is consumed
@@ -127,18 +141,51 @@ func (t *RoutingTable) PickSticky(key PortKey, client netip.Addr, now time.Time)
 			b.lastSeen = now
 			return b.backend, nil
 		}
-		delete(binds, client)
+		// Stale binding (backend left the pool, or idled past the timeout): drop it —
+		// counter-aware, so a stale-refresh never leaks affinityCount (the client is
+		// re-bound below at ++, or degraded at the ceiling; either way the map lost one).
+		t.dropBinding(binds, client)
 	}
 
 	be := t.roundRobin(st, pool)
+	perPortCap := max(1, t.maxAffinityPerPort)
+	totalCap := max(1, t.maxAffinityTotal)
+
+	// Per-port eviction runs BEFORE the global ceiling check: evicting one of THIS
+	// port's own bindings to admit another is net-zero to affinityCount, so a port at
+	// its per-port cap keeps rotating its bindings even under global saturation.
+	if len(binds) >= perPortCap {
+		// O(1) pseudo-random eviction: Go map iteration is randomized and a best-effort
+		// affinity overlay needs no true-LRU victim, so evict the first entry range
+		// visits. This replaces B22's O(cap) least-recently-seen scan under the lock.
+		for k := range binds {
+			t.dropBinding(binds, k)
+			break
+		}
+	}
+
+	// Relay-GLOBAL aggregate ceiling. When the live-binding total across ALL ports is at
+	// the cap, DEGRADE this new client to round-robin: return the picked backend but
+	// record NO binding, so reachability is preserved and only stickiness is lost — this
+	// is a fail-open overlay, never a reject or a closed connection. Warn once (throttled
+	// by affinityWarned) so node-wide stickiness degradation is observable, not silent.
+	if t.affinityCount >= totalCap {
+		if !t.affinityWarned {
+			t.affinityWarned = true
+			t.log.Warn("ClientIP session affinity degraded to round-robin: relay-global binding ceiling reached; new clients stay reachable but lose stickiness",
+				"bindings", t.affinityCount, "max", totalCap)
+		}
+		return be, nil
+	}
+	// Below the ceiling: clear the throttle so a later re-saturation warns again.
+	t.affinityWarned = false
+
 	if binds == nil {
 		binds = make(map[netip.Addr]*affinityBinding)
 		t.affinity[key] = binds
 	}
-	if len(binds) >= maxAffinityBindingsPerPort {
-		evictOldestBinding(binds)
-	}
 	binds[client] = &affinityBinding{backend: be, lastSeen: now}
+	t.affinityCount++
 	return be, nil
 }
 
@@ -156,33 +203,45 @@ func (t *RoutingTable) SweepExpired(now time.Time) {
 	for key, binds := range t.affinity {
 		st := t.states[key]
 		if st == nil {
-			delete(t.affinity, key)
+			// Orphaned port (its state vanished): drop wholesale, decrementing
+			// affinityCount by the sub-map's cardinality so the total stays exact.
+			t.dropAffinity(key)
 			continue
 		}
 		for client, b := range binds {
 			if now.Sub(b.lastSeen) >= st.affinityTimeout {
-				delete(binds, client)
+				t.dropBinding(binds, client) // single-key idle eviction
 			}
 		}
 		if len(binds) == 0 {
-			delete(t.affinity, key)
+			// The single-key deletes above already decremented; dropAffinity on the now-
+			// empty sub-map subtracts 0 and removes the key (no double-count).
+			t.dropAffinity(key)
 		}
 	}
 }
 
-// evictOldestBinding removes the least-recently-seen entry from binds to make room
-// under maxAffinityBindingsPerPort. It is a linear scan, but runs only when a single
-// port is already at the (generous) cap — a pathological client-IP-churn case — so it
-// is a defensive bound, not the hot path. The caller holds t.mu and guarantees binds
-// is non-empty.
-func evictOldestBinding(binds map[netip.Addr]*affinityBinding) {
-	var oldest netip.Addr
-	var oldestSeen time.Time
-	first := true
-	for client, b := range binds {
-		if first || b.lastSeen.Before(oldestSeen) {
-			oldest, oldestSeen, first = client, b.lastSeen, false
-		}
-	}
-	delete(binds, oldest)
+// dropBinding removes ONE client's binding from binds and decrements the global
+// affinityCount by one, keeping affinityCount an exact function of the affinity map. It
+// is the single counter-aware SINGLE-KEY removal site: the stale-binding refresh drop,
+// the per-port O(1) eviction, and the idle sweep all route through it, so a single-key
+// delete can never leak the count (the wholesale sibling is dropAffinity). The caller
+// holds t.mu and guarantees client is present in binds.
+func (t *RoutingTable) dropBinding(binds map[netip.Addr]*affinityBinding, client netip.Addr) {
+	delete(binds, client)
+	t.affinityCount--
+}
+
+// dropAffinity removes key's entire ClientIP binding sub-map and decrements the global
+// affinityCount by that sub-map's CARDINALITY, keeping affinityCount an exact function
+// of the affinity map. It is the single counter-aware wholesale-purge site: every place
+// that drops a whole port's bindings — SetEndpointsPolicy (no Ready backends, or
+// ClientIP toggled off), Delete, and SweepExpired's orphaned/empty-state drops — routes
+// through it, so a wholesale delete can never leak the count (a per-call decrement would
+// under-count by len(binds)-1 and drift the total up to the ceiling). A missing or
+// already-empty sub-map decrements 0 (len(nil) == 0), so there is no special case. The
+// caller holds t.mu.
+func (t *RoutingTable) dropAffinity(key PortKey) {
+	t.affinityCount -= len(t.affinity[key])
+	delete(t.affinity, key)
 }
