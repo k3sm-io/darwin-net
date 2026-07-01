@@ -302,7 +302,7 @@ func TestInternalTrafficPolicyLocalFiltersToNodeLocal(t *testing.T) {
 			{IP: "100.64.0.6", Port: 8080, Ready: true}, // in CIDR  -> local
 			{IP: "100.64.1.5", Port: 8080, Ready: true}, // out /24  -> remote
 			{IP: "100.64.2.9", Port: 8080, Ready: true}, // out /24  -> remote
-		}, trafficLocal)
+		}, trafficLocal, affinityConfig{})
 
 		locals := map[string]bool{"100.64.0.5": true, "100.64.0.6": true}
 		seen := map[string]int{}
@@ -334,7 +334,7 @@ func TestInternalTrafficPolicyLocalFiltersToNodeLocal(t *testing.T) {
 		n := tbl.SetEndpointsPolicy(key, []netv1.Endpoint{
 			{IP: "100.64.1.5", Port: 8080, Ready: true}, // out /24 -> remote
 			{IP: "100.64.2.9", Port: 8080, Ready: true}, // out /24 -> remote
-		}, trafficLocal)
+		}, trafficLocal, affinityConfig{})
 		if n != 2 {
 			t.Fatalf("SetEndpointsPolicy installed %d backends, want 2", n)
 		}
@@ -360,7 +360,7 @@ func TestInternalTrafficPolicyLocalFiltersToNodeLocal(t *testing.T) {
 			name string
 			set  func(*RoutingTable)
 		}{
-			{"explicit trafficCluster", func(rt *RoutingTable) { rt.SetEndpointsPolicy(key, eps, trafficCluster) }},
+			{"explicit trafficCluster", func(rt *RoutingTable) { rt.SetEndpointsPolicy(key, eps, trafficCluster, affinityConfig{}) }},
 			{"SetEndpoints default", func(rt *RoutingTable) { rt.SetEndpoints(key, eps) }},
 		}
 		for _, s := range setters {
@@ -389,7 +389,7 @@ func TestInternalTrafficPolicyLocalFiltersToNodeLocal(t *testing.T) {
 		tbl.SetEndpointsPolicy(key, []netv1.Endpoint{
 			{IP: "100.64.0.5", Port: 8080, Ready: true},
 			{IP: "100.64.1.5", Port: 8080, Ready: true},
-		}, trafficLocal)
+		}, trafficLocal, affinityConfig{})
 
 		seen := map[string]int{}
 		for i := 0; i < 100; i++ {

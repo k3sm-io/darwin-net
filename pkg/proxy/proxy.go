@@ -220,23 +220,58 @@ type portWorker struct {
 
 // portEvent is a desired-state update for one ClusterIP:port delivered to its
 // worker. A nil port means the port (or its Service) was deleted and the worker
-// should tear its listeners down. policy is the Service's internalTrafficPolicy,
-// applied to the routing table atomically with endpoints so Pick never observes a
-// stale (policy, backends) pairing.
+// should tear its listeners down. policy is the Service's internalTrafficPolicy and
+// affinity its ClientIP session-affinity config; both are applied to the routing
+// table atomically with endpoints so a pick never observes a stale (policy,
+// affinity, backends) pairing.
 type portEvent struct {
 	port      *netv1.ServicePort
 	policy    trafficPolicy
+	affinity  affinityConfig
 	endpoints []netv1.Endpoint
 }
 
-// Run starts the proxy's worker supervision loop and blocks until ctx is
-// cancelled, at which point it stops every worker (closing all listeners and
-// removing every lo0 alias it created) and returns. Run is the single owner of
-// the workers map mutation lifecycle.
+// affinitySweepInterval is how often the Proxy evicts idle ClientIP session-affinity
+// bindings from the routing table. It is a coarse backstop: PickSticky already
+// re-validates and TTL-checks a binding inline on every connection, so the sweep only
+// reclaims bindings of clients that have gone completely silent (and never redialed).
+const affinitySweepInterval = 60 * time.Second
+
+// Run starts the proxy's worker supervision loop and the ClientIP affinity idle
+// sweeper, and blocks until ctx is cancelled, at which point it stops every worker
+// (closing all listeners and removing every lo0 alias it created), joins the sweeper,
+// and returns. Run is the single owner of the workers map mutation lifecycle and of
+// the affinity sweeper goroutine.
 func (p *Proxy) Run(ctx context.Context) error {
+	sweeperDone := make(chan struct{})
+	go func() {
+		defer close(sweeperDone)
+		if p.table != nil {
+			p.sweepAffinity(ctx)
+		}
+	}()
 	<-ctx.Done()
 	p.shutdown()
+	<-sweeperDone
 	return ctx.Err()
+}
+
+// sweepAffinity is the single owner of the routing table's ClientIP affinity idle
+// GC: every affinitySweepInterval it calls RoutingTable.SweepExpired(now). The table
+// itself is deliberately clock-injected and goroutine-free (SweepExpired is pure), so
+// this proxy-owned ticker is where the TTL's lifetime lives. It returns when ctx is
+// cancelled; Run joins it after shutdown so it never outlives the Proxy.
+func (p *Proxy) sweepAffinity(ctx context.Context) {
+	ticker := time.NewTicker(affinitySweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			p.table.SweepExpired(now)
+		}
+	}
 }
 
 // shutdown stops all workers and waits for them to release their sockets.
@@ -265,19 +300,19 @@ func (p *Proxy) shutdown() {
 //
 // Reconcile is safe for concurrent callers (the informer event handlers).
 func (p *Proxy) Reconcile(clusterIP string, port *netv1.ServicePort, endpoints []netv1.Endpoint) error {
-	return p.ReconcilePolicy(clusterIP, port, trafficCluster, endpoints)
+	return p.ReconcilePolicy(clusterIP, port, trafficCluster, affinityConfig{}, endpoints)
 }
 
 // ReconcilePolicy delivers the desired state for one Service port — including its
-// internalTrafficPolicy — to its dedicated worker, creating the worker on first
-// sight. Passing port == nil signals deletion. Because every event for a given
-// ClusterIP:port routes to the same worker channel, Service and EndpointSlice
-// updates for that port are applied in a single serialized stream — no two
-// goroutines ever touch one listener, and (policy, endpoints) reach the routing
-// table together.
+// internalTrafficPolicy and ClientIP session-affinity config — to its dedicated
+// worker, creating the worker on first sight. Passing port == nil signals deletion.
+// Because every event for a given ClusterIP:port routes to the same worker channel,
+// Service and EndpointSlice updates for that port are applied in a single serialized
+// stream — no two goroutines ever touch one listener, and (policy, affinity,
+// endpoints) reach the routing table together.
 //
 // ReconcilePolicy is safe for concurrent callers (the informer event handlers).
-func (p *Proxy) ReconcilePolicy(clusterIP string, port *netv1.ServicePort, policy trafficPolicy, endpoints []netv1.Endpoint) error {
+func (p *Proxy) ReconcilePolicy(clusterIP string, port *netv1.ServicePort, policy trafficPolicy, affinity affinityConfig, endpoints []netv1.Endpoint) error {
 	if port == nil {
 		return errors.New("proxy: reconcile requires a port (use ReconcileDelete to remove)")
 	}
@@ -302,7 +337,7 @@ func (p *Proxy) ReconcilePolicy(clusterIP string, port *netv1.ServicePort, polic
 		return errors.New("proxy: shutting down")
 	}
 	select {
-	case w.ch <- portEvent{port: port, policy: policy, endpoints: endpoints}:
+	case w.ch <- portEvent{port: port, policy: policy, affinity: affinity, endpoints: endpoints}:
 		return nil
 	case <-w.stop:
 		return errors.New("proxy: worker stopped")
@@ -372,7 +407,7 @@ func (p *Proxy) runWorker(w *portWorker) {
 				p.table.Delete(w.key)
 				return
 			}
-			p.table.SetEndpointsPolicy(w.key, ev.endpoints, ev.policy)
+			p.table.SetEndpointsPolicy(w.key, ev.endpoints, ev.policy, ev.affinity)
 			if ln == nil {
 				l, err := p.openListener(w.key, ev.port)
 				if err != nil {
@@ -496,10 +531,14 @@ func (p *Proxy) serve(ln net.Listener, key PortKey) {
 	}
 }
 
-// handle proxies one accepted client connection to a Ready backend.
+// handle proxies one accepted client connection to a Ready backend, honoring
+// ClientIP session affinity (PickSticky). The client IP is extracted with its
+// ephemeral source port stripped (clientAddr), because affinity keys on the source
+// IP alone; PickSticky degrades to plain round-robin for a non-affinity port, so this
+// path is unconditional.
 func (p *Proxy) handle(client net.Conn, key PortKey) {
 	defer client.Close()
-	be, err := p.table.Pick(key)
+	be, err := p.table.PickSticky(key, clientAddr(client.RemoteAddr()), time.Now())
 	if err != nil {
 		p.log.Debug("no backend for connection", "vip", key.String(), "err", err)
 		return
@@ -511,6 +550,30 @@ func (p *Proxy) handle(client net.Conn, key PortKey) {
 	}
 	defer backendConn.Close()
 	splice(client, backendConn)
+}
+
+// clientAddr extracts the client's IP — with the ephemeral source port stripped —
+// from a connection's remote address, for ClientIP session affinity: affinity keys
+// on the source IP ALONE, so keying on the full IP:port would silently degrade
+// stickiness to per-connection (no stickiness at all). A remote address that is nil
+// or does not parse yields the zero Addr, which is harmless: that client just shares
+// one affinity bucket (and for a non-affinity port the IP is ignored entirely).
+//
+// Cross-node fidelity caveat: this is the source IP THIS proxy sees. Same-node
+// ClusterIP traffic arrives on loopback carrying the real pod lo0 IP (faithful), but
+// cross-node / NodePort traffic is re-originated from the peer node's mesh-egress /32
+// (the splice does not preserve the client src IP — DESIGN §5b), so all cross-node
+// clients behind one peer collapse to a single affinity binding — a userspace-L4
+// limitation, not a bug.
+func clientAddr(remote net.Addr) netip.Addr {
+	if remote == nil {
+		return netip.Addr{}
+	}
+	ap, err := netip.ParseAddrPort(remote.String())
+	if err != nil {
+		return netip.Addr{}
+	}
+	return ap.Addr().Unmap()
 }
 
 // splice copies bytes in both directions between client and backend until either

@@ -22,6 +22,7 @@ import (
 	"net/netip"
 	"sort"
 	"sync"
+	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
 )
@@ -111,6 +112,15 @@ type RoutingTable struct {
 
 	mu     sync.RWMutex
 	states map[PortKey]*portState
+	// affinity holds ClientIP session-affinity bindings: PortKey -> client IP -> the
+	// backend that client is stuck to. It is TABLE-level (guarded by the same mu, so
+	// the affinity and routing locks are folded into one — no two-lock ordering
+	// hazard) and deliberately NOT a portState field, so a binding SURVIVES endpoint
+	// churn: SetEndpointsPolicy replaces the portState on every reconcile, which would
+	// wipe a per-portState map. Bindings are re-validated against the live pool on
+	// every PickSticky hit and idle-swept by the owning Proxy (SweepExpired); only
+	// ClientIP ports have entries here (a None or deleted port is purged).
+	affinity map[PortKey]map[netip.Addr]*affinityBinding
 
 	// log records the fail-open degradation when internalTrafficPolicy: Local meets
 	// an unknown podCIDR (a loud, throttled Warn so the misconfig is observable). It
@@ -144,6 +154,21 @@ type portState struct {
 	// an unknown-podCIDR iTP: Local port logs once per backend set, not per
 	// connection. A new state (a reconcile) clears it.
 	warned bool
+	// affinityMode is the port's session-affinity mode (affinityClientIP or
+	// affinityNone), installed from the Service's SessionAffinity each reconcile. It
+	// is config, not bindings — the bindings live table-level in RoutingTable.affinity
+	// so they survive this portState being replaced.
+	affinityMode affinityMode
+	// affinityTimeout is the ClientIP idle TTL (from SessionAffinityConfig, defaulted
+	// by the translate layer / clamped in SetEndpointsPolicy). Meaningful only when
+	// affinityMode is affinityClientIP.
+	affinityTimeout time.Duration
+	// allSet and localSet are membership sets over all and locals (same contents,
+	// O(1) lookup), precomputed in SetEndpointsPolicy so PickSticky can re-validate a
+	// cached binding against the active pool without an O(N) slice scan. localSet is
+	// nil when there are no node-local backends.
+	allSet   map[netip.AddrPort]struct{}
+	localSet map[netip.AddrPort]struct{}
 }
 
 // PortKey identifies one bound Service port: the ClusterIP plus the Service Port
@@ -172,9 +197,10 @@ func (k PortKey) String() string {
 // to enable local/remote classification and node-local filtering.
 func NewRoutingTable(podCIDR netip.Prefix) *RoutingTable {
 	return &RoutingTable{
-		podCIDR: podCIDR,
-		states:  make(map[PortKey]*portState),
-		log:     slog.Default(),
+		podCIDR:  podCIDR,
+		states:   make(map[PortKey]*portState),
+		affinity: make(map[PortKey]map[netip.Addr]*affinityBinding),
+		log:      slog.Default(),
 	}
 }
 
@@ -183,7 +209,7 @@ func NewRoutingTable(podCIDR netip.Prefix) *RoutingTable {
 // SetEndpointsPolicy with internalTrafficPolicy: Cluster; the reconcile path calls
 // SetEndpointsPolicy directly to carry a Service's actual policy.
 func (t *RoutingTable) SetEndpoints(key PortKey, eps []netv1.Endpoint) int {
-	return t.SetEndpointsPolicy(key, eps, trafficCluster)
+	return t.SetEndpointsPolicy(key, eps, trafficCluster, affinityConfig{})
 }
 
 // SetEndpointsPolicy replaces the backend set AND the traffic policy for key in a
@@ -199,7 +225,16 @@ func (t *RoutingTable) SetEndpoints(key PortKey, eps []netv1.Endpoint) int {
 //
 // Endpoints that fail netv1.Endpoint.Validate (empty IP, out-of-range port) or
 // whose IP does not parse are skipped; they are not dialable.
-func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, policy trafficPolicy) int {
+//
+// aff carries the port's ClientIP session-affinity config (installed onto the new
+// portState alongside policy). The ClientIP bindings themselves live table-level and
+// are NOT touched here when affinity stays on — they survive the portState swap and
+// PickSticky re-validates them against the fresh backend set. They ARE purged when
+// affinity is off (aff.mode != ClientIP) or the port has no Ready backends, so a
+// Service toggled ClientIP->None (or drained) leaves no stale bindings to resurrect.
+// Membership sets over the full and node-local pools are precomputed here (the O(N)
+// slice build is already paid) so PickSticky re-validation is O(1).
+func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, policy trafficPolicy, aff affinityConfig) int {
 	ready := make([]backend, 0, len(eps))
 	for _, ep := range eps {
 		if !ep.Ready {
@@ -235,25 +270,60 @@ func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, pol
 		}
 	}
 
+	// Precompute membership sets over the full set and the node-local subset so
+	// PickSticky can re-validate a ClientIP binding against the active pool in O(1)
+	// instead of an O(N) slice scan. localSet stays nil when there are no locals.
+	allSet := make(map[netip.AddrPort]struct{}, len(ready))
+	for _, b := range ready {
+		allSet[b.addr] = struct{}{}
+	}
+	var localSet map[netip.AddrPort]struct{}
+	if len(locals) > 0 {
+		localSet = make(map[netip.AddrPort]struct{}, len(locals))
+		for _, b := range locals {
+			localSet[b.addr] = struct{}{}
+		}
+	}
+
+	// A ClientIP port always carries a positive TTL (the translate layer defaults an
+	// absent/zero timeout to affinityDefaultTimeout); clamp defensively so no caller
+	// can install an instantly-expiring binding.
+	if aff.mode == affinityClientIP && aff.timeout <= 0 {
+		aff.timeout = affinityDefaultTimeout
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if len(ready) == 0 {
 		delete(t.states, key)
+		delete(t.affinity, key) // no backends: any bindings are meaningless
 		return 0
 	}
+	if aff.mode != affinityClientIP {
+		// Affinity off for this port: purge bindings so a Service toggled
+		// ClientIP->None (or never sticky) leaves nothing to resurrect on re-enable.
+		delete(t.affinity, key)
+	}
 	t.states[key] = &portState{
-		all:    ready,
-		locals: locals,
-		policy: policy,
+		all:             ready,
+		locals:          locals,
+		policy:          policy,
+		affinityMode:    aff.mode,
+		affinityTimeout: aff.timeout,
+		allSet:          allSet,
+		localSet:        localSet,
 	}
 	return len(ready)
 }
 
-// Delete removes all backends for key (e.g. when a Service or port is deleted).
+// Delete removes all backends for key (e.g. when a Service or port is deleted),
+// including any ClientIP affinity bindings so a re-created port never resurrects a
+// stale stickiness.
 func (t *RoutingTable) Delete(key PortKey) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.states, key)
+	delete(t.affinity, key)
 }
 
 // classify computes a backend's locality from the node podCIDR. A zero podCIDR
@@ -282,11 +352,59 @@ var ErrNoBackends = fmt.Errorf("proxy: no ready backends for service port")
 // unknown podCIDR — that path fails open to all backends (see Pick).
 var ErrNoLocalBackends = fmt.Errorf("proxy: no node-local backends for internalTrafficPolicy:Local service port")
 
+// activePool returns the policy-correct backend pool for st together with a
+// membership set over that EXACT pool, or an error that must be surfaced (never
+// masked by a fallback). It is the SINGLE source of the Ready + internalTrafficPolicy
+// selection policy — both Pick and PickSticky call it, so round-robin and sticky
+// selection can never diverge on which backends are eligible:
+//
+//   - trafficCluster: the full Ready set (all / allSet).
+//   - trafficLocal under a VALID podCIDR: the node-local subset (locals / localSet),
+//     or ErrNoLocalBackends when that subset is empty — the faithful upstream drop,
+//     never a spill to a remote backend.
+//   - trafficLocal under a ZERO/INVALID podCIDR: locality is unknowable, so it FAILS
+//     OPEN to the full set and warns once per backend set (degrade-to-Cluster, never a
+//     blackhole).
+//
+// The set is returned so PickSticky can re-validate a cached binding against the live
+// pool in O(1). The caller must hold t.mu (activePool may flip st.warned and log).
+func (t *RoutingTable) activePool(key PortKey, st *portState) ([]backend, map[netip.AddrPort]struct{}, error) {
+	pool, set := st.all, st.allSet
+	if st.policy == trafficLocal {
+		if t.podCIDR.IsValid() {
+			// Locality is KNOWN: steer only to node-local backends, dropping when none
+			// are local rather than spilling across the mesh.
+			if len(st.locals) == 0 {
+				return nil, nil, ErrNoLocalBackends
+			}
+			pool, set = st.locals, st.localSet
+		} else if !st.warned {
+			// Locality is UNKNOWABLE (zero/invalid podCIDR): fail open to all backends
+			// and warn once per backend set, so an unset/malformed podCIDR degrades
+			// iTP: Local to Cluster loudly instead of blackholing it.
+			st.warned = true
+			t.log.Warn("internalTrafficPolicy:Local routing degraded to Cluster: node podCIDR is unset/invalid so backend locality is unknown; routing to ALL backends instead of dropping",
+				"key", key.String(), "backends", len(st.all))
+		}
+	}
+	return pool, set, nil
+}
+
+// roundRobin returns the next backend in pool and advances st's per-key cursor so
+// successive calls fan out. pool must be non-empty (activePool guarantees it for a
+// non-error return). The caller holds t.mu.
+func (t *RoutingTable) roundRobin(st *portState, pool []backend) backend {
+	i := st.cursor % uint64(len(pool))
+	st.cursor++
+	return pool[i]
+}
+
 // Pick selects the next backend for key using round-robin, advancing a per-key
 // cursor so successive calls fan out across the active pool. It is the accept-path
 // selector: deterministic given a known call count, which is what makes the
-// distribution table-assertable. SessionAffinity is out of scope for M1 — this is
-// round-robin only.
+// distribution table-assertable. Pick is round-robin only; ClientIP session
+// affinity layers on top via PickSticky (affinity.go), which shares activePool so
+// sticky and round-robin selection can never diverge on which backends are eligible.
 //
 // The active pool depends on the key's traffic policy:
 //
@@ -310,29 +428,11 @@ func (t *RoutingTable) Pick(key PortKey) (backend, error) {
 	if st == nil || len(st.all) == 0 {
 		return backend{}, ErrNoBackends
 	}
-
-	pool := st.all
-	if st.policy == trafficLocal {
-		if t.podCIDR.IsValid() {
-			// Locality is KNOWN: steer only to node-local backends, dropping when
-			// none are local rather than spilling across the mesh.
-			if len(st.locals) == 0 {
-				return backend{}, ErrNoLocalBackends
-			}
-			pool = st.locals
-		} else if !st.warned {
-			// Locality is UNKNOWABLE (zero/invalid podCIDR): fail open to all
-			// backends and warn once per backend set, so an unset/malformed podCIDR
-			// degrades iTP: Local to Cluster loudly instead of blackholing it.
-			st.warned = true
-			t.log.Warn("internalTrafficPolicy:Local routing degraded to Cluster: node podCIDR is unset/invalid so backend locality is unknown; routing to ALL backends instead of dropping",
-				"key", key.String(), "backends", len(st.all))
-		}
+	pool, _, err := t.activePool(key, st)
+	if err != nil {
+		return backend{}, err
 	}
-
-	i := st.cursor % uint64(len(pool))
-	st.cursor++
-	return pool[i], nil
+	return t.roundRobin(st, pool), nil
 }
 
 // PickAt selects the backend at index i modulo the Ready-set size, without
