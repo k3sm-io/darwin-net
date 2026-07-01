@@ -94,3 +94,64 @@ func TestGuestResolvConfRender(t *testing.T) {
 		}
 	})
 }
+
+// TestGuestResolvConfRejectsInjection is the B47 post-build hardening: the vm-guest
+// /etc/resolv.conf is a LINE-structured file, so a search domain carrying an interior
+// newline is a directive-injection primitive on the UNTRUSTED tenant path. The classic
+// bypass splits the payload so no single entry holds a literal space/tab (defeating a
+// " \t"-only predicate); the space-join on the `search` line then reintroduces the
+// separator. normalizeSearch DROPs any entry with whitespace OR a control byte, so the
+// forged `nameserver` line can never materialize. ndots is also clamped to the
+// resolv.conf ceiling for host/guest parity.
+func TestGuestResolvConfRejectsInjection(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a split newline-injection payload is dropped, not rendered as a directive", func(t *testing.T) {
+		t.Parallel()
+		// Neither entry holds a space/tab, so a " \t"-only predicate passes both; the
+		// first carries a '\n' that, once the entries are space-joined onto the `search`
+		// line, would forge `search corp\nnameserver 6.6.6.6` — an attacker `nameserver`
+		// directive MITMing the tenant's DNS. The broadened predicate DROPs the '\n' entry.
+		cfg := netv1.DNSConfig{
+			ClusterDNSIP:  "10.43.0.10",
+			ClusterDomain: "cluster.local",
+			SearchDomains: []string{"corp\nnameserver", "6.6.6.6", "svc.cluster.local"},
+			NDots:         2,
+		}
+		got, err := GuestResolvConf(cfg)
+		if err != nil {
+			t.Fatalf("GuestResolvConf: %v", err)
+		}
+		// Exactly ONE nameserver directive — the cluster VIP. On the old " \t" predicate
+		// the injected "corp\nnameserver 6.6.6.6" survives and Count would be 2.
+		if n := strings.Count(got, "nameserver "); n != 1 {
+			t.Fatalf("want exactly 1 nameserver directive (the cluster VIP), got %d:\n%s", n, got)
+		}
+		if strings.Contains(got, "nameserver 6.6.6.6") {
+			t.Fatalf("injected nameserver directive leaked into the guest resolv.conf:\n%s", got)
+		}
+		if strings.Contains(got, "corp") {
+			t.Fatalf("the malformed (newline-bearing) search entry must be DROPPED whole:\n%s", got)
+		}
+		// The well-formed sibling survives.
+		if !strings.Contains(got, "svc.cluster.local") {
+			t.Fatalf("the well-formed search domain should survive:\n%s", got)
+		}
+	})
+
+	t.Run("ndots is clamped to the resolv.conf ceiling for host/guest parity", func(t *testing.T) {
+		t.Parallel()
+		cfg := netv1.DNSConfig{
+			ClusterDNSIP:  "10.43.0.10",
+			ClusterDomain: "cluster.local",
+			NDots:         1000,
+		}
+		got, err := GuestResolvConf(cfg)
+		if err != nil {
+			t.Fatalf("GuestResolvConf: %v", err)
+		}
+		if !strings.Contains(got, "options ndots:15") {
+			t.Fatalf("ndots 1000 should clamp to 15 (RES_MAXNDOTS) for parity with ConfigToEnv:\n%s", got)
+		}
+	})
+}

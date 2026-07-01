@@ -50,10 +50,17 @@ func candidateNames(cfg netv1.DNSConfig, name string) []string {
 		return []string{strings.TrimSuffix(name, ".")}
 	}
 
+	// Iterate the SAME normalized search list the shim env (ConfigToEnv) and guest
+	// resolv.conf (GuestResolvConf) encode, so this reference resolver mirrors them
+	// exactly — it drops the same interior-whitespace domain and honors the same
+	// MaxSearchDomains cap. The extra TrimSuffix(".") below is resolver-local: a
+	// candidate name must not carry the search domain's (shim-tolerated) trailing
+	// dot. A no-op for admission-valid input.
 	dots := strings.Count(name, ".")
-	searched := make([]string, 0, len(cfg.SearchDomains))
-	for _, d := range cfg.SearchDomains {
-		d = strings.TrimSuffix(strings.TrimSpace(d), ".")
+	search := normalizeSearch(cfg.SearchDomains)
+	searched := make([]string, 0, len(search))
+	for _, d := range search {
+		d = strings.TrimSuffix(d, ".")
 		if d == "" {
 			continue
 		}

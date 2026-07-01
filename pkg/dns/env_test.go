@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	netv1 "k3sm.io/apis/net/v1"
@@ -88,6 +89,70 @@ func TestConfigToEnv(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestConfigToEnvCapsAndSanitizes is the B47 gate: it proves ConfigToEnv defends the
+// K3SM_DNS_SEARCH / K3SM_DNS_NDOTS wire values against a config that bypassed
+// admission (k3sm's validatePodDNSConfig). Every assertion here is a no-op for an
+// admission-valid config, so the live cluster-DNS keystone stays byte-identical; the
+// cases below use only INVALID inputs that admission would have rejected. On main
+// (no normalizeSearch, no ndots high-clamp) the interior-whitespace, over-cap, and
+// ndots cases all fail.
+func TestConfigToEnvCapsAndSanitizes(t *testing.T) {
+	cfg := func(search []string, ndots int32) netv1.DNSConfig {
+		return netv1.DNSConfig{
+			ClusterDNSIP:  "10.43.0.10",
+			ClusterDomain: "cluster.local",
+			SearchDomains: search,
+			NDots:         ndots,
+		}
+	}
+
+	t.Run("interior-whitespace domain is dropped whole, not split or stripped", func(t *testing.T) {
+		got := ConfigToEnv(cfg([]string{"svc.cluster.local", "foo bar", "cluster.local"}, 5))[EnvDNSSearch]
+		// The C shim splits K3SM_DNS_SEARCH on " \t" via strtok_r: a leaked "foo bar"
+		// would fork into two in-pod search tokens. It must be dropped whole — never
+		// split into "foo"/"bar" nor fused into "foobar".
+		for _, tok := range strings.Fields(got) {
+			if tok == "foo" || tok == "bar" || tok == "foobar" {
+				t.Fatalf("malformed domain leaked as %q into K3SM_DNS_SEARCH=%q", tok, got)
+			}
+		}
+		if want := "svc.cluster.local cluster.local"; got != want {
+			t.Fatalf("K3SM_DNS_SEARCH = %q, want %q (malformed domain dropped whole)", got, want)
+		}
+	})
+
+	t.Run("over-cap list is prefix-capped to the first MaxSearchDomains, cluster-first", func(t *testing.T) {
+		// 3 cluster + 7 extra = 10 valid domains; only the first MaxSearchDomains(8)
+		// survive (the cluster-first prefix), the tail is truncated.
+		search := []string{
+			"ns.svc.cluster.local", "svc.cluster.local", "cluster.local",
+			"e1.internal", "e2.internal", "e3.internal", "e4.internal",
+			"e5.internal", "e6.internal", "e7.internal",
+		}
+		got := ConfigToEnv(cfg(search, 5))[EnvDNSSearch]
+		toks := strings.Split(got, " ")
+		if len(toks) != MaxSearchDomains {
+			t.Fatalf("K3SM_DNS_SEARCH has %d tokens, want exactly %d", len(toks), MaxSearchDomains)
+		}
+		if want := search[:MaxSearchDomains]; !slices.Equal(toks, want) {
+			t.Fatalf("K3SM_DNS_SEARCH = %v, want the cluster-first prefix %v", toks, want)
+		}
+	})
+
+	t.Run("an out-of-range ndots is clamped high to the RES_MAXNDOTS ceiling", func(t *testing.T) {
+		if got := ConfigToEnv(cfg([]string{"svc.cluster.local"}, 1000))[EnvDNSNdots]; got != "15" {
+			t.Fatalf("K3SM_DNS_NDOTS = %q, want \"15\" (clamped to RES_MAXNDOTS)", got)
+		}
+	})
+
+	t.Run("a trailing-dot domain is preserved, not treated as malformed", func(t *testing.T) {
+		got := ConfigToEnv(cfg([]string{"svc.cluster.local.", "cluster.local."}, 5))[EnvDNSSearch]
+		if want := "svc.cluster.local. cluster.local."; got != want {
+			t.Fatalf("K3SM_DNS_SEARCH = %q, want %q (trailing dot is shim-tolerated, kept)", got, want)
+		}
+	})
 }
 
 // TestShimEnvNamesMatchC is the C<->Go drift guard. It is the one place both the
