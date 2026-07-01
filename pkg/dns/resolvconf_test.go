@@ -100,7 +100,8 @@ func TestGuestResolvConfRender(t *testing.T) {
 // newline is a directive-injection primitive on the UNTRUSTED tenant path. The classic
 // bypass splits the payload so no single entry holds a literal space/tab (defeating a
 // " \t"-only predicate); the space-join on the `search` line then reintroduces the
-// separator. normalizeSearch DROPs any entry with whitespace OR a control byte, so the
+// separator. normalizeSearch DROPs any entry with a char outside the RFC-1123 charset
+// [a-zA-Z0-9.-] (whitespace, control, or a separator like ';' '#' ':' '/' '@'), so the
 // forged `nameserver` line can never materialize. ndots is also clamped to the
 // resolv.conf ceiling for host/guest parity.
 func TestGuestResolvConfRejectsInjection(t *testing.T) {
