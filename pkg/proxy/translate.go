@@ -17,6 +17,8 @@ limitations under the License.
 package proxy
 
 import (
+	"time"
+
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 
@@ -24,26 +26,27 @@ import (
 )
 
 // serviceToVIP flattens a Kubernetes Service into the netv1.ServiceVIP the proxy
-// owns plus its internal traffic policy, or returns (zero, trafficCluster, false)
-// when the Service is not one the proxy serves: headless (no/None ClusterIP),
-// ExternalName, or with no ports. The trafficPolicy is read from
-// svc.Spec.InternalTrafficPolicy and threaded to the routing table by the reconcile
-// path — it is NOT carried on the netv1 contract (apis), since only the proxy
-// consumes it. It is pure (no I/O), so the watch→proxy translation is table-testable
-// independent of client-go.
-func serviceToVIP(svc *corev1.Service) (netv1.ServiceVIP, trafficPolicy, bool) {
+// owns plus its internal traffic policy and ClientIP session-affinity config, or
+// returns (zero, trafficCluster, affinityConfig{}, false) when the Service is not one
+// the proxy serves: headless (no/None ClusterIP), ExternalName, or with no ports. The
+// trafficPolicy and affinityConfig are read from svc.Spec (InternalTrafficPolicy and
+// SessionAffinity) and threaded to the routing table by the reconcile path — neither
+// is carried on the netv1 contract (apis), since only the proxy consumes them. It is
+// pure (no I/O), so the watch→proxy translation is table-testable independent of
+// client-go.
+func serviceToVIP(svc *corev1.Service) (netv1.ServiceVIP, trafficPolicy, affinityConfig, bool) {
 	if svc == nil {
-		return netv1.ServiceVIP{}, trafficCluster, false
+		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false
 	}
 	if svc.Spec.Type == corev1.ServiceTypeExternalName {
-		return netv1.ServiceVIP{}, trafficCluster, false
+		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false
 	}
 	cip := svc.Spec.ClusterIP
 	if cip == "" || cip == corev1.ClusterIPNone {
-		return netv1.ServiceVIP{}, trafficCluster, false
+		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false
 	}
 	if len(svc.Spec.Ports) == 0 {
-		return netv1.ServiceVIP{}, trafficCluster, false
+		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false
 	}
 	out := netv1.ServiceVIP{
 		Namespace: svc.Namespace,
@@ -69,9 +72,30 @@ func serviceToVIP(svc *corev1.Service) (netv1.ServiceVIP, trafficPolicy, bool) {
 		})
 	}
 	if len(out.Ports) == 0 {
-		return netv1.ServiceVIP{}, trafficCluster, false
+		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false
 	}
-	return out.WithDefaults(), internalPolicy(svc.Spec.InternalTrafficPolicy), true
+	return out.WithDefaults(), internalPolicy(svc.Spec.InternalTrafficPolicy), sessionAffinity(&svc.Spec), true
+}
+
+// sessionAffinity maps a Service's SessionAffinity spec to the proxy-internal
+// affinityConfig: SessionAffinity == ClientIP yields affinityClientIP with the
+// configured ClientIP.TimeoutSeconds, and any other value (None/empty) yields the
+// zero affinityConfig (no affinity). The nested SessionAffinityConfig / ClientIP /
+// TimeoutSeconds are all nil-able even when SessionAffinity == ClientIP, so each hop
+// is nil-guarded; an absent or non-positive timeout defaults to affinityDefaultTimeout
+// (kube-proxy's 3h DefaultClientIPServiceAffinitySeconds), never an infinite binding.
+// Like internalPolicy it is proxy-internal — netv1 carries no SessionAffinity field.
+func sessionAffinity(spec *corev1.ServiceSpec) affinityConfig {
+	if spec.SessionAffinity != corev1.ServiceAffinityClientIP {
+		return affinityConfig{}
+	}
+	timeout := affinityDefaultTimeout
+	if c := spec.SessionAffinityConfig; c != nil && c.ClientIP != nil && c.ClientIP.TimeoutSeconds != nil {
+		if secs := *c.ClientIP.TimeoutSeconds; secs > 0 {
+			timeout = time.Duration(secs) * time.Second
+		}
+	}
+	return affinityConfig{mode: affinityClientIP, timeout: timeout}
 }
 
 // internalPolicy maps a corev1 internalTrafficPolicy pointer to the proxy-internal

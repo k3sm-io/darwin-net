@@ -24,13 +24,13 @@ limitations under the License.
 // # Layers
 //
 //   - RoutingTable (routing.go) is the pure-logic core: ClusterIP:port → ordered
-//     Ready backends, with a deterministic round-robin picker (Pick) and an
-//     explicit-index picker (PickAt) for table-assertable distribution. Only
-//     Ready endpoints are ever admitted (SetEndpoints filters at the single
-//     admission point), so an unready endpoint can never be selected. It carries
-//     no sockets and no client-go types, so its behavior is fully unit-tested.
-//     SessionAffinity is intentionally out of scope for M1: this is round-robin
-//     only.
+//     Ready backends, with a deterministic round-robin picker (Pick), an
+//     explicit-index picker (PickAt) for table-assertable distribution, and a
+//     ClientIP-session-affinity picker (PickSticky, affinity.go) layered over the
+//     same activePool policy. Only Ready endpoints are ever admitted (SetEndpoints
+//     filters at the single admission point), so an unready endpoint can never be
+//     selected. It carries no sockets and no client-go types, so its behavior is
+//     fully unit-tested.
 //   - aliasManager (alias.go) abstracts lo0 alias create/teardown. The production
 //     lo0AliasManager shells out to `ifconfig lo0 alias <ip>/32`; it is root-gated,
 //     so in deployment the proxy plumbs VIP aliases through the root netd daemon
@@ -154,4 +154,42 @@ limitations under the License.
 // infra-VIP exemption (WithInfraVIPExemptions) steps the proxy aside before any
 // worker is created, so a legitimate USER UDP Service on a non-exempt VIP is relayed
 // while kube-dns stays node-local on its own resolver.
+//
+// # ClientIP session affinity (TCP) — B22
+//
+// A Service with sessionAffinity: ClientIP pins every connection from one client IP
+// to the same backend. The Watcher reads svc.Spec.SessionAffinity (+
+// SessionAffinityConfig.ClientIP.TimeoutSeconds, nil-safely defaulted to 3h — never
+// infinite) in serviceToVIP and threads it, like internalTrafficPolicy, to the
+// routing table; netv1 carries no SessionAffinity field (only the proxy consumes it).
+// The TCP accept path calls RoutingTable.PickSticky (proxy.handle) instead of Pick.
+//
+// PickSticky is a cache OVER Pick, not a replacement for its policy: it shares the
+// same activePool (the Ready + internalTrafficPolicy:Local-filtered pool with the B21
+// fail-open/ErrNoLocalBackends semantics), so a sticky pick and a round-robin pick can
+// never disagree on which backends are eligible. A binding is reused only when the
+// bound backend is STILL in the live active pool (re-validated in O(1) against a
+// precomputed membership set) AND within the idle TTL; a backend that went unready or
+// (under iTP:Local) left the node-local subset is re-picked, never reused, so affinity
+// never dials a dead backend nor spills node-local traffic across the mesh, and a
+// port with no node-local backend left DROPS (ErrNoLocalBackends). The binding map is
+// TABLE-level (guarded by the routing lock, folded in so there is no second lock to
+// order), so it SURVIVES endpoint churn — SetEndpointsPolicy replaces the portState on
+// every reconcile, which would wipe a per-portState map. Bindings are idle-swept by a
+// single Proxy-owned ticker (SweepExpired is a pure, clock-injected table method — the
+// table stays goroutine-free) and bounded per port, and are purged when affinity is
+// toggled off or the port is deleted so a re-enable never resurrects stale stickiness.
+//
+// Two limitations are deliberate and documented:
+//
+//   - Cross-node fidelity: affinity keys on the source IP THIS proxy sees. Same-node
+//     ClusterIP traffic arrives on loopback carrying the real pod lo0 IP (faithful),
+//     but cross-node and NodePort traffic is re-originated from the peer node's
+//     mesh-egress /32 (the userspace splice does not preserve the client src IP —
+//     DESIGN §5b), so all cross-node clients behind one peer collapse to a SINGLE
+//     affinity binding. This is a userspace-L4 limitation, not a bug.
+//   - UDP affinity is DEFERRED (TCP-only). The ClusterIP UDP relay (B23) reuses a
+//     backend per client 5-tuple for the life of a flow, but that is flow-affinity,
+//     NOT per-client-IP sessionAffinity: it keys on the full 5-tuple (not the IP
+//     alone) and does not span reconnects. udprelay.go still calls Pick, unchanged.
 package proxy

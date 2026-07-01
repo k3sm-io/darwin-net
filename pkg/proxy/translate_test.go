@@ -18,6 +18,7 @@ package proxy
 
 import (
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -104,7 +105,7 @@ func TestServiceToVIP(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			vip, _, ok := serviceToVIP(tc.svc)
+			vip, _, _, ok := serviceToVIP(tc.svc)
 			if ok != tc.wantOK {
 				t.Fatalf("serviceToVIP ok = %v, want %v", ok, tc.wantOK)
 			}
@@ -161,12 +162,67 @@ func TestServiceToVIPInternalTrafficPolicy(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, policy, ok := serviceToVIP(mk(tc.itp))
+			_, policy, _, ok := serviceToVIP(mk(tc.itp))
 			if !ok {
 				t.Fatalf("serviceToVIP ok = false, want true")
 			}
 			if policy != tc.want {
 				t.Fatalf("policy = %d, want %d", policy, tc.want)
+			}
+		})
+	}
+}
+
+// TestServiceToVIPSessionAffinity asserts serviceToVIP reads svc.Spec.SessionAffinity
+// (+ SessionAffinityConfig.ClientIP.TimeoutSeconds) into the proxy-internal
+// affinityConfig, nil-safely: SessionAffinity != ClientIP => no affinity; ClientIP with
+// an absent/nil/non-positive timeout => the 3h default (never infinite); ClientIP with a
+// positive timeout => that duration.
+func TestServiceToVIPSessionAffinity(t *testing.T) {
+	t.Parallel()
+	mk := func(sa corev1.ServiceAffinity, cfg *corev1.SessionAffinityConfig) *corev1.Service {
+		return &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"},
+			Spec: corev1.ServiceSpec{
+				Type:                  corev1.ServiceTypeClusterIP,
+				ClusterIP:             "10.43.0.10",
+				Ports:                 []corev1.ServicePort{{Port: 80, TargetPort: intstr.FromInt32(8080), Protocol: corev1.ProtocolTCP}},
+				SessionAffinity:       sa,
+				SessionAffinityConfig: cfg,
+			},
+		}
+	}
+	clientIP := func(secs *int32) *corev1.SessionAffinityConfig {
+		return &corev1.SessionAffinityConfig{ClientIP: &corev1.ClientIPConfig{TimeoutSeconds: secs}}
+	}
+
+	cases := []struct {
+		name        string
+		svc         *corev1.Service
+		wantMode    affinityMode
+		wantTimeout time.Duration
+	}{
+		{"none is no affinity", mk(corev1.ServiceAffinityNone, nil), affinityNone, 0},
+		{"empty is no affinity", mk("", nil), affinityNone, 0},
+		{"clientIP nil config defaults to 3h", mk(corev1.ServiceAffinityClientIP, nil), affinityClientIP, affinityDefaultTimeout},
+		{"clientIP nil ClientIP defaults to 3h", mk(corev1.ServiceAffinityClientIP, &corev1.SessionAffinityConfig{}), affinityClientIP, affinityDefaultTimeout},
+		{"clientIP nil TimeoutSeconds defaults to 3h", mk(corev1.ServiceAffinityClientIP, clientIP(nil)), affinityClientIP, affinityDefaultTimeout},
+		{"clientIP explicit timeout", mk(corev1.ServiceAffinityClientIP, clientIP(ptrInt32(3600))), affinityClientIP, time.Hour},
+		{"clientIP zero timeout defaults to 3h", mk(corev1.ServiceAffinityClientIP, clientIP(ptrInt32(0))), affinityClientIP, affinityDefaultTimeout},
+		{"clientIP negative timeout defaults to 3h", mk(corev1.ServiceAffinityClientIP, clientIP(ptrInt32(-5))), affinityClientIP, affinityDefaultTimeout},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, _, aff, ok := serviceToVIP(tc.svc)
+			if !ok {
+				t.Fatalf("serviceToVIP ok = false, want true")
+			}
+			if aff.mode != tc.wantMode {
+				t.Fatalf("affinity mode = %d, want %d", aff.mode, tc.wantMode)
+			}
+			if aff.mode == affinityClientIP && aff.timeout != tc.wantTimeout {
+				t.Fatalf("affinity timeout = %v, want %v", aff.timeout, tc.wantTimeout)
 			}
 		})
 	}
