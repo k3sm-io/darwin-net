@@ -48,6 +48,12 @@ const (
 	EnvDNSNdots = "K3SM_DNS_NDOTS"
 )
 
+// maxNDots is the resolv.conf RES_MAXNDOTS ceiling (15). ConfigToEnv clamps ndots
+// to it so the encoder self-defends against a direct caller that bypassed the
+// k3sm-side admission clamp; a value above the ceiling has no resolver meaning and
+// only risks surprising the shim's atoi. It is a no-op for admission-valid input.
+const maxNDots = 15
+
 // ConfigToEnv serializes a cluster DNSConfig into the K3SM_DNS_* environment map
 // the getaddrinfo shim consumes. It is the single pinned encoder of the shim ABI,
 // so callers (k3sm's toPodBox) never hand-roll the wire format — a wrong separator
@@ -56,12 +62,19 @@ const (
 //
 //   - EnvDNSServer — cfg.ClusterDNSIP as an IPv4 string (C: inet_pton, AF_INET).
 //   - EnvDNSDomain — cfg.ClusterDomain verbatim.
-//   - EnvDNSSearch — cfg.SearchDomains joined with a single SPACE; the C side
-//     tokenizes on " \t" via strtok_r, so a comma/newline would collapse to one
-//     un-splittable token and yield zero search expansions (the keystone dead).
+//   - EnvDNSSearch — normalizeSearch(cfg.SearchDomains) joined with a single SPACE;
+//     the C side tokenizes on " \t" via strtok_r, so a comma/newline would collapse
+//     to one un-splittable token and yield zero search expansions (the keystone
+//     dead). normalizeSearch DROPS any interior-whitespace domain before the join
+//     (that domain would otherwise strtok_r-split into fabricated tokens) and
+//     prefix-caps at MaxSearchDomains, keeping this emitted list identical to the
+//     shim, guest resolv.conf, and Go-resolver views (defense-in-depth; a no-op for
+//     admission-valid input).
 //   - EnvDNSNdots  — cfg.NDots in decimal (C: atoi), defaulting to DefaultNDots
 //     when not positive so the wire value is never "0" (a "0" would invert the
-//     short-name vs. absolute candidate ordering).
+//     short-name vs. absolute candidate ordering), and clamped to maxNDots (the
+//     resolv.conf RES_MAXNDOTS ceiling) so a caller that bypassed admission cannot
+//     emit a nonsensical ndots.
 //
 // EnvDNSPort is intentionally omitted: netv1.DNSConfig has no port field and the
 // shim already defaults to 53, so emitting a port could only misconfigure it.
@@ -79,10 +92,13 @@ func ConfigToEnv(cfg netv1.DNSConfig) map[string]string {
 	if ndots <= 0 {
 		ndots = netv1.DefaultNDots
 	}
+	if ndots > maxNDots {
+		ndots = maxNDots
+	}
 	return map[string]string{
 		EnvDNSServer: cfg.ClusterDNSIP,
 		EnvDNSDomain: cfg.ClusterDomain,
-		EnvDNSSearch: strings.Join(cfg.SearchDomains, " "),
+		EnvDNSSearch: strings.Join(normalizeSearch(cfg.SearchDomains), " "),
 		EnvDNSNdots:  strconv.Itoa(int(ndots)),
 	}
 }

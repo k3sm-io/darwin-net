@@ -37,65 +37,89 @@ func clusterBase() netv1.DNSConfig {
 
 func TestMergeDNSConfig(t *testing.T) {
 	tests := []struct {
-		name       string
-		searches   []string
-		ndots      int32
-		wantSearch []string
-		wantNDots  int32
+		name        string
+		searches    []string
+		ndots       int32
+		wantSearch  []string
+		wantNDots   int32
+		wantDropped int
 	}{
 		{
 			// Under-cap append: a single pod search lands after the cluster ones.
 			// ndots:0 is treated as unset, so the cluster default is kept (B20b).
-			name:       "under-cap append, ndots:0 keeps cluster default",
-			searches:   []string{"corp.internal"},
-			ndots:      0,
-			wantSearch: []string{"ns.svc.cluster.local", "svc.cluster.local", "cluster.local", "corp.internal"},
-			wantNDots:  netv1.DefaultNDots,
+			name:        "under-cap append, ndots:0 keeps cluster default",
+			searches:    []string{"corp.internal"},
+			ndots:       0,
+			wantSearch:  []string{"ns.svc.cluster.local", "svc.cluster.local", "cluster.local", "corp.internal"},
+			wantNDots:   netv1.DefaultNDots,
+			wantDropped: 0,
 		},
 		{
 			// A positive pod ndots overrides the cluster default.
-			name:       "positive pod ndots overrides cluster default",
-			searches:   []string{"corp.internal"},
-			ndots:      2,
-			wantSearch: []string{"ns.svc.cluster.local", "svc.cluster.local", "cluster.local", "corp.internal"},
-			wantNDots:  2,
+			name:        "positive pod ndots overrides cluster default",
+			searches:    []string{"corp.internal"},
+			ndots:       2,
+			wantSearch:  []string{"ns.svc.cluster.local", "svc.cluster.local", "cluster.local", "corp.internal"},
+			wantNDots:   2,
+			wantDropped: 0,
 		},
 		{
 			// The CRITICAL boundary: over-cap + a duplicate. The pod adds six
 			// searches, one of which (cluster.local) collides with a cluster entry.
 			// Dedupe drops the collision (cluster wins), leaving cluster(3)+a,b,c,d,e
-			// = exactly 8, so nothing is truncated and the order stays cluster-first.
-			name:       "over-cap plus duplicate: dedupe drops cluster collision, cap at 8, cluster-first",
-			searches:   []string{"a", "b", "cluster.local", "c", "d", "e"},
-			ndots:      3,
-			wantSearch: []string{"ns.svc.cluster.local", "svc.cluster.local", "cluster.local", "a", "b", "c", "d", "e"},
-			wantNDots:  3,
+			// = exactly 8, so nothing is truncated (dropped==0) and the order stays
+			// cluster-first.
+			name:        "over-cap plus duplicate: dedupe drops cluster collision, cap at 8, cluster-first",
+			searches:    []string{"a", "b", "cluster.local", "c", "d", "e"},
+			ndots:       3,
+			wantSearch:  []string{"ns.svc.cluster.local", "svc.cluster.local", "cluster.local", "a", "b", "c", "d", "e"},
+			wantNDots:   3,
+			wantDropped: 0,
 		},
 		{
 			// Six UNIQUE pod searches (no collision): cluster(3)+6 = 9 > 8, so the
-			// 6th unique pod search (f) is truncated. Proves the hard cap, not just
-			// the dedupe path.
-			name:       "over-cap no duplicate: sixth unique pod search is truncated at 8",
-			searches:   []string{"a", "b", "c", "d", "e", "f"},
-			ndots:      1,
-			wantSearch: []string{"ns.svc.cluster.local", "svc.cluster.local", "cluster.local", "a", "b", "c", "d", "e"},
-			wantNDots:  1,
+			// 6th unique pod search (f) is truncated. Proves the hard cap (dropped==1),
+			// not just the dedupe path.
+			name:        "over-cap no duplicate: sixth unique pod search is truncated at 8",
+			searches:    []string{"a", "b", "c", "d", "e", "f"},
+			ndots:       1,
+			wantSearch:  []string{"ns.svc.cluster.local", "svc.cluster.local", "cluster.local", "a", "b", "c", "d", "e"},
+			wantNDots:   1,
+			wantDropped: 1,
 		},
 		{
 			// A negative ndots is also treated as "no override": keep the cluster
 			// default (only a strictly-positive pod ndots wins).
-			name:       "negative ndots keeps cluster default",
-			searches:   nil,
-			ndots:      -1,
-			wantSearch: []string{"ns.svc.cluster.local", "svc.cluster.local", "cluster.local"},
-			wantNDots:  netv1.DefaultNDots,
+			name:        "negative ndots keeps cluster default",
+			searches:    nil,
+			ndots:       -1,
+			wantSearch:  []string{"ns.svc.cluster.local", "svc.cluster.local", "cluster.local"},
+			wantNDots:   netv1.DefaultNDots,
+			wantDropped: 0,
+		},
+		{
+			// Defense-in-depth: a malformed (interior-whitespace) pod search plus an
+			// over-cap tail. Sanitize DROPS "x y" (it would strtok_r-split in the
+			// shim), leaving cluster(3)+a,b,c,d,e,f = 9; the cap then truncates one
+			// (f). The cap-drop count is 1 — the sanitize-dropped "x y" does NOT
+			// count, proving the count is the cap's doing only.
+			name:        "malformed pod search dropped by sanitize does not inflate the cap-drop count",
+			searches:    []string{"a", "b", "x y", "c", "d", "e", "f"},
+			ndots:       4,
+			wantSearch:  []string{"ns.svc.cluster.local", "svc.cluster.local", "cluster.local", "a", "b", "c", "d", "e"},
+			wantNDots:   4,
+			wantDropped: 1,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			base := clusterBase()
-			got := MergeDNSConfig(base, tt.searches, tt.ndots)
+			got, dropped := MergeDNSConfig(base, tt.searches, tt.ndots)
+
+			if dropped != tt.wantDropped {
+				t.Errorf("cap-drop count = %d, want %d", dropped, tt.wantDropped)
+			}
 
 			if !slices.Equal(got.SearchDomains, tt.wantSearch) {
 				t.Errorf("SearchDomains = %v, want %v", got.SearchDomains, tt.wantSearch)
@@ -131,7 +155,7 @@ func TestMergeDNSConfigDoesNotMutateBase(t *testing.T) {
 	base := clusterBase()
 	orig := slices.Clone(base.SearchDomains)
 
-	got := MergeDNSConfig(base, []string{"a", "b", "cluster.local", "c", "d", "e"}, 7)
+	got, _ := MergeDNSConfig(base, []string{"a", "b", "cluster.local", "c", "d", "e"}, 7)
 
 	if !slices.Equal(base.SearchDomains, orig) {
 		t.Fatalf("base.SearchDomains mutated by MergeDNSConfig: got %v, want %v", base.SearchDomains, orig)
