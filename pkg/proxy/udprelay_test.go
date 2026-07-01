@@ -112,6 +112,25 @@ func (r *udpRelay) perSourceTotal() int {
 	return sum
 }
 
+// liveTotal reports the budget's live upstream-flow count across all VIPs, read under
+// mu. It is a white-box test accessor (kept in the test file so it is not compiled
+// into the proxy binary) replacing the pre-B52 budget.n.Load(): total and bySource are
+// now mutex-guarded, so a test reads them under mu to stay -race clean.
+func (b *udpBudget) liveTotal() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.total
+}
+
+// liveSources reports how many distinct source IPs have live flows (len(bySource)),
+// read under mu. Post-teardown it MUST be zero — a positive residue is a leaked
+// per-source count, the B52 counter-conservation bug shape.
+func (b *udpBudget) liveSources() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.bySource)
+}
+
 // TestUDPDatagramRelayRoundTrip is the B23 gate: a ClusterIP UDP Service relays a
 // client datagram to a Ready backend and the echoed payload round-trips back. It
 // drives the full Proxy reconcile path (so openListener builds the relay) with the
@@ -214,7 +233,7 @@ func TestUDPRelayIdleFlowGC(t *testing.T) {
 	tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
 
 	const idle = 200 * time.Millisecond
-	relay := newUDPRelay(pc, key, tbl, netip.Addr{}, idle, maxUDPFlowsPerSource, &udpBudget{max: maxUDPFlows}, slog.Default())
+	relay := newUDPRelay(pc, key, tbl, netip.Addr{}, idle, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), slog.Default())
 	relay.start()
 	defer relay.Close()
 
@@ -283,7 +302,7 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 	}
 
 	t.Run("PerSourceFairShare", func(t *testing.T) {
-		relay := newRelay(&udpBudget{max: 100}, 2) // budget large so per-source is the constraint
+		relay := newRelay(newUDPBudget(100, 100), 2) // budget caps large so the per-VIP per-source cap is the constraint
 		defer relay.Close()
 		var lastWarn time.Time
 
@@ -308,7 +327,7 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 	})
 
 	t.Run("GlobalBudgetAcrossVIPs", func(t *testing.T) {
-		budget := &udpBudget{max: 3} // shared by BOTH relays
+		budget := newUDPBudget(3, 100) // shared by BOTH relays; per-source non-binding so the total is the constraint
 		relayA := newRelay(budget, 100)
 		defer relayA.Close()
 		relayB := newRelay(budget, 100)
@@ -334,13 +353,13 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 		if up := relayA.upstreamFor(client(10, 0, 1, 5, 50000), &warnA); up != nil {
 			t.Fatalf("relayA flow 3 admitted past shared global budget 3")
 		}
-		if n := budget.n.Load(); n != 3 {
+		if n := budget.liveTotal(); n != 3 {
 			t.Fatalf("shared budget count = %d, want 3 (2 on A + 1 on B, no overshoot)", n)
 		}
 	})
 
 	t.Run("SecondLockCounterConsistency", func(t *testing.T) {
-		budget := &udpBudget{max: 100}
+		budget := newUDPBudget(100, 100)
 		relay := newRelay(budget, 3)
 		defer relay.Close()
 		var lastWarn time.Time
@@ -362,7 +381,7 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 		}
 		// The three counters move in lockstep at the second-lock insert, so none can
 		// diverge and none exceeds the per-VIP maxUDPFlows.
-		fc, ps, b := relay.flowCount(), relay.perSourceTotal(), budget.n.Load()
+		fc, ps, b := relay.flowCount(), relay.perSourceTotal(), budget.liveTotal()
 		if fc != 5 || ps != 5 || b != 5 {
 			t.Fatalf("counter divergence: flowCount=%d perSourceTotal=%d budget=%d, want 5/5/5", fc, ps, b)
 		}
@@ -372,7 +391,7 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 	})
 
 	t.Run("CounterPurityReturnsToZero", func(t *testing.T) {
-		budget := &udpBudget{max: 100}
+		budget := newUDPBudget(100, 100)
 		relay := newRelay(budget, 10)
 		defer relay.Close()
 		var lastWarn time.Time
@@ -388,15 +407,15 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 				t.Fatalf("10.0.3.2 flow %d dropped, want admitted", p)
 			}
 		}
-		if ps, b := relay.perSourceTotal(), budget.n.Load(); ps != 7 || b != 7 {
-			t.Fatalf("after 7 admits: perSourceTotal=%d budget=%d, want 7/7", ps, b)
+		if ps, b, s := relay.perSourceTotal(), budget.liveTotal(), budget.liveSources(); ps != 7 || b != 7 || s != 2 {
+			t.Fatalf("after 7 admits: perSourceTotal=%d budgetTotal=%d budgetSources=%d, want 7/7/2", ps, b, s)
 		}
 
 		// Idle-sweep path: force every flow past the idle timeout. Symmetric release
-		// must return ALL counters to zero.
+		// must return ALL counters to zero — the budget total AND its bySource map.
 		relay.sweepExpired(time.Now().Add(time.Hour))
-		if fc, ps, b := relay.flowCount(), relay.perSourceTotal(), budget.n.Load(); fc != 0 || ps != 0 || b != 0 {
-			t.Fatalf("after sweep: flowCount=%d perSourceTotal=%d budget=%d, want 0/0/0 (sweep release must be symmetric)", fc, ps, b)
+		if fc, ps, b, s := relay.flowCount(), relay.perSourceTotal(), budget.liveTotal(), budget.liveSources(); fc != 0 || ps != 0 || b != 0 || s != 0 {
+			t.Fatalf("after sweep: flowCount=%d perSourceTotal=%d budgetTotal=%d budgetSources=%d, want 0/0/0/0 (sweep release must be symmetric — total AND bySource return to zero)", fc, ps, b, s)
 		}
 
 		// Close path: admit more, then Close must ALSO return the global budget to zero.
@@ -405,16 +424,142 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 				t.Fatalf("10.0.3.3 flow %d dropped, want admitted", p)
 			}
 		}
-		if b := budget.n.Load(); b != 5 {
-			t.Fatalf("after 5 more admits: budget=%d, want 5", b)
+		if b, s := budget.liveTotal(), budget.liveSources(); b != 5 || s != 1 {
+			t.Fatalf("after 5 more admits from one source: budgetTotal=%d budgetSources=%d, want 5/1", b, s)
 		}
 		if err := relay.Close(); err != nil {
 			t.Fatalf("relay close: %v", err)
 		}
-		if b := budget.n.Load(); b != 0 {
-			t.Fatalf("after Close: budget=%d, want 0 (Close must release every live flow's slot)", b)
+		if b, s := budget.liveTotal(), budget.liveSources(); b != 0 || s != 0 {
+			t.Fatalf("after Close: budgetTotal=%d budgetSources=%d, want 0/0 (Close must release every live flow's slot — total AND bySource)", b, s)
 		}
 	})
+}
+
+// TestUDPRelayPerSourceGlobalCap is the B52 gate: it proves the per-source-GLOBAL
+// fair share in the shared udpBudget — one source IP is bounded to maxPerSource live
+// flows across ALL VIPs, not per VIP, so a pod fanning flows across N distinct UDP
+// VIPs cannot consume the whole relay-global budget and starve every other pod on
+// every VIP. It drives upstreamFor DIRECTLY on TWO relays (two VIPs) sharing ONE tiny
+// budget (maxTotal=8, maxPerSource=2), with fabricated client source IPs, so only the
+// per-flow upstream DialUDP to a real loopback echo backend is a live fd.
+//
+// Non-vacuity: B48's per-VIP-only per-source cap would let the SAME source IP hold
+// maxPerSource flows on EACH VIP (2×maxPerSource across two VIPs); this gate asserts
+// the source is capped at maxPerSource TOTAL across both VIPs (the 3rd flow, on either
+// VIP, is dropped with rejectPerSourceGlobal), which is RED under a per-VIP-only cap.
+// A missing release leaves a positive residue after teardown (return-to-zero fails).
+func TestUDPRelayPerSourceGlobalCap(t *testing.T) {
+	t.Parallel()
+
+	be := newUDPEchoBackend(t)
+	defer be.close()
+	beIP, bePort := be.addrPort()
+
+	// newRelay builds an UNSTARTED relay (upstreamFor is driven directly) on its own
+	// VIP socket, sharing the caller's budget, with the echo backend registered and a
+	// per-VIP per-source cap (100) high enough that the per-source-GLOBAL budget cap —
+	// not the per-VIP one — is the binding constraint. A long idle timeout means only
+	// an explicit Close reaps.
+	newRelay := func(budget *udpBudget) *udpRelay {
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen vip udp: %v", err)
+		}
+		vipAddr := pc.LocalAddr().(*net.UDPAddr)
+		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
+		tbl := NewRoutingTable(netip.Prefix{})
+		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
+		return newUDPRelay(pc, key, tbl, netip.Addr{}, time.Hour, 100, budget, slog.Default())
+	}
+	client := func(a, b, c, d byte, port int) net.Addr {
+		return &net.UDPAddr{IP: net.IPv4(a, b, c, d), Port: port}
+	}
+
+	// One budget shared by BOTH VIPs: total 8 sockets across all relays, and any ONE
+	// source IP limited to 2 flows GLOBALLY (across both VIPs). 8/4 == 2, matching the
+	// production /4 derivation.
+	budget := newUDPBudget(8, 2)
+	relayA := newRelay(budget)
+	defer relayA.Close()
+	relayB := newRelay(budget)
+	defer relayB.Close()
+	var warnA, warnB time.Time
+
+	// (1) Per-source cap is GLOBAL across VIPs. Source S1 opens ONE flow on VIP-A and
+	// ONE on VIP-B — 2 total == maxPerSource, both admitted.
+	s1 := netip.MustParseAddr("10.1.0.1")
+	if up := relayA.upstreamFor(client(10, 1, 0, 1, 40000), &warnA); up == nil {
+		t.Fatalf("S1 flow on VIP-A dropped, want admitted")
+	}
+	if up := relayB.upstreamFor(client(10, 1, 0, 1, 40001), &warnB); up == nil {
+		t.Fatalf("S1 flow on VIP-B dropped, want admitted")
+	}
+	// The 3rd S1 flow — on EITHER VIP — exceeds the per-source-GLOBAL cap and is
+	// dropped, even though neither VIP's own per-source count is at the per-VIP cap
+	// (100) and the global total (2) is far below maxTotal (8). Under B48's per-VIP-only
+	// cap this 3rd flow would be ADMITTED (S1 has only 1 flow on VIP-A) — the red.
+	if up := relayA.upstreamFor(client(10, 1, 0, 1, 40002), &warnA); up != nil {
+		t.Fatalf("S1 3rd flow on VIP-A admitted past per-source-GLOBAL cap 2 (cap is per-VIP, not global)")
+	}
+	if up := relayB.upstreamFor(client(10, 1, 0, 1, 40003), &warnB); up != nil {
+		t.Fatalf("S1 3rd flow on VIP-B admitted past per-source-GLOBAL cap 2 (cap is per-VIP, not global)")
+	}
+	// The reason is per-source-GLOBAL, not a global-total shortage. reserve on refusal
+	// is side-effect-free (it mutates nothing before the cap check), so probing it here
+	// leaves the budget unchanged.
+	if ok, reason := budget.reserve(s1); ok || reason != rejectPerSourceGlobal {
+		t.Fatalf("reserve(S1) = (%v, %v), want (false, rejectPerSourceGlobal)", ok, reason)
+	}
+
+	// (2) Fair share preserved: a DIFFERENT source S2 still gets its own maxPerSource
+	// flows across the two VIPs — one greedy source does not starve others.
+	if up := relayA.upstreamFor(client(10, 1, 0, 2, 41000), &warnA); up == nil {
+		t.Fatalf("S2 flow on VIP-A starved by S1's saturation, want admitted")
+	}
+	if up := relayB.upstreamFor(client(10, 1, 0, 2, 41001), &warnB); up == nil {
+		t.Fatalf("S2 flow on VIP-B starved by S1's saturation, want admitted")
+	}
+
+	// (3) Global-total still bites. Fill maxTotal (8) with more distinct sources: 4
+	// live already (S1×2 + S2×2), so S3 and S4 add 2 each → 8 == maxTotal.
+	var fillWarn time.Time
+	for i, src := range [][4]byte{{10, 1, 0, 3}, {10, 1, 0, 4}} {
+		r := relayA
+		if i == 1 {
+			r = relayB
+		}
+		if up := r.upstreamFor(client(src[0], src[1], src[2], src[3], 42000), &fillWarn); up == nil {
+			t.Fatalf("source %v flow 1 dropped while filling budget, want admitted", src)
+		}
+		if up := r.upstreamFor(client(src[0], src[1], src[2], src[3], 42001), &fillWarn); up == nil {
+			t.Fatalf("source %v flow 2 dropped while filling budget, want admitted", src)
+		}
+	}
+	if n := budget.liveTotal(); n != 8 {
+		t.Fatalf("budget total after filling = %d, want 8 (== maxTotal, no overshoot)", n)
+	}
+	// A brand-new source S5 — under its own per-source cap (0 < 2) — is refused because
+	// the GLOBAL total is exhausted, with reason rejectGlobalFull (not per-source).
+	if up := relayA.upstreamFor(client(10, 1, 0, 5, 43000), &warnA); up != nil {
+		t.Fatalf("S5 flow admitted past exhausted global total 8")
+	}
+	if ok, reason := budget.reserve(netip.MustParseAddr("10.1.0.5")); ok || reason != rejectGlobalFull {
+		t.Fatalf("reserve(S5) = (%v, %v), want (false, rejectGlobalFull)", ok, reason)
+	}
+
+	// (4) Return-to-zero (conservation backstop): closing both relays releases every
+	// live flow's slot, so total AND bySource return to zero. A missing release-- would
+	// leave a positive residue → red.
+	if err := relayA.Close(); err != nil {
+		t.Fatalf("relayA close: %v", err)
+	}
+	if err := relayB.Close(); err != nil {
+		t.Fatalf("relayB close: %v", err)
+	}
+	if n, s := budget.liveTotal(), budget.liveSources(); n != 0 || s != 0 {
+		t.Fatalf("after closing both relays: budgetTotal=%d budgetSources=%d, want 0/0 (symmetric release must empty total AND bySource)", n, s)
+	}
 }
 
 // udpRoundTrip sends payload on the connected UDP socket c and returns the reply
