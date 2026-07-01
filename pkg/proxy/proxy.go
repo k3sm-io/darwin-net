@@ -37,6 +37,20 @@ import (
 // (loopback) or one mesh hop away.
 const dialTimeout = 5 * time.Second
 
+// udpFlowIdleTimeout is the idle-flow GC timeout for the UDP datagram relay: a
+// flow (a client 5-tuple bound to a connected upstream socket and the backend
+// picked once for it) is reaped after this much two-way silence, so a cached
+// socket and backend selection do not pin to a dead client. It mirrors Linux
+// conntrack-UDP (30s) and kube-proxy's userspace udpIdleTimeout. It is
+// deliberately distinct in MAGNITUDE from a future sessionAffinity: ClientIP
+// timeout: a session-affinity TTL outlives many idle gaps, so the two must not be
+// collapsed into one constant. B22 reuses the named-const + idle-sweeper PATTERN
+// (and may share this GC cadence), NOT this flow map itself: ClientIP affinity keys
+// on the client IP alone — not the 5-tuple this relay keys on — and spans TCP
+// Services too (which never enter this UDP relay), so it needs its own IP-keyed
+// affinity table at the Pick layer.
+const udpFlowIdleTimeout = 30 * time.Second
+
 // Proxy is the userspace Service proxy: it owns one listening socket per bound
 // Service port (a ClusterIP:port on an lo0 alias, plus *:NodePort when set) and
 // L4-load-balances accepted connections to the Ready backends in its
@@ -64,6 +78,14 @@ type Proxy struct {
 	binder binder
 	log    *slog.Logger
 	dialer *net.Dialer
+	// meshEgress is the node's reserved mesh-egress /32, retained from
+	// WithMeshEgressSource for the UDP relay's per-flow upstream source-bind. The TCP
+	// path source-binds via p.dialer.LocalAddr, but the UDP path cannot reuse it: a
+	// net.Dialer whose LocalAddr is a *net.TCPAddr fails to dial "udp" (mismatched
+	// local address type), so the datagram path builds a *net.UDPAddr from this Addr
+	// instead. The zero Addr (single node, no utun) means the kernel default source.
+	// Set once at construction, read-only thereafter.
+	meshEgress netip.Addr
 	// exemptVIPs are infra VIPs owned by a node-local binder (per-node resolver on
 	// the kube-dns VIP) rather than by the proxy: the proxy never aliases, binds,
 	// or routes them. It is set once by WithInfraVIPExemptions and read-only
@@ -98,6 +120,11 @@ func WithLogger(l *slog.Logger) Option {
 // source selection (the single-node path, where no utun exists to bind to).
 func WithMeshEgressSource(src netip.Addr) Option {
 	return func(p *Proxy) {
+		// Retain the address for the UDP relay's per-flow upstream source-bind (it
+		// builds a *net.UDPAddr from this, since a *net.TCPAddr LocalAddr cannot dial
+		// "udp"). The zero Addr stays invalid, so the relay keeps the kernel default
+		// source on a single node — matching the TCP dialer below.
+		p.meshEgress = src
 		if src.IsValid() {
 			p.dialer.LocalAddr = &net.TCPAddr{IP: src.AsSlice()}
 		}
@@ -114,11 +141,12 @@ func WithMeshEgressSource(src netip.Addr) Option {
 // is always answered node-locally over loopback and never
 // steered over the wireguard mesh (which carries only pod /24s — a mesh-steered
 // DNS VIP would blackhole). Without this exemption the proxy's kube-dns Service
-// reconcile would try to bind 10.43.0.10:53/TCP and fail with EADDRINUSE; the M1
-// UDP path only dodged the collision by accident (it opens no datagram socket).
-// The exemption is keyed on the VIP address, so it covers every port and protocol
-// on that VIP; a normal ClusterIP Service (a different address) is unaffected and
-// still claimed.
+// reconcile would try to bind 10.43.0.10:53 and fail with EADDRINUSE — for TCP and,
+// since B23 built the ClusterIP UDP datagram relay, for 53/UDP too (it no longer
+// dodges the collision by opening no datagram socket). The exemption is keyed on the
+// VIP address, so it covers every port and protocol on that VIP, and that
+// address-keyed seam is what keeps cluster DNS node-local while a legitimate USER
+// UDP Service on a different (non-exempt) VIP is still claimed and relayed.
 //
 // The node-local kubernetes (10.43.0.1) endpoint uses the same step-aside
 // mechanism, but its endpoint rewrite is k3sm-owned (k3sm:M3.3); darwin-net
@@ -357,25 +385,35 @@ func (p *Proxy) runWorker(w *portWorker) {
 	}
 }
 
-// openListener binds the sockets for one Service port: the ClusterIP listener on
-// the specific lo0 alias address (net.Listen on clusterIP:port, never :port, so
-// the bound source identity is the VIP), and, when NodePort is set, a node-wide
-// *:NodePort listener (TCP). It ensures the lo0 alias exists first.
+// openListener binds the sockets for one Service port. For TCP it opens the
+// ClusterIP stream listener on the specific lo0 alias address (net.Listen on
+// clusterIP:port, never :port, so the bound source identity is the VIP) and, when
+// NodePort is set, a node-wide *:NodePort stream listener. For UDP it opens the
+// ClusterIP datagram relay (net.ListenPacket on the specific clusterIP:port,
+// mirroring the TCP specific-bind) and runs its dispatcher + idle-flow sweeper. It
+// ensures the lo0 alias exists first.
 //
-// NodePort semantics: the *:NodePort listener accepts on every node interface
+// NodePort semantics (TCP): the *:NodePort listener accepts on every node interface
 // and L4-load-balances to the SAME Ready backend set as the ClusterIP — i.e.
 // externalTrafficPolicy: Cluster. externalTrafficPolicy: Local is NOT honored,
 // because the userspace splice (see splice) opens a fresh backend connection and
 // therefore does NOT preserve the external client's source IP (the backend sees
-// the proxy/mesh-egress source, not the client) — the precondition Local relies
-// on. NodePort is TCP only here; the UDP NodePort relay is deferred with the UDP
-// datagram relay (below + doc.go).
+// the proxy/mesh-egress source, not the client) — the precondition Local relies on.
 //
-// The TCP data path is built end to end. UDP datagram relay (the 53/UDP path)
-// is deferred per the doc.go UDP flow-timeout note: for a UDP port the alias is
-// still ensured (so the VIP is reachable once the relay lands) but no stream
-// listener — ClusterIP or NodePort — is opened. The routing table already steers
-// UDP keys, so adding the relay later needs no change here.
+// UDP: the ClusterIP datagram relay IS built (connectionless — a dispatcher reads
+// the VIP socket, picks a backend ONCE per client flow, opens a connected upstream
+// socket, relays both ways, and idle-GCs the flow; see udprelay.go and doc.go).
+// Like the TCP splice it re-originates traffic (Cluster policy: the upstream socket
+// is source-bound to the node's mesh-egress /32 on a multi-node mesh, never the
+// client pod IP), and a flow stays pinned to its picked backend until idle GC reaps
+// it (no conntrack-style flush in B23). UDP NodePort is DEFERRED: a wildcard-bound
+// *:NodePort UDP reply re-selects its source by route lookup on a multi-homed node,
+// so the client would see the reply from the wrong source IP and drop it; honoring
+// it needs IP_RECVDSTADDR/IP_SENDSRCADDR, out of scope for B23. Privileged (<1024)
+// UDP binds directly via net.ListenPacket (the binder seam is stream-only — a
+// net.Listener/FileListener cannot adopt a datagram fd), so a <1024 UDP ClusterIP
+// without root surfaces an honest net.ListenPacket EACCES; a netd FilePacketConn
+// path is deferred, not dead-ended.
 func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
@@ -391,10 +429,28 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	l := &listener{key: key, alias: p.alias, aliasIP: ip, log: p.log}
 
 	if key.Protocol == netv1.ProtocolUDP {
-		// UDP relay deferred (see doc.go) — this defers BOTH the ClusterIP and the
-		// NodePort UDP datagram paths (no datagram socket is opened for either).
-		// Hold the alias so the VIP resolves once the relay lands.
-		p.log.Info("udp service port: datagram relay deferred (clusterIP + nodePort), alias ensured", "vip", key.String())
+		// ClusterIP UDP: bind the SPECIFIC alias-address datagram socket (mirroring
+		// the TCP specific-bind below) and run the connectionless relay — a dispatcher
+		// reads the VIP socket, picks a backend once per client flow, opens a connected
+		// per-flow upstream socket, and idle-GCs the flow (see udprelay.go). The relay
+		// binds directly via net.ListenPacket, NOT through p.binder: that seam is
+		// stream-only (net.Listener/FileListener), so a privileged (<1024) UDP VIP
+		// without root surfaces an honest EACCES here; the netd datagram path is
+		// deferred. NodePort UDP is deferred too: a wildcard *:NodePort UDP reply
+		// re-selects its source on a multi-homed node (wrong src IP → client drops it),
+		// needing IP_RECVDSTADDR/IP_SENDSRCADDR — out of scope for B23.
+		clusterAP := netip.AddrPortFrom(ip, uint16(port.Port))
+		pc, err := net.ListenPacket("udp", clusterAP.String())
+		if err != nil {
+			_ = p.alias.Remove(ctx, ip)
+			return nil, fmt.Errorf("listen udp clusterIP %s: %w", clusterAP, err)
+		}
+		relay := newUDPRelay(pc, key, p.table, p.meshEgress, udpFlowIdleTimeout, p.log)
+		relay.start()
+		l.udp = relay
+		if port.NodePort != 0 {
+			p.log.Info("udp nodePort deferred (wildcard datagram reply re-selects source IP on a multi-homed node); clusterIP relay built", "vip", key.String())
+		}
 		return l, nil
 	}
 
@@ -480,9 +536,13 @@ type listener struct {
 	key       PortKey
 	clusterIP net.Listener
 	nodePort  net.Listener
-	alias     aliasManager
-	aliasIP   netip.Addr
-	log       *slog.Logger
+	// udp is the ClusterIP UDP datagram relay; it is non-nil only for a UDP port
+	// (nil for TCP). Close reaps it, joining its dispatcher, sweeper, and per-flow
+	// reader goroutines.
+	udp     *udpRelay
+	alias   aliasManager
+	aliasIP netip.Addr
+	log     *slog.Logger
 }
 
 // Close shuts the listeners and removes the lo0 alias, leak-free. It tolerates a
@@ -493,6 +553,11 @@ func (l *listener) Close() {
 	}
 	if l.nodePort != nil {
 		_ = l.nodePort.Close()
+	}
+	if l.udp != nil {
+		// Tears down the VIP datagram socket, the sweeper, and every per-flow upstream
+		// socket + reader, joining them all before returning (no stranded goroutine).
+		_ = l.udp.Close()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()

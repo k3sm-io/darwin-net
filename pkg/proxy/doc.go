@@ -61,11 +61,11 @@ limitations under the License.
 // externalTrafficPolicy: Cluster — externalTrafficPolicy: Local is NOT honored,
 // because the userspace splice opens a fresh backend connection and so does not
 // preserve the external client's source IP (the precondition Local relies on).
-// NodePort is TCP only; the UDP NodePort relay is deferred together with the UDP
-// datagram relay below (a UDP port opens no datagram socket on either the
-// ClusterIP or the NodePort). stockkitty's NodePort surface (VSCode SSH :22, the
-// snapshot gRPC range) is all TCP, so UDP NodePort is not claimed until the relay
-// lands.
+// NodePort is TCP only: the ClusterIP UDP datagram relay (below) is built, but the
+// UDP NodePort is deferred, because a wildcard *:NodePort UDP reply re-selects its
+// source by route lookup on a multi-homed node (the client would see the wrong
+// source IP and drop it). stockkitty's NodePort surface (VSCode SSH :22, the
+// snapshot gRPC range) is all TCP, so UDP NodePort is not claimed.
 //
 // # Locality (load-bearing only for internalTrafficPolicy: Local)
 //
@@ -119,18 +119,39 @@ limitations under the License.
 // darwin-net supplies the per-node DNS Corefile render (pkg/dns.PerNodeDNS) and
 // this exemption seam.
 //
-// # UDP flow timeout (noted, not built in M1)
+// # UDP datagram relay (ClusterIP) + idle-flow GC — B23
 //
-// The ClusterIP and NodePort listeners are protocol-aware (PortKey carries the
-// netv1.Protocol, and network() maps it to "tcp"/"udp"), and 53/UDP is the
-// motivating Service. A correct UDP Service proxy is connectionless: there is no
-// Accept/CloseWrite, so the proxy must (a) read a datagram on the VIP socket, (b)
-// pick a backend, (c) open (and cache) a per-flow upstream socket keyed by the
-// client 5-tuple, (d) relay datagrams both ways, and (e) expire the flow after an
-// idle timeout (Linux conntrack uses 30s for UDP; kube-proxy's userspace proxy
-// used a comparable udpIdleTimeout) so cached sockets and the backend selection
-// do not pin to a dead client. M1 ships the TCP data path end-to-end; the UDP
-// datagram relay + idle-flow GC is deferred (it pairs with the per-node resolver
-// on 53/UDP and is tracked for the DNS milestone — docs/BACKLOG.md B23). The routing table — the part that decides
-// which backend a 53/UDP query goes to — is already protocol-keyed and tested.
+// A ClusterIP UDP Service is served by a connectionless datagram relay
+// (udprelay.go); there is no Accept/CloseWrite. One dispatcher goroutine reads
+// datagrams on the VIP PacketConn (bound on the specific lo0 alias, mirroring the
+// TCP specific-bind) and, per client 5-tuple: (a) selects a backend ONCE via the
+// routing table (Pick — the relay never re-picks per datagram), (b) opens a
+// connected per-flow upstream UDP socket, (c) forwards the datagram, and (d) spawns
+// a reader that writes each backend response back to the client with the VIP as the
+// source. A sweeper goroutine expires a flow after udpFlowIdleTimeout of two-way
+// silence (Linux conntrack-UDP / kube-proxy's userspace udpIdleTimeout) so cached
+// sockets and the backend selection do not pin to a dead client. The flow table is
+// bounded (maxUDPFlows): same-node pods share one trust domain with no per-pod
+// isolation, so ephemeral-source-port churn from one pod must not exhaust fds and
+// goroutines for every Service the proxy owns — on saturation a new flow is dropped
+// (a throttled Warn), never a live one evicted.
+//
+// Like the TCP splice the relay RE-ORIGINATES traffic (Cluster policy): it does NOT
+// preserve the client pod source IP. On a multi-node mesh each upstream socket is
+// source-bound to the node's mesh-egress /32 (WithMeshEgressSource) — the UDP path
+// cannot reuse p.dialer because a *net.TCPAddr LocalAddr fails to dial "udp", so it
+// builds a *net.UDPAddr — or wireguard would drop the cross-node return datagram.
+// B23 has no conntrack-style flush, so a flow stays pinned to its picked backend
+// until idle GC reaps it, even if that endpoint is removed mid-flow.
+//
+// DEFERRED in B23: UDP NodePort (a wildcard *:NodePort UDP reply re-selects its
+// source by route lookup on a multi-homed node → wrong source IP → the client drops
+// it; honoring it needs IP_RECVDSTADDR/IP_SENDSRCADDR) and privileged (<1024) UDP
+// via the netd helper (the binder seam returns net.Listener/FileListener — stream
+// only — and cannot adopt a datagram fd, so a <1024 UDP ClusterIP without root
+// surfaces an honest net.ListenPacket EACCES rather than a helper-bound socket).
+// The cluster-DNS VIP (10.43.0.10:53) never reaches the relay: the address-keyed
+// infra-VIP exemption (WithInfraVIPExemptions) steps the proxy aside before any
+// worker is created, so a legitimate USER UDP Service on a non-exempt VIP is relayed
+// while kube-dns stays node-local on its own resolver.
 package proxy

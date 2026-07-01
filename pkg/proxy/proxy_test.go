@@ -232,12 +232,13 @@ func TestProxyPerVIPSerialization(t *testing.T) {
 // TestNodePortBindsWildcard is the M3.2 acceptance: a NodePort Service yields a
 // node-wide *:NodePort TCP listener (bound to the wildcard so every interface
 // answers — dialed here via loopback) that load-balances to the same ready
-// backends as the ClusterIP, and a UDP NodePort opens NO listener (the datagram
-// relay — ClusterIP and NodePort alike — is deferred, so UDP NodePort is not
-// claimed). The externalTrafficPolicy: Cluster semantics — the userspace L4
-// splice opens a fresh backend connection and so does NOT preserve the client
-// source IP, hence Local is not honored — are documented in doc.go and the
-// openListener comment; this test pins the wildcard bind, the LB, and the UDP
+// backends as the ClusterIP. For UDP (B23) the ClusterIP datagram relay IS built,
+// but the UDP NodePort stays deferred — no datagram socket is bound on the
+// *:NodePort (a wildcard UDP reply would re-select its source on a multi-homed
+// node). The externalTrafficPolicy: Cluster semantics — the userspace L4 splice
+// opens a fresh backend connection and so does NOT preserve the client source IP,
+// hence Local is not honored — are documented in doc.go and the openListener
+// comment; this test pins the wildcard TCP bind, the LB, and the UDP-NodePort
 // deferral.
 func TestNodePortBindsWildcard(t *testing.T) {
 	t.Parallel()
@@ -293,7 +294,7 @@ func TestNodePortBindsWildcard(t *testing.T) {
 		<-runDone
 	})
 
-	t.Run("udp NodePort opens no listener (relay deferred, not claimed)", func(t *testing.T) {
+	t.Run("udp NodePort deferred: clusterIP relay built, NodePort datagram socket not claimed", func(t *testing.T) {
 		t.Parallel()
 		const vip = "127.0.0.1"
 
@@ -313,18 +314,23 @@ func TestNodePortBindsWildcard(t *testing.T) {
 			t.Fatalf("reconcile udp nodeport: %v", err)
 		}
 
-		// Let the worker process the event (the UDP key lands in the table).
+		// Let the worker process the event (the UDP key lands in the table; the
+		// ClusterIP relay binds in the same openListener call).
 		key := PortKey{ClusterIP: vip, Port: clusterPort, Protocol: netv1.ProtocolUDP}
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) && tbl.Len(key) == 0 {
-			time.Sleep(10 * time.Millisecond)
-		}
+		waitBackends(t, tbl, key, 1)
 
-		// No TCP stream listener was opened on the UDP NodePort — UDP NodePort is
-		// deferred with the datagram relay, so it is not claimed.
+		// The ClusterIP UDP relay is built, but the NodePort UDP is deferred. No TCP
+		// listener was opened on the NodePort...
 		if c, err := net.DialTimeout("tcp", hostPort("127.0.0.1", nodePort), 200*time.Millisecond); err == nil {
 			_ = c.Close()
-			t.Fatalf("a TCP listener was opened for a UDP NodePort (relay should be deferred)")
+			t.Fatalf("a TCP listener was opened for a UDP NodePort (must be deferred)")
+		}
+		// ...and no UDP datagram socket claimed the NodePort: the wildcard *:NodePort
+		// is still bindable, proving the relay did not open a NodePort datagram socket.
+		if pc, err := net.ListenPacket("udp", net.JoinHostPort("", strconv.Itoa(int(nodePort)))); err != nil {
+			t.Fatalf("UDP NodePort %d was claimed (datagram relay must be deferred): %v", nodePort, err)
+		} else {
+			_ = pc.Close()
 		}
 
 		cancel()
@@ -332,11 +338,13 @@ func TestNodePortBindsWildcard(t *testing.T) {
 	})
 }
 
-// TestProxyUDPPortDefersRelay asserts the documented UDP decision: a UDP Service
-// port ensures the lo0 alias (so the VIP is reachable once the relay lands) but
-// opens NO TCP stream listener in M1, and the routing table still records the
-// UDP key's backends.
-func TestProxyUDPPortDefersRelay(t *testing.T) {
+// TestProxyUDPClusterIPRelay asserts a ClusterIP UDP Service now BUILDS the
+// datagram relay (B23): the worker ensures the lo0 alias, records the backend in
+// the routing table, and opens a UDP datagram socket on the VIP — NOT a TCP stream
+// listener (a UDP port must never open a TCP socket). The end-to-end datagram
+// round-trip + per-flow reuse is covered by TestUDPDatagramRelayRoundTrip; this
+// test pins the plumbing and that the relay is UDP-only.
+func TestProxyUDPClusterIPRelay(t *testing.T) {
 	t.Parallel()
 	const vip = "127.0.0.1"
 
@@ -355,29 +363,39 @@ func TestProxyUDPPortDefersRelay(t *testing.T) {
 		t.Fatalf("reconcile udp: %v", err)
 	}
 
-	// Give the worker a moment to process the event.
+	// Wait for the worker to process the event (the relay socket binds in the same
+	// openListener call that records the backend).
 	key := PortKey{ClusterIP: vip, Port: udpPort, Protocol: netv1.ProtocolUDP}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && tbl.Len(key) == 0 {
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitBackends(t, tbl, key, 1)
 
 	// Alias ensured for the UDP VIP.
 	if alias.ensures(netip.MustParseAddr(vip)) == 0 {
 		t.Fatalf("UDP port did not ensure the lo0 alias")
 	}
-	// Routing table records the UDP backend (ready for the future relay).
-	if tbl.Len(key) != 1 {
-		t.Fatalf("UDP routing table backends = %d, want 1", tbl.Len(key))
-	}
-	// No TCP stream listener was opened on the UDP port.
+	// No TCP stream listener was opened on the UDP port — the relay is a datagram
+	// socket, not a stream listener.
 	if c, err := net.DialTimeout("tcp", hostPort(vip, udpPort), 200*time.Millisecond); err == nil {
 		_ = c.Close()
-		t.Fatalf("a TCP listener was opened for a UDP service port (relay should be deferred)")
+		t.Fatalf("a TCP listener was opened for a UDP service port (the relay must be UDP-only)")
 	}
 
 	cancel()
 	<-runDone
+}
+
+// waitBackends blocks until the routing table records exactly want backends for
+// key, or fails the test after a short deadline. It is the readiness signal for
+// the per-VIP worker having applied a reconcile event.
+func waitBackends(t *testing.T, tbl *RoutingTable, key PortKey, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if tbl.Len(key) == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("routing table for %s never reached %d backends (have %d)", key, want, tbl.Len(key))
 }
 
 // freePort returns a TCP port currently free on ip by opening and closing a

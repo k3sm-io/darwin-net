@@ -43,12 +43,22 @@ func TestWithMeshEgressSourceBindsDialer(t *testing.T) {
 		if la.Port != 0 {
 			t.Fatalf("dialer LocalAddr port = %d, want 0 (ephemeral)", la.Port)
 		}
+		// The same source is retained for the UDP relay's per-flow upstream
+		// source-bind (it cannot reuse the *net.TCPAddr dialer for "udp").
+		if p.meshEgress != src {
+			t.Fatalf("p.meshEgress = %s, want %s (retained for the UDP relay)", p.meshEgress, src)
+		}
 	})
 
 	t.Run("zero source keeps default selection", func(t *testing.T) {
 		p := New(table, WithMeshEgressSource(netip.Addr{}), withAliasManager(newNoopAliasManager()))
 		if p.dialer.LocalAddr != nil {
 			t.Fatalf("dialer.LocalAddr = %#v, want nil (no mesh source on a single node)", p.dialer.LocalAddr)
+		}
+		// The zero Addr stays invalid, so the UDP relay falls back to the kernel
+		// default source on a single node.
+		if p.meshEgress.IsValid() {
+			t.Fatalf("p.meshEgress = %s, want invalid (single-node default source)", p.meshEgress)
 		}
 	})
 }
