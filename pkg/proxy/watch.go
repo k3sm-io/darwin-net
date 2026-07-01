@@ -104,7 +104,7 @@ func (w *Watcher) onServiceDelete(obj any) {
 	if !ok {
 		return
 	}
-	vip, _, ok := serviceToVIP(svc)
+	vip, _, _, ok := serviceToVIP(svc)
 	if !ok {
 		return
 	}
@@ -142,9 +142,10 @@ func (w *Watcher) onSlice(obj any) {
 
 // reconcileService recomputes each port's backend set from the cached
 // EndpointSlices and reconciles it through the proxy, carrying the Service's
-// internalTrafficPolicy so the routing table can filter to node-local backends.
+// internalTrafficPolicy (so the routing table can filter to node-local backends) and
+// its ClientIP session-affinity config.
 func (w *Watcher) reconcileService(svc *corev1.Service) {
-	vip, policy, ok := serviceToVIP(svc)
+	vip, policy, affinity, ok := serviceToVIP(svc)
 	if !ok {
 		return
 	}
@@ -152,7 +153,7 @@ func (w *Watcher) reconcileService(svc *corev1.Service) {
 	for i := range vip.Ports {
 		p := vip.Ports[i]
 		eps := endpointsForPort(slices, p.Name)
-		if err := w.proxy.ReconcilePolicy(vip.ClusterIP, &p, policy, eps); err != nil {
+		if err := w.proxy.ReconcilePolicy(vip.ClusterIP, &p, policy, affinity, eps); err != nil {
 			w.log.Error("reconcile service port", "service", svc.Namespace+"/"+svc.Name, "port", p.Port, "err", err)
 		}
 	}
