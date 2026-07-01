@@ -65,13 +65,13 @@ func GuestResolvConf(cfg netv1.DNSConfig) (string, error) {
 	// admission-valid input.
 	search := normalizeSearch(cfg.SearchDomains)
 
-	// Clamp ndots to the resolv.conf ceiling (maxNDots == RES_MAXNDOTS) for parity with
+	// Clamp ndots to the resolv.conf ceiling (MaxNDots == RES_MAXNDOTS) for parity with
 	// ConfigToEnv, so the guest and host emit the SAME ndots. A %d of an int32 cannot
 	// inject (glibc clamps to RES_MAXNDOTS, musl ignores ndots), so this is a consistency
-	// guard, not a safety one — a no-op for admission-valid input (ndots <= 15).
+	// guard, not a safety one — a no-op for admission-valid input (ndots <= MaxNDots).
 	ndots := cfg.NDots
-	if ndots > maxNDots {
-		ndots = maxNDots
+	if ndots > MaxNDots {
+		ndots = MaxNDots
 	}
 
 	var b strings.Builder

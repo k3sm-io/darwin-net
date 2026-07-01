@@ -162,14 +162,18 @@ limitations under the License.
 // shim env), GuestResolvConf (the vm-guest /etc/resolv.conf), candidateNames (the Go
 // reference resolver), and MergeDNSConfig itself. They all normalize through ONE
 // helper, normalizeSearch (normalize.go) = sanitizeSearch + capSearch: it TrimSpaces
-// each entry, DROPS any with interior whitespace (the C shim's strtok_r would
-// otherwise split "a b" into two fabricated in-pod tokens — dropping is safer than
-// fusing or splitting), and prefix-caps at MaxSearchDomains. This is defense-in-depth
-// behind k3sm's validatePodDNSConfig admission gate, so it is a no-op for every
-// admission-valid config and the live cluster-DNS keystone stays byte-identical;
-// single-homing it is what keeps the four views dropping the same domain and
-// truncating at the same cap. ConfigToEnv additionally clamps ndots to the
-// resolv.conf RES_MAXNDOTS ceiling (15).
+// each entry, DROPS any holding a byte outside the RFC-1123 subdomain charset
+// [a-zA-Z0-9.-] (a positive allowlist — the C shim's strtok_r would otherwise split
+// "a b" into two fabricated in-pod tokens, and a separator byte could inject into the
+// line-structured vm-guest resolv.conf; dropping is safer than fusing or splitting),
+// and prefix-caps at MaxSearchDomains. The allowlist is a flat charset scan, so a
+// trailing-dot FQDN survives. This is defense-in-depth behind k3sm's
+// validatePodDNSConfig admission gate (whose [a-z0-9.-] charset the allowlist is a
+// superset of), so it is a no-op for every admission-valid config and the live
+// cluster-DNS keystone stays byte-identical; single-homing it is what keeps the four
+// views dropping the same domain and truncating at the same cap. ConfigToEnv and
+// GuestResolvConf additionally clamp ndots to the exported RES_MAXNDOTS ceiling
+// (MaxNDots == 15).
 //
 // MergeDNSConfig takes DISCRETE searches/ndots rather than a full netv1.DNSConfig
 // "extra" on purpose: a full extra carries ClusterDNSIP, and a later edit that

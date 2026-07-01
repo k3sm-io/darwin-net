@@ -48,11 +48,19 @@ const (
 	EnvDNSNdots = "K3SM_DNS_NDOTS"
 )
 
-// maxNDots is the resolv.conf RES_MAXNDOTS ceiling (15). ConfigToEnv clamps ndots
-// to it so the encoder self-defends against a direct caller that bypassed the
-// k3sm-side admission clamp; a value above the ceiling has no resolver meaning and
-// only risks surprising the shim's atoi. It is a no-op for admission-valid input.
-const maxNDots = 15
+// MaxNDots is the resolv.conf RES_MAXNDOTS ceiling (15) — the single source of the
+// ndots CEILING. ConfigToEnv and GuestResolvConf clamp ndots to it so the encoder
+// self-defends against a direct caller that bypassed the k3sm-side admission clamp;
+// a value above the ceiling has no resolver meaning and only risks surprising the
+// shim's atoi. It is a no-op for admission-valid input.
+//
+// The default/ceiling split has two homes on purpose: the ndots DEFAULT
+// (netv1.DefaultNDots == 5, applied when NDots is unset) lives in apis beside the
+// DNSConfig it defaults, while this CEILING (RES_MAXNDOTS, the shim's atoi cap) lives
+// here in darwin-net beside its sibling shim-ABI cap MaxSearchDomains. It is UNTYPED
+// (like MaxSearchDomains) so it adapts with no cast to both the int32 ndots compares
+// here and k3sm's int clamp — wave 2's dnsConfigOverride references dns.MaxNDots.
+const MaxNDots = 15
 
 // ConfigToEnv serializes a cluster DNSConfig into the K3SM_DNS_* environment map
 // the getaddrinfo shim consumes. It is the single pinned encoder of the shim ABI,
@@ -72,7 +80,7 @@ const maxNDots = 15
 //     admission-valid input).
 //   - EnvDNSNdots  — cfg.NDots in decimal (C: atoi), defaulting to DefaultNDots
 //     when not positive so the wire value is never "0" (a "0" would invert the
-//     short-name vs. absolute candidate ordering), and clamped to maxNDots (the
+//     short-name vs. absolute candidate ordering), and clamped to MaxNDots (the
 //     resolv.conf RES_MAXNDOTS ceiling) so a caller that bypassed admission cannot
 //     emit a nonsensical ndots.
 //
@@ -92,8 +100,8 @@ func ConfigToEnv(cfg netv1.DNSConfig) map[string]string {
 	if ndots <= 0 {
 		ndots = netv1.DefaultNDots
 	}
-	if ndots > maxNDots {
-		ndots = maxNDots
+	if ndots > MaxNDots {
+		ndots = MaxNDots
 	}
 	return map[string]string{
 		EnvDNSServer: cfg.ClusterDNSIP,
