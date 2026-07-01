@@ -28,6 +28,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/netd/wire"
 )
@@ -91,6 +93,13 @@ type Proxy struct {
 	// or routes them. It is set once by WithInfraVIPExemptions and read-only
 	// thereafter, so it needs no lock.
 	exemptVIPs map[netip.Addr]struct{}
+	// udpBudget is the relay-GLOBAL cap on concurrent UDP upstream sockets shared by
+	// every per-VIP UDP relay, so the datagram relays cannot jointly exhaust the
+	// process fd table (the co-resident control plane spends from the same table).
+	// Constructed once in New (RLIMIT_NOFILE-derived default, floored at maxUDPFlows)
+	// or overridden by WithUDPFlowBudget; read-only after construction and itself an
+	// atomic leaf, so it needs no proxy lock.
+	udpBudget *udpBudget
 
 	mu      sync.Mutex
 	workers map[PortKey]*portWorker
@@ -104,6 +113,21 @@ type Option func(*Proxy)
 // WithLogger sets the structured logger; the default is slog.Default.
 func WithLogger(l *slog.Logger) Option {
 	return func(p *Proxy) { p.log = l }
+}
+
+// WithUDPFlowBudget overrides the relay-GLOBAL cap on concurrent UDP upstream
+// sockets shared by every per-VIP UDP relay. The default is derived from
+// RLIMIT_NOFILE (see New); the k3sm assembler — which alone sees the whole process
+// fd table (the TCP proxy, kine, and the apiserver client all spend from it) — passes
+// this to partition the relay subsystem's fd slice deliberately, since a leaf
+// subsystem must not unilaterally claim a process-global resource. A non-positive
+// max is ignored, so the RLIMIT-derived default stands.
+func WithUDPFlowBudget(max int64) Option {
+	return func(p *Proxy) {
+		if max > 0 {
+			p.udpBudget = &udpBudget{max: max}
+		}
+	}
 }
 
 // WithMeshEgressSource binds the backend dialer's source address (LocalAddr) to
@@ -183,6 +207,12 @@ func WithNetdHelper(socketPath string) Option {
 
 // New constructs a Proxy steering to the backends in table. By default it uses
 // the root-gated lo0 alias manager; pass options to override (e.g. a logger).
+//
+// The relay-global UDP fd budget defaults to half the process's enforced soft fd
+// limit (RLIMIT_NOFILE.Cur), floored at maxUDPFlows so a low launchd soft limit
+// never regresses a single VIP below its B23 per-VIP capacity; WithUDPFlowBudget
+// lets the k3sm assembler size the relay subsystem's fd slice against the whole
+// process (the TCP proxy + control plane spend from the same table).
 func New(table *RoutingTable, opts ...Option) *Proxy {
 	p := &Proxy{
 		table:      table,
@@ -191,6 +221,7 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 		log:        slog.Default(),
 		dialer:     &net.Dialer{Timeout: dialTimeout},
 		exemptVIPs: make(map[netip.Addr]struct{}),
+		udpBudget:  &udpBudget{max: defaultUDPFlowBudget()},
 		workers:    make(map[PortKey]*portWorker),
 		done:       make(chan struct{}),
 	}
@@ -205,6 +236,25 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 		p.table.log = p.log
 	}
 	return p
+}
+
+// defaultUDPFlowBudget is the relay-global UDP upstream-socket budget when the
+// assembler sets none (WithUDPFlowBudget). It is half the process's ENFORCED soft fd
+// limit (RLIMIT_NOFILE.Cur — not Max, which may be unlimited), leaving the other half
+// for the TCP proxy, the listeners, and the co-resident control plane, but floored at
+// maxUDPFlows so a low launchd soft limit never regresses a single VIP's capacity
+// below the B23 per-VIP bound. A Getrlimit error falls back to the floor.
+//
+// NOTE (deployment): the reservation only leaves REAL headroom for the co-resident
+// control plane when the daemon's soft RLIMIT_NOFILE is provisioned above 2*maxUDPFlows
+// (the launchd plist NumberOfFiles) OR the k3sm assembler passes WithUDPFlowBudget.
+// Below that the floor dominates and the budget bounds only a single VIP — tracked in B52.
+func defaultUDPFlowBudget() int64 {
+	var rl unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rl); err != nil {
+		return maxUDPFlows
+	}
+	return max(int64(maxUDPFlows), int64(rl.Cur)/2)
 }
 
 // portWorker owns one ClusterIP:port. It is the single goroutine that may open
@@ -445,7 +495,7 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 			_ = p.alias.Remove(ctx, ip)
 			return nil, fmt.Errorf("listen udp clusterIP %s: %w", clusterAP, err)
 		}
-		relay := newUDPRelay(pc, key, p.table, p.meshEgress, udpFlowIdleTimeout, p.log)
+		relay := newUDPRelay(pc, key, p.table, p.meshEgress, udpFlowIdleTimeout, maxUDPFlowsPerSource, p.udpBudget, p.log)
 		relay.start()
 		l.udp = relay
 		if port.NodePort != 0 {
