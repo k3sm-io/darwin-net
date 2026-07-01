@@ -150,8 +150,26 @@ limitations under the License.
 // its ndots overrides the cluster default. MergeDNSConfig (merge.go) is the pure
 // darwin-net primitive for that merge: cluster searches FIRST, the pod's appended,
 // deduped first-seen (the cluster WINS a collision, so a pod search equal to a
-// cluster one is dropped), then capped at MaxSearchDomains. A strictly-positive pod
-// ndots overrides the cluster default; otherwise the cluster default stays.
+// cluster one is dropped), sanitized (interior-whitespace domains dropped), then
+// capped at MaxSearchDomains. A strictly-positive pod ndots overrides the cluster
+// default; otherwise the cluster default stays. It returns the merged config plus
+// the count of valid searches DROPPED BY THE CAP (the k3sm caller logs a Warn with
+// pod identity when non-zero; the primitive itself never logs).
+//
+// # Search-list normalization is single-homed (B47)
+//
+// Four consumers read a DNSConfig's SearchDomains: ConfigToEnv (the host-process
+// shim env), GuestResolvConf (the vm-guest /etc/resolv.conf), candidateNames (the Go
+// reference resolver), and MergeDNSConfig itself. They all normalize through ONE
+// helper, normalizeSearch (normalize.go) = sanitizeSearch + capSearch: it TrimSpaces
+// each entry, DROPS any with interior whitespace (the C shim's strtok_r would
+// otherwise split "a b" into two fabricated in-pod tokens — dropping is safer than
+// fusing or splitting), and prefix-caps at MaxSearchDomains. This is defense-in-depth
+// behind k3sm's validatePodDNSConfig admission gate, so it is a no-op for every
+// admission-valid config and the live cluster-DNS keystone stays byte-identical;
+// single-homing it is what keeps the four views dropping the same domain and
+// truncating at the same cap. ConfigToEnv additionally clamps ndots to the
+// resolv.conf RES_MAXNDOTS ceiling (15).
 //
 // MergeDNSConfig takes DISCRETE searches/ndots rather than a full netv1.DNSConfig
 // "extra" on purpose: a full extra carries ClusterDNSIP, and a later edit that

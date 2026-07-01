@@ -57,11 +57,28 @@ func GuestResolvConf(cfg netv1.DNSConfig) (string, error) {
 	}
 	cfg = cfg.WithDefaults()
 
+	// Normalize the search list through the SAME helper the host-process shim env
+	// (ConfigToEnv) and the Go reference resolver (candidateNames) use, so the
+	// untrusted vm-guest path is at least as hardened as the host path: an
+	// interior-whitespace domain would otherwise break a glibc/musl resolv.conf
+	// `search` line the same way it breaks the shim's strtok_r split. A no-op for
+	// admission-valid input.
+	search := normalizeSearch(cfg.SearchDomains)
+
+	// Clamp ndots to the resolv.conf ceiling (maxNDots == RES_MAXNDOTS) for parity with
+	// ConfigToEnv, so the guest and host emit the SAME ndots. A %d of an int32 cannot
+	// inject (glibc clamps to RES_MAXNDOTS, musl ignores ndots), so this is a consistency
+	// guard, not a safety one — a no-op for admission-valid input (ndots <= 15).
+	ndots := cfg.NDots
+	if ndots > maxNDots {
+		ndots = maxNDots
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "nameserver %s\n", cfg.ClusterDNSIP)
-	if len(cfg.SearchDomains) > 0 {
-		fmt.Fprintf(&b, "search %s\n", strings.Join(cfg.SearchDomains, " "))
+	if len(search) > 0 {
+		fmt.Fprintf(&b, "search %s\n", strings.Join(search, " "))
 	}
-	fmt.Fprintf(&b, "options ndots:%d\n", cfg.NDots)
+	fmt.Fprintf(&b, "options ndots:%d\n", ndots)
 	return b.String(), nil
 }
