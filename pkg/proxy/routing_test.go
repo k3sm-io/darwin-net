@@ -412,15 +412,17 @@ func TestInternalTrafficPolicyLocalFiltersToNodeLocal(t *testing.T) {
 
 // TestNodePortIgnoresInternalTrafficPolicy is the B44 gate: internalTrafficPolicy:
 // Local governs the ClusterIP (east-west) path ONLY (KEP-2086), so the *:NodePort
-// (external) selector PickCluster must IGNORE it and route to ALL Ready backends,
+// (external) selector PickStickyCluster must IGNORE it and route to ALL Ready backends,
 // while the ClusterIP selectors (Pick/PickSticky) still honor it and DROP when no
 // backend is node-local. The fixture mirrors the "zero local backends drops" case: a
 // VALID podCIDR + iTP:Local + all-REMOTE backends (every endpoint is outside the /24,
-// so there is ZERO node-local backend).
+// so there is ZERO node-local backend). The port carries no ClientIP affinity
+// (affinityConfig{}), so PickStickyCluster is exactly the old PickCluster it replaced:
+// plain round-robin over the external (Cluster) scope.
 //
 // Non-vacuity: before B44 the *:NodePort listener shared the ClusterIP's key and used
 // PickSticky, so it returned ErrNoLocalBackends and DROPPED the external connection.
-// Asserting PickCluster SUCCEEDS where Pick/PickSticky DROP is red under the old
+// Asserting PickStickyCluster SUCCEEDS where Pick/PickSticky DROP is red under the old
 // shared-key behavior and green only once the external path selects the Cluster pool.
 func TestNodePortIgnoresInternalTrafficPolicy(t *testing.T) {
 	t.Parallel()
@@ -458,15 +460,18 @@ func TestNodePortIgnoresInternalTrafficPolicy(t *testing.T) {
 		t.Parallel()
 		tbl := NewRoutingTable(netip.MustParsePrefix(cidr))
 		tbl.SetEndpointsPolicy(key, remoteEps, trafficLocal, affinityConfig{})
+		// Non-affinity port: PickStickyCluster degrades to plain round-robin over the
+		// external Cluster pool, so a fixed client IP still fans out across all backends.
+		client := netip.MustParseAddr("100.64.9.9")
 		seen := map[string]int{}
 		for i := 0; i < 64; i++ {
-			be, err := tbl.PickCluster(key)
+			be, err := tbl.PickStickyCluster(key, client, time.Now())
 			if err != nil {
-				t.Fatalf("PickCluster = %v, want a remote backend (NodePort ignores iTP:Local)", err)
+				t.Fatalf("PickStickyCluster = %v, want a remote backend (NodePort ignores iTP:Local)", err)
 			}
 			ip := be.Addr().Addr().String()
 			if !remoteSet[ip] {
-				t.Fatalf("PickCluster returned unexpected backend %q", ip)
+				t.Fatalf("PickStickyCluster returned unexpected backend %q", ip)
 			}
 			seen[ip]++
 		}
@@ -478,11 +483,12 @@ func TestNodePortIgnoresInternalTrafficPolicy(t *testing.T) {
 		}
 	})
 
-	t.Run("PickCluster on an empty key returns ErrNoBackends", func(t *testing.T) {
+	t.Run("PickStickyCluster on an empty key returns ErrNoBackends", func(t *testing.T) {
 		t.Parallel()
 		tbl := NewRoutingTable(netip.MustParsePrefix(cidr))
-		if be, err := tbl.PickCluster(key); !errors.Is(err, ErrNoBackends) {
-			t.Fatalf("PickCluster on empty table = (%v, %v), want ErrNoBackends", be.Addr(), err)
+		client := netip.MustParseAddr("100.64.9.9")
+		if be, err := tbl.PickStickyCluster(key, client, time.Now()); !errors.Is(err, ErrNoBackends) {
+			t.Fatalf("PickStickyCluster on empty table = (%v, %v), want ErrNoBackends", be.Addr(), err)
 		}
 	})
 
@@ -505,10 +511,11 @@ func TestNodePortIgnoresInternalTrafficPolicy(t *testing.T) {
 		if _, err := tbl.Pick(key); err != nil {
 			t.Fatalf("Pick under fail-open = %v, want a backend (no panic, degrade-to-Cluster)", err)
 		}
-		// PickCluster (external) also drives activePool(external=true) under the nil
-		// logger — no Warn on that branch, no panic.
-		if _, err := tbl.PickCluster(key); err != nil {
-			t.Fatalf("PickCluster under nil logger = %v, want a backend", err)
+		// PickStickyCluster (external) also drives activePool(external=true) under the
+		// nil logger — no Warn on that branch, no panic.
+		client := netip.MustParseAddr("100.64.9.9")
+		if _, err := tbl.PickStickyCluster(key, client, time.Now()); err != nil {
+			t.Fatalf("PickStickyCluster under nil logger = %v, want a backend", err)
 		}
 	})
 }
