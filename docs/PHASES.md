@@ -2,8 +2,8 @@
 repo: darwin-net
 schema: phases/v1
 current_phase: M5
-updated: 2026-06-27
-updated_by: orchestrate/M5
+updated: 2026-07-02
+updated_by: roadmap/m7-m9
 
 phases:
   - id: M0
@@ -176,6 +176,51 @@ phases:
           - id: M5.2-a1
             met: false
             check: a process inside the vm guest resolves a Service name and kubernetes.default.svc via the cluster resolver using the guest's native resolver (resolv.conf/NSS), with no DYLD shim involved (lab tier, K3SM_LAB=1)
+            method: integration
+
+  - id: M7
+    title: Public CI workflow + SkipUnless conversions (release-engineering slice — no darwin-net product code)
+    status: todo
+    depends_on:
+      - apis:M7
+    subphases:
+      - id: M7.1
+        title: public CI workflow + SkipUnless conversions
+        status: todo
+        deliverables:
+          - id: M7.1-d1
+            done: false
+            desc: "`.github/workflows/ci.yml` — the public per-repo CI workflow on a macOS-15 arm64 GitHub Actions runner (the release-engineering slice; NO product-code change). A thin wrapper over the repo's existing commit gates, not a logic duplication (m7-plan M7.2): `gofmt -l .` (must print nothing), `go vet ./...`, `CGO_ENABLED=0 go build ./...`, `CGO_ENABLED=0 go test ./...` and the `-race` pass. darwin-net stays pure Go (`CGO_ENABLED=0`), so the workflow pins that posture explicitly; it mirrors the apis/runtimed/k3sm `ci.yml` shape. The symbol-canary is a k3sm/runtimed concern (darwin-net imports no darwin SPI), so this workflow is the unit + `-race` tier only; the root-gated lo0/pf/utun integration legs remain the nightly sudo-integration workflow's job (m7-plan M7.2), which is out of this repo's slice."
+          - id: M7.1-d2
+            done: false
+            desc: "Convert the repo's raw `t.Skip` integration sites to the apis-hosted `k3smtest.SkipUnless(t, cap)` helper (m7-plan Resolution 4). The affected `//go:build integration` skip sites are the root-gated lo0/pf/utun tests — `TestLo0AliasIdempotentLeakFree`, `TestLo0AliasChurn`, `TestProxyVIPOnRealAlias` (pkg/proxy); `TestPodNetworkSetupTeardownOnRealLo0` (pkg/podnet); `TestMeshDeviceBringUpOnRealUTUN` (pkg/mesh) — each converts from a hand-rolled `t.Skip(\"needs root\")` to `k3smtest.SkipUnless(t, cap)` over the owned capability taxonomy (`root`/`lo0`/`utun`/`pf`). The helper's only DAG-legal home is `k3sm.io/apis` (a leaf copy would drift or force a sideways import — the depends_on edge to apis:M7); the no-raw-`t.Skip`-in-`-tags integration` lint is what keeps the conversion honest, so a self-skip turns red, not silent."
+          - id: M7.1-d3
+            done: false
+            desc: "`README.md` gains the 'part of k3sm' front-door header (the README-refresh-across-all-repos deliverable, m7-plan M7.3): a one-line pitch — pod networking for k3sm (lo0-alias IPAM, userspace Service proxy, wireguard-go mesh, getaddrinfo DNS shim, the PodNetwork seam) — plus the pointer to the umbrella project. No stale-string offenders (e.g. \"Pre-M0 scaffold\") survive the docs stale-string denylist."
+        acceptance:
+          - id: M7.1-a1
+            met: false
+            check: "the public CI workflow is green on a PR (gofmt/vet/`CGO_ENABLED=0` build/test + `-race` on a macOS-15 arm64 runner) AND no raw `t.Skip` remains in any `-tags integration` file — every root/lo0/pf/utun skip site routes through the apis-hosted `k3smtest.SkipUnless`, enforced by the no-raw-`t.Skip` lint (a grep-level assert, no root)"
+            method: unit
+
+  - id: M8
+    title: MLX serving (no darwin-net product work — one S1 exit-criterion verification obligation)
+    status: todo
+    depends_on:
+      - k3sm:M8.0
+      - runtimed:M8.2
+    subphases:
+      - id: M8.1
+        title: egress-datapath host-listener address set for the M8.2 golden fixtures (verification obligation)
+        status: todo
+        deliverables:
+          - id: M8.1-d1
+            done: false
+            desc: "darwin-net has NO product work in M8 (the MLX serving milestone is apis/runtimed/k3sm — machine-checked by the S1 exit criterion). The ONE real obligation this entry carries — so the \"no work\" claim is honest rather than silent — is to provide + pin the production egress datapath's host-listener address set that runtimed's M8.2-d2 golden SBPL fixtures consume. darwin-net owns that datapath (DNS shim → Service-proxy dialer → egress), so it is the authority on which host-listener addresses the path legitimately touches: the DNS/apiserver VIPs, the pod's own lo0 alias, and the mesh-egress /32. runtimed's `allow_internet_egress` branch layers **range-based** host-local denies over the wide IP-scoped allow (m8-plan Resolution 12: deny 127/8, 169.254/16, all of 100.64.0.0/10, the node's RFC1918 subnets, with tier-3 re-allows for the pod's own IP + the cluster VIPs). This enumerated set is what the tier-3 re-allows are pinned against, so those denies do NOT sever the datapath the S1 exit criterion (HF weight download through the production path) must prove. Range-denies keep the set stale-proof against DHCP/mesh address churn. Cross-domain owner: m8-plan Persona Critique → Cross-Domain Conflicts (darwin-systems → pod-networking)."
+        acceptance:
+          - id: M8.1-a1
+            met: false
+            check: "the egress-datapath host-listener address set is committed and consumed by the M8.2 golden SBPL fixtures, and the S1 exit-criterion HF-weight download through the production datapath (DNS shim → proxy dialer → egress) succeeds under the FULL d2 egress profile — the range-based host-local denies do not sever it"
             method: integration
 ---
 
@@ -434,6 +479,57 @@ behind `sandbox.Backend`). The verifiable parts are unit; the live attach + reac
   via the cluster resolver using the guest's native resolver (`resolv.conf`/NSS), with **no `DYLD`
   shim** involved — *method: integration* (lab). The darwin-net half — the resolv.conf render — is
   proven by `TestGuestResolvConfRender` (nameserver = the DNS VIP; search/ndots from the `DNSConfig`).
+
+## M7 — public CI workflow + SkipUnless conversions ⬜
+
+**Cross-repo deps:** `apis:M7` (the DAG-legal home for the shared `k3smtest.SkipUnless(t, cap)` helper +
+its owned capability taxonomy — m7-plan Resolution 4). The **release-engineering slice** for the public
+open-source launch: **no darwin-net product code changes**, just the CI wiring and the test-honesty
+conversion (m7-plan M7.2/M7.3).
+
+### M7.1 — public CI workflow + SkipUnless conversions ⬜
+**Deliverables**
+- ⬜ `M7.1-d1` `.github/workflows/ci.yml` — a thin macOS-15 arm64 workflow over the existing commit
+  gates (`gofmt -l`, `go vet`, `CGO_ENABLED=0` build/test, `-race`); darwin-net stays pure Go, so the
+  workflow pins `CGO_ENABLED=0`. Mirrors the apis/runtimed/k3sm `ci.yml`; the root-gated lo0/pf/utun
+  legs stay in the nightly sudo-integration workflow (out of this repo's slice).
+- ⬜ `M7.1-d2` Convert the raw `t.Skip` integration sites (the root-gated lo0/pf/utun tests —
+  `TestLo0AliasIdempotentLeakFree`, `TestLo0AliasChurn`, `TestProxyVIPOnRealAlias`,
+  `TestPodNetworkSetupTeardownOnRealLo0`, `TestMeshDeviceBringUpOnRealUTUN`) to the **apis-hosted**
+  `k3smtest.SkipUnless(t, cap)` helper (m7-plan Resolution 4) over the `root`/`lo0`/`utun`/`pf`
+  taxonomy; the no-raw-`t.Skip` lint keeps a self-skip red, not silent.
+- ⬜ `M7.1-d3` `README.md` gains the **"part of k3sm"** front-door header (the cross-repo README refresh,
+  m7-plan M7.3) — one-line pitch + project pointer, no stale-string offenders.
+
+**Acceptance (exit gate)**
+- ⬜ `M7.1-a1` the PR CI workflow is green (gofmt/vet/`CGO_ENABLED=0` build/test + `-race` on macos-15
+  arm64) **and** no raw `t.Skip` remains in any `-tags integration` file — every skip site routes
+  through `k3smtest.SkipUnless` — *method: unit*
+
+## M8 — MLX serving — (no darwin-net product work) ⬜
+
+**No darwin-net product code lands in M8** — MLX serving is an apis/runtimed/k3sm milestone, and the
+"darwin-net has no work" claim is **machine-checked** by the S1 exit criterion (m8-plan). The entry is
+kept honest (not silent) by carrying darwin-net's **one** real obligation.
+
+**Cross-repo deps:** `k3sm:M8.0` (the S1 spike) + `runtimed:M8.2` (the `allow_internet_egress` d2
+profile whose golden SBPL fixtures consume darwin-net's enumerated set).
+
+### M8.1 — egress-datapath host-listener address set for the M8.2 golden fixtures ⬜
+**Deliverables**
+- ⬜ `M8.1-d1` Provide + pin the production egress datapath's **host-listener address set** (DNS shim →
+  Service-proxy dialer → egress: the DNS/apiserver VIPs, the pod's own lo0 alias, the mesh-egress /32)
+  for runtimed's M8.2-d2 golden SBPL fixtures. runtimed's egress branch layers **range-based** host-local
+  denies (m8-plan Resolution 12: 127/8, 169.254/16, all of 100.64.0.0/10, node RFC1918 subnets, with
+  tier-3 re-allows for the pod IP + cluster VIPs) over the wide IP-scoped allow; darwin-net's enumerated
+  set is what the tier-3 re-allows are pinned against, so the denies do **not** sever the datapath S1
+  must prove. Range-denies keep it stale-proof. (Cross-domain owner: m8-plan darwin-systems →
+  pod-networking conflict resolution.)
+
+**Acceptance (exit gate)**
+- ⬜ `M8.1-a1` the address set is committed and consumed by the M8.2 golden SBPL fixtures, and the S1
+  HF-weight download through the production datapath succeeds under the **full d2 profile** (the
+  range-based host-local denies do not sever it) — *method: integration*
 
 ## Next
 M1 code is in (`pkg/proxy` + `pkg/dns`, against `apis:M1.2`). To fully close the milestone: run the
