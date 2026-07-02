@@ -93,12 +93,15 @@ type Proxy struct {
 	// or routes them. It is set once by WithInfraVIPExemptions and read-only
 	// thereafter, so it needs no lock.
 	exemptVIPs map[netip.Addr]struct{}
-	// udpBudget is the relay-GLOBAL cap on concurrent UDP upstream sockets shared by
-	// every per-VIP UDP relay, so the datagram relays cannot jointly exhaust the
-	// process fd table (the co-resident control plane spends from the same table).
-	// Constructed once in New (RLIMIT_NOFILE-derived default, floored at maxUDPFlows)
-	// or overridden by WithUDPFlowBudget; read-only after construction and itself an
-	// atomic leaf, so it needs no proxy lock.
+	// udpBudget is the relay-GLOBAL admission budget shared by every per-VIP UDP relay:
+	// it caps concurrent upstream sockets across ALL relays (so the datagram relays
+	// cannot jointly exhaust the process fd table the co-resident control plane spends
+	// from) AND caps any one source IP's flows across ALL VIPs (the per-source-GLOBAL
+	// fair share, B52). Constructed once in New (RLIMIT_NOFILE-derived total, floored at
+	// maxUDPFlows) or overridden by WithUDPFlowBudget; its maxTotal/maxPerSource are
+	// read-only after construction, and it is a mutex-guarded LEAF that mutates its own
+	// total/bySource under its OWN lock and never calls back into a relay, so it needs
+	// no proxy lock.
 	udpBudget *udpBudget
 
 	mu      sync.Mutex
@@ -125,7 +128,7 @@ func WithLogger(l *slog.Logger) Option {
 func WithUDPFlowBudget(max int64) Option {
 	return func(p *Proxy) {
 		if max > 0 {
-			p.udpBudget = &udpBudget{max: max}
+			p.udpBudget = newUDPBudget(max, udpPerSourceGlobalCap(max))
 		}
 	}
 }
@@ -214,6 +217,7 @@ func WithNetdHelper(socketPath string) Option {
 // lets the k3sm assembler size the relay subsystem's fd slice against the whole
 // process (the TCP proxy + control plane spend from the same table).
 func New(table *RoutingTable, opts ...Option) *Proxy {
+	maxTotal := defaultUDPFlowBudget()
 	p := &Proxy{
 		table:      table,
 		alias:      newLo0AliasManager(),
@@ -221,7 +225,7 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 		log:        slog.Default(),
 		dialer:     &net.Dialer{Timeout: dialTimeout},
 		exemptVIPs: make(map[netip.Addr]struct{}),
-		udpBudget:  &udpBudget{max: defaultUDPFlowBudget()},
+		udpBudget:  newUDPBudget(maxTotal, udpPerSourceGlobalCap(maxTotal)),
 		workers:    make(map[PortKey]*portWorker),
 		done:       make(chan struct{}),
 	}
