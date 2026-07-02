@@ -122,7 +122,7 @@ func (t *RoutingTable) PickSticky(key PortKey, client netip.Addr, now time.Time)
 	if st == nil || len(st.all) == 0 {
 		return backend{}, ErrNoBackends
 	}
-	pool, set, err := t.activePool(key, st)
+	pool, set, err := t.activePool(key, st, false)
 	if err != nil {
 		// e.g. iTP:Local with no node-local backend: propagate the drop; never fall
 		// back to a stale binding (that would spill node-local traffic to a remote).
