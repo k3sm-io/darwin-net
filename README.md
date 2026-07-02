@@ -1,5 +1,9 @@
 # darwin-net — k3sm pod networking for macOS
 
+> Part of **[k3sm](https://github.com/k3sm-io/k3sm)** — a macOS-native Kubernetes distribution for
+> Apple Silicon. Start at the [k3sm repo](https://github.com/k3sm-io/k3sm) for the product overview
+> and quickstart.
+
 `k3sm.io/darwin-net` gives Kubernetes Pods — native Darwin processes that share the host stack, with
 **no network namespaces** — an IP each, plus Services and cross-node networking, for
 [k3sm](https://github.com/k3sm-io/k3sm). It is the analog of flannel + kube-proxy + CNI:
