@@ -3,7 +3,7 @@ repo: darwin-net
 schema: phases/v1
 current_phase: M5
 updated: 2026-07-02
-updated_by: roadmap/m7-m9
+updated_by: roadmap/m10
 
 phases:
   - id: M0
@@ -222,6 +222,60 @@ phases:
             met: false
             check: "the egress-datapath host-listener address set is committed and consumed by the M8.2 golden SBPL fixtures, and the S1 exit-criterion HF-weight download through the production datapath (DNS shim → proxy dialer → egress) succeeds under the FULL d2 egress profile — the range-based host-local denies do not sever it"
             method: integration
+
+  - id: M10
+    title: Kubernetes conformance hardening — per-pod-IP DNS record synthesis + L7 Ingress datapath + NetworkPolicy L4 subset
+    status: todo
+    depends_on:
+      - runtimed:M10.1
+      - k3sm:M10.1
+    subphases:
+      - id: M10.1
+        title: DNS record synthesis (per-pod-A / headless / SRV / PTR) gated on per-pod-/32 wiring
+        status: todo
+        depends_on:
+          - runtimed:M10.1
+          - k3sm:M10.1
+        deliverables:
+          - id: M10.1-d1
+            done: false
+            desc: "Extend the in-process netserve resolver to synthesize per-pod-A / headless (all-backends) / SRV / PTR records from EndpointSlices, gated on the M10.1 per-pod-/32 wiring (runtimed side — depends_on runtimed:M10.1 + k3sm:M10.1, which replaces the `supervisor.NodeNetwork{}` no-op seam with an adapter over `darwin-net/pkg/podnet.Network` so `pod_ip` is a distinct /32, not ≈nodeIP; m10-plan Res.1). This is NET-NEW record synthesis, NOT a CoreDNS freebie: the CoreDNS renderer at `pkg/dns/coredns.go` is UNCONSUMED — the live resolver is k3sm's in-process A-record resolver, so headless/SRV/PTR must be built, not enabled. SPLIT THE GATE (m10-plan M10.1 + Res.12 warning): (1) SERVER-SIDE record synthesis is CI-provable pure logic over a faked EndpointSlice watch — the /go-able half, filed as BACKLOG B81 (`status: blocked`, unblocked by hand once M10.1's podnet wiring lands, since /go can't serialize on an orchestrate slice with no B#, Res.9); (2) IN-POD consumption of SRV/PTR needs a getaddrinfo-shim `res_query` extension — a follow-on integration/lab gate, NOT the same slice, because macOS `getaddrinfo` returns only A/AAAA (SRV/PTR ride `res_query`/`res_search`). Reclassifies + CLOSES the register's per-pod-IP / headless / SRV / PTR rows (B5) from `honest-limitation (ceiling)` to the correct verdict IN THE SAME CHANGE (Res.7) — per-pod IP is achievable-as-wiring, so leaving `ceiling` ships a known lie."
+        acceptance:
+          - id: M10.1-a1
+            met: false
+            check: "server-side record synthesis is proven by pure-logic/faked-watch unit tests (no root, the /go-able B81 half): `TestHeadlessServiceReturnsAllPodIPs` (a headless Service returns the A set of ALL ready backend pod IPs, not a single VIP) plus per-pod-A / SRV / PTR synthesis from a faked EndpointSlice watch — each record type derived from the distinct per-pod /32s the M10.1 podnet wiring now assigns"
+            method: unit
+          - id: M10.1-a2
+            met: false
+            check: "in-pod SRV/PTR consumption is proven by the follow-on integration/lab gate: a pod process resolves an SRV (`_port._proto.<svc>.<ns>.svc.cluster.local`) and a PTR (in-addr.arpa reverse of a pod /32) via the getaddrinfo-shim `res_query` extension — macOS `getaddrinfo` returns only A/AAAA, so this leg exercises the net-new `res_query`/`res_search` path, not the A-record shim"
+            method: integration
+      - id: M10.3
+        title: Ingress L7 datapath — in-process userspace HTTP(S) reverse-proxy in its own package
+        status: todo
+        deliverables:
+          - id: M10.3-d1
+            done: false
+            desc: "An in-process userspace L7 HTTP(S) reverse-proxy in its OWN package (`pkg/ingress` or `pkg/l7`) — NOT accreted onto the L4 `pkg/proxy` (software-architect suggestion; the L4 splice and the L7 router are distinct concerns). Host/path routing, default backend, TLS termination, fronting the ClusterIP VIPs the L4 proxy already owns. Bound to a SPECIFIC node address via the netd `VerbBindPort` fd-passing seam — netd REJECTS a wildcard `*:80`/`*:443` bind (m10-plan Res.12; a wildcard L7 listener on the shared node is a cross-tenant footgun). TLS DISCIPLINE (Res.10/12): the TLS private key is held IN-PROCESS-MEMORY-ONLY — never written to a pod-reachable path under the shared `_k3sm` uid — and the k3sm IngressClass controller's Secret grant is scoped to the referenced `tls[].secretName`. REJECT a bundled Traefik/nginx binary — it forks the single-binary model (Res.10). The klipper-lite `status.loadBalancer.ingress = node IP` (closes register B32) is k3sm-owned; darwin-net provides the L7 datapath + the specific-node bind seam."
+        acceptance:
+          - id: M10.3-a1
+            met: false
+            check: "host/path routing + default backend + TLS termination fronting a ClusterIP VIP are proven by pure-logic/faked unit tests (no root): a host+path match routes to the right ClusterIP backend, an unmatched request hits the default backend, and the TLS key is verified never to touch a filesystem path (in-memory-only). The specific-node-bind (netd rejects `*:80`) + the real `:80/:443` bring-up via the `VerbBindPort` fd-passing seam is the integration leg; `hack/acceptance/m10-ingress.sh` (host/path route + TLS-from-Secret + `status.loadBalancer`) is the k3sm-owned composite"
+            method: unit+integration
+      - id: M10.4
+        title: NetworkPolicy L4 subset — userspace-proxy dst-VIP allow/deny (policy hint, not isolation)
+        status: todo
+        depends_on:
+          - runtimed:M10.1
+          - k3sm:M10.1
+        deliverables:
+          - id: M10.4-d1
+            done: false
+            desc: "A userspace-proxy dst-VIP allow/deny subset, documented as a POLICY HINT on Service-VIP-mediated ingress ONLY — NOT tenant isolation. THE M10.1→M10.4 CAUSAL LINK (m10-plan Res.12, the explicit trade-off): once M10.1 gives each pod its own /32, direct pod-IP→pod-IP traffic over those /32s bypasses the userspace proxy ENTIRELY — M10.1 removes the LAST L4 chokepoint the proxy used to be — so a proxy-mediated NetworkPolicy can only enforce on traffic that still transits a Service VIP. Real tenant isolation (shared lo0 trust domain + a single `_k3sm` uid, so no per-pod uid boundary) is a true platform ceiling: it routes to the `vm` RuntimeClass (M5), NOT to this L4 subset. The register row and `docs/user/limitations.md` carry this as an honest limit (a line-assert), never overstated as isolation. depends_on runtimed:M10.1 + k3sm:M10.1 — the causal link only holds once the per-pod /32s exist."
+        acceptance:
+          - id: M10.4-a1
+            met: false
+            check: "the dst-VIP allow/deny subset is proven by the pure-logic unit test `TestNetworkPolicyL4AllowDeny` (a policy allow/deny verdict is applied at the userspace-proxy dst-VIP seam; an allowed VIP is dialed, a denied VIP is refused). The honest limit — that this is a Service-VIP hint and pod-IP→pod-IP over the per-pod /32s bypasses it, so isolation routes to `vm` — is a `docs/user/limitations.md` line-assert, drawing the M10.1→M10.4 causal link"
+            method: unit
 ---
 
 # darwin-net — Phase roadmap
@@ -530,6 +584,69 @@ profile whose golden SBPL fixtures consume darwin-net's enumerated set).
 - ⬜ `M8.1-a1` the address set is committed and consumed by the M8.2 golden SBPL fixtures, and the S1
   HF-weight download through the production datapath succeeds under the **full d2 profile** (the
   range-based host-local denies do not sever it) — *method: integration*
+
+## M10 — Kubernetes conformance hardening ⬜
+
+**Cross-repo deps:** `runtimed:M10.1` + `k3sm:M10.1` (the per-pod-IP wiring — replacing the
+`supervisor.NodeNetwork{}` no-op seam with an adapter over `pkg/podnet.Network` so `pod_ip` is a
+distinct `/32`, not ≈nodeIP; m10-plan Res.1). Authoritative input: `../../docs/m10-plan.md` (the
+8-persona Phase B review + BINDING Res.1–12). **Scope: conformance hardening, not a certification** —
+k3sm cannot pass Sonobuoy `[Conformance]`; M10 raises honest fidelity where the Darwin substrate
+allows. darwin-net's slices are M10.1 (DNS record synthesis), M10.3 (Ingress L7 datapath), and M10.4
+(NetworkPolicy L4 subset); M10.0 (apiserver config) and M10.2 (workload-execution fidelity) carry no
+darwin-net product code.
+
+### M10.1 — DNS record synthesis (per-pod-A / headless / SRV / PTR) ⬜
+**Deliverables**
+- ⬜ `M10.1-d1` Extend the in-process netserve resolver to synthesize **per-pod-A / headless
+  (all-backends) / SRV / PTR** records from EndpointSlices, gated on the M10.1 per-pod-`/32` wiring
+  (runtimed side). **Net-new record synthesis, NOT a CoreDNS freebie** — the CoreDNS renderer at
+  `pkg/dns/coredns.go` is **unconsumed**; the live resolver is k3sm's in-process A-record resolver, so
+  headless/SRV/PTR must be **built**, not enabled. **Split the gate:** the **server-side** synthesis is
+  CI-provable pure logic (the `/go`-able half, filed as backlog **B81**, `status: blocked` until the
+  `podnet` wiring lands); **in-pod** SRV/PTR consumption needs a **getaddrinfo-shim `res_query`
+  extension** — a follow-on integration/lab gate, since macOS `getaddrinfo` returns only A/AAAA
+  (SRV/PTR ride `res_query`). Reclassifies + **closes the register's B5 per-pod-IP rows** from
+  `honest-limitation (ceiling)` to the correct verdict in the same change (Res.7).
+
+**Acceptance (exit gate)**
+- ⬜ `M10.1-a1` server-side synthesis proven by pure-logic/faked-watch unit tests —
+  `TestHeadlessServiceReturnsAllPodIPs` (all ready backend pod IPs, not one VIP) + per-pod-A/SRV/PTR
+  from a faked EndpointSlice watch — *method: unit* (the B81 half)
+- ⬜ `M10.1-a2` in-pod SRV/PTR resolution via the getaddrinfo-shim `res_query` extension (an SRV +
+  a PTR reverse of a pod `/32`) — *method: integration* (lab; the follow-on gate)
+
+### M10.3 — Ingress L7 datapath ⬜
+**Deliverables**
+- ⬜ `M10.3-d1` An in-process userspace **L7 HTTP(S) reverse-proxy in its OWN package** (`pkg/ingress`
+  or `pkg/l7`) — **not** accreted onto the L4 `pkg/proxy`. Host/path routing, default backend, **TLS
+  termination**, fronting the ClusterIP VIPs. Bound to a **specific node address** via the netd
+  `VerbBindPort` fd-passing seam (**netd rejects `*:80`**). The **TLS private key stays
+  in-process-memory-only** — never a pod-reachable path under the shared `_k3sm` uid — and the
+  IngressClass controller's Secret grant is scoped to the referenced `tls[].secretName` (Res.10/12).
+  **Reject a bundled Traefik binary** (it forks the single-binary model). The klipper-lite
+  `status.loadBalancer` (closes B32) is k3sm-owned.
+
+**Acceptance (exit gate)**
+- ⬜ `M10.3-a1` host/path route + default backend + TLS termination proven by faked/pure-logic unit
+  tests (the TLS key never touches a filesystem path); the specific-node bind + real `:80/:443` via
+  `VerbBindPort` is the integration leg; `hack/acceptance/m10-ingress.sh` is the k3sm composite —
+  *method: unit + integration*
+
+### M10.4 — NetworkPolicy L4 subset ⬜
+**Deliverables**
+- ⬜ `M10.4-d1` A userspace-proxy dst-VIP **allow/deny subset**, documented as a **policy hint on
+  Service-VIP-mediated ingress ONLY — NOT tenant isolation**. **The M10.1→M10.4 causal link** (Res.12):
+  once M10.1 gives each pod its own `/32`, direct pod-IP→pod-IP traffic **bypasses the proxy entirely**
+  — M10.1 removes the **last L4 chokepoint** — so the policy can only enforce on Service-VIP transit.
+  Real isolation (shared lo0 + single `_k3sm` uid) routes to the **`vm`** RuntimeClass (M5), not this
+  L4 subset. Depends on `runtimed:M10.1` + `k3sm:M10.1` — the causal link only holds once the per-pod
+  `/32`s exist.
+
+**Acceptance (exit gate)**
+- ⬜ `M10.4-a1` `TestNetworkPolicyL4AllowDeny` (an allow/deny verdict at the userspace-proxy dst-VIP
+  seam — allowed VIP dialed, denied VIP refused); the honest limit (pod-IP→pod-IP bypasses; isolation
+  routes to `vm`) is a `docs/user/limitations.md` line-assert — *method: unit*
 
 ## Next
 M1 code is in (`pkg/proxy` + `pkg/dns`, against `apis:M1.2`). To fully close the milestone: run the
