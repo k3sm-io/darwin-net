@@ -121,6 +121,30 @@ type RoutingTable struct {
 	// every PickSticky hit and idle-swept by the owning Proxy (SweepExpired); only
 	// ClientIP ports have entries here (a None or deleted port is purged).
 	affinity map[PortKey]map[netip.Addr]*affinityBinding
+	// affinityCount is the live-binding total across ALL PortKeys — the sum of
+	// len(binds) over the affinity map — guarded by mu. It is a PLAIN int under the
+	// single table lock, NOT an atomic: unlike B48's cross-lock udpBudget it never
+	// leaves mu. It backs the relay-GLOBAL aggregate ceiling (maxAffinityTotal) and MUST
+	// stay an exact function of the affinity map's cardinality — +1 at the one create in
+	// PickSticky, -1 at each single-key delete (routed through dropBinding: the
+	// stale-binding refresh, the per-port evict, and the idle sweep), and -len(binds) at
+	// each wholesale delete (routed through dropAffinity) — or it would leak upward until
+	// the ceiling wedged every Service on the node to round-robin.
+	affinityCount int
+	// maxAffinityPerPort bounds any single PortKey's binding sub-map (default
+	// maxAffinityBindingsPerPort). Read via max(1, …) in PickSticky so a non-positive
+	// override cannot break the evict-removes-exactly-one accounting.
+	maxAffinityPerPort int
+	// maxAffinityTotal bounds affinityCount across ALL PortKeys (default
+	// maxAffinityBindingsTotal) — the relay-global memory bound. On saturation PickSticky
+	// degrades a new client to round-robin (no binding recorded), never rejecting it.
+	// Read via max(1, …) in PickSticky so a non-positive override still admits one.
+	maxAffinityTotal int
+	// affinityWarned throttles the aggregate-ceiling degradation Warn to fire once per
+	// saturation episode (mirroring portState.warned for the iTP:Local fail-open): it is
+	// set when the global ceiling first engages and cleared by PickSticky once the count
+	// falls back below the cap, so a later re-saturation is logged again, not silent.
+	affinityWarned bool
 
 	// log records the fail-open degradation when internalTrafficPolicy: Local meets
 	// an unknown podCIDR (a loud, throttled Warn so the misconfig is observable). It
@@ -197,10 +221,12 @@ func (k PortKey) String() string {
 // to enable local/remote classification and node-local filtering.
 func NewRoutingTable(podCIDR netip.Prefix) *RoutingTable {
 	return &RoutingTable{
-		podCIDR:  podCIDR,
-		states:   make(map[PortKey]*portState),
-		affinity: make(map[PortKey]map[netip.Addr]*affinityBinding),
-		log:      slog.Default(),
+		podCIDR:            podCIDR,
+		states:             make(map[PortKey]*portState),
+		affinity:           make(map[PortKey]map[netip.Addr]*affinityBinding),
+		maxAffinityPerPort: maxAffinityBindingsPerPort,
+		maxAffinityTotal:   maxAffinityBindingsTotal,
+		log:                slog.Default(),
 	}
 }
 
@@ -296,13 +322,13 @@ func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, pol
 	defer t.mu.Unlock()
 	if len(ready) == 0 {
 		delete(t.states, key)
-		delete(t.affinity, key) // no backends: any bindings are meaningless
+		t.dropAffinity(key) // no backends: any bindings are meaningless
 		return 0
 	}
 	if aff.mode != affinityClientIP {
 		// Affinity off for this port: purge bindings so a Service toggled
 		// ClientIP->None (or never sticky) leaves nothing to resurrect on re-enable.
-		delete(t.affinity, key)
+		t.dropAffinity(key)
 	}
 	t.states[key] = &portState{
 		all:             ready,
@@ -323,7 +349,7 @@ func (t *RoutingTable) Delete(key PortKey) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.states, key)
-	delete(t.affinity, key)
+	t.dropAffinity(key)
 }
 
 // classify computes a backend's locality from the node podCIDR. A zero podCIDR
