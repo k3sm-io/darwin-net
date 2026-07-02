@@ -136,20 +136,26 @@ limitations under the License.
 // goroutines for every Service the proxy owns — on saturation a new flow is dropped
 // (a throttled Warn), never a live one evicted.
 //
-// # UDP fair-share + fd budget — B48
+// # UDP fair-share + fd budget — B48/B52
 //
-// Two further admission gates harden the relay against one same-node pod
-// monopolizing a VIP or exhausting the co-resident control plane's fds. A per-source
-// sub-cap (maxUDPFlowsPerSource = maxUDPFlows/4) bounds any single source IP's
-// concurrent flows PER VIP, so a pod cycling ephemeral source ports cannot fill a
-// VIP's whole table and starve every other pod's access to that Service. A
-// relay-GLOBAL fd budget (an atomic udpBudget shared by every per-VIP relay via New)
-// bounds concurrent upstream sockets across ALL relays, so the datagram relays cannot
-// jointly exhaust the process fd table. Both counters are an EXACT function of flows
-// membership — incremented only at the authoritative second-lock insert, decremented
-// only at a flow delete (idle sweep or Close) — so an admission that drops a flow
-// never mis-accounts and the caps can never silently stop firing; a doomed dial is
-// still rejected with the socket closed so no fd leaks on rejection.
+// Further admission gates harden the relay against one same-node pod monopolizing a
+// VIP or exhausting the co-resident control plane's fds. A per-source sub-cap
+// (maxUDPFlowsPerSource = maxUDPFlows/4) bounds any single source IP's concurrent
+// flows PER VIP, so a pod cycling ephemeral source ports cannot fill a VIP's whole
+// table and starve every other pod's access to that Service. A relay-GLOBAL budget (a
+// mutex-guarded udpBudget shared by every per-VIP relay via New) then enforces TWO
+// more caps under one lock: it bounds concurrent upstream sockets across ALL relays
+// (so the datagram relays cannot jointly exhaust the process fd table) AND bounds any
+// one source IP's flows across ALL VIPs (maxPerSource = maxTotal/4, B52's
+// per-source-GLOBAL fair share), so a pod fanning flows across N distinct VIPs cannot
+// consume the whole global budget and starve every other pod on every VIP. All
+// counters are an EXACT function of flows membership — incremented only at the
+// authoritative second-lock insert, decremented only at a flow delete (idle sweep or
+// Close) — so an admission that drops a flow never mis-accounts and the caps can never
+// silently stop firing; a doomed dial is still rejected with the socket closed so no
+// fd leaks on rejection. reserve is all-or-nothing (it moves the global-total and
+// per-source counts together, never split), because a partial reserve with a rollback
+// would be the counter-leak shape that permanently locks a source out on every VIP.
 //
 // The budget is an OPEN-LOOP static reservation of the relay's fd slice, NOT a live
 // whole-daemon governor: TCP proxy handles and the kine/apiserver clients spend from
@@ -157,9 +163,11 @@ limitations under the License.
 // RLIMIT_NOFILE, floored at maxUDPFlows so a low launchd soft limit never regresses a
 // single VIP below its B23 per-VIP capacity; the k3sm assembler — which alone sees
 // the whole process fd table — sizes it deliberately via WithUDPFlowBudget, because a
-// leaf subsystem must not unilaterally partition a process-global resource.
-// Fair-share is PER VIP: a pod fanning flows across N distinct VIPs can still reach
-// the global budget; a per-source-GLOBAL sub-cap is a follow-up.
+// leaf subsystem must not unilaterally partition a process-global resource. The
+// per-source caps are DoS-resistance / FAIRNESS within the same-node shared trust
+// domain, NOT tenant isolation: same-node pods share one trust domain (no per-pod
+// uid) and a source-spoofing pod evades the per-source bucket — untrusted workloads
+// belong in a vm RuntimeClass.
 //
 // Like the TCP splice the relay RE-ORIGINATES traffic (Cluster policy): it does NOT
 // preserve the client pod source IP. On a multi-node mesh each upstream socket is
