@@ -1,0 +1,39 @@
+# INTERIM M7-bootstrap public CI: runs darwin-net's hack/ci.sh commit gate plus a
+# -race pass on every PR, on GitHub-hosted ephemeral macOS arm64.
+#
+# darwin-net's go.mod pins `replace k3sm.io/apis => ../apis` (untagged sibling), so a
+# lone checkout cannot resolve the module — CI checks out k3sm-io/apis at its DEFAULT
+# branch alongside this repo. That is the bootstrap simplification; the M7.2 gate
+# (pinned/coordinated sibling revisions) subsumes this workflow later.
+#
+# Security posture mirrors dco.yml: pull_request (never pull_request_target), a
+# read-only token, and every third-party action pinned by commit SHA.
+name: CI
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: darwin-net
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: k3sm-io/apis
+          path: apis
+      - uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
+        with:
+          go-version-file: darwin-net/go.mod
+      - name: gate
+        working-directory: darwin-net
+        run: hack/ci.sh
+      - name: race
+        working-directory: darwin-net
+        run: CGO_ENABLED=1 go test -race ./...
