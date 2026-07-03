@@ -483,7 +483,8 @@ func (p *Proxy) runWorker(w *portWorker) {
 // ensures the lo0 alias exists first.
 //
 // NodePort semantics (TCP): the *:NodePort listener accepts on every node interface
-// and L4-load-balances to ALL Ready backends (the Cluster pool via PickCluster) —
+// and L4-load-balances to ALL Ready backends (the Cluster pool via PickStickyCluster,
+// which also applies ClientIP session affinity over that pool) —
 // externalTrafficPolicy: Cluster. internalTrafficPolicy:Local is IGNORED on the
 // NodePort path: iTP governs the ClusterIP (east-west) path only (KEP-2086), so an
 // iTP:Local Service still serves its NodePort to every backend rather than dropping
@@ -563,8 +564,9 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 
 	// NodePort listener: bind the wildcard (*:NodePort) so every node interface
 	// answers, load-balancing to ALL Ready backends via the external scope
-	// (externalTrafficPolicy: Cluster — PickCluster ignores internalTrafficPolicy:Local;
-	// the splice does not preserve client src IP, so eTP:Local is not honored either).
+	// (externalTrafficPolicy: Cluster — PickStickyCluster ignores internalTrafficPolicy:
+	// Local while applying ClientIP session affinity over the Cluster pool; the splice
+	// does not preserve client src IP, so eTP:Local is not honored either).
 	if port.NodePort != 0 {
 		nodeAddr := net.JoinHostPort("", strconv.Itoa(int(port.NodePort)))
 		nl, err := net.Listen("tcp", nodeAddr)
@@ -584,7 +586,8 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 // file's Locality/trafficPolicy enum idiom). The ClusterIP (east-west) listener is
 // internal — it honors internalTrafficPolicy:Local and ClientIP affinity (PickSticky);
 // the *:NodePort listener is external — externalTrafficPolicy governs it, so it routes
-// to ALL Ready backends (PickCluster), ignoring iTP:Local.
+// to ALL Ready backends with ClientIP affinity over that Cluster pool
+// (PickStickyCluster), ignoring iTP:Local.
 const (
 	internalListener = false
 	externalListener = true
@@ -606,13 +609,13 @@ func (p *Proxy) serve(ln net.Listener, key PortKey, external bool) {
 }
 
 // handle proxies one accepted client connection to a Ready backend. external selects
-// the picker: the external (*:NodePort) path uses PickCluster
-// (externalTrafficPolicy:Cluster — ALL Ready backends, ignoring iTP:Local and without
-// ClientIP affinity, a documented deferral); the internal (ClusterIP) path uses
-// PickSticky, honoring iTP:Local and ClientIP session affinity. For the internal path
-// the client IP is extracted with its ephemeral source port stripped (clientAddr),
-// because affinity keys on the source IP alone; PickSticky degrades to plain
-// round-robin for a non-affinity port, so that path is unconditional.
+// the picker: the external (*:NodePort) path uses PickStickyCluster
+// (externalTrafficPolicy:Cluster — ClientIP session affinity over ALL Ready backends,
+// ignoring iTP:Local); the internal (ClusterIP) path uses PickSticky, honoring
+// iTP:Local and ClientIP session affinity. BOTH paths extract the client IP with its
+// ephemeral source port stripped (clientAddr), because affinity keys on the source IP
+// alone; both pickers degrade to plain round-robin over their scope's pool for a
+// non-affinity port, so either path is unconditional.
 func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 	defer client.Close()
 	var (
@@ -620,7 +623,7 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		err error
 	)
 	if external {
-		be, err = p.table.PickCluster(key)
+		be, err = p.table.PickStickyCluster(key, clientAddr(client.RemoteAddr()), time.Now())
 	} else {
 		be, err = p.table.PickSticky(key, clientAddr(client.RemoteAddr()), time.Now())
 	}
@@ -629,7 +632,7 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		// Debug: handle logs per-connection, so Info here would FLOOD a steady-state
 		// iTP:Local-starved Service; the throttled activePool Warn (once per backend
 		// set) is the observable signal. The ErrNoLocalBackends arm is ClusterIP-only —
-		// PickCluster (external) forces the Cluster pool and never returns it.
+		// PickStickyCluster (external) forces the Cluster pool and never returns it.
 		if errors.Is(err, ErrNoLocalBackends) {
 			p.logger().Debug("no node-local backend for internalTrafficPolicy:Local connection", "vip", key.String(), "err", err)
 		} else {
