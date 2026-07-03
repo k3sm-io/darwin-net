@@ -72,7 +72,14 @@ limitations under the License.
 //   - externalTrafficPolicy: Local is NOT honored — the userspace splice opens a
 //     fresh backend connection and so does not preserve the external client's source
 //     IP (the precondition Local relies on), so an eTP:Local Service gets Cluster
-//     behavior on its NodePort.
+//     behavior on its NodePort. The Watcher surfaces this divergence at the datapath:
+//     onService reads eTP SOLELY to emit a once-per-episode throttled Warn (B56) when
+//     a Service requests eTP:Local on a served NodePort — it never changes routing.
+//     That datapath Warn is COMPLEMENTARY to k3sm's admission-side VAP
+//     pkg/policy.EnsureExternalTrafficPolicyLocalWarn: it gives node-local
+//     observability at the exact point traffic diverges and is defense-in-depth for
+//     this independent module, which must not assume the control plane installed the
+//     VAP. It is not the sole surfacing.
 //   - ClientIP session affinity is NOT applied on the NodePort path. A direct external
 //     client's real source IP IS visible (so affinity COULD apply), but threading it
 //     now collides with the in-flight affinity work; it is an explicit, documented
