@@ -87,46 +87,121 @@ type affinityBinding struct {
 	lastSeen time.Time
 }
 
-// PickSticky selects a backend for key honoring ClientIP session affinity. It is the
-// TCP accept path's selector (proxy.handle): client is the connecting pod's IP with
-// the ephemeral source port already stripped (see clientAddr) — affinity keys on the
-// IP alone — and now is injected so expiry is testable without a real clock.
+// PickSticky selects a backend for key honoring ClientIP session affinity on the
+// INTERNAL (ClusterIP / east-west) accept path. It is a thin wrapper over
+// pickStickyScoped with the internal scope (external=false), so the ClusterIP path
+// gets the Ready + internalTrafficPolicy:Local-filtered pool (ErrNoLocalBackends when
+// no node-local backend remains). See pickStickyScoped for the affinity mechanics.
+func (t *RoutingTable) PickSticky(key PortKey, client netip.Addr, now time.Time) (backend, error) {
+	return t.pickStickyScoped(key, client, now, false)
+}
+
+// PickStickyCluster selects a backend for key honoring ClientIP session affinity on
+// the EXTERNAL (*:NodePort) accept path. It is a thin wrapper over pickStickyScoped
+// with the external scope (external=true), so affinity is applied over the FULL Ready
+// (Cluster) pool: externalTrafficPolicy governs NodePort and its default (Cluster)
+// routes to ALL backends, and internalTrafficPolicy:Local is IGNORED here (KEP-2086) —
+// a NodePort connection is never dropped for lack of a node-local backend, and a
+// binding is always re-validated against the FULL Ready set (allSet), never the
+// iTP:Local subset. It replaces the old non-sticky PickCluster: NodePort now honors
+// ClientIP affinity over the Cluster pool. See pickStickyScoped for the mechanics.
+func (t *RoutingTable) PickStickyCluster(key PortKey, client netip.Addr, now time.Time) (backend, error) {
+	return t.pickStickyScoped(key, client, now, true)
+}
+
+// pickStickyScoped is the scope-parametrized core shared by PickSticky (internal /
+// ClusterIP) and PickStickyCluster (external / NodePort). client is the connecting
+// pod's IP with the ephemeral source port already stripped (see clientAddr) —
+// affinity keys on the IP alone — and now is injected so expiry is testable without a
+// real clock. external selects the pool scope by driving activePool: false yields the
+// internalTrafficPolicy-filtered pool (with the iTP:Local drop/fail-open), true forces
+// the full Ready (Cluster) pool.
 //
-// When the port's affinity mode is not ClientIP, PickSticky is EXACTLY Pick:
-// round-robin over the active pool (so handle can call it unconditionally). Under
-// ClientIP it reuses a client's existing binding ONLY when that backend is still in
-// the current active pool (Ready + internalTrafficPolicy:Local-filtered, via the
-// shared activePool) AND the binding is within the port's idle timeout; otherwise it
-// round-robins a fresh backend and (re)binds. Re-validating against the LIVE pool on
-// every hit is load-bearing: a backend that went unready, or under iTP:Local left the
-// node-local subset, is re-picked, never reused — so affinity never dials a dead
-// backend nor spills node-local traffic across the mesh. An iTP:Local port with no
-// node-local backend propagates ErrNoLocalBackends (a drop), never a stale/remote
-// fallback.
+// The pool and its membership set are CONSUMED from the single activePool call, so
+// every downstream step is scope-agnostic: the cached binding is re-validated against
+// the set RETURNED by activePool (for external=true that is allSet, NOT st.localSet),
+// so the iTP:Local filter can never spill onto the NodePort surface, and the round-
+// robin/evict/ceiling/record steps operate on whichever pool the scope selected.
+//
+// When the port's affinity mode is not ClientIP, pickStickyScoped is EXACTLY Pick over
+// the scope's pool: round-robin (so handle can call either wrapper unconditionally).
+// Under ClientIP it reuses a client's existing binding ONLY when that backend is still
+// in the current active pool (O(1) membership in the returned set) AND the binding is
+// within the port's idle timeout; otherwise it round-robins a fresh backend and
+// (re)binds. Re-validating against the LIVE pool on every hit is load-bearing: a
+// backend that went unready, or (internal scope) under iTP:Local left the node-local
+// subset, is re-picked, never reused — so affinity never dials a dead backend nor (on
+// the internal path) spills node-local traffic across the mesh. An internal-scope
+// iTP:Local port with no node-local backend propagates ErrNoLocalBackends (a drop),
+// never a stale/remote fallback; the external scope never returns it.
 //
 // The round-robin cursor is advanced ONLY on a miss/expiry/invalidation, so a steady
-// sticky client does not perturb the fan-out of new clients. PickSticky takes the
-// table write lock (it may create or refresh a binding, and shares Pick's locking).
+// sticky client does not perturb the fan-out of new clients. pickStickyScoped takes
+// the table write lock (it may create or refresh a binding, and shares Pick's
+// locking).
 //
-// Trust model: the binding key is the client's source IP alone, so stickiness integrity
-// inherits the SAME substrate anti-spoofing the TCP splice and iTP:Local locality
-// already assume — a pod that could forge another's lo0 source IP could share, or (by
-// churning IPs to the cap) evict, that client's binding. This opens NO new isolation
-// boundary: there is no path to OBSERVE another client's binding, and the worst realized
-// effect is loss of stickiness → a fresh, still-revalidated round-robin pick, never a
-// routing or security break.
-func (t *RoutingTable) PickSticky(key PortKey, client netip.Addr, now time.Time) (backend, error) {
+// Trust model: the binding key is the client's source IP alone. On the internal
+// (ClusterIP) surface, stickiness integrity inherits the SAME substrate anti-spoofing
+// the TCP splice and iTP:Local locality already assume — a pod that could forge
+// another's lo0 source IP could share, or (by churning IPs to the cap) evict, that
+// client's binding. On the external (*:NodePort) surface B55 adds, there is NO such
+// substrate: an off-cluster client presents an arbitrary, unauthenticated source IP
+// (it is not a mesh pod and is not confined to the pod CIDR), so it can deliberately
+// collide with an internal client's key (share a binding) or churn source IPs to
+// consume the shared per-port/global budget (see "Shared budget" below). This still
+// opens NO new isolation boundary: there is no path to OBSERVE another client's
+// binding, every reuse is re-validated against the live Ready set (backends behind one
+// Service are fungible endpoints of that Service), and the worst realized effect is
+// loss of stickiness → a fresh, still-revalidated round-robin pick — never a routing,
+// reachability, or observation break. It is fail-open by construction, not a
+// containment control.
+//
+// Cross-scope couplings of the shared table-level t.affinity[key] map. The ClusterIP
+// and *:NodePort listeners are opened with the SAME PortKey (proxy.go:562 and :577),
+// so the binding sub-map for a port is SHARED across both scopes. This is INTENTIONAL
+// (the sub-map is deliberately NOT namespaced by scope), and has three consequences,
+// all self-correcting:
+//
+//   - Shared binding across surfaces: a client IP that hits BOTH the ClusterIP and the
+//     NodePort surface of one Service shares ONE binding, re-validated against each
+//     scope's set on every hit. If a backend is eligible under one scope but not the
+//     other (an iTP:Local Service whose bound backend is node-local: eligible on the
+//     internal path, and still eligible on the external path since external uses the
+//     full set), the mismatch only ever forces a drop-and-re-pick — never a wrong route.
+//     Worst case is stickiness thrash between the two surfaces, never a reachability or
+//     isolation break.
+//   - Shared budget: external NodePort source-IP churn consumes the SAME
+//     maxAffinityPerPort and relay-global affinityCount budget as east-west ClusterIP
+//     bindings, so internet-facing churn on a port can evict on-node ClusterIP
+//     stickiness for that same port (per-port cap) or, at the global ceiling, degrade
+//     new ClusterIP clients to round-robin. This is fail-open: eviction/degradation
+//     only loses stickiness, never reachability.
+//   - Mesh-egress /32 collapse: cross-node mesh-forwarded NodePort traffic is
+//     re-originated from the peer node's mesh-egress /32 (the userspace splice does not
+//     preserve the external client's source IP — DESIGN §5b), so ALL such clients
+//     behind one peer collapse to a SINGLE binding = coarse stickiness. But that one
+//     binding is still re-validated against the live Cluster pool on every hit, so it
+//     always resolves to a Ready backend — coarse, never wrong-routing.
+func (t *RoutingTable) pickStickyScoped(key PortKey, client netip.Addr, now time.Time, external bool) (backend, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	st := t.states[key]
 	if st == nil || len(st.all) == 0 {
 		return backend{}, ErrNoBackends
 	}
-	pool, set, err := t.activePool(key, st, false)
+	pool, set, err := t.activePool(key, st, external)
 	if err != nil {
-		// e.g. iTP:Local with no node-local backend: propagate the drop; never fall
-		// back to a stale binding (that would spill node-local traffic to a remote).
+		// e.g. internal-scope iTP:Local with no node-local backend: propagate the drop;
+		// never fall back to a stale binding (that would spill node-local traffic to a
+		// remote). The external scope is error-free today, but propagate rather than
+		// discard so a future eTP:Local drop surfaces as an error, not a silent spill.
 		return backend{}, err
+	}
+	// Defensive empty-pool guard (folded in from the old PickCluster): activePool's
+	// non-error return is non-empty today, but a future subset scope could empty the
+	// pool — guard roundRobin's cursor%len from a divide-by-zero.
+	if len(pool) == 0 {
+		return backend{}, ErrNoBackends
 	}
 	if st.affinityMode != affinityClientIP {
 		return t.roundRobin(st, pool), nil

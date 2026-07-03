@@ -397,12 +397,12 @@ var ErrNoLocalBackends = fmt.Errorf("proxy: no node-local backends for internalT
 // activePool returns the policy-correct backend pool for st together with a
 // membership set over that EXACT pool, or an error that must be surfaced (never
 // masked by a fallback). It remains the SINGLE selector, now parametrized by a SCOPE
-// rather than forked: activePool is NOT bypassed for NodePort — PickCluster calls it
-// with external=true — so the Ready-set selection can never drift between the
+// rather than forked: activePool is NOT bypassed for NodePort — PickStickyCluster
+// calls it with external=true — so the Ready-set selection can never drift between the
 // ClusterIP and NodePort paths.
 //
-//   - external (the *:NodePort accept path, PickCluster): the full Ready set (all /
-//     allSet), UNCONDITIONALLY. externalTrafficPolicy governs NodePort and its default
+//   - external (the *:NodePort accept path, PickStickyCluster): the full Ready set (all
+//     / allSet), UNCONDITIONALLY. externalTrafficPolicy governs NodePort and its default
 //     (Cluster) routes to ALL backends; internalTrafficPolicy:Local governs the
 //     ClusterIP (east-west) path ONLY (KEP-2086), so it is IGNORED here — a NodePort
 //     connection is never dropped for lack of a node-local backend.
@@ -462,8 +462,8 @@ func (t *RoutingTable) roundRobin(st *portState, pool []backend) backend {
 // only; ClientIP session affinity layers on top via PickSticky (affinity.go). Both
 // ClusterIP selectors call activePool with the INTERNAL scope (external=false), so
 // round-robin and sticky selection can never diverge on which backends are eligible;
-// the NodePort path is PickCluster, which calls the SAME activePool with the EXTERNAL
-// scope (forcing the Cluster pool, ignoring internalTrafficPolicy:Local).
+// the NodePort path is PickStickyCluster, which calls the SAME activePool with the
+// EXTERNAL scope (forcing the Cluster pool, ignoring internalTrafficPolicy:Local).
 //
 // The active pool depends on the key's traffic policy:
 //
@@ -490,54 +490,6 @@ func (t *RoutingTable) Pick(key PortKey) (backend, error) {
 	pool, _, err := t.activePool(key, st, false)
 	if err != nil {
 		return backend{}, err
-	}
-	return t.roundRobin(st, pool), nil
-}
-
-// PickCluster selects the next backend for key for the EXTERNAL (*:NodePort) accept
-// path, round-robining over ALL Ready backends. It is the counterpart to Pick for
-// traffic that arrives on the node-wide *:NodePort listener rather than the ClusterIP
-// VIP, and it shares the SAME per-key round-robin cursor as the ClusterIP path (one
-// fan-out sequence per port — no second cursor, so no new portState field).
-//
-// externalTrafficPolicy governs the NodePort surface; its default (Cluster) routes to
-// EVERY Ready backend, and internalTrafficPolicy:Local is IGNORED here — per KEP-2086
-// iTP governs the ClusterIP (east-west) path only and eTP governs NodePort. So an
-// iTP:Local Service with no node-local backend still serves its NodePort: PickCluster
-// forces the Cluster pool (activePool external scope) and NEVER returns
-// ErrNoLocalBackends. Two behaviors are deliberate, documented deferrals/divergences:
-//
-//   - It does NOT apply ClientIP session affinity. A direct external client's real
-//     source IP IS visible (so affinity COULD apply), but threading it now collides
-//     with the in-flight affinity work; deferred to a follow-up. NodePort connections
-//     round-robin the Cluster pool.
-//   - externalTrafficPolicy:Local is NOT honored: the userspace splice re-originates
-//     the connection from the node's mesh-egress /32, so the external client's source
-//     IP cannot be preserved — an eTP:Local Service gets Cluster behavior on its
-//     NodePort (same root cause as the src-IP note in openListener/doc.go).
-//
-// PickCluster takes the write lock (it advances the round-robin cursor via roundRobin)
-// and returns ErrNoBackends when the key has no Ready backends at all.
-func (t *RoutingTable) PickCluster(key PortKey) (backend, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	st := t.states[key]
-	if st == nil || len(st.all) == 0 {
-		return backend{}, ErrNoBackends
-	}
-	// external=true forces the Cluster pool (all / allSet), ignoring iTP:Local. That
-	// branch is error-free and non-empty TODAY (it returns st.all, guarded above), but
-	// check-and-propagate rather than discard: a deferred eTP:Local in activePool's
-	// external branch would surface a drop as an error here, and a silent discard would
-	// round-robin anyway — the exact iTP:Local-style blackhole this feature removes. The
-	// len(pool)==0 guard keeps roundRobin's cursor%len from a divide-by-zero if a future
-	// subset path can empty the external pool.
-	pool, _, err := t.activePool(key, st, true)
-	if err != nil {
-		return backend{}, err
-	}
-	if len(pool) == 0 {
-		return backend{}, ErrNoBackends
 	}
 	return t.roundRobin(st, pool), nil
 }

@@ -59,31 +59,36 @@ limitations under the License.
 // >=1024 wildcard needs no privilege, so there is no helper NodePort path.
 //
 // The NodePort path is externalTrafficPolicy: Cluster and is a DISTINCT selector from
-// the ClusterIP path: it calls RoutingTable.PickCluster (the external scope of the
-// shared activePool), which routes to every Ready backend and IGNORES
+// the ClusterIP path: it calls RoutingTable.PickStickyCluster (the external scope of
+// the shared activePool), which routes to every Ready backend and IGNORES
 // internalTrafficPolicy: Local. internalTrafficPolicy governs the ClusterIP
 // (east-west) path ONLY, externalTrafficPolicy governs NodePort (KEP-2086), so an
 // iTP:Local Service still serves its NodePort to all backends rather than dropping
 // when the node has no local endpoint — the *:NodePort listener no longer shares the
 // ClusterIP's iTP:Local filter (a plain external listener would otherwise inherit the
-// key's iTP and blackhole NodePort traffic on a node with only remote backends). Two
-// deliberate divergences follow:
+// key's iTP and blackhole NodePort traffic on a node with only remote backends).
 //
-//   - externalTrafficPolicy: Local is NOT honored — the userspace splice opens a
-//     fresh backend connection and so does not preserve the external client's source
-//     IP (the precondition Local relies on), so an eTP:Local Service gets Cluster
-//     behavior on its NodePort.
-//   - ClientIP session affinity is NOT applied on the NodePort path. A direct external
-//     client's real source IP IS visible (so affinity COULD apply), but threading it
-//     now collides with the in-flight affinity work; it is an explicit, documented
-//     deferral to a follow-up. NodePort connections round-robin the Cluster pool.
+// ClientIP session affinity IS applied on the NodePort path (B55), over the CLUSTER
+// pool: PickStickyCluster is PickSticky's external-scope sibling (both are thin
+// wrappers over pickStickyScoped), so a sessionAffinity: ClientIP Service pins each
+// client IP to a backend from the FULL Ready set — the iTP:Local subset is never
+// applied to NodePort, so external stickiness cannot spill the east-west locality
+// filter. The bindings share the port's table-level sub-map with the ClusterIP path
+// (same PortKey), a deliberate coupling documented on pickStickyScoped. One deliberate
+// divergence remains:
+//
+//   - externalTrafficPolicy: Local is NOT honored (a standing deferral, B56) — the
+//     userspace splice opens a fresh backend connection and so does not preserve the
+//     external client's source IP (the precondition Local relies on), so an eTP:Local
+//     Service gets Cluster behavior on its NodePort.
 //
 // SECURITY CAVEAT: internalTrafficPolicy:Local is NOT a mesh-containment boundary for a
 // Service that ALSO exposes a NodePort. The *:NodePort listener binds the wildcard
-// (reachable over the wireguard mesh and lo0), and PickCluster routes to remote backends,
-// so any pod that can dial nodeIP:NodePort reaches remote backends the iTP:Local ClusterIP
-// path would drop. iTP:Local bounds only the ClusterIP (east-west) selector, never the
-// NodePort surface — treat it as a routing policy, not an isolation control.
+// (reachable over the wireguard mesh and lo0), and PickStickyCluster routes to remote
+// backends, so any pod that can dial nodeIP:NodePort reaches remote backends the
+// iTP:Local ClusterIP path would drop. iTP:Local bounds only the ClusterIP (east-west)
+// selector, never the NodePort surface — treat it as a routing policy, not an isolation
+// control.
 //
 // A note on the iTP:Local fail-open (ClusterIP path): the degrade-to-Cluster fires on
 // !podCIDR.IsValid() ONLY (an unset/malformed podCIDR) — a VALID but wrong prefix
@@ -246,10 +251,12 @@ limitations under the License.
 //
 //   - Cross-node fidelity: affinity keys on the source IP THIS proxy sees. Same-node
 //     ClusterIP traffic arrives on loopback carrying the real pod lo0 IP (faithful),
-//     but cross-node and NodePort traffic is re-originated from the peer node's
-//     mesh-egress /32 (the userspace splice does not preserve the client src IP —
-//     DESIGN §5b), so all cross-node clients behind one peer collapse to a SINGLE
-//     affinity binding. This is a userspace-L4 limitation, not a bug.
+//     and the NodePort path applies the SAME ClientIP affinity over the Cluster pool
+//     (B55). But cross-node mesh-forwarded traffic is re-originated from the peer
+//     node's mesh-egress /32 (the userspace splice does not preserve the client src IP
+//     — DESIGN §5b), so all cross-node clients behind one peer collapse to a SINGLE
+//     affinity binding = COARSE stickiness (still re-validated to a Ready backend on
+//     every hit, never a wrong route). This is a userspace-L4 limitation, not a bug.
 //   - UDP affinity is DEFERRED (TCP-only). The ClusterIP UDP relay (B23) reuses a
 //     backend per client 5-tuple for the life of a flow, but that is flow-affinity,
 //     NOT per-client-IP sessionAffinity: it keys on the full 5-tuple (not the IP
