@@ -161,6 +161,28 @@ func (b *udpBudget) reserve(srcIP netip.Addr) (ok bool, reason udpRejectReason) 
 	return true, rejectNone
 }
 
+// peekAtCap is a READ-ONLY best-effort probe of the SAME two caps reserve enforces,
+// in the SAME order (global fd total first, then srcIP's per-source-GLOBAL share), so
+// the relay's first-lock early reject can drop a globally-capped new flow BEFORE the
+// dial. It holds b.mu because total and bySource are plain (mutex-guarded) fields — a
+// lock-free read of bySource (a map[netip.Addr]int) would race the reserve/release
+// writers (a runtime-fatal concurrent map read/write). It mutates NOTHING: the
+// second-lock reserve stays the SOLE authority over the counters, so the
+// conservation invariant is untouched. A stale-high read may drop one datagram the
+// authoritative reserve would have admitted — acceptable on lossy UDP, symmetric with
+// the relay's per-VIP peek.
+func (b *udpBudget) peekAtCap(srcIP netip.Addr) (atCap bool, reason udpRejectReason) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.total >= b.maxTotal {
+		return true, rejectGlobalFull
+	}
+	if b.bySource[srcIP] >= b.maxPerSource {
+		return true, rejectPerSourceGlobal
+	}
+	return false, rejectNone
+}
+
 // release returns one reserved slot: under mu it decrements total and srcIP's
 // per-source count together, pruning the source bucket at zero so an idle source
 // leaks no map slot. It MUST be called exactly once per successful reserve (i.e. once
@@ -246,6 +268,12 @@ type udpRelay struct {
 	budget       *udpBudget
 	log          *slog.Logger
 
+	// dial opens a connected per-flow upstream socket. It defaults to net.DialUDP
+	// (wired once in newUDPRelay) and is an intra-package TEST SEAM ONLY — a test
+	// injects a counting dialer to assert a globally-capped source never reaches the
+	// dial. It is never exported and never a runtime-flippable knob.
+	dial func(laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
+
 	mu     sync.Mutex
 	closed bool
 	flows  map[string]*udpFlow
@@ -282,6 +310,7 @@ func newUDPRelay(conn net.PacketConn, key PortKey, table *RoutingTable, meshEgre
 		perSourceCap: perSourceCap,
 		budget:       budget,
 		log:          log,
+		dial:         func(laddr, raddr *net.UDPAddr) (*net.UDPConn, error) { return net.DialUDP("udp", laddr, raddr) },
 		flows:        make(map[string]*udpFlow),
 		perSource:    make(map[netip.Addr]int),
 		done:         make(chan struct{}),
@@ -330,8 +359,14 @@ func (r *udpRelay) dispatch() {
 //
 // Admission is a first-lock best-effort reject → dial → second-lock authoritative
 // admit. The FIRST lock is a read-only early reject (per-VIP full OR this source at
-// its per-VIP cap) that skips a doomed dial but reserves and increments NOTHING. The
-// SECOND lock, at the insert site, is authoritative: it re-checks per-VIP, then
+// its per-VIP cap) that skips a doomed dial but reserves and increments NOTHING.
+// After r.mu is released, a second read-only best-effort PEEK of the shared budget
+// (budget.peekAtCap, under budget.mu — taken only AFTER r.mu is released, preserving
+// the relay.mu → budget.mu leaf order) drops a new flow whose source is already at
+// its per-source-GLOBAL share OR whose budget is fd-full, BEFORE the Pick+dial. Like
+// the per-VIP peek it is best-effort: a stale-high read may falsely drop one datagram,
+// acceptable on lossy UDP and symmetric with the per-VIP peek — the second lock stays
+// authoritative. The SECOND lock, at the insert site, is authoritative: it re-checks per-VIP, then
 // per-source-per-VIP, then reserves the shared budget LAST — which enforces BOTH the
 // global fd total AND this source's per-source-GLOBAL share across all VIPs (so a
 // successful reservation is always immediately paired with an insert — nothing can
@@ -374,6 +409,24 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 	}
 	r.mu.Unlock()
 
+	// Second best-effort early reject, now against the SHARED budget: budget.mu is
+	// taken only AFTER r.mu is released (relay.mu → budget.mu leaf order preserved), so
+	// a source already at its per-source-GLOBAL share, or a budget that is fd-full, is
+	// dropped BEFORE the Pick+dial. Read-only (peekAtCap reserves nothing); the
+	// second-lock reserve below remains authoritative, so a race here costs at worst a
+	// wasted early drop, never an over-admit. Mirrors the second-lock warn shapes.
+	if atCap, reason := r.budget.peekAtCap(srcIP); atCap {
+		if time.Since(*lastWarn) >= udpSaturationWarnInterval {
+			*lastWarn = time.Now()
+			if reason == rejectPerSourceGlobal {
+				r.log.Warn("udp relay per-source global flow cap reached; dropping new flow", "vip", r.key.String(), "src", srcIP.String(), "maxPerSourceGlobal", r.budget.maxPerSource)
+			} else {
+				r.log.Warn("udp relay global fd budget exhausted; dropping new flow", "vip", r.key.String(), "budget", r.budget.maxTotal)
+			}
+		}
+		return nil
+	}
+
 	be, err := r.table.Pick(r.key)
 	if err != nil {
 		r.log.Debug("udp relay no backend", "vip", r.key.String(), "err", err)
@@ -388,7 +441,7 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 		laddr = &net.UDPAddr{IP: r.meshEgress.AsSlice()}
 	}
 	raddr := net.UDPAddrFromAddrPort(be.Addr())
-	up, err := net.DialUDP("udp", laddr, raddr)
+	up, err := r.dial(laddr, raddr)
 	if err != nil {
 		r.log.Debug("udp relay dial backend", "vip", r.key.String(), "backend", raddr.String(), "err", err)
 		return nil

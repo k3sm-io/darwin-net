@@ -22,6 +22,7 @@ import (
 	"net/netip"
 	"sync"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -210,7 +211,7 @@ func TestExternalTrafficPolicyLocalWarns(t *testing.T) {
 // TestExternalTrafficPolicyReadIsObservabilityOnly proves the eTP read does NOT
 // perturb backend selection: a Service that sets eTP:Local and an otherwise-identical
 // control that leaves eTP unset translate to byte-identical (vip, policy, affinity),
-// and drive byte-identical PickCluster (NodePort) fan-out sequences through the real
+// and drive byte-identical PickStickyCluster (NodePort) fan-out sequences through the real
 // routing table. The eTP read changes ONLY the 5th classification return value.
 func TestExternalTrafficPolicyReadIsObservabilityOnly(t *testing.T) {
 	t.Parallel()
@@ -247,13 +248,16 @@ func TestExternalTrafficPolicyReadIsObservabilityOnly(t *testing.T) {
 		}
 	}
 
-	// Drive both through the real routing table and assert PickCluster (NodePort path)
-	// fan-out is byte-identical — the eTP read left backend selection untouched.
+	// Drive both through the real routing table and assert PickStickyCluster (the
+	// NodePort path since B55) fan-out is byte-identical — the eTP read left backend
+	// selection untouched.
 	eps := []netv1.Endpoint{
 		{IP: "10.42.0.5", Port: 8080, Ready: true},
 		{IP: "10.42.0.6", Port: 8080, Ready: true},
 		{IP: "10.42.0.7", Port: 8080, Ready: true},
 	}
+	client := netip.MustParseAddr("192.0.2.10")
+	now := time.Unix(1000, 0)
 	pick := func(vip netv1.ServiceVIP, pol trafficPolicy, aff affinityConfig) []netip.AddrPort {
 		tbl := NewRoutingTable(netip.Prefix{})
 		p := vip.Ports[0]
@@ -261,9 +265,9 @@ func TestExternalTrafficPolicyReadIsObservabilityOnly(t *testing.T) {
 		tbl.SetEndpointsPolicy(key, eps, pol, aff)
 		var seq []netip.AddrPort
 		for i := 0; i < 7; i++ {
-			b, err := tbl.PickCluster(key)
+			b, err := tbl.PickStickyCluster(key, client, now)
 			if err != nil {
-				t.Fatalf("PickCluster: %v", err)
+				t.Fatalf("PickStickyCluster: %v", err)
 			}
 			seq = append(seq, b.Addr())
 		}

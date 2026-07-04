@@ -562,6 +562,162 @@ func TestUDPRelayPerSourceGlobalCap(t *testing.T) {
 	}
 }
 
+// countingDialer wraps a real dial func and records how many times it was invoked,
+// so a test can assert the relay's first-lock early reject drops a globally-capped new
+// flow BEFORE ever paying the connect(2). It is -race safe: count is mutex-guarded.
+type countingDialer struct {
+	inner func(laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
+
+	mu    sync.Mutex
+	count int
+}
+
+// dial records the call then delegates to the wrapped dialer.
+func (d *countingDialer) dial(laddr, raddr *net.UDPAddr) (*net.UDPConn, error) {
+	d.mu.Lock()
+	d.count++
+	d.mu.Unlock()
+	return d.inner(laddr, raddr)
+}
+
+// calls reports how many times dial was invoked.
+func (d *countingDialer) calls() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.count
+}
+
+// TestUDPRelayFirstLockPerSourceGlobalReject is the B54 gate: it proves the first-lock
+// early reject now PEEKS the shared budget (peekAtCap) so a new flow whose source is
+// already at its per-source-GLOBAL share, OR whose budget is fd-full, is dropped BEFORE
+// the Pick+dial — not after a wasted connect(2)+Close at the authoritative second lock.
+// It drives upstreamFor DIRECTLY with a fabricated client source and an injected
+// counting dialer, asserting the dial counter stays at ZERO for a globally-capped
+// source.
+//
+// Non-vacuity: the "not capped" subtest reaches r.dial (count == 1), so a blanket
+// reject would fail it; without the peek the two capped subtests would dial once each
+// (the second lock rejects, but only AFTER the connect) — RED before B54.
+func TestUDPRelayFirstLockPerSourceGlobalReject(t *testing.T) {
+	t.Parallel()
+
+	be := newUDPEchoBackend(t)
+	defer be.close()
+	beIP, bePort := be.addrPort()
+
+	client := func(a, b, c, d byte, port int) net.Addr {
+		return &net.UDPAddr{IP: net.IPv4(a, b, c, d), Port: port}
+	}
+
+	// newRelay builds an UNSTARTED relay (upstreamFor is driven directly) on its own VIP
+	// socket, sharing the caller's budget, with a per-VIP per-source cap (100) high
+	// enough that ONLY the shared budget's caps bind. It injects a counting dialer that
+	// wraps net.DialUDP to a real loopback echo backend, so a not-capped flow dials once
+	// and a capped flow never dials. A long idle timeout means only explicit Close reaps.
+	newRelay := func(budget *udpBudget) (*udpRelay, *countingDialer) {
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen vip udp: %v", err)
+		}
+		vipAddr := pc.LocalAddr().(*net.UDPAddr)
+		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
+		tbl := NewRoutingTable(netip.Prefix{})
+		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
+		r := newUDPRelay(pc, key, tbl, netip.Addr{}, time.Hour, 100, budget, slog.Default())
+		cd := &countingDialer{inner: r.dial}
+		r.dial = cd.dial
+		return r, cd
+	}
+
+	cases := []struct {
+		name string
+		// budget builds the shared budget; preReserve reserves these sources directly
+		// (via budget.reserve) to pre-load bySource/total to the capped state under test.
+		budget     func() *udpBudget
+		preReserve []netip.Addr
+		src        net.Addr   // the NEW-flow client the subtest drives upstreamFor with
+		srcIP      netip.Addr // its parsed source IP (for the peek-reason assertion)
+		wantAdmit  bool       // true → reaches r.dial (count 1, non-nil); false → early reject (count 0, nil)
+		wantReason udpRejectReason
+	}{
+		{
+			// S1 is at its per-source-GLOBAL cap (2) across VIPs but UNDER the per-VIP cap
+			// (100) and the global total is far below maxTotal — only the per-source-GLOBAL
+			// peek can reject it, and it must, before the dial.
+			name:       "per-source-global capped → no dial",
+			budget:     func() *udpBudget { return newUDPBudget(100, 2) },
+			preReserve: []netip.Addr{netip.MustParseAddr("10.4.0.1"), netip.MustParseAddr("10.4.0.1")},
+			src:        client(10, 4, 0, 1, 40000),
+			srcIP:      netip.MustParseAddr("10.4.0.1"),
+			wantAdmit:  false,
+			wantReason: rejectPerSourceGlobal,
+		},
+		{
+			// The global fd total is exhausted (2 reserved == maxTotal 2). A brand-new
+			// source — under its own per-source cap — is early-rejected with rejectGlobalFull
+			// before the dial.
+			name:       "global-fd full → no dial",
+			budget:     func() *udpBudget { return newUDPBudget(2, 100) },
+			preReserve: []netip.Addr{netip.MustParseAddr("10.4.1.1"), netip.MustParseAddr("10.4.1.2")},
+			src:        client(10, 4, 1, 9, 40000),
+			srcIP:      netip.MustParseAddr("10.4.1.9"),
+			wantAdmit:  false,
+			wantReason: rejectGlobalFull,
+		},
+		{
+			// A source under ALL caps reaches r.dial (count 1, non-nil) — the non-vacuous
+			// negative proving the peek is not a blanket reject.
+			name:       "not capped → dials",
+			budget:     func() *udpBudget { return newUDPBudget(100, 100) },
+			preReserve: nil,
+			src:        client(10, 4, 2, 1, 40000),
+			srcIP:      netip.MustParseAddr("10.4.2.1"),
+			wantAdmit:  true,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			budget := tc.budget()
+			for _, s := range tc.preReserve {
+				if ok, _ := budget.reserve(s); !ok {
+					t.Fatalf("pre-reserve %v failed", s)
+				}
+			}
+			relay, cd := newRelay(budget)
+			defer relay.Close()
+			var lastWarn time.Time
+
+			up := relay.upstreamFor(tc.src, &lastWarn)
+
+			if tc.wantAdmit {
+				if up == nil {
+					t.Fatalf("flow dropped, want admitted (peek must not blanket-reject an under-cap source)")
+				}
+				if n := cd.calls(); n != 1 {
+					t.Fatalf("dial count = %d, want 1 (an admitted flow dials exactly once)", n)
+				}
+				return
+			}
+
+			// Capped: the flow is early-rejected and the dial is NEVER paid.
+			if up != nil {
+				t.Fatalf("flow admitted, want early-rejected at the first lock")
+			}
+			if n := cd.calls(); n != 0 {
+				t.Fatalf("dial count = %d, want 0 (a globally-capped source must be dropped BEFORE the dial)", n)
+			}
+			// The two regimes are distinguished by the peek's reason, which routes the
+			// throttled Warn (per-source-global vs global-fd). peekAtCap is read-only, so
+			// probing it here does not perturb the budget.
+			if atCap, reason := budget.peekAtCap(tc.srcIP); !atCap || reason != tc.wantReason {
+				t.Fatalf("peekAtCap(%v) = (%v, %v), want (true, %v)", tc.srcIP, atCap, reason, tc.wantReason)
+			}
+		})
+	}
+}
+
 // udpRoundTrip sends payload on the connected UDP socket c and returns the reply
 // read back within timeout. It fails the test on a write/read error.
 func udpRoundTrip(t *testing.T, c *net.UDPConn, payload string, timeout time.Duration) string {

@@ -306,6 +306,207 @@ func TestSessionAffinityClientIPSticky(t *testing.T) {
 	})
 }
 
+// TestNodePortClientIPAffinity is the B55 gate: the *:NodePort (external) accept path
+// honors ClientIP session affinity via RoutingTable.PickStickyCluster, over the CLUSTER
+// pool — externalTrafficPolicy:Cluster routes to ALL Ready backends and iTP:Local is
+// ignored (KEP-2086), so external stickiness is applied to the full Ready set and never
+// conflated with the east-west node-local filter. Each sub-case guards a failure mode
+// the pre-build critiques flagged:
+//
+//  1. Sticky over a >=2-backend pool — non-vacuous: distinct clients spread across the
+//     pool (round-robin would otherwise rotate), yet one client sticks.
+//  2. Cluster-scope, NOT iTP:Local-conflated — an iTP:Local port whose Ready backends
+//     are ALL REMOTE still sticks over the full pool on the external path, while the
+//     internal PickSticky DROPS (ErrNoLocalBackends) on the same port.
+//  3. Re-pick on a stale binding — a bound backend that leaves the pool is re-picked to
+//     a still-Ready backend, never dialed dead.
+//  4. Non-affinity NodePort degrades to round-robin — PickStickyCluster is safe to call
+//     unconditionally (the handle contract).
+func TestNodePortClientIPAffinity(t *testing.T) {
+	t.Parallel()
+
+	// 1. Sticky over a >=2-backend pool, non-vacuously. Over a pool of 8 backends,
+	// distinct client IPs fan out (>=2 backends seen), proving round-robin underneath
+	// would rotate — so one client returning the SAME backend across many calls is real
+	// stickiness, not a 1-backend artifact.
+	t.Run("sticky over a >=2-backend cluster pool (distribution not collapsed)", func(t *testing.T) {
+		t.Parallel()
+		tbl := NewRoutingTable(netip.Prefix{})
+		key := keyFor("10.43.0.55", 80)
+		eps := manyEndpoints(8)
+		tbl.SetEndpointsPolicy(key, eps, trafficCluster, clientIPAffinity(affinityTestTimeout))
+		pool := endpointIPSet(eps)
+		now := time.Unix(1000, 0)
+
+		// One client sticks to a single backend across many calls.
+		c1 := netip.MustParseAddr("10.1.2.3")
+		first, err := tbl.PickStickyCluster(key, c1, now)
+		if err != nil {
+			t.Fatalf("PickStickyCluster (bind c1): %v", err)
+		}
+		if !pool[first.Addr().Addr().String()] {
+			t.Fatalf("bound backend %q not in the cluster pool", first.Addr())
+		}
+		for i := 0; i < 50; i++ {
+			got, err := tbl.PickStickyCluster(key, c1, now)
+			if err != nil {
+				t.Fatalf("PickStickyCluster (sticky c1): %v", err)
+			}
+			if got.Addr() != first.Addr() {
+				t.Fatalf("NodePort affinity broke: c1 hit %v != %v (must stick over the cluster pool)", got.Addr(), first.Addr())
+			}
+		}
+
+		// A distinct second client is served (and stable); many distinct clients spread
+		// across >=2 backends, so the pool is NOT collapsed to one and single-client
+		// stickiness above is meaningful (a 1-backend pool would trivially pass).
+		c2 := netip.MustParseAddr("10.1.2.4")
+		second, err := tbl.PickStickyCluster(key, c2, now)
+		if err != nil {
+			t.Fatalf("PickStickyCluster (bind c2): %v", err)
+		}
+		if !pool[second.Addr().Addr().String()] {
+			t.Fatalf("c2 backend %q not in the cluster pool", second.Addr())
+		}
+		seen := map[string]int{first.Addr().Addr().String(): 1, second.Addr().Addr().String(): 1}
+		for i := 0; i < 40; i++ {
+			c := netip.MustParseAddr(fmt.Sprintf("10.7.7.%d", i+1))
+			be, err := tbl.PickStickyCluster(key, c, now)
+			if err != nil {
+				t.Fatalf("PickStickyCluster (distinct client): %v", err)
+			}
+			seen[be.Addr().Addr().String()]++
+		}
+		if len(seen) < 2 {
+			t.Fatalf("all clients collapsed to a single backend (%v); cluster round-robin under affinity must spread", seen)
+		}
+	})
+
+	// 2. THE CRITICAL: cluster-scope, NOT iTP:Local-conflated. A VALID podCIDR +
+	// iTP:Local + all-REMOTE backends has ZERO node-local backends. The external path
+	// must still stick over the FULL cluster pool (external forces allSet), while the
+	// internal PickSticky DROPS with ErrNoLocalBackends — proving PickStickyCluster
+	// re-validates against allSet, never st.localSet, so eTP:Local/B56 is not conflated.
+	t.Run("cluster-scope: iTP:Local all-remote sticks externally, drops internally", func(t *testing.T) {
+		t.Parallel()
+		cidr := netip.MustParsePrefix("100.64.0.0/24")
+		key := keyFor("10.43.0.56", 80)
+		// All-REMOTE (outside the /24): ZERO node-local backends under a valid podCIDR.
+		remoteEps := []netv1.Endpoint{
+			{IP: "100.64.1.5", Port: 8080, Ready: true},
+			{IP: "100.64.1.6", Port: 8080, Ready: true},
+			{IP: "100.64.1.7", Port: 8080, Ready: true},
+		}
+		remoteSet := endpointIPSet(remoteEps)
+		now := time.Unix(2000, 0)
+
+		tbl := NewRoutingTable(cidr)
+		tbl.SetEndpointsPolicy(key, remoteEps, trafficLocal, clientIPAffinity(affinityTestTimeout))
+
+		// External path: binds and sticks over the full (all-remote) cluster pool.
+		c1 := netip.MustParseAddr("100.64.9.9")
+		bound, err := tbl.PickStickyCluster(key, c1, now)
+		if err != nil {
+			t.Fatalf("PickStickyCluster with all-remote iTP:Local = %v, want a remote backend (external forces the cluster pool)", err)
+		}
+		if !remoteSet[bound.Addr().Addr().String()] {
+			t.Fatalf("external bound backend %q not in the (remote) cluster pool", bound.Addr())
+		}
+		for i := 0; i < 40; i++ {
+			got, err := tbl.PickStickyCluster(key, c1, now)
+			if err != nil {
+				t.Fatalf("PickStickyCluster (sticky): %v", err)
+			}
+			if got.Addr() != bound.Addr() {
+				t.Fatalf("external affinity broke over the cluster pool: %v != %v", got.Addr(), bound.Addr())
+			}
+		}
+
+		// Contrast: the INTERNAL selector on the SAME port drops — iTP:Local with no
+		// node-local backend. The external path did NOT weaken this east-west guarantee.
+		if be, err := tbl.PickSticky(key, c1, now); !errors.Is(err, ErrNoLocalBackends) {
+			t.Fatalf("PickSticky (internal) = (%v, %v), want ErrNoLocalBackends (iTP:Local drop preserved)", be.Addr(), err)
+		}
+	})
+
+	// 3. Re-pick on a stale binding: a bound backend that leaves the Ready pool (a
+	// reconcile to a set excluding it) is re-picked to a still-Ready backend on the next
+	// external call, never dialed dead.
+	t.Run("re-pick when the bound backend goes unready", func(t *testing.T) {
+		t.Parallel()
+		tbl := NewRoutingTable(netip.Prefix{})
+		key := keyFor("10.43.0.57", 80)
+		eps := manyEndpoints(6)
+		tbl.SetEndpointsPolicy(key, eps, trafficCluster, clientIPAffinity(affinityTestTimeout))
+		now := time.Unix(3000, 0)
+
+		// Warm the cursor so the bound backend is unlikely to be pool[0] (a fresh cursor
+		// re-picking pool[0] would make the re-pick assertion vacuous).
+		for i := 0; i < 3; i++ {
+			if _, err := tbl.PickStickyCluster(key, netip.MustParseAddr(fmt.Sprintf("10.8.8.%d", i+1)), now); err != nil {
+				t.Fatalf("warm-up PickStickyCluster: %v", err)
+			}
+		}
+		client := netip.MustParseAddr("10.1.2.3")
+		bound, err := tbl.PickStickyCluster(key, client, now)
+		if err != nil {
+			t.Fatalf("PickStickyCluster (bind): %v", err)
+		}
+		boundIP := bound.Addr().Addr().String()
+
+		// Reconcile to a set that EXCLUDES the bound backend (it went unready).
+		remaining := make([]netv1.Endpoint, 0, len(eps))
+		for _, e := range eps {
+			if e.IP != boundIP {
+				remaining = append(remaining, e)
+			}
+		}
+		tbl.SetEndpointsPolicy(key, remaining, trafficCluster, clientIPAffinity(affinityTestTimeout))
+
+		got, err := tbl.PickStickyCluster(key, client, now)
+		if err != nil {
+			t.Fatalf("PickStickyCluster after bound backend left pool: %v", err)
+		}
+		gotIP := got.Addr().Addr().String()
+		if gotIP == boundIP {
+			t.Fatalf("stale binding reused: %q left the Ready pool but was returned again (dead backend)", boundIP)
+		}
+		if !endpointIPSet(remaining)[gotIP] {
+			t.Fatalf("re-pick %q is not a Ready backend of the live pool", gotIP)
+		}
+	})
+
+	// 4. Non-affinity NodePort degrades to round-robin: a port with affinityMode !=
+	// ClientIP round-robins over the cluster pool, so handle can call PickStickyCluster
+	// unconditionally (the same contract PickSticky honors on the internal path).
+	t.Run("non-affinity NodePort round-robins over the cluster pool", func(t *testing.T) {
+		t.Parallel()
+		tbl := NewRoutingTable(netip.Prefix{})
+		key := keyFor("10.43.0.58", 80)
+		eps := manyEndpoints(6)
+		tbl.SetEndpointsPolicy(key, eps, trafficCluster, affinityConfig{}) // affinityNone
+		now := time.Unix(4000, 0)
+
+		// A single client is NOT pinned: it spreads across the pool by round-robin.
+		client := netip.MustParseAddr("10.1.2.3")
+		seen := map[string]int{}
+		for i := 0; i < 60; i++ {
+			be, err := tbl.PickStickyCluster(key, client, now)
+			if err != nil {
+				t.Fatalf("PickStickyCluster (None): %v", err)
+			}
+			seen[be.Addr().Addr().String()]++
+		}
+		if len(seen) < 2 {
+			t.Fatalf("non-affinity NodePort pinned one client to a single backend (%v); want round-robin spread", seen)
+		}
+		// No bindings recorded for a non-affinity port.
+		if n := len(tbl.affinity[key]); n != 0 {
+			t.Fatalf("non-affinity NodePort recorded %d bindings, want 0", n)
+		}
+	})
+}
+
 // TestAffinityAggregateBoundAndEviction is the B51 gate: it hardens B22's ClientIP
 // affinity with a relay-GLOBAL aggregate binding ceiling and an O(1) eviction. It
 // asserts INVARIANTS (count-conservation, reachability), never a specific eviction
