@@ -77,10 +77,17 @@ limitations under the License.
 // (same PortKey), a deliberate coupling documented on pickStickyScoped. One deliberate
 // divergence remains:
 //
-//   - externalTrafficPolicy: Local is NOT honored (a standing deferral, B56) — the
-//     userspace splice opens a fresh backend connection and so does not preserve the
-//     external client's source IP (the precondition Local relies on), so an eTP:Local
-//     Service gets Cluster behavior on its NodePort.
+//   - externalTrafficPolicy: Local is NOT honored — the userspace splice opens a
+//     fresh backend connection and so does not preserve the external client's source
+//     IP (the precondition Local relies on), so an eTP:Local Service gets Cluster
+//     behavior on its NodePort. The Watcher surfaces this divergence at the datapath:
+//     onService reads eTP SOLELY to emit a once-per-episode throttled Warn (B56) when
+//     a Service requests eTP:Local on a served NodePort — it never changes routing.
+//     That datapath Warn is COMPLEMENTARY to k3sm's admission-side VAP
+//     pkg/policy.EnsureExternalTrafficPolicyLocalWarn: it gives node-local
+//     observability at the exact point traffic diverges and is defense-in-depth for
+//     this independent module, which must not assume the control plane installed the
+//     VAP. It is not the sole surfacing.
 //
 // SECURITY CAVEAT: internalTrafficPolicy:Local is NOT a mesh-containment boundary for a
 // Service that ALSO exposes a NodePort. The *:NodePort listener binds the wildcard

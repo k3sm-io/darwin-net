@@ -26,27 +26,37 @@ import (
 )
 
 // serviceToVIP flattens a Kubernetes Service into the netv1.ServiceVIP the proxy
-// owns plus its internal traffic policy and ClientIP session-affinity config, or
-// returns (zero, trafficCluster, affinityConfig{}, false) when the Service is not one
-// the proxy serves: headless (no/None ClusterIP), ExternalName, or with no ports. The
-// trafficPolicy and affinityConfig are read from svc.Spec (InternalTrafficPolicy and
+// owns plus its internal traffic policy, ClientIP session-affinity config, and a
+// classification bool (externalLocalUnhonored), or returns (zero, trafficCluster,
+// affinityConfig{}, false, false) when the Service is not one the proxy serves:
+// headless (no/None ClusterIP), ExternalName, or with no ports. The trafficPolicy
+// and affinityConfig are read from svc.Spec (InternalTrafficPolicy and
 // SessionAffinity) and threaded to the routing table by the reconcile path — neither
-// is carried on the netv1 contract (apis), since only the proxy consumes them. It is
-// pure (no I/O), so the watch→proxy translation is table-testable independent of
-// client-go.
-func serviceToVIP(svc *corev1.Service) (netv1.ServiceVIP, trafficPolicy, affinityConfig, bool) {
+// is carried on the netv1 contract (apis), since only the proxy consumes them.
+//
+// externalLocalUnhonored is true iff the Service requests
+// externalTrafficPolicy:Local AND serves at least one NodePort — the exact
+// condition k3sm's userspace proxy cannot honor (the NodePort splice re-originates
+// from the node mesh-egress /32, so the client source IP is not preserved and
+// node-local endpoint selection is not applied; NodePort is delivered with Cluster
+// semantics). It is a PURE classification for the Watcher's throttled observability
+// Warn — routing is unaffected; serviceToVIP itself never logs.
+//
+// It is pure (no I/O), so the watch→proxy translation is table-testable independent
+// of client-go.
+func serviceToVIP(svc *corev1.Service) (netv1.ServiceVIP, trafficPolicy, affinityConfig, bool, bool) {
 	if svc == nil {
-		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false
+		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false, false
 	}
 	if svc.Spec.Type == corev1.ServiceTypeExternalName {
-		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false
+		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false, false
 	}
 	cip := svc.Spec.ClusterIP
 	if cip == "" || cip == corev1.ClusterIPNone {
-		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false
+		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false, false
 	}
 	if len(svc.Spec.Ports) == 0 {
-		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false
+		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false, false
 	}
 	out := netv1.ServiceVIP{
 		Namespace: svc.Namespace,
@@ -72,9 +82,20 @@ func serviceToVIP(svc *corev1.Service) (netv1.ServiceVIP, trafficPolicy, affinit
 		})
 	}
 	if len(out.Ports) == 0 {
-		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false
+		return netv1.ServiceVIP{}, trafficCluster, affinityConfig{}, false, false
 	}
-	return out.WithDefaults(), internalPolicy(svc.Spec.InternalTrafficPolicy), sessionAffinity(&svc.Spec), true
+	// externalTrafficPolicy:Local is unhonorable only on a served NodePort — the
+	// ClusterIP path never carried source-IP/node-local semantics, so eTP is a no-op
+	// there. Gate the classification on a NodePort being present among served ports.
+	hasNodePort := false
+	for i := range out.Ports {
+		if out.Ports[i].NodePort != 0 {
+			hasNodePort = true
+			break
+		}
+	}
+	externalLocalUnhonored := hasNodePort && svc.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal
+	return out.WithDefaults(), internalPolicy(svc.Spec.InternalTrafficPolicy), sessionAffinity(&svc.Spec), true, externalLocalUnhonored
 }
 
 // sessionAffinity maps a Service's SessionAffinity spec to the proxy-internal
