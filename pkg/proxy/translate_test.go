@@ -105,7 +105,7 @@ func TestServiceToVIP(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			vip, _, _, ok := serviceToVIP(tc.svc)
+			vip, _, _, ok, _ := serviceToVIP(tc.svc)
 			if ok != tc.wantOK {
 				t.Fatalf("serviceToVIP ok = %v, want %v", ok, tc.wantOK)
 			}
@@ -162,12 +162,54 @@ func TestServiceToVIPInternalTrafficPolicy(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, policy, _, ok := serviceToVIP(mk(tc.itp))
+			_, policy, _, ok, _ := serviceToVIP(mk(tc.itp))
 			if !ok {
 				t.Fatalf("serviceToVIP ok = false, want true")
 			}
 			if policy != tc.want {
 				t.Fatalf("policy = %d, want %d", policy, tc.want)
+			}
+		})
+	}
+}
+
+// TestServiceToVIPExternalLocalUnhonored asserts the pure 5th return value: the
+// externalLocalUnhonored classification is true iff the Service requests
+// externalTrafficPolicy:Local AND serves at least one NodePort — the exact
+// configuration k3sm's userspace NodePort splice cannot honor. It reads eTP SOLELY
+// for this observability signal; the classification is pure and never logs.
+func TestServiceToVIPExternalLocalUnhonored(t *testing.T) {
+	t.Parallel()
+	mk := func(etp corev1.ServiceExternalTrafficPolicy, nodePort int32) *corev1.Service {
+		return &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"},
+			Spec: corev1.ServiceSpec{
+				Type:                  corev1.ServiceTypeClusterIP,
+				ClusterIP:             "10.43.0.10",
+				ExternalTrafficPolicy: etp,
+				Ports:                 []corev1.ServicePort{{Port: 80, TargetPort: intstr.FromInt32(8080), Protocol: corev1.ProtocolTCP, NodePort: nodePort}},
+			},
+		}
+	}
+	cases := []struct {
+		name string
+		svc  *corev1.Service
+		want bool
+	}{
+		{"local on nodeport is unhonored", mk(corev1.ServiceExternalTrafficPolicyLocal, 30080), true},
+		{"local without nodeport is honorable (clusterip-only)", mk(corev1.ServiceExternalTrafficPolicyLocal, 0), false},
+		{"cluster on nodeport is honored", mk(corev1.ServiceExternalTrafficPolicyCluster, 30080), false},
+		{"unset on nodeport is honored", mk("", 30080), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, _, _, ok, unhonored := serviceToVIP(tc.svc)
+			if !ok {
+				t.Fatalf("serviceToVIP ok = false, want true")
+			}
+			if unhonored != tc.want {
+				t.Fatalf("externalLocalUnhonored = %v, want %v", unhonored, tc.want)
 			}
 		})
 	}
@@ -214,7 +256,7 @@ func TestServiceToVIPSessionAffinity(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, _, aff, ok := serviceToVIP(tc.svc)
+			_, _, aff, ok, _ := serviceToVIP(tc.svc)
 			if !ok {
 				t.Fatalf("serviceToVIP ok = false, want true")
 			}

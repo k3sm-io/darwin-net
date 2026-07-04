@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -40,6 +41,19 @@ type Watcher struct {
 	svcs    cache.SharedIndexInformer
 	slices  cache.SharedIndexInformer
 	log     *slog.Logger
+
+	// eTPLocalWarned throttles the externalTrafficPolicy:Local-unhonored datapath
+	// Warn to once per contiguous eTP:Local-on-NodePort episode, keyed by
+	// "namespace/name". It is touched ONLY from onService / onServiceDelete, which
+	// are the SAME single Service-informer handler goroutine, so it is race-free by
+	// that discipline; reconcileService (also driven by the EndpointSlice informer
+	// goroutine) must NOT touch it. eTPMu guards it anyway as defense-in-depth: the
+	// single-goroutine property is an implicit client-go behavior, and the failure
+	// mode of a future refactor breaking it is a fatal `concurrent map writes` throw
+	// that crashes k3sm-netd (a node data-path DoS), so the near-free lock removes
+	// the reliance on an un-contracted invariant.
+	eTPMu          sync.Mutex
+	eTPLocalWarned map[string]bool
 }
 
 // NewWatcher builds a Watcher over client for the given Proxy. It wires Service
@@ -50,11 +64,12 @@ func NewWatcher(client kubernetes.Interface, proxy *Proxy, log *slog.Logger) *Wa
 	}
 	f := informers.NewSharedInformerFactory(client, 0)
 	return &Watcher{
-		proxy:   proxy,
-		factory: f,
-		svcs:    f.Core().V1().Services().Informer(),
-		slices:  f.Discovery().V1().EndpointSlices().Informer(),
-		log:     log,
+		proxy:          proxy,
+		factory:        f,
+		svcs:           f.Core().V1().Services().Informer(),
+		slices:         f.Discovery().V1().EndpointSlices().Informer(),
+		log:            log,
+		eTPLocalWarned: make(map[string]bool),
 	}
 }
 
@@ -89,13 +104,66 @@ func (w *Watcher) Run(ctx context.Context) error {
 }
 
 // onService recomputes desired state for a changed Service and reconciles each of
-// its ports.
+// its ports. It first runs the throttled externalTrafficPolicy:Local observability
+// Warn (warnExternalLocal) — done HERE, on the single Service-informer goroutine,
+// not in reconcileService (which the EndpointSlice informer also drives on a second
+// goroutine, where the throttle map would race). Routing is unchanged by the Warn.
 func (w *Watcher) onService(obj any) {
 	svc, ok := obj.(*corev1.Service)
 	if !ok {
 		return
 	}
+	w.warnExternalLocal(svc)
 	w.reconcileService(svc)
+}
+
+// warnExternalLocal emits a once-per-episode Warn when svc requests
+// externalTrafficPolicy:Local on a served NodePort — the one configuration k3sm's
+// userspace proxy cannot honor. It reads eTP SOLELY for this signal; routing is
+// unaffected (the NodePort path already delivers Cluster semantics). The throttle
+// (eTPLocalWarned) fires once per CONTIGUOUS eTP:Local-on-NodePort episode: the
+// entry is cleared when the Service is observed no longer in that state (a
+// Local->Cluster->Local flip re-warns) and on delete (delete+recreate re-warns, no
+// leak).
+//
+// This is COMPLEMENTARY to k3sm's admission-side VAP
+// pkg/policy.EnsureExternalTrafficPolicyLocalWarn: this datapath Warn gives
+// node-local observability at the exact point traffic diverges and is
+// defense-in-depth for the independent darwin-net module, which must not assume the
+// k3sm control plane installed the VAP. It is not the sole surfacing.
+//
+// CONCURRENCY: called ONLY from onService / onServiceDelete (the single
+// Service-informer handler goroutine), so eTPLocalWarned needs no lock. Never call
+// this from reconcileService — the EndpointSlice informer drives that on a separate
+// goroutine.
+func (w *Watcher) warnExternalLocal(svc *corev1.Service) {
+	key := svc.Namespace + "/" + svc.Name
+	vip, _, _, ok, unhonored := serviceToVIP(svc)
+	if !ok || !unhonored {
+		// No longer eTP:Local-on-NodePort (or not served): end the episode so a
+		// later flip back to Local warns again.
+		w.eTPMu.Lock()
+		delete(w.eTPLocalWarned, key)
+		w.eTPMu.Unlock()
+		return
+	}
+	w.eTPMu.Lock()
+	already := w.eTPLocalWarned[key]
+	if !already {
+		w.eTPLocalWarned[key] = true
+	}
+	w.eTPMu.Unlock()
+	if already {
+		return
+	}
+	var nodePorts []int32
+	for _, p := range vip.Ports {
+		if p.NodePort != 0 {
+			nodePorts = append(nodePorts, p.NodePort)
+		}
+	}
+	w.log.Warn("externalTrafficPolicy:Local requested but not honored: k3sm serves NodePort with Cluster semantics — the userspace splice re-originates from the node mesh-egress /32, so the client source IP is not preserved and node-local endpoint selection is not applied",
+		"service", key, "externalTrafficPolicy", "Local", "delivered", "Cluster", "nodePorts", nodePorts)
 }
 
 // onServiceDelete tears down every port a deleted Service owned.
@@ -104,7 +172,13 @@ func (w *Watcher) onServiceDelete(obj any) {
 	if !ok {
 		return
 	}
-	vip, _, _, ok := serviceToVIP(svc)
+	// End any eTP:Local warn episode so a delete+recreate warns again (no map leak).
+	// Shares the single Service-informer goroutine with onService; eTPMu guards it
+	// as defense-in-depth regardless (see the eTPLocalWarned field doc).
+	w.eTPMu.Lock()
+	delete(w.eTPLocalWarned, svc.Namespace+"/"+svc.Name)
+	w.eTPMu.Unlock()
+	vip, _, _, ok, _ := serviceToVIP(svc)
 	if !ok {
 		return
 	}
@@ -145,7 +219,7 @@ func (w *Watcher) onSlice(obj any) {
 // internalTrafficPolicy (so the routing table can filter to node-local backends) and
 // its ClientIP session-affinity config.
 func (w *Watcher) reconcileService(svc *corev1.Service) {
-	vip, policy, affinity, ok := serviceToVIP(svc)
+	vip, policy, affinity, ok, _ := serviceToVIP(svc)
 	if !ok {
 		return
 	}
