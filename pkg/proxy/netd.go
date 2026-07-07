@@ -18,10 +18,10 @@ package proxy
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"net/netip"
 
+	"k3sm.io/darwin-net/pkg/netbind"
 	"k3sm.io/darwin-net/pkg/netd/wire"
 )
 
@@ -43,34 +43,27 @@ func (m *netdAliasManager) Remove(ctx context.Context, ip netip.Addr) error {
 }
 
 // binder opens the proxy's listening sockets. It is the consumer seam between the
-// proxy and the privilege model: the direct binder calls net.Listen (the proxy
-// binds its own sockets, an explicit run-as-root or unprivileged-≥1024 mode); the
-// netd binder asks the root daemon to bind a privileged (<1024) Service port and
-// passes the listening socket back over SCM_RIGHTS, so the unprivileged proxy can
-// serve a VIP:port it could not bind itself.
-type binder interface {
-	// Listen returns a listening socket on the SPECIFIC addr (never the wildcard).
-	Listen(ctx context.Context, network string, addr netip.AddrPort) (net.Listener, error)
-}
+// proxy and the privilege model, now shared with pkg/ingress and homed in
+// pkg/netbind: the direct binder calls net.Listen (the proxy binds its own
+// sockets, an explicit run-as-root or unprivileged-≥1024 mode); the netd binder
+// asks the root daemon to bind a privileged (<1024) Service port and passes the
+// listening socket back over SCM_RIGHTS, so the unprivileged proxy can serve a
+// VIP:port it could not bind itself.
+type binder = netbind.Binder
 
 // directBinder binds the proxy's own sockets with net.Listen. It is the default
-// and the run-as-root path.
-type directBinder struct{}
+// and the run-as-root path (the netbind.Direct implementation, aliased so proxy
+// call sites read unchanged).
+type directBinder = netbind.Direct
 
-// Listen binds addr directly.
-func (directBinder) Listen(_ context.Context, network string, addr netip.AddrPort) (net.Listener, error) {
-	return net.Listen(network, addr.String())
-}
-
-// netdBinder binds privileged ports through the root netd daemon. A port the proxy
-// can bind itself (>=1024) is bound locally to avoid a needless helper round-trip;
-// a privileged port (<1024) is requested from the daemon, which authorizes it and
-// returns the listening socket over SCM_RIGHTS. This is the one selection of the
-// bind backend (paired with the alias backend by WithNetdHelper), not a per-call
-// fork of policy: the <1024 split is a transport optimization, the daemon remains
+// netdBinder keeps the proxy's >=1024-binds-locally transport optimization while
+// delegating the privileged (<1024) bind to netbind.Netd — the module's single
+// SCM_RIGHTS fd-adoption path. This is the one selection of the bind backend
+// (paired with the alias backend by WithNetdHelper), not a per-call fork of
+// policy: the <1024 split avoids a needless helper round-trip, the daemon remains
 // the sole authority for the privileged bind.
 type netdBinder struct {
-	client *wire.Client
+	netd *netbind.Netd
 }
 
 // Listen binds addr, routing a privileged (<1024) port through the daemon.
@@ -78,14 +71,5 @@ func (b *netdBinder) Listen(ctx context.Context, network string, addr netip.Addr
 	if addr.Port() >= 1024 {
 		return net.Listen(network, addr.String())
 	}
-	f, err := b.client.BindPort(ctx, network, addr)
-	if err != nil {
-		return nil, fmt.Errorf("netd bind %s %s: %w", network, addr, err)
-	}
-	defer f.Close()
-	ln, err := net.FileListener(f)
-	if err != nil {
-		return nil, fmt.Errorf("adopt netd socket for %s: %w", addr, err)
-	}
-	return ln, nil
+	return b.netd.Listen(ctx, network, addr)
 }

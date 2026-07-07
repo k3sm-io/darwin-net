@@ -31,6 +31,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/netbind"
 	"k3sm.io/darwin-net/pkg/netd/wire"
 )
 
@@ -204,7 +205,7 @@ func WithNetdHelper(socketPath string) Option {
 	return func(p *Proxy) {
 		c := wire.NewClient(socketPath)
 		p.alias = &netdAliasManager{client: c}
-		p.binder = &netdBinder{client: c}
+		p.binder = &netdBinder{netd: &netbind.Netd{Client: c}}
 	}
 }
 
