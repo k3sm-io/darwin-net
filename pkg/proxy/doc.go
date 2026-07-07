@@ -268,4 +268,56 @@ limitations under the License.
 //     backend per client 5-tuple for the life of a flow, but that is flow-affinity,
 //     NOT per-client-IP sessionAffinity: it keys on the full 5-tuple (not the IP
 //     alone) and does not span reconnects. udprelay.go still calls Pick, unchanged.
+//
+// # NetworkPolicy L4 subset — VIP-mediated ingress hint, NOT isolation (M10.4)
+//
+// PolicyTable (policy.go) + PolicyWatcher (policywatch.go) add an
+// upstream-faithful RESTRICTION of NetworkPolicy ingress enforcement at the
+// userspace proxy's accept paths. The verdict is per (source addr, PICKED backend
+// pod IP, backend port), evaluated AFTER the routing table picks the backend —
+// TCP in handle post-Pick, UDP at relay flow admission (the once-per-flow pick in
+// upstreamFor; a denied flow is never created) — never per VIP/Service, because
+// one Service can front policy-heterogeneous pods. Semantics: a backend no policy
+// selects is allowed (default-allow-unless-selected); a selected backend admits a
+// source iff ANY policy's resolved ingress rule matches source AND port (union of
+// allows); otherwise deny. The PolicyWatcher resolves selectors (NetworkPolicy +
+// Pod + NAMESPACE informers — namespaceSelector matches namespace labels) into
+// concrete /32 source sets and port sets via a debounced FULL recompute
+// (policyRecomputeDebounce; O(policies × pods) is microseconds at k3sm scale and
+// wholesale replacement keeps the table trivially consistent), installed
+// atomically via PolicyTable.Update. Convergence after an API change is bounded
+// by informer latency + the debounce window; the table is EMPTY (allow
+// everything) until WaitForCacheSync — fail-open, never a partial-cache deny.
+//
+// THE HONEST CEILING (the M10.1→M10.4 causal link, m10-plan Res.12): once M10.1
+// gives each pod its own /32, direct pod-IP→pod-IP traffic bypasses the userspace
+// proxy ENTIRELY — the proxy is no longer an L4 chokepoint — so this subset
+// enforces ONLY on traffic that transits a Service VIP. ALL headless/StatefulSet
+// traffic (which resolves to pod IPs, never a VIP) bypasses it, as does any
+// direct pod-IP dial. The PolicyWatcher Warns once per policy about exactly this.
+// Policies aimed at infra VIPs the proxy yields via WithInfraVIPExemptions (the
+// kube-dns VIP, the rewritten kubernetes endpoint) are likewise unenforceable —
+// exempt VIPs never transit the hooked accept paths. Real tenant isolation
+// (shared lo0 trust domain, single _k3sm uid) routes to the vm RuntimeClass (M5),
+// never to this hint.
+//
+// Widen-only discipline: an inexpressible clause may only WIDEN allows, never
+// manufacture a deny upstream would not have. DEFERRED (widened or ignored
+// accordingly): ipBlock peers (widen the rule to any-source), ALL egress rules
+// (policyTypes: Egress is ignored entirely; an egress-only policy selects nothing
+// for ingress), named ports / endPort ranges / protocol-only port entries (widen
+// the rule to any-port), and the rule's protocol field (ignored — a TCP-only
+// allow also admits UDP on that port).
+//
+// Availability guardrails (fail-open by design): loopback sources and the
+// constructor-seeded always-allow /32s (node InternalIP, this node's + every
+// peer's mesh-egress /32) always pass, so node-origin dialers — the in-process
+// Ingress datapath, apiserver webhooks, hostNetwork clients — and re-originated
+// cross-node mesh traffic are never locked out by a pod policy (cross-node
+// sources collapse to the peer's mesh-egress /32, the same L4 fidelity limit
+// session affinity documents, so per-pod cross-node attribution is impossible
+// here). An UNKNOWN source (not a resolved pod IP, not always-allowed) is ALLOWED
+// with a throttled Warn naming it; a deny is a throttled Info. A nil PolicyTable
+// (the default — the k3sm assembler opts in via WithPolicyTable) allows
+// everything: the feature is strictly additive.
 package proxy

@@ -31,6 +31,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/netbind"
 	"k3sm.io/darwin-net/pkg/netd/wire"
 )
 
@@ -93,6 +94,11 @@ type Proxy struct {
 	// or routes them. It is set once by WithInfraVIPExemptions and read-only
 	// thereafter, so it needs no lock.
 	exemptVIPs map[netip.Addr]struct{}
+	// policy is the optional NetworkPolicy L4-subset verdict table (M10.4),
+	// consulted on the accept paths AFTER the backend pick. Nil (the default)
+	// allows everything — PolicyTable.Allow is nil-receiver-safe, so the hooks are
+	// unconditional. Set once by WithPolicyTable and read-only thereafter.
+	policy *PolicyTable
 	// udpBudget is the relay-GLOBAL admission budget shared by every per-VIP UDP relay:
 	// it caps concurrent upstream sockets across ALL relays (so the datagram relays
 	// cannot jointly exhaust the process fd table the co-resident control plane spends
@@ -188,6 +194,16 @@ func WithInfraVIPExemptions(vips ...netip.Addr) Option {
 	}
 }
 
+// WithPolicyTable wires the NetworkPolicy L4-subset verdict table (M10.4): the
+// accept paths consult it per (source, PICKED backend pod IP, backend port) —
+// TCP in handle after the pick, UDP at relay flow admission — and refuse a denied
+// connection/flow. Unset (nil) the proxy is policy-free: everything is allowed.
+// The k3sm assembler constructs the table (NewPolicyTable with the node's
+// always-allow seeds) and feeds it from a PolicyWatcher.
+func WithPolicyTable(t *PolicyTable) Option {
+	return func(p *Proxy) { p.policy = t }
+}
+
 // withAliasManager overrides the alias manager (tests inject the rootless fake).
 func withAliasManager(a aliasManager) Option {
 	return func(p *Proxy) { p.alias = a }
@@ -204,7 +220,7 @@ func WithNetdHelper(socketPath string) Option {
 	return func(p *Proxy) {
 		c := wire.NewClient(socketPath)
 		p.alias = &netdAliasManager{client: c}
-		p.binder = &netdBinder{client: c}
+		p.binder = &netdBinder{netd: &netbind.Netd{Client: c}}
 	}
 }
 
@@ -238,6 +254,12 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 	// table.log is safe under the goroutine-start happens-before.
 	if p.table != nil {
 		p.table.log = p.log
+	}
+	// Same propagation for the policy table's two throttled data-path signals (the
+	// unknown-source fail-open Warn and the deny Info); its logger() accessor
+	// nil-guards a WithLogger(nil) override, like the routing table's.
+	if p.policy != nil {
+		p.policy.log = p.log
 	}
 	return p
 }
@@ -541,6 +563,11 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 			return nil, fmt.Errorf("listen udp clusterIP %s: %w", clusterAP, err)
 		}
 		relay := newUDPRelay(pc, key, p.table, p.meshEgress, udpFlowIdleTimeout, maxUDPFlowsPerSource, p.udpBudget, p.log)
+		// NetworkPolicy L4 subset (M10.4): the relay consults the shared verdict
+		// table at flow admission (upstreamFor, after its once-per-flow Pick). Set
+		// before start so the dispatcher's read is covered by the goroutine-start
+		// happens-before; nil means policy-free.
+		relay.policy = p.policy
 		relay.start()
 		l.udp = relay
 		if port.NodePort != 0 {
@@ -618,14 +645,15 @@ func (p *Proxy) serve(ln net.Listener, key PortKey, external bool) {
 // non-affinity port, so either path is unconditional.
 func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 	defer client.Close()
+	src := clientAddr(client.RemoteAddr())
 	var (
 		be  backend
 		err error
 	)
 	if external {
-		be, err = p.table.PickStickyCluster(key, clientAddr(client.RemoteAddr()), time.Now())
+		be, err = p.table.PickStickyCluster(key, src, time.Now())
 	} else {
-		be, err = p.table.PickSticky(key, clientAddr(client.RemoteAddr()), time.Now())
+		be, err = p.table.PickSticky(key, src, time.Now())
 	}
 	if err != nil {
 		// Distinct messages so the two drop reasons are greppable, but BOTH stay at
@@ -638,6 +666,15 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		} else {
 			p.logger().Debug("no backend for connection", "vip", key.String(), "external", external, "err", err)
 		}
+		return
+	}
+	// NetworkPolicy L4-subset verdict (M10.4), AFTER the pick — per (source,
+	// picked-backend pod IP, backend port), never per VIP, because one Service can
+	// front policy-heterogeneous pods. A deny closes the accepted connection
+	// (deferred Close → client sees RST/EOF) before any backend dial; nil p.policy
+	// allows unconditionally (Allow is nil-receiver-safe).
+	if !p.policy.Allow(src, be.Addr().Addr(), be.Addr().Port()) {
+		p.policy.logDenied("tcp", key, src, be.Addr())
 		return
 	}
 	backendConn, err := p.dialer.Dial("tcp", be.Addr().String())
