@@ -268,6 +268,13 @@ type udpRelay struct {
 	budget       *udpBudget
 	log          *slog.Logger
 
+	// policy is the optional NetworkPolicy L4-subset verdict table (M10.4), shared
+	// with the owning Proxy and consulted ONCE per flow at admission (upstreamFor,
+	// after the once-per-flow Pick, before the dial) — a denied flow is never
+	// created. Nil allows everything (Allow is nil-receiver-safe). Set before
+	// start (goroutine-start happens-before) and read-only thereafter.
+	policy *PolicyTable
+
 	// dial opens a connected per-flow upstream socket. It defaults to net.DialUDP
 	// (wired once in newUDPRelay) and is an intra-package TEST SEAM ONLY — a test
 	// injects a counting dialer to assert a globally-capped source never reaches the
@@ -430,6 +437,14 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 	be, err := r.table.Pick(r.key)
 	if err != nil {
 		r.log.Debug("udp relay no backend", "vip", r.key.String(), "err", err)
+		return nil
+	}
+	// NetworkPolicy L4-subset verdict (M10.4) at flow admission, AFTER the
+	// once-per-flow pick (the verdict is per picked backend, never per VIP) and
+	// BEFORE the dial: a denied flow is never created — no upstream socket, no
+	// reader, no flow-table entry, and the datagram is dropped.
+	if !r.policy.Allow(srcIP, be.Addr().Addr(), be.Addr().Port()) {
+		r.policy.logDenied("udp", r.key, srcIP, be.Addr())
 		return nil
 	}
 	var laddr *net.UDPAddr
