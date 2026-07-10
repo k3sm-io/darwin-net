@@ -241,13 +241,27 @@ static int k3sm_query_a(const k3sm_cfg_t *c, const char *fqdn,
         return -1;
     }
 
-    if (sendto(fd, qbuf, pos, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+    /* CONNECT the UDP socket to the resolver, then send()/recv() — deliberately
+     * NOT sendto()/recvfrom(). Under a pod's Seatbelt profile an UNCONNECTED
+     * datagram socket's recvfrom() accepts from any peer and is classified
+     * network-inbound, which (allow network-outbound) does NOT grant — the reply
+     * is dropped with EPERM and every cluster lookup misses ("no such host"),
+     * while the raw UDP query works fine outside the sandbox. A connected socket's
+     * recv() belongs to the outbound flow the profile allows, and it hardens the
+     * client to accept only the queried resolver's reply. PROBE-VERIFIED on macOS
+     * 26.5.1 through the real execshim/Seatbelt path: unconnected recvfrom → EPERM,
+     * connected recv → ok, under (allow network-outbound)(allow network-bind). */
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (send(fd, qbuf, pos, 0) < 0) {
         close(fd);
         return -1;
     }
 
     uint8_t rbuf[1500];
-    ssize_t rn = recvfrom(fd, rbuf, sizeof(rbuf), 0, NULL, NULL);
+    ssize_t rn = recv(fd, rbuf, sizeof(rbuf), 0);
     close(fd);
     if (rn < 12) {
         return -1;
