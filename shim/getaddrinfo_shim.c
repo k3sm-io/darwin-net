@@ -349,8 +349,23 @@ int k3sm_getaddrinfo(const char *node, const char *service,
     k3sm_cfg_t cfg;
     k3sm_load_cfg(&cfg);
 
+    /* Diagnostic trace, gated on K3SM_DNS_DEBUG: report exactly what the shim sees
+     * (whether K3SM_DNS_SERVER was inherited, the config, and each cluster-query
+     * outcome) so an in-pod "no such host" localizes to env-not-seen vs query-miss.
+     * Off by default (unset env) — zero overhead and no workload stderr noise. */
+    int dbg = getenv("K3SM_DNS_DEBUG") != NULL;
+    if (dbg) {
+        fprintf(stderr, "k3sm-dns: getaddrinfo node=%s enabled=%d server=%s port=%s domain=%s nsearch=%d ndots=%d\n",
+                node ? node : "(null)", cfg.enabled, cfg.server[0] ? cfg.server : "(unset)",
+                cfg.port, cfg.domain[0] ? cfg.domain : "(unset)", cfg.nsearch, cfg.ndots);
+    }
+
     /* Not configured, or no hostname to resolve: defer to the system. */
     if (!cfg.enabled || node == NULL || node[0] == '\0') {
+        if (dbg) {
+            fprintf(stderr, "k3sm-dns: DEFER node=%s (enabled=%d) — K3SM_DNS_SERVER not seen in-pod\n",
+                    node ? node : "(null)", cfg.enabled);
+        }
         return getaddrinfo(node, service, hints, res);
     }
     /* AI_NUMERICHOST or a literal IPv4: let the system parse it. */
@@ -370,10 +385,18 @@ int k3sm_getaddrinfo(const char *node, const char *service,
     int ncand = k3sm_candidates(&cfg, node, cands, K3SM_MAX_SEARCH + 1);
     for (int i = 0; i < ncand; i++) {
         uint8_t addr4[4];
-        if (k3sm_query_a(&cfg, cands[i], addr4) == 0) {
+        int rc = k3sm_query_a(&cfg, cands[i], addr4);
+        if (dbg) {
+            fprintf(stderr, "k3sm-dns:   query %s @ %s:%s -> %s\n",
+                    cands[i], cfg.server, cfg.port, rc == 0 ? "HIT" : "miss/err");
+        }
+        if (rc == 0) {
             return k3sm_make_result(addr4, service, hints, res);
         }
     }
     /* Cluster resolver had no answer: fall through so external names still work. */
+    if (dbg) {
+        fprintf(stderr, "k3sm-dns: DEFER node=%s — cluster resolver missed all %d candidate(s)\n", node, ncand);
+    }
     return getaddrinfo(node, service, hints, res);
 }
