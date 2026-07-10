@@ -289,9 +289,9 @@ limitations under the License.
 // by informer latency + the debounce window; the table is EMPTY (allow
 // everything) until WaitForCacheSync — fail-open, never a partial-cache deny.
 //
-// THE HONEST CEILING (the M10.1→M10.4 causal link, m10-plan Res.12): once M10.1
-// gives each pod its own /32, direct pod-IP→pod-IP traffic bypasses the userspace
-// proxy ENTIRELY — the proxy is no longer an L4 chokepoint — so this subset
+// THE HONEST CEILING (the per-pod-/32 causal link): once each pod has its own
+// /32, direct pod-IP→pod-IP traffic bypasses the userspace proxy ENTIRELY — the
+// proxy is no longer an L4 chokepoint — so this subset
 // enforces ONLY on traffic that transits a Service VIP. ALL headless/StatefulSet
 // traffic (which resolves to pod IPs, never a VIP) bypasses it, as does any
 // direct pod-IP dial. The PolicyWatcher Warns once per policy about exactly this.

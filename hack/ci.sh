@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # darwin-net local CI — the docs/GO-STANDARDS.md commit gate in one command.
-# Exactly what a /orchestrate builder agent runs before checkpointing, and what the
-# workspace hack/ci.sh invokes for this repo. Run from anywhere.
+# The standard CI / pre-commit gate for this repo. Run from anywhere.
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
