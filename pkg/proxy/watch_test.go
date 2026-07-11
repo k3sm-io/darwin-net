@@ -25,12 +25,71 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
 
 	netv1 "k3sm.io/apis/net/v1"
 )
+
+// TestBackendsForPortStaticOverride pins the static-backend seam
+// (WithStaticBackends): an overridden Service resolves to its pinned backend set
+// — regardless of what EndpointSlices exist — while every other Service keeps the
+// slice-derived path. The seam exists for the loopback-bound single-node
+// apiserver: upstream EndpointSlice validation rejects loopback endpoint
+// addresses on create, so no slice can carry 127.0.0.1:6444 and the kubernetes
+// VIP would otherwise have no backend (in-pod client-go dials reset).
+func TestBackendsForPortStaticOverride(t *testing.T) {
+	static := map[string][]netv1.Endpoint{
+		"default/kubernetes": {{IP: "127.0.0.1", Port: 6444, Ready: true}},
+	}
+	w := NewWatcher(fake.NewSimpleClientset(), nil, slog.New(slog.DiscardHandler), WithStaticBackends(static))
+
+	ready := true
+	https := "https"
+	slicePort := int32(9999)
+	slices := []*discoveryv1.EndpointSlice{{
+		ObjectMeta:  metav1.ObjectMeta{Namespace: "default", Name: "stray"},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses:  []string{"100.64.0.9"},
+			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+		}},
+		Ports: []discoveryv1.EndpointPort{{Name: &https, Port: &slicePort}},
+	}}
+
+	tests := []struct {
+		name     string
+		key      string
+		slices   []*discoveryv1.EndpointSlice
+		wantN    int
+		wantIP   string
+		wantPort int32
+	}{
+		{"override wins even with slices present", "default/kubernetes", slices, 1, "127.0.0.1", 6444},
+		{"override applies with no slices", "default/kubernetes", nil, 1, "127.0.0.1", 6444},
+		{"non-overridden service keeps slice-derived backends", "default/web", slices, 1, "100.64.0.9", 9999},
+		{"non-overridden service with no slices is empty", "default/web", nil, 0, "", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eps := w.backendsForPort(tt.key, tt.slices, "https")
+			if len(eps) != tt.wantN {
+				t.Fatalf("backendsForPort(%s) returned %d endpoints, want %d", tt.key, len(eps), tt.wantN)
+			}
+			if tt.wantN == 0 {
+				return
+			}
+			if eps[0].IP != tt.wantIP || eps[0].Port != tt.wantPort {
+				t.Errorf("backendsForPort(%s) = %s:%d, want %s:%d", tt.key, eps[0].IP, eps[0].Port, tt.wantIP, tt.wantPort)
+			}
+			if !eps[0].Ready {
+				t.Errorf("backendsForPort(%s) endpoint not Ready", tt.key)
+			}
+		})
+	}
+}
 
 // captureHandler is a minimal slog.Handler that records emitted records so a test
 // can assert on level, message, and attributes. Its mutex makes it -race-safe even
