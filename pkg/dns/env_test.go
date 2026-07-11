@@ -183,7 +183,7 @@ func TestShimEnvNamesMatchC(t *testing.T) {
 	}
 	slices.Sort(got)
 
-	want := []string{EnvDNSServer, EnvDNSPort, EnvDNSDomain, EnvDNSSearch, EnvDNSNdots}
+	want := []string{EnvDNSServer, EnvDNSPort, EnvDNSDomain, EnvDNSSearch, EnvDNSNdots, EnvDNSDebug}
 	slices.Sort(want)
 
 	if !slices.Equal(got, want) {

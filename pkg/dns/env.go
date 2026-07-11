@@ -46,6 +46,11 @@ const (
 	// EnvDNSNdots names the ndots value in decimal. The C side reads it with atoi
 	// and defaults to 5 when unset or non-positive.
 	EnvDNSNdots = "K3SM_DNS_NDOTS"
+	// EnvDNSDebug gates the shim's stderr diagnostic trace (set to any value to
+	// enable). ConfigToEnv never emits it — the acceptance harness sets it
+	// directly on a pod under diagnosis — but it is part of the shim ABI, so the
+	// drift guard tracks it.
+	EnvDNSDebug = "K3SM_DNS_DEBUG"
 )
 
 // MaxNDots is the resolv.conf RES_MAXNDOTS ceiling (15) — the single source of the
