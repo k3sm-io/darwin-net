@@ -35,6 +35,52 @@ func newTestNetwork(t *testing.T) (*Network, *fakeAliasManager) {
 	return n, fake
 }
 
+// TestEnsureNodeAlias covers the node's OWN lo0 alias (the mesh-egress .1 the VK
+// node advertises as its NodeInternalIP so the apiserver node-proxy can dial
+// :10250 for `kubectl top node`): EnsureNodeAlias plumbs it, is idempotent, and —
+// critically — it survives a full stale-sweep because .1 lies outside the swept
+// pod range [.2, .254]. The sweep-survival leg is the regression guard for the
+// property the kubectl-top fix relies on (a reaped node alias would make top-node
+// fail intermittently moments after boot).
+func TestEnsureNodeAlias(t *testing.T) {
+	n, fake := newTestNetwork(t)
+	ctx := context.Background()
+
+	nodeIP, err := MeshEgressIP(n.CIDR())
+	if err != nil {
+		t.Fatalf("MeshEgressIP: %v", err)
+	}
+	if want := netip.MustParseAddr("100.64.0.1"); nodeIP != want {
+		t.Fatalf("MeshEgressIP = %s, want %s (the node's advertised NodeInternalIP)", nodeIP, want)
+	}
+
+	if err := n.EnsureNodeAlias(ctx, nodeIP); err != nil {
+		t.Fatalf("EnsureNodeAlias: %v", err)
+	}
+	if got := fake.ensures(nodeIP); got != 1 {
+		t.Errorf("ensures(%s) = %d, want 1", nodeIP, got)
+	}
+
+	// Idempotent: a startup reconcile may re-ensure it every boot; still one live alias.
+	if err := n.EnsureNodeAlias(ctx, nodeIP); err != nil {
+		t.Fatalf("EnsureNodeAlias (idempotent re-ensure): %v", err)
+	}
+	if got := fake.liveAliases(); got != 1 {
+		t.Errorf("liveAliases = %d after re-ensure, want 1", got)
+	}
+
+	// A full stale-sweep must NOT reclaim the reserved .1 (it is outside [.2, .254]).
+	if err := n.SweepStale(ctx, nil); err != nil {
+		t.Fatalf("SweepStale: %v", err)
+	}
+	if got := fake.removes(nodeIP); got != 0 {
+		t.Errorf("removes(%s) = %d after SweepStale, want 0 — the reserved .1 must be outside the swept range", nodeIP, got)
+	}
+	if got := fake.liveAliases(); got != 1 {
+		t.Errorf("liveAliases = %d after SweepStale, want 1 — the node .1 alias must survive the sweep", got)
+	}
+}
+
 // TestNetworkSetupAllocatesAndAliases maps to acceptance M2.1-a2 (rootless leg):
 // Setup returns a bindable IP inside the node /24 and ensures exactly one lo0
 // alias for it; the IP is recorded for the pod.
