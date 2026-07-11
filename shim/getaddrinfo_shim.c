@@ -167,7 +167,25 @@ static int k3sm_candidates(const k3sm_cfg_t *c, const char *name,
     return n;
 }
 
-/* -------- minimal DNS A query over UDP -------- */
+/* -------- minimal DNS A query over UDP (TCP refetch on truncation) -------- */
+
+/*
+ * Per-candidate attempts on a TRANSIENT failure (timeout, network error,
+ * SERVFAIL). Mirrors the Go reference resolver's queryAttempts and the
+ * resolv.conf "attempts" default; a definitive NOERROR/NXDOMAIN never retries.
+ */
+#define K3SM_DNS_ATTEMPTS 2
+
+/*
+ * k3sm_query_a outcomes. MISS is definitive — the server answered and the name
+ * has nothing (NXDOMAIN, or NOERROR with no A record) — so the caller moves to
+ * the next search candidate. TEMPFAIL means the outcome is UNKNOWN (timeout,
+ * network error, SERVFAIL, malformed response): the caller retries and, if it
+ * keeps failing, must NOT treat the name as absent.
+ */
+#define K3SM_DNS_HIT 0
+#define K3SM_DNS_MISS 1
+#define K3SM_DNS_TEMPFAIL (-1)
 
 /* Encode a dotted name into DNS wire label format. Returns bytes written or -1. */
 static int k3sm_encode_name(const char *name, uint8_t *buf, size_t cap) {
@@ -197,49 +215,56 @@ static int k3sm_encode_name(const char *name, uint8_t *buf, size_t cap) {
     return (int)pos;
 }
 
-/*
- * Query the configured DNS server for an A record of fqdn. On success writes the
- * 4-byte IPv4 address into addr4 and returns 0; returns -1 on any failure
- * (timeout, NXDOMAIN, no A record).
- */
-static int k3sm_query_a(const k3sm_cfg_t *c, const char *fqdn,
-                        uint8_t addr4[4]) {
-    uint8_t qbuf[512];
-    /* DNS header: id, flags(RD), qd=1 */
+/* Build a DNS A query for fqdn into qbuf. Returns the query length or -1. */
+static int k3sm_build_query(const char *fqdn, uint8_t qbuf[512]) {
+    /* DNS header: id, flags(RD), qd=1. The deterministic id matches the Go
+     * reference resolver's stance (trusted VIP path; and a late duplicate from
+     * a retried attempt still validates). */
     uint16_t id = 0x1234;
     memset(qbuf, 0, 12);
     qbuf[0] = (uint8_t)(id >> 8);
     qbuf[1] = (uint8_t)(id & 0xff);
     qbuf[2] = 0x01; /* RD */
     qbuf[5] = 0x01; /* QDCOUNT=1 */
-    int npos = k3sm_encode_name(fqdn, qbuf + 12, sizeof(qbuf) - 12);
+    int npos = k3sm_encode_name(fqdn, qbuf + 12, 512 - 12);
     if (npos < 0) {
         return -1;
     }
     size_t pos = 12 + (size_t)npos;
-    if (pos + 4 > sizeof(qbuf)) {
+    if (pos + 4 > 512) {
         return -1;
     }
     qbuf[pos++] = 0x00;
     qbuf[pos++] = 0x01; /* QTYPE=A */
     qbuf[pos++] = 0x00;
     qbuf[pos++] = 0x01; /* QCLASS=IN */
+    return (int)pos;
+}
 
+/* Fill sa from the configured server/port. Returns 0 or -1. */
+static int k3sm_server_addr(const k3sm_cfg_t *c, struct sockaddr_in *sa) {
+    memset(sa, 0, sizeof(*sa));
+    sa->sin_family = AF_INET;
+    sa->sin_port = htons((uint16_t)atoi(c->port));
+    if (inet_pton(AF_INET, c->server, &sa->sin_addr) != 1) {
+        return -1;
+    }
+    return 0;
+}
+
+/* One UDP round-trip. Returns response length into rbuf, or -1. */
+static ssize_t k3sm_udp_exchange(const k3sm_cfg_t *c, const uint8_t *qbuf,
+                                 size_t qlen, uint8_t *rbuf, size_t rcap) {
+    struct sockaddr_in sa;
+    if (k3sm_server_addr(c, &sa) != 0) {
+        return -1;
+    }
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         return -1;
     }
     struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t)atoi(c->port));
-    if (inet_pton(AF_INET, c->server, &sa.sin_addr) != 1) {
-        close(fd);
-        return -1;
-    }
 
     /* CONNECT the UDP socket to the resolver, then send()/recv() — deliberately
      * NOT sendto()/recvfrom(). Under a pod's Seatbelt profile an UNCONNECTED
@@ -255,26 +280,116 @@ static int k3sm_query_a(const k3sm_cfg_t *c, const char *fqdn,
         close(fd);
         return -1;
     }
-    if (send(fd, qbuf, pos, 0) < 0) {
+    if (send(fd, qbuf, qlen, 0) < 0) {
         close(fd);
         return -1;
     }
-
-    uint8_t rbuf[1500];
-    ssize_t rn = recv(fd, rbuf, sizeof(rbuf), 0);
+    ssize_t rn = recv(fd, rbuf, rcap, 0);
     close(fd);
-    if (rn < 12) {
+    return rn;
+}
+
+/*
+ * One TCP round-trip with RFC 1035 §4.2.2 length framing — the refetch path
+ * when a UDP response has TC set (the answer set did not fit a datagram).
+ */
+static ssize_t k3sm_tcp_exchange(const k3sm_cfg_t *c, const uint8_t *qbuf,
+                                 size_t qlen, uint8_t *rbuf, size_t rcap) {
+    struct sockaddr_in sa;
+    if (k3sm_server_addr(c, &sa) != 0) {
         return -1;
     }
-
-    /* Verify id and that it is a response. */
-    if (rbuf[0] != qbuf[0] || rbuf[1] != qbuf[1]) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
         return -1;
+    }
+    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        close(fd);
+        return -1;
+    }
+    uint8_t framed[2 + 512];
+    if (qlen > 512) {
+        close(fd);
+        return -1;
+    }
+    framed[0] = (uint8_t)(qlen >> 8);
+    framed[1] = (uint8_t)(qlen & 0xff);
+    memcpy(framed + 2, qbuf, qlen);
+    if (write(fd, framed, 2 + qlen) != (ssize_t)(2 + qlen)) {
+        close(fd);
+        return -1;
+    }
+    uint8_t lb[2];
+    size_t got = 0;
+    while (got < 2) {
+        ssize_t n = read(fd, lb + got, 2 - got);
+        if (n <= 0) {
+            close(fd);
+            return -1;
+        }
+        got += (size_t)n;
+    }
+    size_t rlen = ((size_t)lb[0] << 8) | lb[1];
+    if (rlen > rcap) {
+        close(fd);
+        return -1;
+    }
+    got = 0;
+    while (got < rlen) {
+        ssize_t n = read(fd, rbuf + got, rlen - got);
+        if (n <= 0) {
+            close(fd);
+            return -1;
+        }
+        got += (size_t)n;
+    }
+    close(fd);
+    return (ssize_t)rlen;
+}
+
+/*
+ * Parse a DNS response for the first A record. Returns K3SM_DNS_HIT (addr4
+ * filled), K3SM_DNS_MISS (definitive NXDOMAIN / no A record), or
+ * K3SM_DNS_TEMPFAIL (malformed / SERVFAIL and friends). *truncated is set when
+ * the response carries TC — the caller refetches over TCP.
+ */
+static int k3sm_parse_a(const uint8_t *rbuf, ssize_t rn, const uint8_t *qbuf,
+                        uint8_t addr4[4], int *truncated) {
+    *truncated = 0;
+    if (rn < 12) {
+        return K3SM_DNS_TEMPFAIL;
+    }
+    /* Verify id and that it actually is a response (QR bit). */
+    if (rbuf[0] != qbuf[0] || rbuf[1] != qbuf[1]) {
+        return K3SM_DNS_TEMPFAIL;
+    }
+    if ((rbuf[2] & 0x80) == 0) {
+        return K3SM_DNS_TEMPFAIL;
+    }
+    if (rbuf[2] & 0x02) { /* TC: answer set did not fit — refetch over TCP */
+        *truncated = 1;
+        return K3SM_DNS_TEMPFAIL; /* overridden by the caller's TCP refetch */
+    }
+    /*
+     * rcode: NOERROR and NXDOMAIN are DEFINITIVE (the server answered);
+     * SERVFAIL and everything else is transient upstream trouble and must
+     * never be treated as "no such host" (mirrors the Go lookupCandidate).
+     */
+    int rcode = rbuf[3] & 0x0f;
+    if (rcode == 3) { /* NXDOMAIN */
+        return K3SM_DNS_MISS;
+    }
+    if (rcode != 0) { /* SERVFAIL & friends */
+        return K3SM_DNS_TEMPFAIL;
     }
     int qdcount = (rbuf[4] << 8) | rbuf[5];
     int ancount = (rbuf[6] << 8) | rbuf[7];
     if (ancount < 1) {
-        return -1;
+        return K3SM_DNS_MISS; /* NOERROR, no answers: NODATA */
     }
 
     /* Skip the question section. */
@@ -294,31 +409,65 @@ static int k3sm_query_a(const k3sm_cfg_t *c, const char *fqdn,
 
     /* Walk answers for the first A record. */
     for (int a = 0; a < ancount && off + 12 <= (size_t)rn; a++) {
-        /* name (may be a compression pointer) */
-        if ((rbuf[off] & 0xc0) == 0xc0) {
-            off += 2;
-        } else {
-            while (off < (size_t)rn && rbuf[off] != 0) {
-                off += rbuf[off] + 1;
+        /* name (label sequence, possibly ending in a compression pointer) */
+        while (off < (size_t)rn && rbuf[off] != 0) {
+            if ((rbuf[off] & 0xc0) == 0xc0) {
+                off += 1; /* second pointer byte consumed below */
+                break;
             }
-            off += 1;
+            off += rbuf[off] + 1;
         }
+        off += 1;
         if (off + 10 > (size_t)rn) {
-            return -1;
+            return K3SM_DNS_TEMPFAIL;
         }
         int type = (rbuf[off] << 8) | rbuf[off + 1];
         int rdlen = (rbuf[off + 8] << 8) | rbuf[off + 9];
         off += 10;
         if (off + (size_t)rdlen > (size_t)rn) {
-            return -1;
+            return K3SM_DNS_TEMPFAIL;
         }
         if (type == 1 && rdlen == 4) { /* A */
             memcpy(addr4, rbuf + off, 4);
-            return 0;
+            return K3SM_DNS_HIT;
         }
         off += rdlen;
     }
-    return -1;
+    return K3SM_DNS_MISS;
+}
+
+/*
+ * Query the configured DNS server for an A record of fqdn: one UDP round-trip,
+ * refetched over TCP when the response is truncated. Returns K3SM_DNS_HIT
+ * (addr4 filled), K3SM_DNS_MISS (definitive), or K3SM_DNS_TEMPFAIL.
+ */
+static int k3sm_query_a(const k3sm_cfg_t *c, const char *fqdn,
+                        uint8_t addr4[4]) {
+    uint8_t qbuf[512];
+    int qlen = k3sm_build_query(fqdn, qbuf);
+    if (qlen < 0) {
+        return K3SM_DNS_MISS; /* unencodable name can never resolve: definitive */
+    }
+
+    uint8_t rbuf[1500];
+    ssize_t rn = k3sm_udp_exchange(c, qbuf, (size_t)qlen, rbuf, sizeof(rbuf));
+    if (rn < 0) {
+        return K3SM_DNS_TEMPFAIL;
+    }
+    int truncated = 0;
+    int rc = k3sm_parse_a(rbuf, rn, qbuf, addr4, &truncated);
+    if (!truncated) {
+        return rc;
+    }
+    rn = k3sm_tcp_exchange(c, qbuf, (size_t)qlen, rbuf, sizeof(rbuf));
+    if (rn < 0) {
+        return K3SM_DNS_TEMPFAIL;
+    }
+    rc = k3sm_parse_a(rbuf, rn, qbuf, addr4, &truncated);
+    if (truncated) {
+        return K3SM_DNS_TEMPFAIL; /* TC over TCP is malformed */
+    }
+    return rc;
 }
 
 /* Build a one-entry struct addrinfo result for an IPv4 address. */
@@ -399,16 +548,42 @@ int k3sm_getaddrinfo(const char *node, const char *service,
     int ncand = k3sm_candidates(&cfg, node, cands, K3SM_MAX_SEARCH + 1);
     for (int i = 0; i < ncand; i++) {
         uint8_t addr4[4];
-        int rc = k3sm_query_a(&cfg, cands[i], addr4);
+        int rc = K3SM_DNS_TEMPFAIL;
+        for (int attempt = 0; attempt < K3SM_DNS_ATTEMPTS && rc == K3SM_DNS_TEMPFAIL;
+             attempt++) {
+            rc = k3sm_query_a(&cfg, cands[i], addr4);
+        }
         if (dbg) {
             fprintf(stderr, "k3sm-dns:   query %s @ %s:%s -> %s\n",
-                    cands[i], cfg.server, cfg.port, rc == 0 ? "HIT" : "miss/err");
+                    cands[i], cfg.server, cfg.port,
+                    rc == K3SM_DNS_HIT      ? "HIT"
+                    : rc == K3SM_DNS_MISS   ? "miss"
+                                            : "TEMPFAIL");
         }
-        if (rc == 0) {
+        if (rc == K3SM_DNS_HIT) {
             return k3sm_make_result(addr4, service, hints, res);
         }
+        if (rc == K3SM_DNS_TEMPFAIL) {
+            /*
+             * The cluster resolver is not answering. Every candidate asks the
+             * same server, so trying the rest only burns timeouts — and
+             * deferring to the host resolver would let it give a confident
+             * WRONG answer (NXDOMAIN) for a cluster name. Report an honest
+             * temporary failure instead; callers retry EAI_AGAIN. Mirrors the
+             * Go resolver's ErrTempFail.
+             */
+            if (dbg) {
+                fprintf(stderr,
+                        "k3sm-dns: EAI_AGAIN node=%s — cluster resolver unreachable "
+                        "(candidate %s, %d attempts)\n",
+                        node, cands[i], K3SM_DNS_ATTEMPTS);
+            }
+            return EAI_AGAIN;
+        }
+        /* K3SM_DNS_MISS: definitive — try the next search candidate. */
     }
-    /* Cluster resolver had no answer: fall through so external names still work. */
+    /* Every candidate definitively missed: an external name — fall through so
+     * the host resolver can answer it. */
     if (dbg) {
         fprintf(stderr, "k3sm-dns: DEFER node=%s — cluster resolver missed all %d candidate(s)\n", node, ncand);
     }

@@ -141,3 +141,87 @@ func TestNewResolverRejectsBadConfig(t *testing.T) {
 		t.Fatalf("NewResolver with no cluster IP err = %v, want ErrInvalid", err)
 	}
 }
+
+// TestLookupHostRetriesLostDatagram asserts a single lost UDP datagram does not
+// fail the candidate: the resolver retries (queryAttempts) and resolves the SAME
+// candidate, rather than sliding past it to a later search domain — which is how
+// one dropped packet used to turn into a wrong NXDOMAIN.
+func TestLookupHostRetriesLostDatagram(t *testing.T) {
+	t.Parallel()
+	want := netip.MustParseAddr("10.43.0.42")
+	stub := newStubDNS(t, map[string]netip.Addr{
+		"web.default.svc.cluster.local": want,
+	})
+	defer stub.close()
+	stub.dropNext("web.default.svc.cluster.local", 1)
+
+	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(200*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	addrs, err := r.LookupHost(context.Background(), "web")
+	if err != nil {
+		t.Fatalf("LookupHost(web) with one dropped datagram: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0] != want {
+		t.Fatalf("LookupHost = %v, want [%v]", addrs, want)
+	}
+}
+
+// TestLookupHostServfailIsTempFailNotNotFound asserts SERVFAIL surfaces as
+// ErrTempFail and STOPS the candidate walk: every candidate asks the same
+// server, so continuing past a failing candidate can only produce a wrong
+// answer from a later search domain (or a false "no such host").
+func TestLookupHostServfailIsTempFailNotNotFound(t *testing.T) {
+	t.Parallel()
+	// The later candidate exists — a resolver that slid past the SERVFAIL
+	// would "resolve" kube-dns from the wrong search domain.
+	stub := newStubDNS(t, map[string]netip.Addr{
+		"kube-dns.svc.cluster.local": netip.MustParseAddr("10.43.0.99"),
+	})
+	defer stub.close()
+	stub.setServfail("kube-dns.default.svc.cluster.local")
+
+	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(time.Second))
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	_, err = r.LookupHost(context.Background(), "kube-dns")
+	if !errors.Is(err, ErrTempFail) {
+		t.Fatalf("LookupHost with SERVFAIL err = %v, want ErrTempFail", err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Fatalf("SERVFAIL collapsed into ErrNotFound: %v", err)
+	}
+	if stub.asked("kube-dns.svc.cluster.local") {
+		t.Fatalf("resolver walked past a SERVFAIL candidate to a later search domain")
+	}
+}
+
+// TestLookupHostTruncatedRefetchesTCP asserts a TC-bit UDP response triggers a
+// TCP refetch of the same query (RFC 1035 §4.2.2) and the lookup returns the
+// full answer from the TCP path.
+func TestLookupHostTruncatedRefetchesTCP(t *testing.T) {
+	t.Parallel()
+	want := netip.MustParseAddr("10.43.0.7")
+	stub := newStubDNS(t, map[string]netip.Addr{
+		"big.default.svc.cluster.local": want,
+	})
+	defer stub.close()
+	stub.setTruncateUDP("big.default.svc.cluster.local")
+
+	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(time.Second))
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	addrs, err := r.LookupHost(context.Background(), "big")
+	if err != nil {
+		t.Fatalf("LookupHost(big) with truncated UDP: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0] != want {
+		t.Fatalf("LookupHost = %v, want [%v]", addrs, want)
+	}
+	if !stub.askedTCP("big.default.svc.cluster.local") {
+		t.Fatalf("resolver never re-fetched the truncated answer over TCP")
+	}
+}

@@ -18,8 +18,10 @@ package dns
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"time"
@@ -32,10 +34,23 @@ import (
 // defaultQueryTimeout bounds a single CoreDNS query attempt.
 const defaultQueryTimeout = 2 * time.Second
 
+// queryAttempts is how many times one candidate FQDN is queried when the
+// attempt fails transiently (timeout, network error, SERVFAIL). It mirrors the
+// resolv.conf "attempts" default; a definitive answer (NOERROR/NXDOMAIN) never
+// retries. The C shim mirrors this as K3SM_DNS_ATTEMPTS.
+const queryAttempts = 2
+
 // ErrNotFound is returned by Resolver.LookupHost when no candidate name resolved
 // to any address (NXDOMAIN/empty across the whole search list). It mirrors the
 // "no such host" outcome the getaddrinfo shim reports to the caller.
 var ErrNotFound = errors.New("dns: no address found for name")
+
+// ErrTempFail is returned by Resolver.LookupHost when a candidate query kept
+// failing transiently (timeout, network error, SERVFAIL) after queryAttempts.
+// It is deliberately distinct from ErrNotFound: "the resolver did not answer"
+// must never be collapsed into "the name does not exist". The C shim mirrors
+// this outcome as EAI_AGAIN.
+var ErrTempFail = errors.New("dns: cluster resolver temporarily unavailable")
 
 // Resolver turns a hostname into addresses by applying ndots/search expansion
 // (the pure candidateNames logic) and querying CoreDNS over the cluster DNS VIP.
@@ -101,40 +116,72 @@ func (r *Resolver) serverAddr() string {
 // candidate in order and returning the addresses from the first candidate that
 // resolves. A SHORT name (e.g. "web") is expanded through the search domains
 // first, so it resolves as a Service name without the caller qualifying it. It
-// returns ErrNotFound when no candidate resolves.
+// returns ErrNotFound when every candidate misses definitively, and ErrTempFail
+// (wrapped) when a candidate's queries kept failing transiently — it does NOT
+// try later candidates past a transient failure: every candidate asks the same
+// server, and a definitive answer from a LATER candidate after a lost earlier
+// one is a wrong answer, not a fallback.
 func (r *Resolver) LookupHost(ctx context.Context, name string) ([]netip.Addr, error) {
 	cands := r.Candidates(name)
 	if len(cands) == 0 {
 		return nil, fmt.Errorf("dns: empty query name")
 	}
-	var firstErr error
 	for _, fqdn := range cands {
-		addrs, err := r.queryA(ctx, fqdn)
+		addrs, err := r.lookupCandidate(ctx, fqdn)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
+			return nil, fmt.Errorf("dns: lookup %q: %w", name, err)
 		}
 		if len(addrs) > 0 {
 			return addrs, nil
 		}
 	}
-	if firstErr != nil {
-		return nil, fmt.Errorf("dns: lookup %q: %w", name, firstErr)
-	}
 	return nil, fmt.Errorf("dns: lookup %q: %w", name, ErrNotFound)
 }
 
-// queryA sends a single A-record query for fqdn to CoreDNS and returns the
-// answer addresses (empty when the name has no A records / NXDOMAIN).
-func (r *Resolver) queryA(ctx context.Context, fqdn string) ([]netip.Addr, error) {
+// lookupCandidate resolves one FQDN, retrying transient failures up to
+// queryAttempts. A nil error with empty addrs is a DEFINITIVE miss (NXDOMAIN or
+// NODATA — the server answered, the name has nothing); a non-nil error wraps
+// ErrTempFail and means the outcome is unknown.
+func (r *Resolver) lookupCandidate(ctx context.Context, fqdn string) ([]netip.Addr, error) {
+	var lastErr error
+	for range queryAttempts {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrTempFail, err)
+		}
+		res, err := r.queryA(ctx, fqdn)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		switch res.rcode {
+		case dnsmessage.RCodeSuccess, dnsmessage.RCodeNameError:
+			return res.addrs, nil
+		default:
+			// SERVFAIL and friends are transient upstream trouble; retrying is
+			// right and treating them as "no such host" is not.
+			lastErr = fmt.Errorf("server returned %v", res.rcode)
+		}
+	}
+	return nil, fmt.Errorf("%w after %d attempts: %v", ErrTempFail, queryAttempts, lastErr)
+}
+
+// aResult is one candidate query's decoded outcome: the rcode distinguishes a
+// definitive NXDOMAIN from transient server trouble, which addrs alone cannot.
+type aResult struct {
+	addrs []netip.Addr
+	rcode dnsmessage.RCode
+}
+
+// queryA sends a single A-record query for fqdn to CoreDNS over UDP, re-fetching
+// over TCP when the response has TC set (RFC 1035 §4.2.2 — the answer set did
+// not fit a plain-UDP response).
+func (r *Resolver) queryA(ctx context.Context, fqdn string) (aResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
 	name, err := dnsmessage.NewName(ensureFQDN(fqdn))
 	if err != nil {
-		return nil, fmt.Errorf("encode name %q: %w", fqdn, err)
+		return aResult{}, fmt.Errorf("encode name %q: %w", fqdn, err)
 	}
 	msg := dnsmessage.Message{
 		Header: dnsmessage.Header{
@@ -149,65 +196,111 @@ func (r *Resolver) queryA(ctx context.Context, fqdn string) ([]netip.Addr, error
 	}
 	packed, err := msg.Pack()
 	if err != nil {
-		return nil, fmt.Errorf("pack query: %w", err)
+		return aResult{}, fmt.Errorf("pack query: %w", err)
 	}
 
-	conn, err := r.dial(ctx, "udp", r.serverAddr())
+	resp, err := r.exchange(ctx, "udp", packed)
 	if err != nil {
-		return nil, fmt.Errorf("dial coredns %s: %w", r.serverAddr(), err)
+		return aResult{}, err
+	}
+	res, truncated, err := parseAAddrs(resp, msg.Header.ID)
+	if err != nil {
+		return aResult{}, err
+	}
+	if truncated {
+		resp, err = r.exchange(ctx, "tcp", packed)
+		if err != nil {
+			return aResult{}, fmt.Errorf("tcp refetch: %w", err)
+		}
+		res, _, err = parseAAddrs(resp, msg.Header.ID)
+		if err != nil {
+			return aResult{}, fmt.Errorf("tcp refetch: %w", err)
+		}
+	}
+	return res, nil
+}
+
+// exchange performs one DNS message round-trip: a single datagram on "udp", a
+// length-prefixed message on "tcp" (RFC 1035 §4.2.2 framing).
+func (r *Resolver) exchange(ctx context.Context, network string, packed []byte) ([]byte, error) {
+	conn, err := r.dial(ctx, network, r.serverAddr())
+	if err != nil {
+		return nil, fmt.Errorf("dial coredns %s %s: %w", network, r.serverAddr(), err)
 	}
 	defer conn.Close()
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	}
+	if network == "tcp" {
+		framed := make([]byte, 2+len(packed))
+		binary.BigEndian.PutUint16(framed, uint16(len(packed)))
+		copy(framed[2:], packed)
+		if _, err := conn.Write(framed); err != nil {
+			return nil, fmt.Errorf("write query: %w", err)
+		}
+		var lb [2]byte
+		if _, err := io.ReadFull(conn, lb[:]); err != nil {
+			return nil, fmt.Errorf("read response length: %w", err)
+		}
+		resp := make([]byte, binary.BigEndian.Uint16(lb[:]))
+		if _, err := io.ReadFull(conn, resp); err != nil {
+			return nil, fmt.Errorf("read response: %w", err)
+		}
+		return resp, nil
+	}
 	if _, err := conn.Write(packed); err != nil {
 		return nil, fmt.Errorf("write query: %w", err)
 	}
-
 	buf := make([]byte, 1500)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
-	return parseAAddrs(buf[:n], msg.Header.ID)
+	return buf[:n], nil
 }
 
-// parseAAddrs decodes a DNS response and returns its A-record addresses. It
-// verifies the response ID matches the query.
-func parseAAddrs(resp []byte, wantID uint16) ([]netip.Addr, error) {
+// parseAAddrs decodes a DNS response into its A-record addresses, rcode, and
+// truncation bit. It verifies the response ID matches the query.
+func parseAAddrs(resp []byte, wantID uint16) (aResult, bool, error) {
 	var p dnsmessage.Parser
 	hdr, err := p.Start(resp)
 	if err != nil {
-		return nil, fmt.Errorf("parse header: %w", err)
+		return aResult{}, false, fmt.Errorf("parse header: %w", err)
 	}
 	if hdr.ID != wantID {
-		return nil, fmt.Errorf("dns: response id %d != query id %d", hdr.ID, wantID)
+		return aResult{}, false, fmt.Errorf("dns: response id %d != query id %d", hdr.ID, wantID)
+	}
+	if !hdr.Response {
+		return aResult{}, false, fmt.Errorf("dns: message is not a response")
 	}
 	if err := p.SkipAllQuestions(); err != nil {
-		return nil, fmt.Errorf("skip questions: %w", err)
+		return aResult{}, false, fmt.Errorf("skip questions: %w", err)
 	}
-	var addrs []netip.Addr
+	res := aResult{rcode: hdr.RCode}
+	if hdr.Truncated {
+		return res, true, nil
+	}
 	for {
 		ah, err := p.AnswerHeader()
 		if errors.Is(err, dnsmessage.ErrSectionDone) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("answer header: %w", err)
+			return aResult{}, false, fmt.Errorf("answer header: %w", err)
 		}
 		if ah.Type != dnsmessage.TypeA {
 			if err := p.SkipAnswer(); err != nil {
-				return nil, fmt.Errorf("skip answer: %w", err)
+				return aResult{}, false, fmt.Errorf("skip answer: %w", err)
 			}
 			continue
 		}
 		ar, err := p.AResource()
 		if err != nil {
-			return nil, fmt.Errorf("a resource: %w", err)
+			return aResult{}, false, fmt.Errorf("a resource: %w", err)
 		}
-		addrs = append(addrs, netip.AddrFrom4(ar.A))
+		res.addrs = append(res.addrs, netip.AddrFrom4(ar.A))
 	}
-	return addrs, nil
+	return res, false, nil
 }
 
 // ensureFQDN appends a trailing dot if missing, as DNS wire names require.
