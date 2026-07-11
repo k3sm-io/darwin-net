@@ -144,6 +144,21 @@ func New(nodeCIDR netip.Prefix, opts ...Option) (*Network, error) {
 // CIDR returns the node /24 this network allocates pod IPs from.
 func (n *Network) CIDR() netip.Prefix { return n.alloc.CIDR() }
 
+// EnsureNodeAlias plumbs an lo0 /32 alias for the node's OWN advertised address —
+// the reserved mesh-egress /32 (.1 of the node /24, see MeshEgressIP) the VK node
+// advertises as its NodeInternalIP. The apiserver node-proxy dials that
+// address:10250 to serve /nodes/<n>/proxy/stats/summary (kubectl top node), and a
+// connect to a non-loopback address loops back to the local listener on the same
+// host ONLY when the address is an lo0 alias. Unlike Setup this is NOT pod-keyed
+// and lies outside the allocator's usable range ([.2, .254]), so SweepStale never
+// reclaims it (the .1 is excluded — see reconcile.go). It touches only the alias
+// manager (which serializes on its own lock), never the pod IPAM maps, so it needs
+// no Network lock. Idempotent (ifconfig alias re-add is a no-op success), so a
+// caller may re-ensure it at every startup reconcile.
+func (n *Network) EnsureNodeAlias(ctx context.Context, ip netip.Addr) error {
+	return n.alias.Ensure(ctx, ip)
+}
+
 // Setup allocates an IP for podID, ensures its lo0 alias, and returns the bindable
 // address. It provisions the HOST-PROCESS backend: the returned /32 is aliased on
 // lo0 for the runtime to bind the pod's processes to (IP_BOUND_IF). It is
