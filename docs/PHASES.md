@@ -278,6 +278,48 @@ phases:
             met: true
             check: "the dst-VIP allow/deny subset is proven by the pure-logic unit test `TestNetworkPolicyL4AllowDeny` (a policy allow/deny verdict is applied at the userspace-proxy dst-VIP seam; an allowed VIP is dialed, a denied VIP is refused). The honest limit — that this is a Service-VIP hint and pod-IP→pod-IP over the per-pod /32s bypasses it, so isolation routes to `vm` — is a `docs/user/limitations.md` line-assert, drawing the M10.1→M10.4 causal link"
             method: unit
+
+  - id: M11
+    title: Linux containers & multi-arch (darwin-net slice — vm-pod network identity, reachability, policy attribution)
+    status: todo
+    depends_on: []
+    notes: >-
+      First-class design work (upgraded from M5's "same-node open question" prose;
+      docs/m11-plan.md §M11.3 is authoritative), driven by spike S5's findings. BINDING
+      Phase-B decisions this sub-phase encodes: (a) pod.status.podIP authority for vm
+      pods — the guest agent's Health lease is the SINGLE live-address authority (VZ
+      exposes no guest-IP API; the "runtimed reconciles from the attachment" comments
+      are retired); (b) the Service-backend posture — same-node documented ceiling vs
+      the routed-bypass design (vmnet source-NAT is structurally incompatible with the
+      mesh's symmetric AllowedIPs, so cross-node NEVER "just works"); (c) the
+      probes/port-forward host→guest path; (d) B113 NetworkPolicy source attribution
+      (today NAT-rewritten vm-pod traffic hits the proxy's fail-open UNKNOWN-source
+      path — the untrusted-tenancy rung must not be the unattributable one). Hard cut:
+      a new backend branch in the existing podnet.Backend fork; anything touching
+      MeshPeer/AllowedIPs would be a named exception and is explicitly NOT in M11.
+    subphases:
+      - id: M11.3
+        title: guest→VIP reachability + vm-pod identity + source attribution + network-trust ceiling
+        status: todo
+        depends_on: [apis:M11.1]
+        deliverables:
+          - id: M11.3-d1
+            done: false
+            desc: "guest→VIP reachability: resolve S5(1) — does XNU weak-host-deliver a vmnet-NAT guest packet to a host lo0-alias VIP (every ClusterIP incl. the DNS VIP the guest resolv.conf points at)? If delivery fails, the fix is a NEW netd route verb (root-helper surface — security-critiqued, its own small deliverable) or a host route installed by the unprivileged daemon if sufficient. The M5.1 open question, finally owned."
+          - id: M11.3-d2
+            done: false
+            desc: "vm-pod identity: implement the S5(3)-decided podIP model (PodIP-as-guest-eth0-alias + host route, or NAT-address-published) with the consumer matrix reconciled to the ONE authority (EndpointSlices the Service proxy dials, M10 per-pod DNS A/PTR synthesis, downward-API status.podIP in-guest, host-side probe/port-forward dialing); the provider podIP() vm branch retires its nodeIP placeholder. Whichever address is published must be DELIVERABLE — an EndpointSlice/DNS identity nothing can dial is worse than none."
+          - id: M11.3-d3
+            done: false
+            desc: "B113 NetworkPolicy source attribution: register the guest address→pod mapping with the Service-proxy policy engine on agent-Health lease report WITH a lease-change liveness contract (DHCP addresses move across guest restarts; the deterministic MAC makes leases semi-stable — S5(5) verifies), or flip unknown-source to deny on vm-hosting nodes. Closes the fail-open UNKNOWN path (proxy policy.go ALLOW+Warn) for the one pod class NetworkPolicy most needs to constrain."
+          - id: M11.3-d4
+            done: false
+            desc: "Network-trust ceiling recorded: the S5(4) guest↔guest + guest→LAN reachability matrix is a SECURITY fact — guests share one vmnet NAT segment (guest↔guest at NAT addresses bypasses Services/policy; unfiltered L3 to the gateway/LAN). Lands in docs/user/limitations.md + the register wording, or a pf-filter-on-the-vmnet-member follow-up is scoped as its own forward-marker. Guest link MTU ≤1380 in the DHCP/init plan if cross-node is ever claimed (the mesh mss-clamp is utun-scoped and does not cover non-TCP guest traffic)."
+        acceptance:
+          - id: M11.3-a1
+            met: false
+            check: "the identity/attribution logic is unit-proven at the seams (B113's TestVMPodSourceAttribution table incl. the stale-lease and fail-open-regression negatives; the podIP-authority consumer matrix as pure translation tables); the LIVE legs — guest→VIP delivery, host→guest dial, guest DNS resolution, the Service-consumed leg — ride hack/lab/m11.sh (K3SM_LAB=1, human-run), never auto-greened"
+            method: unit
 ---
 
 # darwin-net — Phase roadmap
@@ -673,3 +715,24 @@ bridged** ("bridged" struck — needs the unobtainable `com.apple.vm.networking`
 remainder (`K3SM_LAB=1`) is the live NAT attach, the **guest→ClusterIP-VIP reachability** open
 question (and a possible new `netd` route-verb), and cross-node routing — a NAT-private guest IP is
 **not yet a cross-node Service backend**. M2 deps `apis:M2.1`; M5 deps `apis:M5.1`.
+
+## M11 — Linux containers & multi-arch (darwin-net slice) ⬜
+First-class design work, upgraded from M5's "same-node open question" prose (`docs/m11-plan.md`
+§M11.3 authoritative; spike **S5** supplies the empirical inputs). **Hard cut** — a new backend
+branch in the existing `podnet.Backend` fork; nothing touches MeshPeer/AllowedIPs (that would be a
+named exception, explicitly out of M11).
+
+### M11.3 — vm-pod identity, reachability, attribution, trust ceiling ⬜
+**Cross-repo dep:** `apis:M11.1` (the Health lease report). **BINDING decisions encoded here**
+(fed by S5): the agent-Health lease is the **single live-address authority** for a vm pod; the
+Service-backend posture (same-node documented ceiling vs a routed bypass of vmnet's source-NAT —
+which breaks symmetric AllowedIPs, so cross-node never "just works"); the probes/port-forward
+host→guest path; B113 source attribution (closing the proxy's fail-open UNKNOWN path for
+NAT-rewritten guest traffic).
+**Deliverables** — frontmatter `M11.3-d1…d4`: d1 guest→VIP delivery (possible new `netd` route
+verb — root-helper surface, security-critiqued); d2 the podIP model + consumer matrix
+(EndpointSlices, per-pod DNS A/PTR, downward-API, probe dialing) reconciled to the one authority;
+d3 B113 attribution with a lease-change liveness contract; d4 the network-trust ceiling recorded
+(guest↔guest / guest→LAN segment facts → limitations.md/register, or a pf-filter forward-marker).
+**Acceptance** — frontmatter `M11.3-a1`: seams unit-proven; every live leg rides
+`hack/lab/m11.sh` (`K3SM_LAB=1`), never auto-greened.
