@@ -27,6 +27,8 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+
+	netv1 "k3sm.io/apis/net/v1"
 )
 
 // Watcher drives a Proxy from Kubernetes Service and EndpointSlice informers. It
@@ -54,16 +56,39 @@ type Watcher struct {
 	// the reliance on an un-contracted invariant.
 	eTPMu          sync.Mutex
 	eTPLocalWarned map[string]bool
+
+	// static maps "namespace/name" Service keys to a FIXED backend set that
+	// replaces the EndpointSlice-derived one for that Service (every port routes
+	// to these endpoints; each Endpoint carries its own dial port). It exists for
+	// exactly one shape: a backend that CANNOT have an EndpointSlice — upstream
+	// validation hard-rejects loopback endpoint addresses on create, so a
+	// loopback-advertising single-node apiserver can publish no slice for the
+	// kubernetes Service (neither can anyone else on its behalf). Set at
+	// construction (WithStaticBackends), read-only afterwards — no lock needed.
+	static map[string][]netv1.Endpoint
+}
+
+// WatcherOption customizes a Watcher at construction.
+type WatcherOption func(*Watcher)
+
+// WithStaticBackends pins the given Services to fixed backend sets, keyed
+// "namespace/name". An entry fully replaces the Service's EndpointSlice-derived
+// backends: reconciles route every port of that Service to the given endpoints
+// (each Endpoint's own Port is the dial port) and ignore any slice that appears.
+// Use ONLY for a backend no EndpointSlice can represent (the loopback-bound
+// apiserver); everything else must flow from real slices.
+func WithStaticBackends(backends map[string][]netv1.Endpoint) WatcherOption {
+	return func(w *Watcher) { w.static = backends }
 }
 
 // NewWatcher builds a Watcher over client for the given Proxy. It wires Service
 // and EndpointSlice informers but does not start them; call Run.
-func NewWatcher(client kubernetes.Interface, proxy *Proxy, log *slog.Logger) *Watcher {
+func NewWatcher(client kubernetes.Interface, proxy *Proxy, log *slog.Logger, opts ...WatcherOption) *Watcher {
 	if log == nil {
 		log = slog.Default()
 	}
 	f := informers.NewSharedInformerFactory(client, 0)
-	return &Watcher{
+	w := &Watcher{
 		proxy:          proxy,
 		factory:        f,
 		svcs:           f.Core().V1().Services().Informer(),
@@ -71,6 +96,10 @@ func NewWatcher(client kubernetes.Interface, proxy *Proxy, log *slog.Logger) *Wa
 		log:            log,
 		eTPLocalWarned: make(map[string]bool),
 	}
+	for _, o := range opts {
+		o(w)
+	}
+	return w
 }
 
 // Run starts the informers and blocks until ctx is cancelled. It registers event
@@ -215,22 +244,35 @@ func (w *Watcher) onSlice(obj any) {
 }
 
 // reconcileService recomputes each port's backend set from the cached
-// EndpointSlices and reconciles it through the proxy, carrying the Service's
-// internalTrafficPolicy (so the routing table can filter to node-local backends) and
-// its ClientIP session-affinity config.
+// EndpointSlices (or the Service's static override) and reconciles it through
+// the proxy, carrying the Service's internalTrafficPolicy (so the routing table
+// can filter to node-local backends) and its ClientIP session-affinity config.
 func (w *Watcher) reconcileService(svc *corev1.Service) {
 	vip, policy, affinity, ok, _ := serviceToVIP(svc)
 	if !ok {
 		return
 	}
+	key := svc.Namespace + "/" + svc.Name
 	slices := w.slicesForService(svc.Namespace, svc.Name)
 	for i := range vip.Ports {
 		p := vip.Ports[i]
-		eps := endpointsForPort(slices, p.Name)
+		eps := w.backendsForPort(key, slices, p.Name)
 		if err := w.proxy.ReconcilePolicy(vip.ClusterIP, &p, policy, affinity, eps); err != nil {
-			w.log.Error("reconcile service port", "service", svc.Namespace+"/"+svc.Name, "port", p.Port, "err", err)
+			w.log.Error("reconcile service port", "service", key, "port", p.Port, "err", err)
 		}
 	}
+}
+
+// backendsForPort resolves one Service port's backend set: the Service's static
+// override when one is pinned (WithStaticBackends — the override replaces the
+// slice-derived set entirely, so a stray slice for an overridden Service can
+// never shadow or split the pinned backend), else the Ready endpoints matched
+// from the cached EndpointSlices by port name.
+func (w *Watcher) backendsForPort(key string, slices []*discoveryv1.EndpointSlice, portName string) []netv1.Endpoint {
+	if eps, ok := w.static[key]; ok {
+		return eps
+	}
+	return endpointsForPort(slices, portName)
 }
 
 // slicesForService returns the cached EndpointSlices labeled for the Service.
