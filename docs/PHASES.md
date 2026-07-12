@@ -285,7 +285,9 @@ phases:
     depends_on: []
     notes: >-
       First-class design work (upgraded from M5's "same-node open question" prose;
-      docs/m11-plan.md §M11.3 is authoritative), driven by spike S5's findings. BINDING
+      docs/m11-plan.md §M11.3 is authoritative), driven by spike S5's findings.
+      RE-SEQUENCED PRE-LAUNCH (2026-07-11, its R16): ships functional-EXPERIMENTAL at
+      v0.1; the network-trust-ceiling text is a LAUNCH-SLICE deliverable (its R22). BINDING
       Phase-B decisions this sub-phase encodes: (a) pod.status.podIP authority for vm
       pods — the guest agent's Health lease is the SINGLE live-address authority (VZ
       exposes no guest-IP API; the "runtimed reconciles from the attachment" comments
