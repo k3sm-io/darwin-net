@@ -44,10 +44,17 @@ type stubDNS struct {
 	// Fault injection, keyed by normalized name: drop swallows the next N UDP
 	// queries for the name (no response — the client times out); servfail
 	// answers with RCodeServerFailure; truncate answers UDP with TC set and no
-	// answers. The TCP listener always serves the real zone answer.
-	drop     map[string]int
-	servfail map[string]bool
-	truncate map[string]bool
+	// answers; truncateTCP answers even the TCP refetch with TC set and no
+	// answers (a malformed server, to exercise the TC-over-TCP transient path).
+	drop        map[string]int
+	servfail    map[string]bool
+	truncate    map[string]bool
+	truncateTCP map[string]bool
+	// EDNS0 OPT observed on the most recent query (any transport): optSeen is set
+	// when the query carried an OPT pseudo-RR, and optUDPSize is its advertised
+	// UDP payload size (the OPT ResourceHeader Class field).
+	optSeen    bool
+	optUDPSize int
 
 	wg   sync.WaitGroup
 	done chan struct{}
@@ -67,13 +74,14 @@ func newStubDNS(t *testing.T, zone map[string]netip.Addr) *stubDNS {
 		t.Fatalf("stub dns tcp listen: %v", err)
 	}
 	s := &stubDNS{
-		conn:     conn,
-		tcpLn:    tcpLn,
-		zone:     zone,
-		drop:     map[string]int{},
-		servfail: map[string]bool{},
-		truncate: map[string]bool{},
-		done:     make(chan struct{}),
+		conn:        conn,
+		tcpLn:       tcpLn,
+		zone:        zone,
+		drop:        map[string]int{},
+		servfail:    map[string]bool{},
+		truncate:    map[string]bool{},
+		truncateTCP: map[string]bool{},
+		done:        make(chan struct{}),
 	}
 	s.wg.Add(2)
 	go s.serve()
@@ -112,6 +120,22 @@ func (s *stubDNS) setTruncateUDP(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.truncate[normalizeName(name)] = true
+}
+
+// setTruncateTCP makes even the TCP refetch for name answer with TC set and no
+// answers — a malformed server, used to exercise the TC-over-TCP transient path.
+func (s *stubDNS) setTruncateTCP(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.truncateTCP[normalizeName(name)] = true
+}
+
+// lastOPT returns whether the most recent query carried an EDNS0 OPT record and
+// the UDP payload size it advertised.
+func (s *stubDNS) lastOPT() (seen bool, udpSize int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.optSeen, s.optUDPSize
 }
 
 // askedTCP reports whether the server received a TCP query for the given name.
@@ -212,7 +236,23 @@ func (s *stubDNS) respond(query []byte, transport string) ([]byte, bool) {
 	}
 	qname := normalizeName(q.Name.String())
 
+	// Record whether the query carried an EDNS0 OPT pseudo-RR and its advertised
+	// UDP payload size. A full Unpack is simplest here (the streaming parser above
+	// only read the question); the OPT lives in the Additional section.
+	optSeen, optSize := false, 0
+	var full dnsmessage.Message
+	if err := full.Unpack(query); err == nil {
+		for _, a := range full.Additionals {
+			if a.Header.Type == dnsmessage.TypeOPT {
+				optSeen = true
+				optSize = int(a.Header.Class)
+			}
+		}
+	}
+
 	s.mu.Lock()
+	s.optSeen = optSeen
+	s.optUDPSize = optSize
 	if transport == "tcp" {
 		s.tcpQueries = append(s.tcpQueries, qname)
 	} else {
@@ -224,7 +264,8 @@ func (s *stubDNS) respond(query []byte, transport string) ([]byte, bool) {
 		return nil, false
 	}
 	fail := s.servfail[qname]
-	trunc := transport == "udp" && s.truncate[qname]
+	trunc := (transport == "udp" && s.truncate[qname]) ||
+		(transport == "tcp" && s.truncateTCP[qname])
 	s.mu.Unlock()
 
 	rb := dnsmessage.NewBuilder(nil, dnsmessage.Header{

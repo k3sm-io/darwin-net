@@ -25,6 +25,7 @@
  */
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdint.h>
@@ -33,9 +34,23 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 /* -------- DYLD interpose plumbing -------- */
+
+/*
+ * DYLD-strip ceiling (detection deferred — documented, not enforced here):
+ * DYLD_INSERT_LIBRARIES (hence this interposer) is IGNORED for a process whose
+ * main executable is an Apple-platform binary, runs under the hardened runtime,
+ * or enables library validation. In those cases the shim silently never loads
+ * and getaddrinfo() takes its normal mDNSResponder path, so a cluster name gets
+ * an NXDOMAIN instead of being resolved. runtimed spawns pods via its
+ * NON-platform exec-shim precisely so the injection survives (see
+ * ../pkg/dns/doc.go); a workload that re-execs into a platform/hardened binary
+ * loses cluster DNS. Auto-detecting that condition from inside the shim is a
+ * future item; for now it is a known operational boundary, not a runtime error.
+ */
 
 typedef struct interpose_s {
     const void *replacement;
@@ -167,6 +182,79 @@ static int k3sm_candidates(const k3sm_cfg_t *c, const char *name,
     return n;
 }
 
+/* True if name ends in "."suffix or equals suffix (a single trailing dot on
+ * either side is ignored). Both are treated case-sensitively — DNS labels from
+ * the config and the candidate list are already lowercased/normalized. */
+static int k3sm_has_suffix_domain(const char *name, const char *suffix) {
+    size_t nl = strlen(name);
+    size_t sl = strlen(suffix);
+    if (nl > 0 && name[nl - 1] == '.') {
+        nl--;
+    }
+    if (sl > 0 && suffix[sl - 1] == '.') {
+        sl--;
+    }
+    if (sl == 0 || nl < sl) {
+        return 0;
+    }
+    if (nl == sl) {
+        return strncmp(name, suffix, sl) == 0;
+    }
+    return name[nl - sl - 1] == '.' && strncmp(name + nl - sl, suffix, sl) == 0;
+}
+
+/*
+ * Whether a TRANSIENT failure on this candidate must fail CLOSED (EAI_AGAIN, no
+ * host fallthrough) rather than fall through to the host resolver. A candidate
+ * is cluster-scoped — fail closed — when it is under the cluster domain or a
+ * search domain, OR when it is a bare single-label name (which can never be a
+ * real external FQDN, so it is a Service short name). Only a dotted candidate
+ * that is NOT under any cluster/search domain (e.g. "github.com") is external:
+ * during a resolver blip it may fall through to the host so external DNS stays
+ * alive. Deliberate fail-closed-for-cluster / fall-through-for-external trade,
+ * mirrored in the Go resolver's LookupHost walk.
+ */
+static int k3sm_candidate_fail_closed(const k3sm_cfg_t *c, const char *cand) {
+    if (strchr(cand, '.') == NULL) {
+        return 1; /* bare label: a cluster short name, never external */
+    }
+    if (c->domain[0] != '\0' && k3sm_has_suffix_domain(cand, c->domain)) {
+        return 1;
+    }
+    for (int i = 0; i < c->nsearch; i++) {
+        if (k3sm_has_suffix_domain(cand, c->search[i])) {
+            return 1;
+        }
+    }
+    return 0; /* dotted, not under any cluster/search domain: external */
+}
+
+/*
+ * Resolve a getaddrinfo service string to a numeric port for the cluster path.
+ * A NULL/empty service yields port 0. A purely-numeric service is used verbatim.
+ * A non-numeric named service (e.g. "http") is NOT supported on the cluster
+ * A-record path — rather than silently mapping to port 0 (the old atoi
+ * behavior), it returns EAI_SERVICE. Returns 0 on success, an EAI_* code on
+ * error.
+ */
+static int k3sm_parse_port(const char *service, uint16_t *port) {
+    *port = 0;
+    if (service == NULL || service[0] == '\0') {
+        return 0;
+    }
+    for (const char *p = service; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            return EAI_SERVICE;
+        }
+    }
+    long v = atol(service);
+    if (v < 0 || v > 65535) {
+        return EAI_SERVICE;
+    }
+    *port = (uint16_t)v;
+    return 0;
+}
+
 /* -------- minimal DNS A query over UDP (TCP refetch on truncation) -------- */
 
 /*
@@ -186,6 +274,21 @@ static int k3sm_candidates(const k3sm_cfg_t *c, const char *name,
 #define K3SM_DNS_HIT 0
 #define K3SM_DNS_MISS 1
 #define K3SM_DNS_TEMPFAIL (-1)
+
+/*
+ * EDNS0 advertised UDP payload size (RFC 6891). The query carries an OPT RR
+ * telling the server it may return datagrams up to this size before setting TC,
+ * so a modestly large answer set (a Service with several endpoints) survives on
+ * UDP instead of forcing a TCP refetch. It MUST NOT exceed the UDP receive
+ * buffer (a recv() silently drops an oversized datagram) — a _Static_assert in
+ * k3sm_query_a couples the two. This is the single C source of the value; the Go
+ * reference exports it as dns.EDNSUDPPayloadSize and TestShimEDNSSizeMatchesC
+ * binds the two so they cannot drift.
+ */
+#define K3SM_EDNS_UDP_SIZE 1232
+
+/* Per-attempt wall-clock timeout (seconds) for a UDP/TCP exchange. */
+#define K3SM_DNS_TIMEOUT_SEC 2
 
 /* Encode a dotted name into DNS wire label format. Returns bytes written or -1. */
 static int k3sm_encode_name(const char *name, uint8_t *buf, size_t cap) {
@@ -226,18 +329,44 @@ static int k3sm_build_query(const char *fqdn, uint8_t qbuf[512]) {
     qbuf[1] = (uint8_t)(id & 0xff);
     qbuf[2] = 0x01; /* RD */
     qbuf[5] = 0x01; /* QDCOUNT=1 */
+    /* ARCOUNT=1 for the EDNS0 OPT appended below. WITHOUT bumping ARCOUNT the
+     * server never parses the OPT and the advertised UDP payload size is a
+     * silent no-op — the header count, not the trailing bytes, is what makes
+     * EDNS take effect. */
+    qbuf[11] = 0x01; /* ARCOUNT=1 */
     int npos = k3sm_encode_name(fqdn, qbuf + 12, 512 - 12);
     if (npos < 0) {
         return -1;
     }
     size_t pos = 12 + (size_t)npos;
-    if (pos + 4 > 512) {
+    /* question QTYPE/QCLASS (4 bytes) + the OPT pseudo-RR (11 bytes) must fit. */
+    if (pos + 4 + 11 > 512) {
         return -1;
     }
     qbuf[pos++] = 0x00;
     qbuf[pos++] = 0x01; /* QTYPE=A */
     qbuf[pos++] = 0x00;
     qbuf[pos++] = 0x01; /* QCLASS=IN */
+
+    /*
+     * EDNS0 OPT pseudo-RR in the Additional section (RFC 6891 §6.1.2):
+     *   NAME  = 0x00                 (root)
+     *   TYPE  = 0x00 0x29            (OPT = 41)
+     *   CLASS = K3SM_EDNS_UDP_SIZE   (the requestor's UDP payload size, NOT IN)
+     *   TTL   = 0x00000000           (ext-rcode 0, version 0, flags 0 — no DO bit)
+     *   RDLEN = 0x0000               (no options)
+     */
+    qbuf[pos++] = 0x00; /* root NAME */
+    qbuf[pos++] = 0x00;
+    qbuf[pos++] = 0x29; /* TYPE = OPT (41) */
+    qbuf[pos++] = (uint8_t)((K3SM_EDNS_UDP_SIZE >> 8) & 0xff);
+    qbuf[pos++] = (uint8_t)(K3SM_EDNS_UDP_SIZE & 0xff); /* CLASS = UDP payload size */
+    qbuf[pos++] = 0x00; /* TTL: extended RCODE */
+    qbuf[pos++] = 0x00; /* TTL: version */
+    qbuf[pos++] = 0x00;
+    qbuf[pos++] = 0x00; /* TTL: flags (DO bit clear) */
+    qbuf[pos++] = 0x00;
+    qbuf[pos++] = 0x00; /* RDLEN = 0 */
     return (int)pos;
 }
 
@@ -252,6 +381,118 @@ static int k3sm_server_addr(const k3sm_cfg_t *c, struct sockaddr_in *sa) {
     return 0;
 }
 
+/*
+ * -------- EINTR-safe blocking I/O bounded by a monotonic deadline --------
+ *
+ * The shim is interposed into ARBITRARY app threads, including ones a profiler
+ * (SIGPROF at ~100Hz/thread) or another signal source keeps interrupting. A
+ * naive `do {...} while (n < 0 && errno == EINTR)` around recv() re-arms the
+ * fixed 2s SO_RCVTIMEO timer on every pass, so under a steady signal the timer
+ * is reset before it can fire and an UNREACHABLE resolver hangs the thread
+ * FOREVER. Instead we fix an absolute CLOCK_MONOTONIC deadline once per exchange
+ * and, on each EINTR retry, re-arm SO_{RCV,SND}TIMEO to only the time that
+ * REMAINS — so the exchange is bounded by real wall-clock regardless of how
+ * often it is interrupted.
+ */
+
+static void k3sm_deadline_from_now(struct timespec *deadline, int timeout_sec) {
+    clock_gettime(CLOCK_MONOTONIC, deadline);
+    deadline->tv_sec += timeout_sec;
+}
+
+/*
+ * Arm optname (SO_RCVTIMEO / SO_SNDTIMEO) with the time remaining until
+ * deadline. Returns 0 if time remains (socket armed), -1 if the deadline has
+ * already passed (the caller treats this as a timeout). A strictly-positive but
+ * sub-microsecond remainder is clamped to 1us: a {0,0} timeval means "block
+ * forever" for SO_*TIMEO and must never be armed while time still remains.
+ */
+static int k3sm_arm_remaining(int fd, int optname, const struct timespec *deadline) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long sec = deadline->tv_sec - now.tv_sec;
+    long nsec = deadline->tv_nsec - now.tv_nsec;
+    if (nsec < 0) {
+        sec -= 1;
+        nsec += 1000000000L;
+    }
+    if (sec < 0) {
+        return -1; /* deadline passed */
+    }
+    struct timeval tv;
+    tv.tv_sec = sec;
+    tv.tv_usec = nsec / 1000;
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+        tv.tv_usec = 1; /* never arm {0,0} (== block forever) while time remains */
+    }
+    setsockopt(fd, SOL_SOCKET, optname, &tv, sizeof(tv));
+    return 0;
+}
+
+/* recv() retried across EINTR, bounded by deadline. Returns bytes, or -1. */
+static ssize_t k3sm_recv_deadline(int fd, void *buf, size_t len,
+                                  const struct timespec *deadline) {
+    for (;;) {
+        if (k3sm_arm_remaining(fd, SO_RCVTIMEO, deadline) < 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        ssize_t n = recv(fd, buf, len, 0);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        return n;
+    }
+}
+
+/* send() retried across EINTR, bounded by deadline. Returns bytes, or -1. */
+static ssize_t k3sm_send_deadline(int fd, const void *buf, size_t len,
+                                  const struct timespec *deadline) {
+    for (;;) {
+        if (k3sm_arm_remaining(fd, SO_SNDTIMEO, deadline) < 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        ssize_t n = send(fd, buf, len, 0);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        return n;
+    }
+}
+
+/* read() retried across EINTR, bounded by deadline. Returns bytes, or -1. */
+static ssize_t k3sm_read_deadline(int fd, void *buf, size_t len,
+                                  const struct timespec *deadline) {
+    for (;;) {
+        if (k3sm_arm_remaining(fd, SO_RCVTIMEO, deadline) < 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        ssize_t n = read(fd, buf, len);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        return n;
+    }
+}
+
+/* write() retried across EINTR, bounded by deadline. Returns bytes, or -1. */
+static ssize_t k3sm_write_deadline(int fd, const void *buf, size_t len,
+                                   const struct timespec *deadline) {
+    for (;;) {
+        if (k3sm_arm_remaining(fd, SO_SNDTIMEO, deadline) < 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        ssize_t n = write(fd, buf, len);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        return n;
+    }
+}
+
 /* One UDP round-trip. Returns response length into rbuf, or -1. */
 static ssize_t k3sm_udp_exchange(const k3sm_cfg_t *c, const uint8_t *qbuf,
                                  size_t qlen, uint8_t *rbuf, size_t rcap) {
@@ -263,8 +504,8 @@ static ssize_t k3sm_udp_exchange(const k3sm_cfg_t *c, const uint8_t *qbuf,
     if (fd < 0) {
         return -1;
     }
-    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct timespec deadline;
+    k3sm_deadline_from_now(&deadline, K3SM_DNS_TIMEOUT_SEC);
 
     /* CONNECT the UDP socket to the resolver, then send()/recv() — deliberately
      * NOT sendto()/recvfrom(). Under a pod's Seatbelt profile an UNCONNECTED
@@ -275,16 +516,20 @@ static ssize_t k3sm_udp_exchange(const k3sm_cfg_t *c, const uint8_t *qbuf,
      * recv() belongs to the outbound flow the profile allows, and it hardens the
      * client to accept only the queried resolver's reply. PROBE-VERIFIED on macOS
      * 26.5.1 through the real execshim/Seatbelt path: unconnected recvfrom → EPERM,
-     * connected recv → ok, under (allow network-outbound)(allow network-bind). */
+     * connected recv → ok, under (allow network-outbound)(allow network-bind).
+     *
+     * connect() on a DATAGRAM socket only records the default peer in the kernel;
+     * it does no handshake and cannot block, so it cannot return EINTR and needs
+     * no retry wrapper (unlike the TCP connect() below). */
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         close(fd);
         return -1;
     }
-    if (send(fd, qbuf, qlen, 0) < 0) {
+    if (k3sm_send_deadline(fd, qbuf, qlen, &deadline) < 0) {
         close(fd);
         return -1;
     }
-    ssize_t rn = recv(fd, rbuf, rcap, 0);
+    ssize_t rn = k3sm_recv_deadline(fd, rbuf, rcap, &deadline);
     close(fd);
     return rn;
 }
@@ -303,10 +548,15 @@ static ssize_t k3sm_tcp_exchange(const k3sm_cfg_t *c, const uint8_t *qbuf,
     if (fd < 0) {
         return -1;
     }
-    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    struct timespec deadline;
+    k3sm_deadline_from_now(&deadline, K3SM_DNS_TIMEOUT_SEC);
 
+    /* A blocking connect() on a STREAM socket CAN be interrupted by a signal and
+     * return EINTR — and it must NOT be re-called: a second connect() on the same
+     * fd returns EISCONN/EALREADY (the handshake is already in progress), not a
+     * fresh attempt. So on ANY connect() error, EINTR included, we fail this
+     * attempt; the caller's TEMPFAIL retry opens a brand-new socket. This is the
+     * deliberate opposite of the UDP connect(), which cannot block at all. */
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         close(fd);
         return -1;
@@ -319,14 +569,14 @@ static ssize_t k3sm_tcp_exchange(const k3sm_cfg_t *c, const uint8_t *qbuf,
     framed[0] = (uint8_t)(qlen >> 8);
     framed[1] = (uint8_t)(qlen & 0xff);
     memcpy(framed + 2, qbuf, qlen);
-    if (write(fd, framed, 2 + qlen) != (ssize_t)(2 + qlen)) {
+    if (k3sm_write_deadline(fd, framed, 2 + qlen, &deadline) != (ssize_t)(2 + qlen)) {
         close(fd);
         return -1;
     }
     uint8_t lb[2];
     size_t got = 0;
     while (got < 2) {
-        ssize_t n = read(fd, lb + got, 2 - got);
+        ssize_t n = k3sm_read_deadline(fd, lb + got, 2 - got, &deadline);
         if (n <= 0) {
             close(fd);
             return -1;
@@ -340,7 +590,7 @@ static ssize_t k3sm_tcp_exchange(const k3sm_cfg_t *c, const uint8_t *qbuf,
     }
     got = 0;
     while (got < rlen) {
-        ssize_t n = read(fd, rbuf + got, rlen - got);
+        ssize_t n = k3sm_read_deadline(fd, rbuf + got, rlen - got, &deadline);
         if (n <= 0) {
             close(fd);
             return -1;
@@ -450,6 +700,12 @@ static int k3sm_query_a(const k3sm_cfg_t *c, const char *fqdn,
     }
 
     uint8_t rbuf[1500];
+    /* The advertised EDNS UDP payload size must fit this receive buffer: the
+     * kernel silently DROPS a datagram larger than the buffer, so a too-small
+     * rbuf under a larger K3SM_EDNS_UDP_SIZE would turn a fitting answer into a
+     * phantom timeout. Couple the two at compile time. */
+    _Static_assert(K3SM_EDNS_UDP_SIZE <= sizeof(rbuf),
+                   "EDNS UDP payload size must fit the UDP receive buffer");
     ssize_t rn = k3sm_udp_exchange(c, qbuf, (size_t)qlen, rbuf, sizeof(rbuf));
     if (rn < 0) {
         return K3SM_DNS_TEMPFAIL;
@@ -459,19 +715,36 @@ static int k3sm_query_a(const k3sm_cfg_t *c, const char *fqdn,
     if (!truncated) {
         return rc;
     }
-    rn = k3sm_tcp_exchange(c, qbuf, (size_t)qlen, rbuf, sizeof(rbuf));
-    if (rn < 0) {
+
+    /*
+     * Truncation refetch over TCP. The answer set did not fit UDP, so it can be
+     * far larger than rbuf — up to the 65535-byte ceiling of the 2-byte TCP
+     * length prefix (mirrors the Go reference, which sizes the TCP read from
+     * that prefix). Allocate the 64 KiB receive buffer on the HEAP: a buffer
+     * that large must never be a stack array in an interposed function running
+     * on an arbitrary (possibly small-stacked) app thread. free() on EVERY
+     * return path below.
+     */
+    uint8_t *tbuf = (uint8_t *)malloc(65535);
+    if (tbuf == NULL) {
         return K3SM_DNS_TEMPFAIL;
     }
-    rc = k3sm_parse_a(rbuf, rn, qbuf, addr4, &truncated);
+    rn = k3sm_tcp_exchange(c, qbuf, (size_t)qlen, tbuf, 65535);
+    if (rn < 0) {
+        free(tbuf);
+        return K3SM_DNS_TEMPFAIL;
+    }
+    truncated = 0;
+    rc = k3sm_parse_a(tbuf, rn, qbuf, addr4, &truncated);
+    free(tbuf);
     if (truncated) {
         return K3SM_DNS_TEMPFAIL; /* TC over TCP is malformed */
     }
     return rc;
 }
 
-/* Build a one-entry struct addrinfo result for an IPv4 address. */
-static int k3sm_make_result(const uint8_t addr4[4], const char *service,
+/* Build a one-entry struct addrinfo result for an IPv4 address and port. */
+static int k3sm_make_result(const uint8_t addr4[4], uint16_t port,
                             const struct addrinfo *hints,
                             struct addrinfo **res) {
     struct addrinfo *ai = (struct addrinfo *)calloc(1, sizeof(struct addrinfo));
@@ -487,12 +760,15 @@ static int k3sm_make_result(const uint8_t addr4[4], const char *service,
     sin->sin_family = AF_INET;
     sin->sin_len = sizeof(struct sockaddr_in);
     memcpy(&sin->sin_addr, addr4, 4);
-    if (service != NULL && service[0] != '\0') {
-        sin->sin_port = htons((uint16_t)atoi(service));
-    }
+    sin->sin_port = htons(port);
 
     ai->ai_family = AF_INET;
-    ai->ai_socktype = hints ? hints->ai_socktype : 0;
+    /* Emit a CONCRETE socktype. A wildcard hints->ai_socktype of 0 would make
+     * this single entry advertise "any" (real getaddrinfo returns one entry PER
+     * socktype instead); default to SOCK_STREAM so callers that switch on
+     * ai_socktype are not handed a 0. */
+    ai->ai_socktype =
+        (hints != NULL && hints->ai_socktype != 0) ? hints->ai_socktype : SOCK_STREAM;
     ai->ai_protocol = hints ? hints->ai_protocol : 0;
     ai->ai_addrlen = sizeof(struct sockaddr_in);
     ai->ai_addr = (struct sockaddr *)sin;
@@ -544,9 +820,38 @@ int k3sm_getaddrinfo(const char *node, const char *service,
         return getaddrinfo(node, service, hints, res);
     }
 
+    /* Resolve the service to a numeric port up front: a non-numeric named
+     * service (e.g. "http") is unsupported on the cluster path and is a hard
+     * EAI_SERVICE, not a silent port 0. */
+    uint16_t port = 0;
+    int serr = k3sm_parse_port(service, &port);
+    if (serr != 0) {
+        return serr;
+    }
+
     char cands[K3SM_MAX_SEARCH + 1][K3SM_MAX_NAME];
     int ncand = k3sm_candidates(&cfg, node, cands, K3SM_MAX_SEARCH + 1);
+    /*
+     * cluster_tempfail records that a CLUSTER-scoped candidate failed
+     * transiently. We keep walking past it (a later EXTERNAL absolute candidate
+     * may still fall through to the host and keep external DNS alive across a
+     * resolver bounce), and only fail closed with EAI_AGAIN at the end if no
+     * external fall-through happened. A transient on an EXTERNAL candidate falls
+     * through to the host immediately.
+     */
+    int cluster_tempfail = 0;
     for (int i = 0; i < ncand; i++) {
+        /*
+         * Once a cluster-scoped candidate has failed transiently, do NOT try any
+         * remaining cluster-scoped candidate: they ask the same unreachable
+         * server, and a definitive HIT from a LATER search domain would be a
+         * WRONG answer for the short name (the risk TestLookupHostServfail...
+         * guards). We keep walking only to reach a still-pending EXTERNAL
+         * candidate that may fall through to the host.
+         */
+        if (cluster_tempfail && k3sm_candidate_fail_closed(&cfg, cands[i])) {
+            continue;
+        }
         uint8_t addr4[4];
         int rc = K3SM_DNS_TEMPFAIL;
         for (int attempt = 0; attempt < K3SM_DNS_ATTEMPTS && rc == K3SM_DNS_TEMPFAIL;
@@ -561,26 +866,50 @@ int k3sm_getaddrinfo(const char *node, const char *service,
                                             : "TEMPFAIL");
         }
         if (rc == K3SM_DNS_HIT) {
-            return k3sm_make_result(addr4, service, hints, res);
+            return k3sm_make_result(addr4, port, hints, res);
         }
         if (rc == K3SM_DNS_TEMPFAIL) {
+            if (k3sm_candidate_fail_closed(&cfg, cands[i])) {
+                /*
+                 * A CLUSTER-scoped candidate went transient. Deferring to the
+                 * host resolver would let it give a confident WRONG answer
+                 * (NXDOMAIN) for a cluster name, so we do NOT fall through for
+                 * this candidate. Remember it and keep walking — a later
+                 * external candidate may still fall through — then fail closed
+                 * with EAI_AGAIN below if none does. Mirrors ErrTempFail.
+                 */
+                cluster_tempfail = 1;
+                continue;
+            }
             /*
-             * The cluster resolver is not answering. Every candidate asks the
-             * same server, so trying the rest only burns timeouts — and
-             * deferring to the host resolver would let it give a confident
-             * WRONG answer (NXDOMAIN) for a cluster name. Report an honest
-             * temporary failure instead; callers retry EAI_AGAIN. Mirrors the
-             * Go resolver's ErrTempFail.
+             * An EXTERNAL candidate (dotted, not under the cluster domain) went
+             * transient. The cluster resolver is not authoritative for it, so
+             * fall through to the host resolver — this keeps github.com and
+             * other external names resolving across a resolver blip.
              */
             if (dbg) {
                 fprintf(stderr,
-                        "k3sm-dns: EAI_AGAIN node=%s — cluster resolver unreachable "
-                        "(candidate %s, %d attempts)\n",
-                        node, cands[i], K3SM_DNS_ATTEMPTS);
+                        "k3sm-dns: DEFER node=%s — external candidate %s transient, "
+                        "falling through to host\n",
+                        node, cands[i]);
             }
-            return EAI_AGAIN;
+            return getaddrinfo(node, service, hints, res);
         }
         /* K3SM_DNS_MISS: definitive — try the next search candidate. */
+    }
+    if (cluster_tempfail) {
+        /*
+         * A cluster-scoped candidate failed transiently and nothing resolved or
+         * fell through. Report an honest temporary failure; callers retry
+         * EAI_AGAIN. This is the fail-closed-for-cluster half of the trade.
+         */
+        if (dbg) {
+            fprintf(stderr,
+                    "k3sm-dns: EAI_AGAIN node=%s — cluster resolver unreachable "
+                    "(%d candidate(s), %d attempts each)\n",
+                    node, ncand, K3SM_DNS_ATTEMPTS);
+        }
+        return EAI_AGAIN;
     }
     /* Every candidate definitively missed: an external name — fall through so
      * the host resolver can answer it. */
