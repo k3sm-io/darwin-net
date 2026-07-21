@@ -183,7 +183,7 @@ func TestShimEnvNamesMatchC(t *testing.T) {
 	}
 	slices.Sort(got)
 
-	want := []string{EnvDNSServer, EnvDNSPort, EnvDNSDomain, EnvDNSSearch, EnvDNSNdots}
+	want := []string{EnvDNSServer, EnvDNSPort, EnvDNSDomain, EnvDNSSearch, EnvDNSNdots, EnvDNSDebug}
 	slices.Sort(want)
 
 	if !slices.Equal(got, want) {
@@ -216,5 +216,47 @@ func TestShimMaxSearchMatchesC(t *testing.T) {
 	}
 	if cMax != MaxSearchDomains {
 		t.Errorf("getaddrinfo-shim search-cap drift: %s #define K3SM_MAX_SEARCH = %d, but pkg/dns MaxSearchDomains = %d", shimPath, cMax, MaxSearchDomains)
+	}
+}
+
+// shimDefine reads the value of a `#define <name> <n>` integer macro from the C
+// shim source, failing the test if it is absent — the shared machinery behind
+// the numeric C<->Go drift guards below.
+func shimDefine(t *testing.T, name string) int {
+	t.Helper()
+	const shimPath = "../../shim/getaddrinfo_shim.c"
+	src, err := os.ReadFile(shimPath)
+	if err != nil {
+		t.Fatalf("read shim source %s: %v", shimPath, err)
+	}
+	re := regexp.MustCompile(`#define\s+` + regexp.QuoteMeta(name) + `\s+(\d+)`)
+	m := re.FindStringSubmatch(string(src))
+	if m == nil {
+		t.Fatalf("no `#define %s <n>` found in %s — regex or shim layout drifted", name, shimPath)
+	}
+	v, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parse %s %q: %v", name, m[1], err)
+	}
+	return v
+}
+
+// TestShimAttemptsMatchesC binds the C shim's per-candidate transient-retry count
+// to the Go resolver's queryAttempts. Both implement the resolv.conf "attempts"
+// default; a drift would make a pod and the reference resolver retry a lost
+// datagram a different number of times before giving up.
+func TestShimAttemptsMatchesC(t *testing.T) {
+	if cAttempts := shimDefine(t, "K3SM_DNS_ATTEMPTS"); cAttempts != queryAttempts {
+		t.Errorf("getaddrinfo-shim attempts drift: #define K3SM_DNS_ATTEMPTS = %d, but pkg/dns queryAttempts = %d", cAttempts, queryAttempts)
+	}
+}
+
+// TestShimEDNSSizeMatchesC binds the C shim's advertised EDNS0 UDP payload size
+// to the Go resolver's EDNSUDPPayloadSize. Both append an OPT RR advertising this
+// size; a drift would make a pod and the reference resolver ask CoreDNS to
+// truncate at different thresholds, diverging their UDP-vs-TCP behavior.
+func TestShimEDNSSizeMatchesC(t *testing.T) {
+	if cSize := shimDefine(t, "K3SM_EDNS_UDP_SIZE"); cSize != EDNSUDPPayloadSize {
+		t.Errorf("getaddrinfo-shim EDNS-size drift: #define K3SM_EDNS_UDP_SIZE = %d, but pkg/dns EDNSUDPPayloadSize = %d", cSize, EDNSUDPPayloadSize)
 	}
 }

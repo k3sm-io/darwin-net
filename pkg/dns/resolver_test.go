@@ -141,3 +141,177 @@ func TestNewResolverRejectsBadConfig(t *testing.T) {
 		t.Fatalf("NewResolver with no cluster IP err = %v, want ErrInvalid", err)
 	}
 }
+
+// TestLookupHostRetriesLostDatagram asserts a single lost UDP datagram does not
+// fail the candidate: the resolver retries (queryAttempts) and resolves the SAME
+// candidate, rather than sliding past it to a later search domain — which is how
+// one dropped packet used to turn into a wrong NXDOMAIN.
+func TestLookupHostRetriesLostDatagram(t *testing.T) {
+	t.Parallel()
+	want := netip.MustParseAddr("10.43.0.42")
+	stub := newStubDNS(t, map[string]netip.Addr{
+		"web.default.svc.cluster.local": want,
+	})
+	defer stub.close()
+	stub.dropNext("web.default.svc.cluster.local", 1)
+
+	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(200*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	addrs, err := r.LookupHost(context.Background(), "web")
+	if err != nil {
+		t.Fatalf("LookupHost(web) with one dropped datagram: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0] != want {
+		t.Fatalf("LookupHost = %v, want [%v]", addrs, want)
+	}
+}
+
+// TestLookupHostServfailIsTempFailNotNotFound asserts SERVFAIL surfaces as
+// ErrTempFail and STOPS the candidate walk: every candidate asks the same
+// server, so continuing past a failing candidate can only produce a wrong
+// answer from a later search domain (or a false "no such host").
+func TestLookupHostServfailIsTempFailNotNotFound(t *testing.T) {
+	t.Parallel()
+	// The later candidate exists — a resolver that slid past the SERVFAIL
+	// would "resolve" kube-dns from the wrong search domain.
+	stub := newStubDNS(t, map[string]netip.Addr{
+		"kube-dns.svc.cluster.local": netip.MustParseAddr("10.43.0.99"),
+	})
+	defer stub.close()
+	stub.setServfail("kube-dns.default.svc.cluster.local")
+
+	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(time.Second))
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	_, err = r.LookupHost(context.Background(), "kube-dns")
+	if !errors.Is(err, ErrTempFail) {
+		t.Fatalf("LookupHost with SERVFAIL err = %v, want ErrTempFail", err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Fatalf("SERVFAIL collapsed into ErrNotFound: %v", err)
+	}
+	if stub.asked("kube-dns.svc.cluster.local") {
+		t.Fatalf("resolver walked past a SERVFAIL candidate to a later search domain")
+	}
+}
+
+// TestLookupHostTruncatedRefetchesTCP asserts a TC-bit UDP response triggers a
+// TCP refetch of the same query (RFC 1035 §4.2.2) and the lookup returns the
+// full answer from the TCP path.
+func TestLookupHostTruncatedRefetchesTCP(t *testing.T) {
+	t.Parallel()
+	want := netip.MustParseAddr("10.43.0.7")
+	stub := newStubDNS(t, map[string]netip.Addr{
+		"big.default.svc.cluster.local": want,
+	})
+	defer stub.close()
+	stub.setTruncateUDP("big.default.svc.cluster.local")
+
+	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(time.Second))
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	addrs, err := r.LookupHost(context.Background(), "big")
+	if err != nil {
+		t.Fatalf("LookupHost(big) with truncated UDP: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0] != want {
+		t.Fatalf("LookupHost = %v, want [%v]", addrs, want)
+	}
+	if !stub.askedTCP("big.default.svc.cluster.local") {
+		t.Fatalf("resolver never re-fetched the truncated answer over TCP")
+	}
+}
+
+// TestLookupHostTruncatedTCPStaysTruncatedIsTempFail asserts that when even the
+// TCP refetch comes back with the TC bit set (a malformed server), the lookup is
+// a TRANSIENT failure (ErrTempFail), never a definitive miss — the answer set
+// must fit a length-prefixed TCP message, so a still-truncated TCP response is
+// not trustworthy. Mirrors the C shim's TEMPFAIL on TC-over-TCP.
+func TestLookupHostTruncatedTCPStaysTruncatedIsTempFail(t *testing.T) {
+	t.Parallel()
+	stub := newStubDNS(t, map[string]netip.Addr{
+		"big.default.svc.cluster.local": netip.MustParseAddr("10.43.0.7"),
+	})
+	defer stub.close()
+	// UDP truncates → resolver refetches over TCP; TCP also truncates.
+	stub.setTruncateUDP("big.default.svc.cluster.local")
+	stub.setTruncateTCP("big.default.svc.cluster.local")
+
+	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(300*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	_, err = r.LookupHost(context.Background(), "big")
+	if !errors.Is(err, ErrTempFail) {
+		t.Fatalf("LookupHost with TC-over-TCP err = %v, want ErrTempFail", err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Fatalf("TC-over-TCP collapsed into ErrNotFound: %v", err)
+	}
+	if !stub.askedTCP("big.default.svc.cluster.local") {
+		t.Fatalf("resolver never attempted the TCP refetch")
+	}
+}
+
+// TestLookupHostQueryCarriesEDNSOPT is the behavioral golden for the dual-authored
+// OPT bytes: it asserts the resolver's query carries a well-formed EDNS0 OPT
+// pseudo-RR advertising exactly EDNSUDPPayloadSize, pinning the Go path to the
+// same wire advertisement the C shim emits.
+func TestLookupHostQueryCarriesEDNSOPT(t *testing.T) {
+	t.Parallel()
+	want := netip.MustParseAddr("10.43.0.42")
+	stub := newStubDNS(t, map[string]netip.Addr{
+		"web.default.svc.cluster.local": want,
+	})
+	defer stub.close()
+
+	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(time.Second))
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	if _, err := r.LookupHost(context.Background(), "web"); err != nil {
+		t.Fatalf("LookupHost(web): %v", err)
+	}
+	seen, size := stub.lastOPT()
+	if !seen {
+		t.Fatalf("resolver query carried no EDNS0 OPT record")
+	}
+	if size != EDNSUDPPayloadSize {
+		t.Fatalf("EDNS0 OPT UDP payload size = %d, want %d", size, EDNSUDPPayloadSize)
+	}
+}
+
+// TestLookupHostClosedPortIsTempFail points the resolver at a closed loopback
+// port: a connected-UDP exchange gets an immediate ECONNREFUSED, which is a
+// TRANSIENT failure (ErrTempFail), never ErrNotFound — the Go analog of the
+// shim's EAI_AGAIN when the cluster resolver is unreachable.
+func TestLookupHostClosedPortIsTempFail(t *testing.T) {
+	t.Parallel()
+	// Reserve then release a loopback UDP port so it is (near-certainly) closed.
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("reserve closed port: %v", err)
+	}
+	closedAddr := c.LocalAddr().String()
+	_ = c.Close()
+
+	dialClosed := withDialer(func(ctx context.Context, network, _ string) (net.Conn, error) {
+		d := net.Dialer{}
+		return d.DialContext(ctx, network, closedAddr)
+	})
+	r, err := NewResolver(stdConfig(), dialClosed, WithTimeout(300*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	_, err = r.LookupHost(context.Background(), "web")
+	if !errors.Is(err, ErrTempFail) {
+		t.Fatalf("LookupHost against a closed port err = %v, want ErrTempFail", err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Fatalf("ECONNREFUSED collapsed into ErrNotFound: %v", err)
+	}
+}

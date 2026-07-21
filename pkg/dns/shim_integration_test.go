@@ -139,3 +139,78 @@ func TestGetaddrinfoShimResolvesViaStub(t *testing.T) {
 		}
 	})
 }
+
+// TestGetaddrinfoShimNamedService pins the named-service ("http") contract: a
+// named service must never hard-fail up front — it DEFERS to the system
+// resolver for external names (the behavior an up-front EAI_SERVICE once
+// regressed) and is refused with EAI_SERVICE only on a cluster HIT, where the
+// shim itself would have to fabricate the port. A numeric service still rides
+// the cluster path into the returned sockaddr.
+func TestGetaddrinfoShimNamedService(t *testing.T) {
+	if _, err := exec.LookPath("clang"); err != nil {
+		t.Skip("clang not available")
+	}
+
+	want := netip.MustParseAddr("10.43.0.42")
+	stub := newStubDNS(t, map[string]netip.Addr{
+		"web.default.svc.cluster.local": want,
+	})
+	defer stub.close()
+
+	dylib := buildShim(t)
+	probe := buildProbe(t)
+
+	env := append(os.Environ(),
+		"K3SM_DNS_SERVER=127.0.0.1",
+		"K3SM_DNS_PORT="+strconv.Itoa(stub.port()),
+		"K3SM_DNS_DOMAIN=cluster.local",
+		"K3SM_DNS_SEARCH=default.svc.cluster.local svc.cluster.local cluster.local",
+		"K3SM_DNS_NDOTS=5",
+		"DYLD_INSERT_LIBRARIES="+dylib,
+	)
+
+	t.Run("numeric service rides the cluster path into the sockaddr", func(t *testing.T) {
+		cmd := exec.Command(probe, "web", "8080")
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("probe web 8080 failed: %v\n%s", err, out)
+		}
+		if got := strings.TrimSpace(string(out)); got != want.String()+":8080" {
+			t.Fatalf("probe resolved %q, want %q", got, want.String()+":8080")
+		}
+	})
+
+	t.Run("named service on a cluster HIT is EAI_SERVICE, not port 0", func(t *testing.T) {
+		cmd := exec.Command(probe, "web", "http")
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("probe web http succeeded, want EAI_SERVICE; out=%s", out)
+		}
+		if !strings.Contains(string(out), "EAI_SERVICE") {
+			t.Fatalf("probe web http failed without EAI_SERVICE: %s", out)
+		}
+		if !stub.asked("web.default.svc.cluster.local") {
+			t.Fatalf("cluster candidate was never queried — EAI_SERVICE fired up front again")
+		}
+	})
+
+	t.Run("named service on an external name defers to the system resolver", func(t *testing.T) {
+		cmd := exec.Command(probe, "name.invalid", "http")
+		cmd.Env = env
+		out, _ := cmd.CombinedOutput()
+		// .invalid never resolves (RFC 2606), so the DEFERRED system call fails
+		// with a name error — but never with EAI_SERVICE, which is the pre-walk
+		// hard-fail regression signature for external name + named service.
+		if strings.Contains(string(out), "EAI_SERVICE") {
+			t.Fatalf("external name + named service returned EAI_SERVICE (up-front hard fail regressed): %s", out)
+		}
+		if !stub.asked("name.invalid.default.svc.cluster.local") {
+			t.Fatalf("search-expanded cluster candidate was never queried — shim not active?")
+		}
+		if stub.asked("name.invalid") {
+			t.Fatalf("absolute external candidate was queried in-shim; want defer-before-query")
+		}
+	})
+}
