@@ -197,6 +197,14 @@ func (r *Resolver) LookupHost(ctx context.Context, name string) ([]netip.Addr, e
 // real external FQDN, so a Service short name). Only a dotted candidate that is
 // under NO cluster/search domain (e.g. "github.com") is external. It mirrors the
 // C shim's k3sm_candidate_fail_closed.
+//
+// ACKNOWLEDGED CEILING of the trade: the k8s partial forms "svc.ns" /
+// "svc.ns.svc" are dotted and under no suffix, so they classify external —
+// during a cluster-resolver outage their search-expanded candidates fail
+// closed, but the absolute candidate falls through to the host, whose NXDOMAIN
+// turns a TRANSIENT outage into a definitive not-found for exactly those
+// forms. Suffix-based scoping cannot tell "db.prod" from "github.com"; the
+// bare-label and fully-qualified cluster forms keep the ErrTempFail guarantee.
 func (r *Resolver) isClusterCandidate(fqdn string) bool {
 	name := strings.TrimSuffix(fqdn, ".")
 	if !strings.Contains(name, ".") {

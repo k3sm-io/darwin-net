@@ -213,6 +213,14 @@ static int k3sm_has_suffix_domain(const char *name, const char *suffix) {
  * during a resolver blip it may fall through to the host so external DNS stays
  * alive. Deliberate fail-closed-for-cluster / fall-through-for-external trade,
  * mirrored in the Go resolver's LookupHost walk.
+ *
+ * ACKNOWLEDGED CEILING of that trade: the k8s partial forms "svc.ns" /
+ * "svc.ns.svc" are dotted and under no suffix, so they classify EXTERNAL —
+ * during a cluster-resolver outage their search-expanded candidates fail
+ * closed, but the absolute candidate falls through to the host, whose NXDOMAIN
+ * turns a TRANSIENT outage into a definitive not-found for exactly those
+ * forms. Suffix-based scoping cannot tell "db.prod" from "github.com"; the
+ * bare-label and fully-qualified cluster forms keep the EAI_AGAIN guarantee.
  */
 static int k3sm_candidate_fail_closed(const k3sm_cfg_t *c, const char *cand) {
     if (strchr(cand, '.') == NULL) {
@@ -231,20 +239,28 @@ static int k3sm_candidate_fail_closed(const k3sm_cfg_t *c, const char *cand) {
 
 /*
  * Resolve a getaddrinfo service string to a numeric port for the cluster path.
- * A NULL/empty service yields port 0. A purely-numeric service is used verbatim.
- * A non-numeric named service (e.g. "http") is NOT supported on the cluster
- * A-record path — rather than silently mapping to port 0 (the old atoi
- * behavior), it returns EAI_SERVICE. Returns 0 on success, an EAI_* code on
- * error.
+ * A NULL/empty service yields port 0. A purely-numeric service is used
+ * verbatim; a numeric service outside the uint16 range is a hard EAI_SERVICE
+ * (the system resolver rejects it identically). A non-numeric NAMED service
+ * (e.g. "http") is legal getaddrinfo input that the cluster A-record path
+ * cannot map to a port — no getservbyname here: Darwin's is not thread-safe
+ * and this code runs interposed on arbitrary app threads. It is reported via
+ * *named (with *port left 0) so the caller can DEFER the call to the system
+ * resolver, which resolves named services natively; only a cluster HIT — where
+ * this shim itself would have to fabricate the port — turns a named service
+ * into EAI_SERVICE (never a silent port 0, the old atoi behavior). Returns 0
+ * on success, an EAI_* code on error.
  */
-static int k3sm_parse_port(const char *service, uint16_t *port) {
+static int k3sm_parse_port(const char *service, uint16_t *port, int *named) {
     *port = 0;
+    *named = 0;
     if (service == NULL || service[0] == '\0') {
         return 0;
     }
     for (const char *p = service; *p != '\0'; p++) {
         if (*p < '0' || *p > '9') {
-            return EAI_SERVICE;
+            *named = 1;
+            return 0;
         }
     }
     long v = atol(service);
@@ -820,11 +836,14 @@ int k3sm_getaddrinfo(const char *node, const char *service,
         return getaddrinfo(node, service, hints, res);
     }
 
-    /* Resolve the service to a numeric port up front: a non-numeric named
-     * service (e.g. "http") is unsupported on the cluster path and is a hard
-     * EAI_SERVICE, not a silent port 0. */
+    /* Resolve the service to a numeric port up front. Only a numeric service
+     * out of the uint16 range is a hard EAI_SERVICE here; a NAMED service
+     * ("http") sets named_service and the walk below defers to the system
+     * resolver wherever it would otherwise have to fabricate the port (see
+     * k3sm_parse_port). */
     uint16_t port = 0;
-    int serr = k3sm_parse_port(service, &port);
+    int named_service = 0;
+    int serr = k3sm_parse_port(service, &port, &named_service);
     if (serr != 0) {
         return serr;
     }
@@ -852,6 +871,22 @@ int k3sm_getaddrinfo(const char *node, const char *service,
         if (cluster_tempfail && k3sm_candidate_fail_closed(&cfg, cands[i])) {
             continue;
         }
+        if (named_service && !k3sm_candidate_fail_closed(&cfg, cands[i])) {
+            /*
+             * EXTERNAL candidate + NAMED service: even a HIT would need a
+             * fabricated port, and the system resolver handles both the name
+             * and the service natively — defer the whole call without querying.
+             * (An up-front EAI_SERVICE here once broke previously-working
+             * external lookups like ("api.github.com", "https").)
+             */
+            if (dbg) {
+                fprintf(stderr,
+                        "k3sm-dns: DEFER node=%s service=%s — external candidate %s "
+                        "with named service\n",
+                        node, service, cands[i]);
+            }
+            return getaddrinfo(node, service, hints, res);
+        }
         uint8_t addr4[4];
         int rc = K3SM_DNS_TEMPFAIL;
         for (int attempt = 0; attempt < K3SM_DNS_ATTEMPTS && rc == K3SM_DNS_TEMPFAIL;
@@ -866,6 +901,16 @@ int k3sm_getaddrinfo(const char *node, const char *service,
                                             : "TEMPFAIL");
         }
         if (rc == K3SM_DNS_HIT) {
+            if (named_service) {
+                /*
+                 * Only CLUSTER-scoped candidates are queried when the service
+                 * is named (external ones deferred above), and the A-record
+                 * path cannot map "http" to a port for the fabricated
+                 * sockaddr — refuse honestly rather than return port 0. Use a
+                 * numeric port for cluster names.
+                 */
+                return EAI_SERVICE;
+            }
             return k3sm_make_result(addr4, port, hints, res);
         }
         if (rc == K3SM_DNS_TEMPFAIL) {
