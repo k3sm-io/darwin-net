@@ -18,9 +18,11 @@ limitations under the License.
 // by darwin-net's socket-owning consumers (the L4 Service proxy in pkg/proxy and
 // the L7 ingress in pkg/ingress).
 //
-// A Binder opens a listening socket on a SPECIFIC address (never the wildcard —
-// the root netd daemon rejects a wildcard bind as a cross-tenant footgun on the
-// shared node). Two implementations exist:
+// A Binder opens a listening socket on the address the CALLER chooses. An
+// implementation may refuse an address it is not authorized to bind — Netd
+// refuses the wildcard, which the root netd daemon rejects as a cross-tenant
+// footgun on the shared node — so callers handle the error rather than assume a
+// legal address by construction. Two implementations exist:
 //
 //   - Direct binds with net.Listen in-process: the explicit run-as-root mode and
 //     the rootless-test mode.

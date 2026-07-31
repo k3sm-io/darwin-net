@@ -30,7 +30,13 @@ import (
 // unprivileged->=1024); Netd asks the root daemon to bind and adopts the socket
 // over SCM_RIGHTS.
 type Binder interface {
-	// Listen returns a listening socket on the SPECIFIC addr (never the wildcard).
+	// Listen returns a listening socket on addr. An implementation MAY refuse
+	// an address it is not authorized to bind — Netd refuses the wildcard,
+	// which the root daemon rejects as a cross-tenant footgun on the shared
+	// node — so every caller must handle the error. Legality is a property of
+	// the binder in hand, NOT a precondition callers can discharge by knowing
+	// the concrete type: a seam whose contract depends on which implementation
+	// is behind it is a hidden type dependency, not a seam.
 	Listen(ctx context.Context, network string, addr netip.AddrPort) (net.Listener, error)
 }
 
