@@ -648,8 +648,8 @@ darwin-net product code.
   (runtimed side). **Net-new record synthesis, NOT a CoreDNS freebie** — the CoreDNS renderer at
   `pkg/dns/coredns.go` is **unconsumed**; the live resolver is k3sm's in-process A-record resolver, so
   headless/SRV/PTR must be **built**, not enabled. **Split the gate:** the **server-side** synthesis is
-  CI-provable pure logic (the unit-testable half, tracked internally, `status: blocked` until the
-  `podnet` wiring lands); **in-pod** SRV/PTR consumption needs a **getaddrinfo-shim `res_query`
+  CI-provable pure logic (the unit-testable half, tracked internally as B81 — `status: done` since the
+  `podnet` wiring landed; this read `blocked` until 2026-07-31); **in-pod** SRV/PTR consumption needs a **getaddrinfo-shim `res_query`
   extension** — a follow-on integration/lab gate, since macOS `getaddrinfo` returns only A/AAAA
   (SRV/PTR ride `res_query`). Reclassifies + **closes the register's per-pod-IP rows** from
   `honest-limitation (ceiling)` to the correct verdict in the same change.
