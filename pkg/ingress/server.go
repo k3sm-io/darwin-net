@@ -45,9 +45,25 @@ const drainTimeout = 5 * time.Second
 // high-port dev config) — there is deliberately NO fallback logic here: the
 // configured ports are bound or Run fails with ErrBind.
 type Config struct {
-	// Addr is the SPECIFIC node address to bind. A wildcard is rejected — by
-	// this package before dialing and by the netd daemon's bind policy — because
-	// a wildcard L7 listener on the shared node is a cross-tenant footgun.
+	// Addr is the node address to bind. It must be a valid address; the
+	// WILDCARD (0.0.0.0) IS accepted, so a host that needs the L7 listener to
+	// answer on every node interface can ask for it explicitly.
+	//
+	// This package used to reject the wildcard here, because a wildcard L7
+	// listener on the shared node is a cross-tenant footgun. That rationale
+	// still holds — the DECISION moved rather than the concern going away, to
+	// the two places that can actually make it:
+	//
+	//   - the HOST assembler, which now chooses the bind address (and,
+	//     separately, the address it advertises). Denying the wildcard from
+	//     inside this constructor only hid the choice; it never made the node
+	//     less shared.
+	//   - the root netd daemon, which STILL refuses a wildcard bind outright
+	//     (pkg/netd handleBindPort, pinned by
+	//     pkg/netd::TestServerBindPortWildcardRejected — not duplicated here).
+	//     So a wildcard can never be laundered through the privileged helper:
+	//     in helper mode (Binder is netbind.Netd) a wildcard Addr constructs
+	//     fine and then fails at Run with ErrBind.
 	Addr netip.Addr
 	// HTTPPort is the plaintext HTTP port; 0 disables the HTTP listener.
 	HTTPPort uint16
@@ -66,8 +82,9 @@ type Config struct {
 }
 
 // Server is the L7 socket layer: it binds the configured HTTP/HTTPS listeners
-// on the specific node address through the netbind seam and serves the routing
-// handler, draining gracefully when its context is cancelled.
+// on the configured node address (the wildcard included) through the netbind
+// seam and serves the routing handler, draining gracefully when its context is
+// cancelled.
 type Server struct {
 	cfg     Config
 	binder  netbind.Binder
@@ -82,8 +99,11 @@ func NewServer(table *RouteTable, cfg Config) (*Server, error) {
 	if table == nil {
 		return nil, errors.New("ingress: nil route table")
 	}
-	if !cfg.Addr.IsValid() || cfg.Addr.IsUnspecified() {
-		return nil, fmt.Errorf("ingress: config requires a specific node address, got %q", cfg.Addr)
+	// Only VALIDITY is checked: the wildcard is a legal choice for the host to
+	// make (see Config.Addr), but the zero Addr is not — it would otherwise
+	// reach net.Listen as the literal string "invalid AddrPort".
+	if !cfg.Addr.IsValid() {
+		return nil, fmt.Errorf("ingress: config requires a valid node address, got %q", cfg.Addr)
 	}
 	if cfg.HTTPPort == 0 && cfg.HTTPSPort == 0 {
 		return nil, errors.New("ingress: config enables no listener (both ports zero)")

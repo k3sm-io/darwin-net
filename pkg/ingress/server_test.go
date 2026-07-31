@@ -132,12 +132,31 @@ func TestIngressServerRunBindDrain(t *testing.T) {
 		}
 	})
 
+	// The wildcard used to be rejected here; the decision moved to the host
+	// assembler (which chooses the address) and to the netd daemon (which still
+	// refuses a wildcard bind — pinned by pkg/netd's
+	// TestServerBindPortWildcardRejected, deliberately not duplicated here).
+	t.Run("wildcard address accepted", func(t *testing.T) {
+		s, err := NewServer(NewRouteTable(), Config{
+			Addr:     netip.MustParseAddr("0.0.0.0"),
+			HTTPPort: 80,
+			Logger:   slog.New(slog.DiscardHandler),
+		})
+		if err != nil {
+			t.Fatalf("NewServer rejected the wildcard: %v", err)
+		}
+		if got := s.cfg.Addr; !got.IsUnspecified() {
+			t.Fatalf("cfg.Addr = %v, want the wildcard preserved", got)
+		}
+	})
+
 	t.Run("config validation fails fast", func(t *testing.T) {
 		cases := []struct {
 			name string
 			cfg  Config
 		}{
-			{"wildcard address rejected", Config{Addr: netip.MustParseAddr("0.0.0.0"), HTTPPort: 80}},
+			// KEEP: relaxing IsUnspecified must not also relax IsValid — a
+			// zero Addr would reach net.Listen as "invalid AddrPort".
 			{"invalid address rejected", Config{HTTPPort: 80}},
 			{"no listener enabled", Config{Addr: netip.MustParseAddr("127.0.0.1")}},
 			{"https without cert resolver", Config{Addr: netip.MustParseAddr("127.0.0.1"), HTTPSPort: 443}},
