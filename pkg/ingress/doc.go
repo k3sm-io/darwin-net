@@ -41,10 +41,11 @@ limitations under the License.
 //     the peer (never appended), inbound Forwarded / X-Real-IP are stripped, and
 //     the inbound Host is preserved for backend virtual hosting. A down backend
 //     returns 502 with a throttled Warn.
-//   - Server (server.go) is the socket layer: it binds the SPECIFIC node
-//     address (the netd daemon rejects a wildcard bind) through the shared
-//     pkg/netbind seam, serves HTTP and TLS listeners, and drains gracefully on
-//     context cancel.
+//   - Server (server.go) is the socket layer: it binds the node address the
+//     HOST chose — the wildcard included, though the netd daemon still refuses
+//     a wildcard bind, so helper mode is specific-address only (see
+//     Config.Addr) — through the shared pkg/netbind seam, serves HTTP and TLS
+//     listeners, and drains gracefully on context cancel.
 //   - Watcher (watch.go) converts class-filtered networking/v1 Ingress objects
 //     (plus referenced Services, for the ClusterIP VIP and port-by-name
 //     resolution) into RouteTable rules, and surfaces tls[] Secret references to
