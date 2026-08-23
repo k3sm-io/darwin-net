@@ -286,21 +286,45 @@ func TestLookupHostQueryCarriesEDNSOPT(t *testing.T) {
 	}
 }
 
-// TestUnencodableLabelDefinitiveMiss pins the >63-byte-label case to the C
-// shim's classification. dnsmessage.NewName bounds only a name's TOTAL length
-// (<=255), so a name with a single 64-byte label passes construction and is
-// rejected by Message.Pack instead; before the fix that Pack error was returned
-// as a plain error, which lookupCandidate retried like a lost datagram and
-// reported as ErrTempFail — while the C shim's k3sm_encode_name rejects the
-// over-long label at build time and returns K3SM_DNS_MISS with zero wire I/O.
-// The assertion is the CLASSIFICATION (a definitive miss: nil error, no addrs)
-// plus zero exchanges: an unencodable name must never reach the wire, and must
-// never be retried.
+// TestUnencodableLabelDefinitiveMiss pins the two LABEL-shaped encode failures to
+// the C shim's classification. dnsmessage.NewName bounds only a name's TOTAL
+// length, so a name whose defect is a single label — 64 bytes, or zero bytes —
+// passes construction and is rejected by Message.Pack instead; before the fix
+// that Pack error was returned as a plain error, which lookupCandidate retried
+// like a lost datagram and reported as ErrTempFail. The C shim's
+// k3sm_encode_name rejects both at build time and returns K3SM_DNS_MISS with
+// zero wire I/O. The assertion is the CLASSIFICATION (a definitive miss: nil
+// error, no addrs) plus zero exchanges: an unencodable name must never reach the
+// wire, and must never be retried.
 //
 // See also: TestDNSWireClassificationDifferential (differential_integration_test.go)
-// asserts the same case against the REAL dylib.
+// asserts both cases against the REAL dylib.
 func TestUnencodableLabelDefinitiveMiss(t *testing.T) {
 	t.Parallel()
+
+	t.Run("label over the 63-byte ceiling", func(t *testing.T) {
+		// One 64-byte label (the wire ceiling is 63) in a name whose total is far
+		// under 255 — so NewName accepts it and ONLY the Pack encode rejects it.
+		fqdn := strings.Repeat("x", 64) + ".test.invalid"
+		if n := len(ensureFQDN(fqdn)); n > 255 {
+			t.Fatalf("fixture name is %d bytes; it must stay <=255 so NewName is not the rejecting step", n)
+		}
+		assertUnencodableDefinitiveMiss(t, fqdn)
+	})
+
+	t.Run("zero-length interior label", func(t *testing.T) {
+		// "a..b": Pack fails with errZeroSegLen. The C shim used to SKIP an empty
+		// label, collapsing this to "a.b" and querying a name the caller never
+		// asked for; k3sm_encode_name now rejects it, so both engines agree.
+		assertUnencodableDefinitiveMiss(t, "a..b.test.invalid")
+	})
+}
+
+// assertUnencodableDefinitiveMiss asserts the resolver classifies fqdn as a
+// DEFINITIVE miss — at the per-candidate altitude and at the caller-visible
+// LookupHost altitude — with zero exchanges on the wire.
+func assertUnencodableDefinitiveMiss(t *testing.T, fqdn string) {
+	t.Helper()
 	stub := newStubDNS(t, map[string]netip.Addr{})
 	defer stub.close()
 
@@ -317,19 +341,12 @@ func TestUnencodableLabelDefinitiveMiss(t *testing.T) {
 		t.Fatalf("NewResolver: %v", err)
 	}
 
-	// One 64-byte label (the wire ceiling is 63) in a name whose total is far
-	// under 255 — so NewName accepts it and ONLY the Pack encode rejects it.
-	fqdn := strings.Repeat("x", 64) + ".test.invalid"
-	if n := len(ensureFQDN(fqdn)); n > 255 {
-		t.Fatalf("fixture name is %d bytes; it must stay <=255 so NewName is not the rejecting step", n)
-	}
-
 	addrs, err := r.lookupCandidate(context.Background(), fqdn)
 	if err != nil {
-		t.Fatalf("lookupCandidate(64-byte label) err = %v, want a DEFINITIVE miss (nil error, no addrs)", err)
+		t.Fatalf("lookupCandidate(%q) err = %v, want a DEFINITIVE miss (nil error, no addrs)", fqdn, err)
 	}
 	if len(addrs) != 0 {
-		t.Fatalf("lookupCandidate(64-byte label) = %v, want no addresses", addrs)
+		t.Fatalf("lookupCandidate(%q) = %v, want no addresses", fqdn, addrs)
 	}
 	if dials != 0 {
 		t.Fatalf("resolver attempted %d exchange(s) for an unencodable name; want 0", dials)
