@@ -21,6 +21,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -282,6 +283,72 @@ func TestLookupHostQueryCarriesEDNSOPT(t *testing.T) {
 	}
 	if size != EDNSUDPPayloadSize {
 		t.Fatalf("EDNS0 OPT UDP payload size = %d, want %d", size, EDNSUDPPayloadSize)
+	}
+}
+
+// TestUnencodableLabelDefinitiveMiss pins the >63-byte-label case to the C
+// shim's classification. dnsmessage.NewName bounds only a name's TOTAL length
+// (<=255), so a name with a single 64-byte label passes construction and is
+// rejected by Message.Pack instead; before the fix that Pack error was returned
+// as a plain error, which lookupCandidate retried like a lost datagram and
+// reported as ErrTempFail — while the C shim's k3sm_encode_name rejects the
+// over-long label at build time and returns K3SM_DNS_MISS with zero wire I/O.
+// The assertion is the CLASSIFICATION (a definitive miss: nil error, no addrs)
+// plus zero exchanges: an unencodable name must never reach the wire, and must
+// never be retried.
+//
+// See also: TestDNSWireClassificationDifferential (differential_integration_test.go)
+// asserts the same case against the REAL dylib.
+func TestUnencodableLabelDefinitiveMiss(t *testing.T) {
+	t.Parallel()
+	stub := newStubDNS(t, map[string]netip.Addr{})
+	defer stub.close()
+
+	// dials counts every exchange the resolver attempts. It is written only from
+	// the resolver's synchronous dial seam on this goroutine, so it needs no lock.
+	dials := 0
+	counting := withDialer(func(ctx context.Context, network, _ string) (net.Conn, error) {
+		dials++
+		d := net.Dialer{}
+		return d.DialContext(ctx, network, stub.addr())
+	})
+	r, err := NewResolver(stdConfig(), counting, WithTimeout(200*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	// One 64-byte label (the wire ceiling is 63) in a name whose total is far
+	// under 255 — so NewName accepts it and ONLY the Pack encode rejects it.
+	fqdn := strings.Repeat("x", 64) + ".test.invalid"
+	if n := len(ensureFQDN(fqdn)); n > 255 {
+		t.Fatalf("fixture name is %d bytes; it must stay <=255 so NewName is not the rejecting step", n)
+	}
+
+	addrs, err := r.lookupCandidate(context.Background(), fqdn)
+	if err != nil {
+		t.Fatalf("lookupCandidate(64-byte label) err = %v, want a DEFINITIVE miss (nil error, no addrs)", err)
+	}
+	if len(addrs) != 0 {
+		t.Fatalf("lookupCandidate(64-byte label) = %v, want no addresses", addrs)
+	}
+	if dials != 0 {
+		t.Fatalf("resolver attempted %d exchange(s) for an unencodable name; want 0", dials)
+	}
+	if stub.asked(fqdn) {
+		t.Fatalf("stub received a query for an unencodable name")
+	}
+
+	// The caller-visible consequence: ErrNotFound (the name cannot exist), never
+	// ErrTempFail (which would make a pod retry a name that can never resolve).
+	_, err = r.LookupHost(context.Background(), fqdn+".")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LookupHost(unencodable) err = %v, want ErrNotFound", err)
+	}
+	if errors.Is(err, ErrTempFail) {
+		t.Fatalf("unencodable name reported as transient: %v", err)
+	}
+	if dials != 0 {
+		t.Fatalf("LookupHost attempted %d exchange(s) for an unencodable name; want 0", dials)
 	}
 }
 
