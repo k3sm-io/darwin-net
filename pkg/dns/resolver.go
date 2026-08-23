@@ -309,7 +309,12 @@ func (r *Resolver) queryA(ctx context.Context, fqdn string) (aResult, error) {
 		// an over-long label at build time and yields K3SM_DNS_MISS with zero
 		// wire I/O (shim/getaddrinfo_shim.c, k3sm_encode_name -> k3sm_query_a).
 		// TestUnencodableLabelDefinitiveMiss and the wire-classification
-		// differential pin the two sides together.
+		// differential pin the two sides together for THAT case. The mirror
+		// claim is NOT yet true for every Pack failure: a ZERO-LENGTH label
+		// ("a..b") lands here too, but the C shim silently SKIPS empty labels
+		// and queries the collapsed name on the wire — a known, backlogged
+		// C-side divergence (with the >255 snprintf truncation the differential
+		// pins); close it C-side, then add the fixture here.
 		return aResult{rcode: dnsmessage.RCodeNameError}, nil
 	}
 
