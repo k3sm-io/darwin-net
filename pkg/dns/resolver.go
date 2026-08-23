@@ -297,7 +297,25 @@ func (r *Resolver) queryA(ctx context.Context, fqdn string) (aResult, error) {
 	}
 	packed, err := msg.Pack()
 	if err != nil {
-		return aResult{}, fmt.Errorf("pack query: %w", err)
+		// Same synthetic DEFINITIVE miss as the NewName failure above, for the
+		// same reason. Pack's only realistic failure here is NAME ENCODING: the
+		// header, question and OPT RR are built from constants, so the single
+		// variable input is the name — and dnsmessage.NewName bounds only the
+		// TOTAL length (<=255), so a name carrying one label of 64+ bytes sails
+		// past it and is rejected here instead. An unencodable name can never
+		// resolve at CoreDNS, so retrying it is pointless; returning an error
+		// would make lookupCandidate retry it like a lost datagram and report
+		// ErrTempFail, diverging from the C shim, whose k3sm_encode_name rejects
+		// an over-long label at build time and yields K3SM_DNS_MISS with zero
+		// wire I/O (shim/getaddrinfo_shim.c, k3sm_encode_name -> k3sm_query_a).
+		// TestUnencodableLabelDefinitiveMiss and the wire-classification
+		// differential pin the two sides together for THAT case. The mirror
+		// claim is NOT yet true for every Pack failure: a ZERO-LENGTH label
+		// ("a..b") lands here too, but the C shim silently SKIPS empty labels
+		// and queries the collapsed name on the wire — a known, backlogged
+		// C-side divergence (with the >255 snprintf truncation the differential
+		// pins); close it C-side, then add the fixture here.
+		return aResult{rcode: dnsmessage.RCodeNameError}, nil
 	}
 
 	resp, err := r.exchange(ctx, "udp", packed)
