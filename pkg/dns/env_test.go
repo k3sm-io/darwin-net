@@ -161,6 +161,12 @@ func TestConfigToEnvCapsAndSanitizes(t *testing.T) {
 // the .c as text, extracts every getenv("K3SM_DNS_…") name, and asserts that set
 // exactly equals the consts ConfigToEnv and k3sm depend on. A rename on either
 // side fails here instead of silently disabling cluster DNS in pods.
+//
+// See also: TestDNSWireClassificationDifferential
+// (differential_integration_test.go) is the BEHAVIOURAL half of the same C<->Go
+// contract — it runs both engines over the same wire bytes. This guard binds the
+// CONSTANTS by reading the .c as text and needs no toolchain, so it is neither
+// subsumed by nor redundant with the differential; keep both.
 func TestShimEnvNamesMatchC(t *testing.T) {
 	const shimPath = "../../shim/getaddrinfo_shim.c"
 	src, err := os.ReadFile(shimPath)
@@ -199,6 +205,10 @@ func TestShimEnvNamesMatchC(t *testing.T) {
 // emitted K3SM_DNS_SEARCH list, the shim's effective in-pod list, and the Go
 // resolver mirror cannot silently diverge. A future edit to either side fails the
 // build here instead of truncating the search list at a different bound in pods.
+//
+// See also: TestDNSWireClassificationDifferential
+// (differential_integration_test.go), the behavioural sibling of this whole
+// family of constant-level drift guards.
 func TestShimMaxSearchMatchesC(t *testing.T) {
 	const shimPath = "../../shim/getaddrinfo_shim.c"
 	src, err := os.ReadFile(shimPath)
