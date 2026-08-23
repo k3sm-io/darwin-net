@@ -208,11 +208,13 @@ static int k3sm_count_dots(const char *name) {
  * without touching the wire.
  *
  * The same test is applied identically before EACH of the three snprintf sites
- * below. The wire differential only exercises the ABSOLUTE site (it passes names
- * with a trailing dot so expansion collapses to a single candidate); the search
- * and plain sites are correct BY CONSTRUCTION — same computation of the would-be
- * length, same comparison against the same constant. Keep them literally
- * parallel so that stays true.
+ * below. ACCEPTED COVERAGE SCOPE, not a parity proof: the wire differential
+ * exercises only the ABSOLUTE site (it passes names with a trailing dot so
+ * expansion collapses to a single candidate); the search and plain sites carry
+ * the same would-be-length computation against the same constant and are pinned
+ * today only by this literal parallelism plus review. Wire-level coverage of
+ * the non-absolute sites is tracked in the workspace backlog (differential
+ * coverage completion). Keep the sites literally parallel until that lands.
  */
 static int k3sm_candidates(const k3sm_cfg_t *c, const char *name,
                            char out[][K3SM_MAX_NAME], int *bad, int max) {
