@@ -224,10 +224,12 @@ static int k3sm_count_dots(const char *name) {
  *     polarity is the ordinary in-pod path, pinned behaviourally by
  *     TestGetaddrinfoShimResolvesViaStub (a short name's search-expanded
  *     candidate reaches the stub and HITs).
- *   - PLAIN, `len > MAX` (the absolute-first site and the identical tail site):
- *     plain_over_boundary pins the TRUE polarity at the tail site (an over-long
- *     bare name makes every candidate bad and the stub observes zero queries),
- *     and search_suffix_over_boundary's second candidate pins the FALSE one (the
+ *   - PLAIN, `len > MAX` (two physical occurrences of one check):
+ *     plain_over_boundary pins the TRUE polarity at the TAIL site (ndots high,
+ *     an over-long bare name makes every candidate bad, zero observed queries),
+ *     absolute_first_over_boundary pins the TRUE polarity at the ABSOLUTE-FIRST
+ *     site (the same name with ndots 1, dots >= ndots), and
+ *     search_suffix_over_boundary's second candidate pins the FALSE one (the
  *     under-MAX bare name does reach the wire).
  *
  * Keep the sites literally parallel: the differential compares the two engines

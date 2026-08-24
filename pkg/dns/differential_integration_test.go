@@ -554,6 +554,19 @@ func differentialCases(t *testing.T) []diffCase {
 				queried: nil,
 			},
 			why: "INPUT-ONLY (no fixture): a bare name one byte past the ceiling makes EVERY candidate bad — the tail/plain bad[] site's TRUE polarity, proven by zero observed queries on both engines"},
+		{name: "absolute_first_over_boundary", host: bareOver,
+			multi: &multiCand{
+				// The same boundary+1 name as plain_over_boundary, but ndots: 1 —
+				// bareOver carries interior dots from nameOfLength, so dots >= ndots
+				// routes the bare candidate through the ABSOLUTE-FIRST plain site
+				// (the fourth physical length-check occurrence), not the tail. Same
+				// empty search list, for the same truncation reason.
+				search:  "",
+				ndots:   1,
+				want:    map[string]wireVerdict{bareOver: verdictMiss},
+				queried: nil,
+			},
+			why: "INPUT-ONLY (no fixture): the boundary+1 name routed via dots >= ndots pins the ABSOLUTE-FIRST plain bad[] site's TRUE polarity — zero observed queries on both engines"},
 		{name: "cluster_named_service", host: "cluster-named-service.default.svc.cluster.local",
 			want: verdictHit, wire: true, probeService: "http",
 			why: "a NAMED service on a CLUSTER-scoped candidate must still be QUERIED, not deferred (only an EXTERNAL candidate defers — Caveat 3): the shim traces the same HIT the Go reference reaches, and only then refuses the call with EAI_SERVICE"},
