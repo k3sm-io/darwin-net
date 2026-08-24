@@ -207,14 +207,34 @@ static int k3sm_count_dots(const char *name) {
  * short-circuits a bad slot to a definitive miss, without classifying it and
  * without touching the wire.
  *
- * The same test is applied identically before EACH of the three snprintf sites
- * below. ACCEPTED COVERAGE SCOPE, not a parity proof: the wire differential
- * exercises only the ABSOLUTE site (it passes names with a trailing dot so
- * expansion collapses to a single candidate); the search and plain sites carry
- * the same would-be-length computation against the same constant and are pinned
- * today only by this literal parallelism plus review. Wire-level coverage of
- * the non-absolute sites is tracked in the workspace backlog (differential
- * coverage completion). Keep the sites literally parallel until that lands.
+ * The same test is applied identically before EACH of the three would-be-length
+ * computations below, and ALL THREE now have WIRE-LEVEL coverage in
+ * ../pkg/dns/differential_integration_test.go — named case by named case, never
+ * a blanket "covered":
+ *
+ *   - ABSOLUTE, `len - 1 > MAX` (the trailing-dot branch): boundary_max_name
+ *     pins the FALSE polarity (a name at exactly MAX still reaches the wire on
+ *     both engines) and boundary_over_max_name the TRUE one (one byte past MAX
+ *     reaches neither engine's wire).
+ *   - SEARCH-SUFFIXED, `len + 1 + strlen(search) > MAX` (the search loop):
+ *     search_suffix_over_boundary pins the TRUE polarity — one dedicated search
+ *     domain calibrated so the bare name is under MAX but the suffixed candidate
+ *     is over it, so the two candidates of ONE request straddle the boundary and
+ *     exactly the suffixed one shows a miss with zero wire I/O. Its FALSE
+ *     polarity is the ordinary in-pod path, pinned behaviourally by
+ *     TestGetaddrinfoShimResolvesViaStub (a short name's search-expanded
+ *     candidate reaches the stub and HITs).
+ *   - PLAIN, `len > MAX` (two physical occurrences of one check):
+ *     plain_over_boundary pins the TRUE polarity at the TAIL site (ndots high,
+ *     an over-long bare name makes every candidate bad, zero observed queries),
+ *     absolute_first_over_boundary pins the TRUE polarity at the ABSOLUTE-FIRST
+ *     site (the same name with ndots 1, dots >= ndots), and
+ *     search_suffix_over_boundary's second candidate pins the FALSE one (the
+ *     under-MAX bare name does reach the wire).
+ *
+ * Keep the sites literally parallel: the differential compares the two engines
+ * per CANDIDATE NAME, so a site that computed its length differently would show
+ * up as a missing key rather than as a silently wrong verdict.
  */
 static int k3sm_candidates(const k3sm_cfg_t *c, const char *name,
                            char out[][K3SM_MAX_NAME], int *bad, int max) {
@@ -389,10 +409,32 @@ static int k3sm_parse_port(const char *service, uint16_t *port, int *named) {
  * dot would not actually reach the reject: the loop ends when the character
  * after the final dot is the NUL. The invariant is what makes that safe, and
  * k3sm_query_a is the single caller today — keep it if that changes.)
+ *
+ * That same trailing-dot strip is ALSO how a WHOLLY EMPTY name arrives: the
+ * request "." leaves k3sm_candidates' absolute branch as "". The per-label loop
+ * below never executes for it, so the zero-length-label reject cannot fire and
+ * the function would fall through to emitting a BARE ROOT query — a query for
+ * the root zone, not for anything the caller asked about. The explicit
+ * empty-name guard at the top of the function is what closes that: it is the
+ * degenerate member of the same unencodable class, and the Go reference reaches
+ * the identical verdict (Message.Pack returns errNonCanonicalName for the empty
+ * name, which queryA maps to a definitive miss with zero wire I/O). The wire
+ * differential's unencodable_empty_name case pins both engines on it, verdict
+ * AND zero queries.
  */
 static int k3sm_encode_name(const char *name, uint8_t *buf, size_t cap) {
     size_t pos = 0;
     const char *p = name;
+    /*
+     * A WHOLLY EMPTY name is UNENCODABLE — reject before the loop, which would
+     * never run for it (see the invariant above). Same -1 channel as the
+     * zero-length-label reject: it flows through k3sm_build_query < 0 to
+     * k3sm_query_a's K3SM_DNS_MISS boundary, so the empty name is a definitive
+     * miss with zero wire I/O instead of a root query.
+     */
+    if (*p == '\0') {
+        return -1;
+    }
     while (*p != '\0') {
         const char *dot = strchr(p, '.');
         size_t label = dot ? (size_t)(dot - p) : strlen(p);

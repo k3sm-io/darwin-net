@@ -328,10 +328,14 @@ func (r *Resolver) queryA(ctx context.Context, fqdn string) (aResult, error) {
 		//     behaviour on both sides of it (boundary_max_name reaches the wire
 		//     on both engines, boundary_over_max_name and unencodable_total_gt255
 		//     reach it on neither).
-		// One member of the class is deliberately NOT claimed: the degenerate
-		// EMPTY name (errNonCanonicalName — ensureFQDN cannot add a dot to ""),
-		// which candidateNames produces only for the input ".". The shim encodes
-		// that as a bare root query instead of a miss.
+		//   - the degenerate EMPTY name (errNonCanonicalName — ensureFQDN cannot
+		//     append a dot to "", so Pack refuses the non-canonical name), which
+		//     candidateNames produces for the input "." — shim: the explicit
+		//     empty-name reject at the top of k3sm_encode_name, whose per-label
+		//     loop never runs for "" and which therefore used to emit a BARE ROOT
+		//     query instead of a miss. The differential's unencodable_empty_name
+		//     pins it on both engines, verdict AND zero queries — the zero-query
+		//     half is what that stray root query tripped.
 		return aResult{rcode: dnsmessage.RCodeNameError}, nil
 	}
 
