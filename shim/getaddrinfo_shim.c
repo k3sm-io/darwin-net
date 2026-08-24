@@ -68,7 +68,50 @@ __attribute__((used)) static const interpose_t k3sm_interposers[]
 /* -------- config from environment -------- */
 
 #define K3SM_MAX_SEARCH 8
+
+/*
+ * K3SM_DNS_MAX_NAME_LEN is the ONE shared boundary for how long a candidate name
+ * may be, measured as this shim stores it: PRESENTATION form, dotted labels, NO
+ * trailing dot, no NUL. Every length check in this file compares against it. The
+ * buffer capacities nearby (K3SM_MAX_NAME below, the 500-byte wire budget in
+ * k3sm_build_query) are incidental sizes and must NEVER be used as the boundary
+ * — that conflation is exactly the bug this constant closes.
+ *
+ * DERIVED FROM THE GO REFERENCE (pkg/dns/resolver.go queryA), not from RFC
+ * memory, because the two engines must accept and reject the SAME names:
+ *   - queryA encodes ensureFQDN(candidate) — the candidate WITH a trailing dot
+ *     appended — through dnsmessage.NewName then Message.Pack.
+ *   - dnsmessage.Name.pack rejects Length > nonEncodedNameMax == 254, so the
+ *     dotted form is encodable iff it is <= 254 bytes. (NewName alone only
+ *     bounds <= 255, so a 255-byte dotted name gets past it and dies in Pack;
+ *     either way the Go side yields a definitive miss with zero wire I/O.)
+ *   - candidate + '.'  <= 254   <=>   candidate <= 253.
+ * So a name of exactly 253 bytes is encodable on BOTH sides and 254 is rejected
+ * on BOTH. Independently confirmed by the wire arithmetic: a presentation name
+ * of L bytes with k labels encodes to L + 2 octets (each of the k-1 dots becomes
+ * a length byte, plus one leading length byte and the root label), so L = 253 is
+ * exactly the RFC 1035 255-octet wire ceiling, and by dnsmessage's unpack guard,
+ * which refuses a decoded name once it would reach 254 bytes.
+ *
+ * pkg/dns/env_test.go TestShimMaxNameLenMatchesGo binds this value to the Go
+ * encoder behaviourally (it must be the largest length the reference resolver
+ * still puts on the wire), and the wire differential pins the boundary and
+ * boundary+1 cases on both engines.
+ */
+#define K3SM_DNS_MAX_NAME_LEN 253
+
+/*
+ * Storage capacity for one presentation name: the boundary, plus its NUL, plus
+ * slack. This is a BUFFER SIZE, never a policy: a candidate is judged against
+ * K3SM_DNS_MAX_NAME_LEN *before* it is written here, so bumping this number can
+ * never widen what the shim will encode or put on the wire. Shrinking it below
+ * K3SM_DNS_MAX_NAME_LEN + 1 would silently truncate a LEGAL name, which the
+ * assertion below refuses at compile time.
+ */
 #define K3SM_MAX_NAME 256
+
+_Static_assert(K3SM_MAX_NAME >= K3SM_DNS_MAX_NAME_LEN + 1,
+               "candidate buffer must hold a boundary-length name plus its NUL");
 
 typedef struct {
     int enabled;
@@ -150,14 +193,38 @@ static int k3sm_count_dots(const char *name) {
  * pkg/dns/expand.go: absolute (trailing dot) -> just the name; dots >= ndots ->
  * absolute first then search; else search first then absolute. Returns the
  * count; candidates are written into out (each up to K3SM_MAX_NAME).
+ *
+ * bad[i] is set when candidate i's would-be PRESENTATION length exceeds
+ * K3SM_DNS_MAX_NAME_LEN — precisely the names the Go reference refuses to
+ * encode. The length is computed from the INPUTS, before the snprintf, because
+ * afterwards the stored bytes are truncated to K3SM_MAX_NAME and strlen(out[i])
+ * can no longer tell an over-long name from a merely long one.
+ *
+ * An over-long candidate KEEPS ITS SLOT: out[i] holds the truncated bytes and
+ * the returned count is unchanged. The list must walk in per-candidate lockstep
+ * with the Go resolver's, and the wire differential asserts exactly ONE debug
+ * trace line per candidate, so shrinking the list would break both. The caller
+ * short-circuits a bad slot to a definitive miss, without classifying it and
+ * without touching the wire.
+ *
+ * The same test is applied identically before EACH of the three snprintf sites
+ * below. ACCEPTED COVERAGE SCOPE, not a parity proof: the wire differential
+ * exercises only the ABSOLUTE site (it passes names with a trailing dot so
+ * expansion collapses to a single candidate); the search and plain sites carry
+ * the same would-be-length computation against the same constant and are pinned
+ * today only by this literal parallelism plus review. Wire-level coverage of
+ * the non-absolute sites is tracked in the workspace backlog (differential
+ * coverage completion). Keep the sites literally parallel until that lands.
  */
 static int k3sm_candidates(const k3sm_cfg_t *c, const char *name,
-                           char out[][K3SM_MAX_NAME], int max) {
+                           char out[][K3SM_MAX_NAME], int *bad, int max) {
     int n = 0;
     size_t len = strlen(name);
 
     if (len > 0 && name[len - 1] == '.') {
         if (n < max) {
+            /* would-be length: the name minus its trailing dot */
+            bad[n] = (len - 1 > (size_t)K3SM_DNS_MAX_NAME_LEN);
             snprintf(out[n], K3SM_MAX_NAME, "%.*s", (int)(len - 1), name);
             n++;
         }
@@ -168,14 +235,20 @@ static int k3sm_candidates(const k3sm_cfg_t *c, const char *name,
     int absolute_first = (dots >= c->ndots);
 
     if (absolute_first && n < max) {
+        /* would-be length: the name itself */
+        bad[n] = (len > (size_t)K3SM_DNS_MAX_NAME_LEN);
         snprintf(out[n], K3SM_MAX_NAME, "%s", name);
         n++;
     }
     for (int i = 0; i < c->nsearch && n < max; i++) {
+        /* would-be length: name + '.' + search domain */
+        bad[n] = (len + 1 + strlen(c->search[i]) > (size_t)K3SM_DNS_MAX_NAME_LEN);
         snprintf(out[n], K3SM_MAX_NAME, "%s.%s", name, c->search[i]);
         n++;
     }
     if (!absolute_first && n < max) {
+        /* would-be length: the name itself */
+        bad[n] = (len > (size_t)K3SM_DNS_MAX_NAME_LEN);
         snprintf(out[n], K3SM_MAX_NAME, "%s", name);
         n++;
     }
@@ -306,17 +379,35 @@ static int k3sm_parse_port(const char *service, uint16_t *port, int *named) {
 /* Per-attempt wall-clock timeout (seconds) for a UDP/TCP exchange. */
 #define K3SM_DNS_TIMEOUT_SEC 2
 
-/* Encode a dotted name into DNS wire label format. Returns bytes written or -1. */
+/*
+ * Encode a dotted name into DNS wire label format. Returns bytes written or -1.
+ *
+ * INVARIANT: callers pass a name with NO trailing dot. k3sm_candidates strips
+ * the one legitimate trailing dot in its absolute branch and k3sm_load_cfg
+ * strips it from every search domain at config load, so any empty label reaching
+ * the loop below is a defect in the requested name, not punctuation. (A trailing
+ * dot would not actually reach the reject: the loop ends when the character
+ * after the final dot is the NUL. The invariant is what makes that safe, and
+ * k3sm_query_a is the single caller today — keep it if that changes.)
+ */
 static int k3sm_encode_name(const char *name, uint8_t *buf, size_t cap) {
     size_t pos = 0;
     const char *p = name;
     while (*p != '\0') {
         const char *dot = strchr(p, '.');
         size_t label = dot ? (size_t)(dot - p) : strlen(p);
-        if (label == 0) { /* skip empty label (e.g. trailing dot) */
-            if (dot == NULL) break;
-            p = dot + 1;
-            continue;
+        if (label == 0) {
+            /*
+             * A ZERO-LENGTH label is UNENCODABLE — reject, never skip. The Go
+             * reference reaches the same verdict (dnsmessage's pack returns
+             * errZeroSegLen, which queryA maps to a definitive miss with zero
+             * wire I/O). Skipping it silently collapsed "a..b" to "a.b", putting
+             * a query for a DIFFERENT name than the caller asked for on the
+             * wire, which can return a HIT belonging to another host. -1 flows
+             * through k3sm_build_query < 0 to k3sm_query_a's existing
+             * K3SM_DNS_MISS boundary; no new outcome channel is needed.
+             */
+            return -1;
         }
         if (label > 63 || pos + label + 1 >= cap) {
             return -1;
@@ -794,6 +885,21 @@ static int k3sm_make_result(const uint8_t addr4[4], uint16_t port,
 }
 
 /*
+ * Print the per-candidate K3SM_DNS_DEBUG verdict line. This is the SINGLE place
+ * that wording lives: pkg/dns/differential_integration_test.go's traceRE parses
+ * it to read the C engine's verdict, and asserts exactly ONE line per candidate.
+ * Every path that finishes a candidate calls this exactly once (callers gate on
+ * the debug flag). Note it prints cands[i] as STORED — for an over-long name
+ * those are the truncated bytes, a storage fact, not a name anything queried.
+ */
+static void k3sm_trace_verdict(const k3sm_cfg_t *c, const char *cand, int rc) {
+    fprintf(stderr, "k3sm-dns:   query %s @ %s:%s -> %s\n", cand, c->server, c->port,
+            rc == K3SM_DNS_HIT    ? "HIT"
+            : rc == K3SM_DNS_MISS ? "miss"
+                                  : "TEMPFAIL");
+}
+
+/*
  * The interposed getaddrinfo. When the shim is configured (K3SM_DNS_SERVER set)
  * and the request is a plain hostname (not a numeric literal, not a service-only
  * lookup), it resolves via CoreDNS using ndots/search expansion. Anything it
@@ -849,7 +955,10 @@ int k3sm_getaddrinfo(const char *node, const char *service,
     }
 
     char cands[K3SM_MAX_SEARCH + 1][K3SM_MAX_NAME];
-    int ncand = k3sm_candidates(&cfg, node, cands, K3SM_MAX_SEARCH + 1);
+    /* bad[i] marks candidate i as over K3SM_DNS_MAX_NAME_LEN — unencodable, so
+     * a definitive miss decided without any wire I/O (see the walk below). */
+    int bad[K3SM_MAX_SEARCH + 1] = {0};
+    int ncand = k3sm_candidates(&cfg, node, cands, bad, K3SM_MAX_SEARCH + 1);
     /*
      * cluster_tempfail records that a CLUSTER-scoped candidate failed
      * transiently. We keep walking past it (a later EXTERNAL absolute candidate
@@ -860,6 +969,25 @@ int k3sm_getaddrinfo(const char *node, const char *service,
      */
     int cluster_tempfail = 0;
     for (int i = 0; i < ncand; i++) {
+        /*
+         * An UNENCODABLE candidate (would-be presentation length over
+         * K3SM_DNS_MAX_NAME_LEN) is a DEFINITIVE miss with ZERO wire I/O, and it
+         * is decided FIRST — before the cluster_tempfail skip, before the
+         * named_service defer, and so before k3sm_candidate_fail_closed is ever
+         * consulted for this slot. That ordering is the substance, not a style
+         * choice: cands[i] holds only the TRUNCATED bytes, so letting them reach
+         * either the suffix classification (which decides fail-closed vs
+         * external from a name the caller never asked for) or the wire is the
+         * same defect twice. The Go reference likewise refuses to encode the
+         * name and never classifies it. Falling out of the walk as a miss
+         * matches the Go resolver, which advances to the next candidate.
+         */
+        if (bad[i]) {
+            if (dbg) {
+                k3sm_trace_verdict(&cfg, cands[i], K3SM_DNS_MISS);
+            }
+            continue;
+        }
         /*
          * Once a cluster-scoped candidate has failed transiently, do NOT try any
          * remaining cluster-scoped candidate: they ask the same unreachable
@@ -894,11 +1022,7 @@ int k3sm_getaddrinfo(const char *node, const char *service,
             rc = k3sm_query_a(&cfg, cands[i], addr4);
         }
         if (dbg) {
-            fprintf(stderr, "k3sm-dns:   query %s @ %s:%s -> %s\n",
-                    cands[i], cfg.server, cfg.port,
-                    rc == K3SM_DNS_HIT      ? "HIT"
-                    : rc == K3SM_DNS_MISS   ? "miss"
-                                            : "TEMPFAIL");
+            k3sm_trace_verdict(&cfg, cands[i], rc);
         }
         if (rc == K3SM_DNS_HIT) {
             if (named_service) {

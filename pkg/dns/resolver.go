@@ -301,20 +301,37 @@ func (r *Resolver) queryA(ctx context.Context, fqdn string) (aResult, error) {
 		// same reason. Pack's only realistic failure here is NAME ENCODING: the
 		// header, question and OPT RR are built from constants, so the single
 		// variable input is the name — and dnsmessage.NewName bounds only the
-		// TOTAL length (<=255), so a name carrying one label of 64+ bytes sails
-		// past it and is rejected here instead. An unencodable name can never
-		// resolve at CoreDNS, so retrying it is pointless; returning an error
-		// would make lookupCandidate retry it like a lost datagram and report
-		// ErrTempFail, diverging from the C shim, whose k3sm_encode_name rejects
-		// an over-long label at build time and yields K3SM_DNS_MISS with zero
-		// wire I/O (shim/getaddrinfo_shim.c, k3sm_encode_name -> k3sm_query_a).
-		// TestUnencodableLabelDefinitiveMiss and the wire-classification
-		// differential pin the two sides together for THAT case. The mirror
-		// claim is NOT yet true for every Pack failure: a ZERO-LENGTH label
-		// ("a..b") lands here too, but the C shim silently SKIPS empty labels
-		// and queries the collapsed name on the wire — a known, backlogged
-		// C-side divergence (with the >255 snprintf truncation the differential
-		// pins); close it C-side, then add the fixture here.
+		// TOTAL length, so a name whose defect is a single LABEL sails past it
+		// and is rejected here instead. An unencodable name can never resolve at
+		// CoreDNS, so retrying it is pointless; returning an error would make
+		// lookupCandidate retry it like a lost datagram and report ErrTempFail,
+		// diverging from the C shim, which reaches the same verdict with zero
+		// wire I/O.
+		//
+		// The C shim now mirrors every name-encoding rejection reachable from a
+		// real hostname, each pinned by a named test:
+		//   - a label of 64+ bytes (errSegTooLong) — shim: k3sm_encode_name
+		//     returns -1. TestUnencodableLabelDefinitiveMiss/"label over the
+		//     63-byte ceiling" (this side) and the wire differential's
+		//     unencodable_label_gt63 (both engines, zero queries).
+		//   - a ZERO-LENGTH label, "a..b" (errZeroSegLen) — shim: the same
+		//     k3sm_encode_name reject, which used to SKIP the empty label and
+		//     query the collapsed name. TestUnencodableLabelDefinitiveMiss/
+		//     "zero-length interior label" and the differential's
+		//     unencodable_empty_label.
+		//   - a TOTAL length past the ceiling (NewName above, or pack's
+		//     nonEncodedNameMax) — shim: k3sm_candidates flags the candidate
+		//     against K3SM_DNS_MAX_NAME_LEN and the walk short-circuits it to a
+		//     miss BEFORE classifying or querying the snprintf-truncated bytes.
+		//     env_test.go's TestShimMaxNameLenMatchesGo binds that constant to
+		//     this encoder's real ceiling, and the differential pins the
+		//     behaviour on both sides of it (boundary_max_name reaches the wire
+		//     on both engines, boundary_over_max_name and unencodable_total_gt255
+		//     reach it on neither).
+		// One member of the class is deliberately NOT claimed: the degenerate
+		// EMPTY name (errNonCanonicalName — ensureFQDN cannot add a dot to ""),
+		// which candidateNames produces only for the input ".". The shim encodes
+		// that as a bare root query instead of a miss.
 		return aResult{rcode: dnsmessage.RCodeNameError}, nil
 	}
 
