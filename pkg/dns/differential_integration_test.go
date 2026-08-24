@@ -84,9 +84,15 @@ limitations under the License.
 // exception is malformed_wrongid, where the stub deliberately answers with the
 // incoming ID XOR 0xFFFF, i.e. wrong relative to whatever each engine sent.
 //
-// TWO cases are INPUT-ONLY and deliberately have NO .golden.wire fixture — do
-// not go looking for one: unencodable_label_gt63 and unencodable_total_gt255 are
-// rejected at query-encode time, so no response is ever served.
+// FOUR cases are INPUT-ONLY and deliberately have NO .golden.wire fixture — do
+// not go looking for one: unencodable_label_gt63, unencodable_total_gt255,
+// unencodable_empty_label and boundary_over_max_name are rejected at
+// query-encode time on BOTH engines, so no response is ever served.
+//
+// boundary_max_name has no fixture either, for a different reason: it is the
+// name one byte SHORTER than boundary_over_max_name, it does reach the wire on
+// both engines, and the stub's synthesized NXDOMAIN (below) is the answer. The
+// two together pin the shared presentation-length boundary from both sides.
 package dns
 
 import (
@@ -160,8 +166,9 @@ type wireQuery struct {
 // unit tier). Serving fixed bytes is what lets one fixture drive two independent
 // parsers: the template is byte-identical for both engines, with only the 2-byte
 // ID patched per query. A query for a name with no fixture is answered with a
-// synthesized NXDOMAIN, which only the pinned C-side truncation divergence below
-// ever reaches.
+// synthesized NXDOMAIN; the only case that reaches it is boundary_max_name,
+// whose point is that a name at exactly the shared length ceiling still gets
+// encoded and asked on both engines.
 type templateDNS struct {
 	udp    *net.UDPConn
 	tcpLn  net.Listener
@@ -302,7 +309,8 @@ func (s *templateDNS) respond(query []byte, transport string) ([]byte, bool) {
 }
 
 // synthNXDomain builds a minimal NXDOMAIN answer echoing the query's question
-// section. Only the C shim's over-long-name TRUNCATION (pinned below) reaches it.
+// section. Only boundary_max_name — the fixture-less case that deliberately DOES
+// reach the wire on both engines — is answered from here.
 func synthNXDomain(query []byte, qend int, id uint16) []byte {
 	resp := make([]byte, 12, 12+(qend-12))
 	binary.BigEndian.PutUint16(resp[0:2], id)
@@ -346,15 +354,22 @@ type diffCase struct {
 	name string // subtest name; also the testdata/<name>.golden.wire basename
 	host string // the queried name, without a trailing dot
 	want wireVerdict
-	// wire is false for the two INPUT-ONLY cases, which are rejected at
-	// query-encode time and therefore have no fixture file.
+	// wire is false for the four INPUT-ONLY cases (rejected at query-encode time
+	// on both engines) and for boundary_max_name (answered by the stub's
+	// synthesized NXDOMAIN); none of them has a fixture file.
 	wire    bool
 	tcpWire bool // a testdata/<name>.tcp.golden.wire also exists
 	wrongID bool
 	why     string
 }
 
-func differentialCases() []diffCase {
+func differentialCases(t *testing.T) []diffCase {
+	t.Helper()
+	// The boundary is read out of the C shim source rather than restated here, so
+	// these two cases follow K3SM_DNS_MAX_NAME_LEN if it is ever re-derived.
+	// TestShimMaxNameLenMatchesGo (env_test.go) is what binds that constant to the
+	// Go encoder; this pair pins the two engines' BEHAVIOUR either side of it.
+	maxNameLen := shimDefine(t, "K3SM_DNS_MAX_NAME_LEN")
 	return []diffCase{
 		{name: "nxdomain", host: "nxdomain.test.invalid", want: verdictMiss, wire: true,
 			why: "RCODE=NXDOMAIN: the server answered and the name does not exist"},
@@ -379,7 +394,13 @@ func differentialCases() []diffCase {
 		{name: "unencodable_label_gt63", host: strings.Repeat("x", 64) + ".test.invalid", want: verdictMiss,
 			why: "INPUT-ONLY (no fixture): a 64-byte label cannot be encoded, so the name can never resolve"},
 		{name: "unencodable_total_gt255", host: overlongName(), want: verdictMiss,
-			why: "INPUT-ONLY (no fixture): a name over 255 bytes cannot be encoded"},
+			why: "INPUT-ONLY (no fixture): a name past the presentation-length ceiling cannot be encoded"},
+		{name: "unencodable_empty_label", host: "a..b.test.invalid", want: verdictMiss,
+			why: "INPUT-ONLY (no fixture): a zero-length label is unencodable — it must never be SKIPPED into a query for the collapsed name"},
+		{name: "boundary_max_name", host: nameOfLength(t, maxNameLen), want: verdictMiss, wire: false,
+			why: "a name at EXACTLY the shared ceiling is encodable on both engines: it reaches the wire and the stub's NXDOMAIN makes it a definitive miss"},
+		{name: "boundary_over_max_name", host: nameOfLength(t, maxNameLen+1), want: verdictMiss,
+			why: "INPUT-ONLY (no fixture): one byte past the ceiling is unencodable on both engines"},
 	}
 }
 
@@ -445,6 +466,17 @@ func goVerdict(t *testing.T, stub *templateDNS, fqdn string) wireVerdict {
 	}
 }
 
+// probeDeadline bounds one probe run. The verdict trace is printed BEFORE the
+// shim falls through to the host resolver, so killing the probe at the deadline
+// never costs a verdict — it only cuts short the ambient post-miss lookup, which
+// this gate deliberately does not assert on. Without it a single case can cost
+// 30s of wall clock: macOS's own resolver stalls for its full timeout on a name
+// of exactly 255 presentation bytes (the boundary_over_max_name fixture with its
+// trailing dot), while both shorter and longer names are rejected instantly. The
+// bound is well above the shim's own worst case (K3SM_DNS_ATTEMPTS attempts of a
+// K3SM_DNS_TIMEOUT_SEC UDP exchange plus a TCP refetch).
+const probeDeadline = 10 * time.Second
+
 // shimVerdict runs the probe binary with the REAL dylib injected and reads the
 // per-candidate verdict out of the shim's K3SM_DNS_DEBUG trace. It returns the
 // verdict and the candidate name the shim reported querying. The probe's own exit
@@ -452,10 +484,12 @@ func goVerdict(t *testing.T, stub *templateDNS, fqdn string) wireVerdict {
 // defers to the host resolver, whose answer is ambient (see the file comment).
 func shimVerdict(t *testing.T, dylib, probe string, stub *templateDNS, host string) (wireVerdict, string) {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), probeDeadline)
+	defer cancel()
 	// The name is passed ABSOLUTE (trailing dot) so the shim's ndots/search
 	// expansion yields exactly ONE candidate — hence exactly one trace line, at
 	// the same altitude as the single lookupCandidate call on the Go side.
-	cmd := exec.Command(probe, host+".")
+	cmd := exec.CommandContext(ctx, probe, host+".")
 	cmd.Env = append(os.Environ(),
 		EnvDNSServer+"=127.0.0.1",
 		EnvDNSPort+"="+strconv.Itoa(stub.port()),
@@ -468,8 +502,8 @@ func shimVerdict(t *testing.T, dylib, probe string, stub *templateDNS, host stri
 	out, _ := cmd.CombinedOutput()
 	m := traceRE.FindAllStringSubmatch(string(out), -1)
 	if len(m) != 1 {
-		t.Fatalf("want exactly 1 shim verdict trace line for %q, got %d — the shim's K3SM_DNS_DEBUG wording drifted from traceRE, or the dylib did not load:\n%s",
-			host, len(m), out)
+		t.Fatalf("want exactly 1 shim verdict trace line for %q, got %d — the shim's K3SM_DNS_DEBUG wording drifted from traceRE, the dylib did not load, or the probe was killed at the %s deadline before it traced:\n%s",
+			host, len(m), probeDeadline, out)
 	}
 	cand, verdict := m[0][1], m[0][3]
 	switch verdict {
@@ -497,7 +531,7 @@ func TestDNSWireClassificationDifferential(t *testing.T) {
 		t.Fatalf("clang is required for the C<->Go wire differential (this gate must not be skipped): %v", err)
 	}
 
-	cases := differentialCases()
+	cases := differentialCases(t)
 	fixtures := loadFixtures(t, cases)
 	dylib := buildShim(t)
 	probe := buildProbe(t)
@@ -521,42 +555,38 @@ func TestDNSWireClassificationDifferential(t *testing.T) {
 				t.Fatalf("both engines classify %s (%s) as %v, want %v — parity held but the shared verdict is wrong",
 					c.name, c.why, goGot, c.want)
 			}
-			// Both engines must have judged the SAME name. (The one case where the
-			// shim reports a different candidate is the truncation divergence pinned
-			// below, which is why it is excluded here.)
+			// Both engines must have judged the SAME name. The one exemption is
+			// unencodable_total_gt255, and it is a STORAGE fact, not a divergence:
+			// the shim's candidate slot is a K3SM_MAX_NAME (256-byte) buffer, which
+			// physically cannot hold that case's longer name, so the trace can only
+			// report the stored — truncated — bytes. Nothing is queried or
+			// classified from them (the walk short-circuits the slot to a definitive
+			// miss first, asserted below); only the debug line sees them.
 			if c.name != "unencodable_total_gt255" && cand != c.host {
 				t.Fatalf("shim traced candidate %q, want %q — the search expansion did not collapse to one candidate", cand, c.host)
 			}
 
 			switch c.name {
-			case "unencodable_label_gt63":
-				// Both sides reject at encode time, so NEITHER may touch the wire:
-				// the Go resolver's Message.Pack fails on the 64-byte label and the
-				// shim's k3sm_encode_name returns -1, each yielding a definitive
-				// miss with zero I/O.
+			case "unencodable_label_gt63", "unencodable_total_gt255",
+				"unencodable_empty_label", "boundary_over_max_name":
+				// Both sides reject at encode time, so NEITHER may touch the wire.
+				// Go: Message.Pack fails (errSegTooLong on the 64-byte label,
+				// errZeroSegLen on the empty one) or dnsmessage refuses the
+				// over-long total. C: k3sm_encode_name returns -1, or
+				// k3sm_candidates flags the slot over K3SM_DNS_MAX_NAME_LEN and the
+				// walk short-circuits it. Each yields a definitive miss with zero
+				// I/O — and, for the over-long names, that is what keeps the
+				// TRUNCATED bytes in the candidate slot off the wire and out of the
+				// suffix classification.
 				assertNoQueries(t, "Go reference resolver", goStub)
 				assertNoQueries(t, "C getaddrinfo shim", cStub)
-			case "unencodable_total_gt255":
-				assertNoQueries(t, "Go reference resolver", goStub)
-				// KNOWN DIVERGENCE, pinned here rather than hidden: the C shim does
-				// NOT reject an over-long name. k3sm_candidates copies each candidate
-				// with snprintf(out[n], K3SM_MAX_NAME, ...), which TRUNCATES at 255
-				// bytes, and the truncated name encodes fine — so the shim puts a
-				// query for a DIFFERENT name than the caller asked for on the wire
-				// (which could return a wrong HIT if that truncated name exists),
-				// while the Go resolver sends nothing. The verdicts still agree here
-				// only because the stub answers the unknown truncated name NXDOMAIN.
-				// The C shim is out of scope for this change; when it is fixed to
-				// reject over-long names, this assertion goes red and should collapse
-				// into the zero-queries case above.
-				obs := cStub.observed()
-				if len(obs) != 1 {
-					t.Fatalf("C shim sent %d queries for an over-long name, want exactly 1 (the pinned truncation divergence): %v", len(obs), obs)
-				}
-				if obs[0].name == c.host || !strings.HasPrefix(c.host, obs[0].name) {
-					t.Fatalf("C shim queried %q (%d bytes); want a strict K3SM_MAX_NAME truncation of the %d-byte requested name",
-						obs[0].name, len(obs[0].name), len(c.host))
-				}
+			case "boundary_max_name":
+				// The other side of the boundary: at EXACTLY the ceiling both
+				// engines still encode the name and ask it. Without this, a shim
+				// that rejected one byte too eagerly would pass the zero-queries
+				// case above while silently refusing legal names in pods.
+				assertQueriedOnce(t, "Go reference resolver", goStub, c.host)
+				assertQueriedOnce(t, "C getaddrinfo shim", cStub, c.host)
 			}
 		})
 	}
@@ -567,5 +597,20 @@ func assertNoQueries(t *testing.T, side string, stub *templateDNS) {
 	t.Helper()
 	if obs := stub.observed(); len(obs) != 0 {
 		t.Fatalf("%s queried an unencodable name (%v); such a name can never resolve, so it must never reach the wire", side, obs)
+	}
+}
+
+// assertQueriedOnce fails unless side asked for exactly want, exactly once — the
+// positive half of the boundary pin (an encodable name must reach the wire, and
+// must reach it VERBATIM, not truncated).
+func assertQueriedOnce(t *testing.T, side string, stub *templateDNS, want string) {
+	t.Helper()
+	obs := stub.observed()
+	if len(obs) != 1 {
+		t.Fatalf("%s sent %d queries for a boundary-length name, want exactly 1: %v", side, len(obs), obs)
+	}
+	if obs[0].name != want {
+		t.Fatalf("%s queried %q (%d bytes), want %q (%d bytes) — a name at the encodable ceiling must go on the wire verbatim",
+			side, obs[0].name, len(obs[0].name), want, len(want))
 	}
 }
