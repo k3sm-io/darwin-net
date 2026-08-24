@@ -52,8 +52,21 @@ limitations under the License.
 // DEFER), so the process's ultimate answer depends on ambient network state. The
 // trace fires BEFORE that fallthrough, so the asserted verdict stays hermetic
 // even though the probe process may perform a live lookup afterwards. Fixture
-// hostnames all sit under RFC 2606 ".invalid" to bound that fallthrough to a name
-// no real resolver can answer.
+// hostnames sit under RFC 2606 ".invalid" to bound that fallthrough to a name no
+// real resolver can answer — with one deliberate exception, cluster_named_service,
+// whose name must be under the cluster domain to classify cluster-scoped at all,
+// and which HITs and therefore never falls through.
+//
+// # Two altitudes: single-candidate rows and multi-candidate rows
+//
+// Most rows are SINGLE-CANDIDATE: the probe is handed an ABSOLUTE name (trailing
+// dot) so the shim's expansion collapses to one candidate and the comparison is
+// one verdict against one lookupCandidate call. A few rows are opt-in
+// MULTI-CANDIDATE (diffCase.multi): the probe is handed the BARE name with a
+// per-case search/ndots env, every trace line is collected, and the two engines'
+// per-candidate verdict MAPS — keyed by candidate NAME, never by index — are
+// compared. Name-keying is what makes an ordering bug fail distinctly (two
+// missing keys) instead of quietly swapping two equal verdicts.
 //
 // # Caveat 1 — trace-wording coupling
 //
@@ -72,6 +85,24 @@ limitations under the License.
 // therefore misclassified IDENTICALLY on both sides, and this differential would
 // still be green. Identity here proves PARITY, not correctness.
 //
+// # Caveat 3 — the EXTERNAL + named-service DEFER branch is not differentiable
+//
+// One branch of the shim's candidate walk is deliberately EXCLUDED from this
+// gate: an EXTERNAL candidate (dotted, under no cluster/search domain) combined
+// with a NAMED service ("http"), which defers the whole call to the system
+// resolver BEFORE querying. Two independent reasons, either sufficient. It emits
+// a "DEFER … external candidate … with named service" line and NO per-candidate
+// verdict line, so there is no C-side verdict to read at this file's altitude.
+// And the Go reference has no analog to compare it against: pkg/dns models
+// neither a service argument nor a host-resolver fallthrough, so covering it
+// would mean inventing a Go-side verdict the reference resolver does not
+// produce — the opposite of what a differential is for. That branch is pinned
+// instead, C-side only, by TestGetaddrinfoShimNamedService/"named service on an
+// external name defers to the system resolver" (shim_integration_test.go). The
+// CLUSTER half of the same named_service branch IS differentiable — a
+// cluster-scoped candidate is queried rather than deferred — and cluster_named_service
+// covers it here.
+//
 // # Fixtures
 //
 // testdata/<case>.golden.wire is the UDP response TEMPLATE for <case>; a case
@@ -84,10 +115,13 @@ limitations under the License.
 // exception is malformed_wrongid, where the stub deliberately answers with the
 // incoming ID XOR 0xFFFF, i.e. wrong relative to whatever each engine sent.
 //
-// FOUR cases are INPUT-ONLY and deliberately have NO .golden.wire fixture — do
+// SEVEN cases are INPUT-ONLY and deliberately have NO .golden.wire fixture — do
 // not go looking for one: unencodable_label_gt63, unencodable_total_gt255,
-// unencodable_empty_label and boundary_over_max_name are rejected at
-// query-encode time on BOTH engines, so no response is ever served.
+// unencodable_empty_label, unencodable_empty_name, boundary_over_max_name and
+// plain_over_boundary are rejected at query-encode time on BOTH engines, so no
+// response is ever served; search_suffix_over_boundary is rejected on its
+// SUFFIXED candidate only and its bare candidate is answered by the synthesized
+// NXDOMAIN below.
 //
 // boundary_max_name has no fixture either, for a different reason: it is the
 // name one byte SHORTER than boundary_over_max_name, it does reach the wire on
@@ -105,6 +139,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -146,7 +181,14 @@ func (v wireVerdict) String() string {
 // tries prints once, and a TC-on-UDP answer refetched over TCP prints once, as
 // the HIT the TCP response yielded (the refetch happens inside k3sm_query_a,
 // below the trace point, and emits no line of its own).
-var traceRE = regexp.MustCompile(`(?m)^k3sm-dns:\s+query (\S+) @ (\S+) -> (HIT|miss|TEMPFAIL)$`)
+//
+// The candidate group is (\S*), not (\S+): the DEGENERATE EMPTY candidate (the
+// request ".", whose trailing dot k3sm_candidates strips to "") prints nothing
+// between the two spaces, and (\S+) matches that line ZERO times — which the
+// callers below report as "the dylib did not load", masking the real verdict.
+// (\S*) is a STRICT SUPERSET of (\S+) here: every other candidate this file
+// produces is non-empty, so no pre-existing row's parse changes.
+var traceRE = regexp.MustCompile(`(?m)^k3sm-dns:\s+query (\S*) @ (\S+) -> (HIT|miss|TEMPFAIL)$`)
 
 // wireFixture is one case's served response templates.
 type wireFixture struct {
@@ -166,9 +208,14 @@ type wireQuery struct {
 // unit tier). Serving fixed bytes is what lets one fixture drive two independent
 // parsers: the template is byte-identical for both engines, with only the 2-byte
 // ID patched per query. A query for a name with no fixture is answered with a
-// synthesized NXDOMAIN; the only case that reaches it is boundary_max_name,
-// whose point is that a name at exactly the shared length ceiling still gets
-// encoded and asked on both engines.
+// synthesized NXDOMAIN; the cases that reach it are boundary_max_name — whose
+// point is that a name at exactly the shared length ceiling still gets encoded
+// and asked on both engines — and search_suffix_over_boundary's bare candidate.
+//
+// That catch-all is also why the zero-query assertions matter: an unencodable
+// name that WAS put on the wire would come back NXDOMAIN and land on the same
+// MISS verdict as one that was never sent, so verdict parity alone would be
+// vacuously green. Only stub.observed() can tell the two apart.
 type templateDNS struct {
 	udp    *net.UDPConn
 	tcpLn  net.Listener
@@ -353,14 +400,64 @@ func wireQName(msg []byte) (name string, qend int, ok bool) {
 type diffCase struct {
 	name string // subtest name; also the testdata/<name>.golden.wire basename
 	host string // the queried name, without a trailing dot
+	// want is the verdict both engines must reach for a SINGLE-CANDIDATE row. A
+	// multi row's per-candidate wants live in multi.want and this field is never
+	// read for it — runMultiCandidate returns before the single-candidate
+	// comparison. Do not overload it.
 	want wireVerdict
-	// wire is false for the four INPUT-ONLY cases (rejected at query-encode time
-	// on both engines) and for boundary_max_name (answered by the stub's
-	// synthesized NXDOMAIN); none of them has a fixture file.
+	// wire is false for the INPUT-ONLY cases (rejected at query-encode time on
+	// both engines), for boundary_max_name (answered by the stub's synthesized
+	// NXDOMAIN), and for every multi row; none of them has a fixture file.
 	wire    bool
 	tcpWire bool // a testdata/<name>.tcp.golden.wire also exists
 	wrongID bool
-	why     string
+	// probeService, when non-empty, is passed to the probe as its SERVICE argv —
+	// the getaddrinfo `service` argument. Empty (the 15 pre-existing rows) means
+	// the probe is invoked with a name only, exactly as before.
+	probeService string
+	// multi, when non-nil, makes this an opt-in MULTI-CANDIDATE row: the probe
+	// gets the BARE host with multi's own search/ndots env and both engines are
+	// read per candidate. host keeps its meaning (the queried name); the fixture
+	// fields above must stay unset.
+	multi *multiCand
+	why   string
+}
+
+// multiCand is a multi-candidate row's own contract: the per-case shim/resolver
+// config the two engines must be given IDENTICALLY, the verdict each candidate
+// must reach on BOTH engines, and the names that must actually have reached the
+// wire.
+//
+// It is a separate struct rather than more fields on diffCase so a single-candidate
+// row cannot half-configure a multi-candidate run by leaving a zero value behind.
+type multiCand struct {
+	// search is the ONE dedicated search domain this row expands against (empty
+	// = no search list at all). One domain, not the standard three, so exactly
+	// one search-suffixed candidate exists and its length is calibrated, not
+	// incidental.
+	search string
+	// ndots is the row's ndots. It selects WHICH k3sm_candidates site writes the
+	// bare name: ndots above the name's dot count puts the search candidates
+	// first and the bare name at the TAIL site.
+	ndots int
+	// want is the verdict both engines must reach, keyed by CANDIDATE NAME. Keyed
+	// by name and not by index on purpose: an expansion-ORDER divergence then
+	// surfaces as missing/extra keys instead of as two interchangeable verdicts.
+	want map[string]wireVerdict
+	// queried is the exact list of names, in order, that EACH engine must have
+	// put on the wire. This is the assertion verdict-equality cannot make: the
+	// stub answers any unknown name with a synthesized NXDOMAIN, so a candidate
+	// that was wrongly queried still MISSES.
+	queried []string
+}
+
+// searchDomains renders multi's single search domain as the Go resolver's
+// SearchDomains slice, so both engines are configured from the same field.
+func (m multiCand) searchDomains() []string {
+	if m.search == "" {
+		return nil
+	}
+	return []string{m.search}
 }
 
 func differentialCases(t *testing.T) []diffCase {
@@ -370,6 +467,37 @@ func differentialCases(t *testing.T) []diffCase {
 	// TestShimMaxNameLenMatchesGo (env_test.go) is what binds that constant to the
 	// Go encoder; this pair pins the two engines' BEHAVIOUR either side of it.
 	maxNameLen := shimDefine(t, "K3SM_DNS_MAX_NAME_LEN")
+
+	// Calibration for the two multi-candidate boundary rows. Both numbers are
+	// DERIVED from the shim's own macros, never restated, so they follow a
+	// re-derivation of either constant.
+	//
+	// maxStored is the longest candidate the shim can hold WITHOUT snprintf
+	// truncation (K3SM_MAX_NAME counts the NUL). Staying at or below it is
+	// load-bearing for a name-keyed comparison: an over-long candidate keeps its
+	// slot and the shim traces the bytes it STORED, so a truncated candidate would
+	// be traced under a name the Go side never produced and the two maps could not
+	// line up. (unencodable_total_gt255 is the pre-existing case that deliberately
+	// does overflow the slot, and it is exempted from the name check below.)
+	maxStored := shimDefine(t, "K3SM_MAX_NAME") - 1
+	const overSearch = "over.invalid"
+	// bareUnderBoundary + "." + overSearch is exactly maxStored bytes: over
+	// K3SM_DNS_MAX_NAME_LEN (so the SUFFIXED candidate is unencodable on both
+	// engines) yet still storable un-truncated. The bare name itself stays under
+	// the boundary, so the two candidates of ONE request straddle it.
+	bareUnderBoundary := maxStored - 1 - len(overSearch)
+	if bareUnderBoundary > maxNameLen || bareUnderBoundary+1+len(overSearch) <= maxNameLen {
+		t.Fatalf("search_suffix_over_boundary calibration broke: bare=%d, bare+.+%q=%d, K3SM_DNS_MAX_NAME_LEN=%d — the bare name must be AT OR UNDER the boundary and the suffixed candidate OVER it",
+			bareUnderBoundary, overSearch, bareUnderBoundary+1+len(overSearch), maxNameLen)
+	}
+	bareOK := nameOfLength(t, bareUnderBoundary)
+	// bareOver is the boundary + 1 — the smallest over-long bare name, which is
+	// also the largest one the candidate slot still stores un-truncated.
+	bareOver := nameOfLength(t, maxNameLen+1)
+	if maxNameLen+1 > maxStored {
+		t.Fatalf("plain_over_boundary calibration broke: a boundary+1 name (%d) no longer fits the untruncated candidate slot (%d)", maxNameLen+1, maxStored)
+	}
+
 	return []diffCase{
 		{name: "nxdomain", host: "nxdomain.test.invalid", want: verdictMiss, wire: true,
 			why: "RCODE=NXDOMAIN: the server answered and the name does not exist"},
@@ -401,6 +529,47 @@ func differentialCases(t *testing.T) []diffCase {
 			why: "a name at EXACTLY the shared ceiling is encodable on both engines: it reaches the wire and the stub's NXDOMAIN makes it a definitive miss"},
 		{name: "boundary_over_max_name", host: nameOfLength(t, maxNameLen+1), want: verdictMiss,
 			why: "INPUT-ONLY (no fixture): one byte past the ceiling is unencodable on both engines"},
+		{name: "unencodable_empty_name", host: "", want: verdictMiss,
+			why: "INPUT-ONLY (no fixture): the DEGENERATE empty name — the probe is handed \".\", whose trailing dot both expansions strip to \"\". Go's Pack refuses it as non-canonical; the shim must reject it in k3sm_encode_name rather than fall through its never-executed label loop into a BARE ROOT query"},
+		{name: "search_suffix_over_boundary", host: bareOK,
+			multi: &multiCand{
+				search: overSearch,
+				ndots:  15, // above the name's dot count: search candidates first, bare name at the TAIL site
+				want: map[string]wireVerdict{
+					bareOK + "." + overSearch: verdictMiss, // over the boundary: unencodable
+					bareOK:                    verdictMiss, // under it: encodable, answered by the stub's NXDOMAIN
+				},
+				queried: []string{bareOK},
+			},
+			why: "the two candidates of ONE request straddle the shared length boundary: the search-suffixed one is unencodable and must MISS with zero wire I/O, while the bare one must reach the wire — the search-loop bad[] site's TRUE polarity and the tail site's FALSE polarity in a single row"},
+		{name: "plain_over_boundary", host: bareOver,
+			multi: &multiCand{
+				// No search list: with one, the suffixed candidate would overflow the
+				// shim's candidate slot and be traced under truncated bytes the Go
+				// side never produces. An empty list is also precisely what routes the
+				// bare name to the TAIL site (nsearch == 0, absolute_first false).
+				search:  "",
+				ndots:   15,
+				want:    map[string]wireVerdict{bareOver: verdictMiss},
+				queried: nil,
+			},
+			why: "INPUT-ONLY (no fixture): a bare name one byte past the ceiling makes EVERY candidate bad — the tail/plain bad[] site's TRUE polarity, proven by zero observed queries on both engines"},
+		{name: "absolute_first_over_boundary", host: bareOver,
+			multi: &multiCand{
+				// The same boundary+1 name as plain_over_boundary, but ndots: 1 —
+				// bareOver carries interior dots from nameOfLength, so dots >= ndots
+				// routes the bare candidate through the ABSOLUTE-FIRST plain site
+				// (the fourth physical length-check occurrence), not the tail. Same
+				// empty search list, for the same truncation reason.
+				search:  "",
+				ndots:   1,
+				want:    map[string]wireVerdict{bareOver: verdictMiss},
+				queried: nil,
+			},
+			why: "INPUT-ONLY (no fixture): the boundary+1 name routed via dots >= ndots pins the ABSOLUTE-FIRST plain bad[] site's TRUE polarity — zero observed queries on both engines"},
+		{name: "cluster_named_service", host: "cluster-named-service.default.svc.cluster.local",
+			want: verdictHit, wire: true, probeService: "http",
+			why: "a NAMED service on a CLUSTER-scoped candidate must still be QUERIED, not deferred (only an EXTERNAL candidate defers — Caveat 3): the shim traces the same HIT the Go reference reaches, and only then refuses the call with EAI_SERVICE"},
 	}
 }
 
@@ -518,6 +687,146 @@ func shimVerdict(t *testing.T, dylib, probe string, stub *templateDNS, host stri
 	return verdictTempFail, cand
 }
 
+// traceLine is one parsed per-candidate verdict line from the shim's trace.
+type traceLine struct {
+	cand    string
+	verdict wireVerdict
+}
+
+// shimTrace runs the probe with the REAL dylib injected under a PER-CASE shim
+// env and returns EVERY per-candidate verdict line it printed, in order.
+//
+// It is a deliberate SIBLING of shimVerdict, not a refactor of it. Giving
+// shimVerdict new parameters (a service argv, a search list, an ndots) would
+// re-route all 15 pre-existing single-candidate rows through zero-value
+// defaults, and a zero-valued ndots is not a no-op — it is ndots 0, which
+// inverts the expansion order. The duplicated exec/parse body is the price of
+// leaving those rows on byte-identical behaviour; keep the two in step if the
+// trace wording moves (traceRE is still the single home of that wording).
+func shimTrace(t *testing.T, dylib, probe string, stub *templateDNS, args []string, search string, ndots int) []traceLine {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), probeDeadline)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, probe, args...)
+	cmd.Env = append(os.Environ(),
+		EnvDNSServer+"=127.0.0.1",
+		EnvDNSPort+"="+strconv.Itoa(stub.port()),
+		EnvDNSDomain+"=cluster.local",
+		EnvDNSSearch+"="+search,
+		EnvDNSNdots+"="+strconv.Itoa(ndots),
+		EnvDNSDebug+"=1",
+		"DYLD_INSERT_LIBRARIES="+dylib,
+	)
+	out, _ := cmd.CombinedOutput()
+	ms := traceRE.FindAllStringSubmatch(string(out), -1)
+	if len(ms) == 0 {
+		t.Fatalf("no shim verdict trace line for probe %v (search=%q ndots=%d) — the shim's K3SM_DNS_DEBUG wording drifted from traceRE, the dylib did not load, or the probe was killed at the %s deadline before it traced:\n%s",
+			args, search, ndots, probeDeadline, out)
+	}
+	lines := make([]traceLine, 0, len(ms))
+	for _, m := range ms {
+		lines = append(lines, traceLine{cand: m[1], verdict: parseTraceVerdict(t, m[3])})
+	}
+	return lines
+}
+
+// parseTraceVerdict maps the trace's verdict word onto the three-way verdict.
+func parseTraceVerdict(t *testing.T, verdict string) wireVerdict {
+	t.Helper()
+	switch verdict {
+	case "HIT":
+		return verdictHit
+	case "miss":
+		return verdictMiss
+	case "TEMPFAIL":
+		return verdictTempFail
+	}
+	t.Fatalf("unparsed shim verdict %q", verdict)
+	return verdictTempFail
+}
+
+// shimVerdictService is shimVerdict's sibling for a row that passes a SERVICE
+// argv (diffCase.probeService). The name is still passed ABSOLUTE, so exactly
+// one candidate — and therefore exactly one trace line — is expected.
+func shimVerdictService(t *testing.T, dylib, probe string, stub *templateDNS, host, service string) (wireVerdict, string) {
+	t.Helper()
+	lines := shimTrace(t, dylib, probe, stub, []string{host + ".", service},
+		strings.Join(stdSearch(), " "), 5)
+	if len(lines) != 1 {
+		t.Fatalf("want exactly 1 shim verdict trace line for %q with service %q, got %d — an absolute name must collapse to one candidate: %v",
+			host, service, len(lines), lines)
+	}
+	return lines[0].verdict, lines[0].cand
+}
+
+// shimVerdictFor routes a SINGLE-CANDIDATE row to the right C-side reader: the
+// 15 pre-existing rows keep shimVerdict verbatim, and only a row that opts in
+// with a service argv takes the sibling.
+func shimVerdictFor(t *testing.T, dylib, probe string, stub *templateDNS, c diffCase) (wireVerdict, string) {
+	t.Helper()
+	if c.probeService == "" {
+		return shimVerdict(t, dylib, probe, stub, c.host)
+	}
+	return shimVerdictService(t, dylib, probe, stub, c.host, c.probeService)
+}
+
+// shimVerdictsPerCandidate is the C-side MULTI-CANDIDATE reader: it hands the
+// probe the BARE name (no trailing dot) under mc's own search/ndots env, so the
+// shim performs a real expansion, and returns every candidate's verdict keyed by
+// the CANDIDATE NAME the shim itself reported.
+func shimVerdictsPerCandidate(t *testing.T, dylib, probe string, stub *templateDNS, name string, mc multiCand) map[string]wireVerdict {
+	t.Helper()
+	lines := shimTrace(t, dylib, probe, stub, []string{name}, mc.search, mc.ndots)
+	out := make(map[string]wireVerdict, len(lines))
+	for _, l := range lines {
+		if _, dup := out[l.cand]; dup {
+			t.Fatalf("shim traced candidate %q twice; the trace must carry exactly one line per candidate: %v", l.cand, lines)
+		}
+		out[l.cand] = l.verdict
+	}
+	return out
+}
+
+// goVerdictsPerCandidate is the Go-side MULTI-CANDIDATE reader: it walks the
+// reference resolver's OWN expansion for name under mc's config and classifies
+// each candidate through lookupCandidate — the same altitude goVerdict reads,
+// one entry per candidate.
+func goVerdictsPerCandidate(t *testing.T, stub *templateDNS, name string, mc multiCand) map[string]wireVerdict {
+	t.Helper()
+	cfg := stdConfig()
+	cfg.SearchDomains = mc.searchDomains()
+	cfg.NDots = int32(mc.ndots)
+	r, err := NewResolver(cfg, withDialer(func(ctx context.Context, network, _ string) (net.Conn, error) {
+		d := net.Dialer{}
+		return d.DialContext(ctx, network, stub.addr())
+	}), WithTimeout(2*time.Second))
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cands := r.Candidates(name)
+	if len(cands) == 0 {
+		t.Fatalf("the Go reference resolver produced no candidates for %q", name)
+	}
+	out := make(map[string]wireVerdict, len(cands))
+	for _, fqdn := range cands {
+		if _, dup := out[fqdn]; dup {
+			t.Fatalf("candidateNames returned %q twice; dedupe regressed", fqdn)
+		}
+		addrs, err := r.lookupCandidate(context.Background(), fqdn)
+		switch {
+		case err != nil && errors.Is(err, ErrTempFail):
+			out[fqdn] = verdictTempFail
+		case err != nil:
+			t.Fatalf("lookupCandidate(%q) returned a non-transient hard error: %v", fqdn, err)
+		case len(addrs) > 0:
+			out[fqdn] = verdictHit
+		default:
+			out[fqdn] = verdictMiss
+		}
+	}
+	return out
+}
+
 // TestDNSWireClassificationDifferential is the B126 gate: it feeds each golden
 // response template through BOTH resolvers and asserts they reach the SAME
 // three-way verdict — the property the constant-level drift guards in
@@ -545,8 +854,13 @@ func TestDNSWireClassificationDifferential(t *testing.T) {
 			cStub := newTemplateDNS(t, fixtures)
 			defer cStub.close()
 
+			if c.multi != nil {
+				runMultiCandidate(t, dylib, probe, goStub, cStub, c)
+				return
+			}
+
 			goGot := goVerdict(t, goStub, c.host)
-			cGot, cand := shimVerdict(t, dylib, probe, cStub, c.host)
+			cGot, cand := shimVerdictFor(t, dylib, probe, cStub, c)
 			if goGot != cGot {
 				t.Fatalf("C<->Go wire-classification drift on %s (%s):\n  Go reference resolver: %v\n  C getaddrinfo shim:    %v",
 					c.name, c.why, goGot, cGot)
@@ -568,7 +882,8 @@ func TestDNSWireClassificationDifferential(t *testing.T) {
 
 			switch c.name {
 			case "unencodable_label_gt63", "unencodable_total_gt255",
-				"unencodable_empty_label", "boundary_over_max_name":
+				"unencodable_empty_label", "unencodable_empty_name",
+				"boundary_over_max_name":
 				// Both sides reject at encode time, so NEITHER may touch the wire.
 				// Go: Message.Pack fails (errSegTooLong on the 64-byte label,
 				// errZeroSegLen on the empty one) or dnsmessage refuses the
@@ -589,6 +904,60 @@ func TestDNSWireClassificationDifferential(t *testing.T) {
 				assertQueriedOnce(t, "C getaddrinfo shim", cStub, c.host)
 			}
 		})
+	}
+}
+
+// runMultiCandidate is the MULTI-CANDIDATE half of the differential: it drives a
+// real ndots/search expansion on both engines under c.multi's config and compares
+// their per-candidate verdict MAPS, then the names each actually queried.
+//
+// Comparing maps rather than a single verdict is what makes this the first
+// behavioural exercise of candidate ORDERING: the keys are candidate names, so an
+// engine that expanded to a different candidate set fails with missing/extra keys
+// naming the offender, not with two equal verdicts that happen to line up.
+func runMultiCandidate(t *testing.T, dylib, probe string, goStub, cStub *templateDNS, c diffCase) {
+	t.Helper()
+	// A multi row must not half-configure itself as a single-candidate row: the
+	// fixture fields belong to the other path and would be silently ignored here.
+	if c.wire || c.tcpWire || c.wrongID {
+		t.Fatalf("multi-candidate row %s must not set the single-candidate fixture fields (wire=%v tcpWire=%v wrongID=%v)", c.name, c.wire, c.tcpWire, c.wrongID)
+	}
+	mc := *c.multi
+
+	goGot := goVerdictsPerCandidate(t, goStub, c.host, mc)
+	cGot := shimVerdictsPerCandidate(t, dylib, probe, cStub, c.host, mc)
+	if !reflect.DeepEqual(goGot, cGot) {
+		t.Fatalf("C<->Go per-candidate drift on %s (%s):\n  Go reference resolver: %v\n  C getaddrinfo shim:    %v",
+			c.name, c.why, goGot, cGot)
+	}
+	if !reflect.DeepEqual(goGot, mc.want) {
+		t.Fatalf("both engines classify %s (%s) as %v, want %v — parity held but the shared per-candidate verdicts are wrong",
+			c.name, c.why, goGot, mc.want)
+	}
+	// Verdict parity alone is vacuous here: the stub synthesizes NXDOMAIN for any
+	// unknown name, so a candidate that was WRONGLY put on the wire still misses.
+	// The observed query log is the assertion with teeth.
+	assertQueriedNames(t, "Go reference resolver", goStub, mc.queried)
+	assertQueriedNames(t, "C getaddrinfo shim", cStub, mc.queried)
+}
+
+// assertQueriedNames fails unless side asked for exactly want, in order — the
+// wire half of a multi-candidate row (an empty want means nothing may be sent).
+func assertQueriedNames(t *testing.T, side string, stub *templateDNS, want []string) {
+	t.Helper()
+	obs := stub.observed()
+	got := make([]string, 0, len(obs))
+	for _, q := range obs {
+		got = append(got, q.name)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("%s sent %d queries, want %d — an unencodable candidate must never reach the wire and an encodable one must:\n  got:  %v\n  want: %v",
+			side, len(got), len(want), got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("%s queried %q at position %d, want %q:\n  got:  %v\n  want: %v", side, got[i], i, want[i], got, want)
+		}
 	}
 }
 
