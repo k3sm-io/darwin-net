@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 
 	netv1 "k3sm.io/apis/net/v1"
 )
@@ -342,4 +343,271 @@ func TestExternalTrafficPolicyReadIsObservabilityOnly(t *testing.T) {
 			t.Fatalf("pick[%d] diverged: local=%v control=%v — eTP read perturbed routing", i, seqL[i], seqC[i])
 		}
 	}
+}
+
+// orderService builds the served single-port ClusterIP Service the ordering
+// reproduction drives. The VIP is a real bindable loopback address so the
+// reconcile runs the production worker path end to end.
+func orderService(clusterIP string, port int32) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"},
+		Spec: corev1.ServiceSpec{
+			Type:      corev1.ServiceTypeClusterIP,
+			ClusterIP: clusterIP,
+			Ports: []corev1.ServicePort{{
+				Name: "http", Port: port, TargetPort: intstr.FromInt32(8080),
+				Protocol: corev1.ProtocolTCP,
+			}},
+		},
+	}
+}
+
+// orderSlice builds the EndpointSlice for orderService's Service, labeled with
+// kubernetes.io/service-name so onSlice maps it back.
+func orderSlice(backendIP string, backendPort int32) *discoveryv1.EndpointSlice {
+	ready := true
+	name := "http"
+	port := backendPort
+	return &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "web-abc",
+			Labels:    map[string]string{discoveryv1.LabelServiceName: "web"},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses:  []string{backendIP},
+			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+		}},
+		Ports: []discoveryv1.EndpointPort{{Name: &name, Port: &port}},
+	}
+}
+
+// newOrderProxy builds a rootless Proxy (noop alias manager) plus its routing
+// table and starts its supervision loop, tearing it down at test end. The routing
+// table is the observation seam: runWorker calls SetEndpointsPolicy from the event
+// payload BEFORE it touches any listener, so a backend appearing there proves a
+// reconcile carried it — the listener-open retry cannot fabricate one.
+func newOrderProxy(t *testing.T) (*Proxy, *RoutingTable) {
+	t.Helper()
+	tbl := NewRoutingTable(netip.Prefix{})
+	px := New(tbl, withAliasManager(newNoopAliasManager()), WithLogger(slog.New(slog.DiscardHandler)))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = px.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	return px, tbl
+}
+
+// assertNoBackends asserts key carries NO backends for the whole settle window,
+// so it cannot pass on a reconcile that simply has not arrived yet. It is the
+// negative counterpart of waitBackends.
+func assertNoBackends(t *testing.T, tbl *RoutingTable, key PortKey, settle time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(settle)
+	for time.Now().Before(deadline) {
+		if n := tbl.Len(key); n != 0 {
+			t.Fatalf("routing table for %s has %d backends, want 0", key, n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestSliceBeforeServiceIsNotLost is the B160 gate. onSlice silently returns when
+// the slice's Service is not yet in the Service informer's store, and both
+// informers run with resyncPeriod 0, so that event is never re-delivered. The
+// question is whether the DROP is LOSSY — whether a Service whose slice was
+// observed first is left with no (or stale) backends forever.
+//
+// IT IS NOT, and this test is the standing proof. The drop is real (pinned by the
+// "onSlice drops" case and by the empty-table assertion before the Service is
+// created), but it costs a redundant reconcile, never a backend: reconcileService
+// recomputes the WHOLE backend set from the EndpointSlice store on every event, and
+// a shared informer adds an object to its store BEFORE dispatching that object's
+// event (sharedIndexInformer.HandleDeltas). So a slice already in the slice store
+// when its Service arrives is necessarily visible to that Service's own Add
+// handler. Formally: slice-store-add -> (svc-store read that saw nothing) ->
+// svc-store-add -> slice-store read, so the last read always sees the slice. A
+// re-queue-on-miss or a non-zero resyncPeriod would buy nothing here.
+//
+// The gate is not vacuous: with onService reconciling from an empty slice set (the
+// world the "lost" hypothesis describes), the three ordering cases below go red
+// while "Service then slice" stays green — it discriminates ORDERING.
+//
+// It exercises ordering ONLY. Its observation seam is the routing table, which
+// runWorker fills from the event payload BEFORE it touches any listener, so the
+// listener-open retry cannot make it pass.
+func TestSliceBeforeServiceIsNotLost(t *testing.T) {
+	t.Parallel()
+
+	t.Run("real informers: slice observed before its Service still lands in the routing table", func(t *testing.T) {
+		t.Parallel()
+		const vip = "127.0.0.1"
+		port := freePort(t, vip)
+		key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
+
+		// The slice pre-exists, so it arrives in the EndpointSlice informer's initial
+		// LIST; the Service is created only afterwards. That is the slice-then-Service
+		// ordering, forced rather than raced.
+		client := fake.NewSimpleClientset(orderSlice("10.42.0.5", 8080))
+		px, tbl := newOrderProxy(t)
+		w := NewWatcher(client, px, slog.New(slog.DiscardHandler))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		runDone := make(chan struct{})
+		go func() { defer close(runDone); _ = w.Run(ctx) }()
+		// Cancel BEFORE joining: Run blocks on ctx.Done, so the join must follow the
+		// cancel (a defer pair in the other order deadlocks).
+		defer func() {
+			cancel()
+			<-runDone
+		}()
+
+		if !cache.WaitForCacheSync(ctx.Done(), w.svcs.HasSynced, w.slices.HasSynced) {
+			t.Fatal("informer cache sync failed")
+		}
+		// The drop itself: the slice is cached but no reconcile has carried it,
+		// because its Service was not in the Service store when onSlice ran.
+		assertNoBackends(t, tbl, key, 200*time.Millisecond)
+		if n := len(w.slicesForService("default", "web")); n != 1 {
+			t.Fatalf("slice informer cached %d slices for default/web, want 1", n)
+		}
+
+		// The Service arrives second. Nothing re-delivers the dropped slice event —
+		// so if the drop were lossy, the table would stay empty.
+		if _, err := client.CoreV1().Services("default").Create(ctx, orderService(vip, port), metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create service: %v", err)
+		}
+		waitBackends(t, tbl, key, 1)
+		got := tbl.Backends(key)
+		if addr := got[0].Addr().String(); addr != "10.42.0.5:8080" {
+			t.Errorf("backend = %s, want 10.42.0.5:8080", addr)
+		}
+	})
+
+	t.Run("handler seam: both orderings converge on the same backend set", func(t *testing.T) {
+		t.Parallel()
+		// Drives the two handlers directly in each order, mirroring the informer
+		// contract that a shared informer adds an object to its store BEFORE it
+		// dispatches that object's event (sharedIndexInformer.HandleDeltas).
+		tests := []struct {
+			name        string
+			sliceFirst  bool
+			wantBackend string
+		}{
+			{"Service then slice", false, "10.42.0.5:8080"},
+			{"slice then Service", true, "10.42.0.5:8080"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				const vip = "127.0.0.1"
+				port := freePort(t, vip)
+				key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
+
+				px, tbl := newOrderProxy(t)
+				w := NewWatcher(fake.NewSimpleClientset(), px, slog.New(slog.DiscardHandler))
+				svc := orderService(vip, port)
+				sl := orderSlice("10.42.0.5", 8080)
+
+				deliverSvc := func() {
+					if err := w.svcs.GetStore().Add(svc); err != nil {
+						t.Fatalf("seed service store: %v", err)
+					}
+					w.onService(svc)
+				}
+				deliverSlice := func() {
+					if err := w.slices.GetStore().Add(sl); err != nil {
+						t.Fatalf("seed slice store: %v", err)
+					}
+					w.onSlice(sl)
+				}
+				if tt.sliceFirst {
+					deliverSlice()
+					deliverSvc()
+				} else {
+					deliverSvc()
+					deliverSlice()
+				}
+
+				waitBackends(t, tbl, key, 1)
+				got := tbl.Backends(key)
+				if addr := got[0].Addr().String(); addr != tt.wantBackend {
+					t.Errorf("%s: backend = %s, want %s", tt.name, addr, tt.wantBackend)
+				}
+			})
+		}
+	})
+
+	t.Run("concurrent creation converges regardless of which informer wins", func(t *testing.T) {
+		t.Parallel()
+		// The adversarial ordering: both objects are created AFTER cache sync, from
+		// two goroutines, so the Service and EndpointSlice informers race to deliver
+		// them. Every interleaving — Service first, slice first, or simultaneous —
+		// must converge on the backend. Repeated so a narrow window would surface.
+		for i := 0; i < 20; i++ {
+			const vip = "127.0.0.1"
+			port := freePort(t, vip)
+			key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
+
+			client := fake.NewSimpleClientset()
+			px, tbl := newOrderProxy(t)
+			w := NewWatcher(client, px, slog.New(slog.DiscardHandler))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			runDone := make(chan struct{})
+			go func() { defer close(runDone); _ = w.Run(ctx) }()
+			if !cache.WaitForCacheSync(ctx.Done(), w.svcs.HasSynced, w.slices.HasSynced) {
+				cancel()
+				<-runDone
+				t.Fatal("informer cache sync failed")
+			}
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			var svcErr, sliceErr error
+			go func() {
+				defer wg.Done()
+				_, svcErr = client.CoreV1().Services("default").Create(ctx, orderService(vip, port), metav1.CreateOptions{})
+			}()
+			go func() {
+				defer wg.Done()
+				_, sliceErr = client.DiscoveryV1().EndpointSlices("default").Create(ctx, orderSlice("10.42.0.5", 8080), metav1.CreateOptions{})
+			}()
+			wg.Wait()
+			if svcErr != nil || sliceErr != nil {
+				cancel()
+				<-runDone
+				t.Fatalf("iteration %d: create service=%v slice=%v", i, svcErr, sliceErr)
+			}
+
+			waitBackends(t, tbl, key, 1)
+			if addr := tbl.Backends(key)[0].Addr().String(); addr != "10.42.0.5:8080" {
+				t.Fatalf("iteration %d: backend = %s, want 10.42.0.5:8080", i, addr)
+			}
+			cancel()
+			<-runDone
+		}
+	})
+
+	t.Run("onSlice drops an event whose Service is uncached", func(t *testing.T) {
+		t.Parallel()
+		// Pins the MECHANISM the two cases above are about: with the slice cached but
+		// its Service absent, onSlice reconciles nothing at all.
+		const vip = "127.0.0.1"
+		port := freePort(t, vip)
+		key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
+
+		px, tbl := newOrderProxy(t)
+		w := NewWatcher(fake.NewSimpleClientset(), px, slog.New(slog.DiscardHandler))
+		sl := orderSlice("10.42.0.5", 8080)
+		if err := w.slices.GetStore().Add(sl); err != nil {
+			t.Fatalf("seed slice store: %v", err)
+		}
+		w.onSlice(sl)
+		assertNoBackends(t, tbl, key, 200*time.Millisecond)
+	})
 }
