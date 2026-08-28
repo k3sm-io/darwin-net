@@ -21,10 +21,16 @@ OUT="${OUT_DIR}/libk3sm_getaddrinfo_shim.dylib"
 
 mkdir -p "$OUT_DIR"
 
-# arm64 + x86_64 fat dylib so it loads regardless of the pod binary's arch.
+# arm64 + x86_64 universal (fat) dylib so it loads regardless of the pod binary's
+# arch: dyld HARD-TERMINATES a process whose DYLD_INSERT_LIBRARIES library lacks a
+# slice for that process's architecture, so an arm64-only shim would kill a
+# darwin/amd64 pod payload running under Rosetta rather than merely skip DNS.
+# Asserted on the built Mach-O by pkg/dns TestShimIsUniversalBinary -- assert the
+# ARTIFACT, never these flags, since the flags are what drifted from this comment.
 # -fPIC and -dynamiclib for a shared library; -install_name keeps it relocatable.
 clang \
   -arch arm64 \
+  -arch x86_64 \
   -dynamiclib \
   -fPIC \
   -O2 \
