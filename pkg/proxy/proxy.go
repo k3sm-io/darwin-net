@@ -307,6 +307,22 @@ type portEvent struct {
 	endpoints []netv1.Endpoint
 }
 
+// openRetryInitial and openRetryMax bound the exponential backoff runWorker uses to
+// re-attempt a listener open that FAILED. A failure is routinely transient: the
+// ClusterIP path first ensures the lo0 alias, which shells out to ifconfig (or
+// crosses the netd socket) under a bounded context, and a loaded host can blow that
+// deadline; a bind can also lose a port race. Retrying here is load-bearing rather
+// than defensive, because nothing else re-attempts the open — the only other trigger
+// is the arrival of another portEvent, and one is NOT guaranteed: the Service and
+// EndpointSlice informers are independent, Watcher.onSlice drops a slice whose
+// Service is not yet in the Service store, and both factories run with resync 0. So
+// without this the FIRST transient failure leaves the Service's ClusterIP and
+// NodePort sockets unbound for the process's lifetime, with one Error log to say so.
+const (
+	openRetryInitial = 250 * time.Millisecond
+	openRetryMax     = 30 * time.Second
+)
+
 // affinitySweepInterval is how often the Proxy evicts idle ClientIP session-affinity
 // bindings from the routing table. It is a coarse backstop: PickSticky already
 // re-validates and TTL-checks a binding inline on every connection, so the sweep only
@@ -461,6 +477,11 @@ func (p *Proxy) worker(key PortKey) *portWorker {
 
 // runWorker is the per-VIP serialized reconcile loop. It is the only goroutine
 // permitted to open or close key's listeners.
+//
+// A failed open is RETRIED here on its own timer (openRetryInitial..openRetryMax),
+// not left to the next informer event: an event may never come, and a Service whose
+// sockets are unbound serves nothing. The retry re-uses the last desired port, so it
+// converges on the current desired state; an event arriving mid-backoff supersedes it.
 func (p *Proxy) runWorker(w *portWorker) {
 	defer close(w.done)
 	var ln *listener
@@ -470,10 +491,38 @@ func (p *Proxy) runWorker(w *portWorker) {
 		}
 	}()
 
+	// pending is the desired port whose listener is not open yet; retry fires the
+	// next re-attempt for it. Both are cleared as soon as an open succeeds.
+	var pending *netv1.ServicePort
+	backoff := openRetryInitial
+	retry := time.NewTimer(openRetryInitial)
+	retry.Stop() // armed only after a failed open (Go 1.23+ Stop admits no stale fire)
+	defer retry.Stop()
+
+	// open attempts the listener for port, arming the retry timer on failure. It is
+	// called only from this goroutine, so it may close over ln/pending/backoff.
+	open := func(port *netv1.ServicePort) {
+		l, err := p.openListener(w.key, port)
+		if err != nil {
+			p.log.Error("open service listener; retrying", "vip", w.key.String(), "retry-in", backoff, "err", err)
+			pending = port
+			retry.Reset(backoff)
+			backoff = min(2*backoff, openRetryMax)
+			return
+		}
+		ln = l
+		pending = nil
+		backoff = openRetryInitial
+	}
+
 	for {
 		select {
 		case <-w.stop:
 			return
+		case <-retry.C:
+			if ln == nil && pending != nil {
+				open(pending)
+			}
 		case ev := <-w.ch:
 			if ev.port == nil {
 				if ln != nil {
@@ -485,12 +534,7 @@ func (p *Proxy) runWorker(w *portWorker) {
 			}
 			p.table.SetEndpointsPolicy(w.key, ev.endpoints, ev.policy, ev.affinity)
 			if ln == nil {
-				l, err := p.openListener(w.key, ev.port)
-				if err != nil {
-					p.log.Error("open service listener", "vip", w.key.String(), "err", err)
-					continue
-				}
-				ln = l
+				open(ev.port)
 			}
 		}
 	}
