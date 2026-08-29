@@ -18,10 +18,12 @@ limitations under the License.
 // algorithm the getaddrinfo DYLD shim mirrors inside pods, plus the per-pod
 // DNSConfig that shim consumes. The cluster resolver that actually RUNS is k3sm's
 // in-process A-record + upstream-forward resolver (k3sm/pkg/netserve), NOT
-// CoreDNS-the-binary; the CoreDNS Corefile this package renders (CorefileOptions /
-// PerNodeDNS) is an UNCONSUMED export kept for the deferred "native CoreDNS"
-// follow-up (DESIGN §5b). (Corrected 2026-06 upstream-alignment audit: earlier
-// prose here wrongly said k3sm runs CoreDNS per-node.)
+// CoreDNS-the-binary. (Corrected 2026-06 upstream-alignment audit: earlier prose
+// here wrongly said k3sm runs CoreDNS per-node. This package formerly also carried
+// an UNCONSUMED CoreDNS Corefile renderer, CorefileOptions/PerNodeDNS, exported
+// for a deferred "native CoreDNS" follow-up (DESIGN §5b); it was deleted 2026-08-29
+// (B33, operator decision: nothing ever consumed it) — a future native-CoreDNS
+// effort re-derives it from git history rather than reviving dead code.)
 //
 // # Why a shim at all
 //
@@ -43,12 +45,10 @@ limitations under the License.
 //     golang.org/x/net/dns/dnsmessage, keeping darwin-net pure Go). The C shim
 //     mirrors this algorithm; sharing the expansion semantics here keeps the two
 //     in lockstep and lets the hard part (ndots/search) be tested in Go.
-//   - coredns.go — CorefileOptions / PodDNSConfig: PodDNSConfig hands each pod the
-//     DNSConfig the shim consumes (LIVE). CorefileOptions / PerNodeDNS RENDER a
-//     CoreDNS Corefile string bound to the DNS VIP (DefaultDNSVIP) that is
-//     currently UNCONSUMED — an export for the deferred native-CoreDNS follow-up
-//     (DESIGN §5b), not what serves DNS today (the in-process k3sm/pkg/netserve
-//     resolver does). See the M3.3 section below.
+//   - dnsconfig.go — DefaultDNSVIP / DefaultClusterDomain / PodDNSConfig:
+//     PodDNSConfig hands each pod the DNSConfig the shim consumes (LIVE), built
+//     around the same VIP/domain defaults the per-node resolver (the in-process
+//     k3sm/pkg/netserve resolver) binds. See the M3.3 section below.
 //   - merge.go — MergeDNSConfig / MaxSearchDomains: the pure ClusterFirst additive
 //     dnsConfig merge — a pod's search domains APPEND to the cluster search list
 //     (cluster-first, deduped, capped) and its ndots overrides the cluster
@@ -111,11 +111,10 @@ limitations under the License.
 // it over the wireguard mesh — where no peer's symmetric AllowedIPs (= podCIDR)
 // cover it, blackholing in-pod DNS. The fix is to keep DNS node-local: k3sm runs
 // a per-node resolver bound directly to the DNS VIP (the in-process resolver in
-// k3sm/pkg/netserve; PerNodeDNS here renders the equivalent Corefile, BindIP =
-// DefaultDNSVIP, for the future native-CoreDNS path), so a pod's query resolves
-// over loopback and never crosses the mesh. The mesh routes only peer pod /24s to
-// the utun (pkg/mesh, M3.1), so the DNS VIP is never steered there — locality
-// stays a hint, not a routing input.
+// k3sm/pkg/netserve, binding DefaultDNSVIP), so a pod's query resolves over
+// loopback and never crosses the mesh. The mesh routes only peer pod /24s to the
+// utun (pkg/mesh, M3.1), so the DNS VIP is never steered there — locality stays a
+// hint, not a routing input.
 //
 // Because the per-node resolver binds 10.43.0.10:53 (TCP and UDP) directly, the
 // Service proxy must NOT also try to own that VIP, or the two collide
@@ -126,7 +125,7 @@ limitations under the License.
 // The sibling infra VIP, the kubernetes endpoint (10.43.0.1), is fixed the same
 // way in spirit but is k3sm-owned (k3sm:M3.3): k3sm rewrites the kubernetes
 // Service endpoint to a node-local apiserver/proxy address per node. darwin-net
-// provides this half — the per-node DNS Corefile render (PerNodeDNS) + the proxy
+// provides this half — the per-node resolver's DNS-VIP defaults + the proxy
 // exemption seam — and depends on k3sm:M3.3 for the kubernetes-endpoint half.
 //
 // # Guest-side resolver for the vm RuntimeClass (M5.2)
