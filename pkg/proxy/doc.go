@@ -147,18 +147,17 @@ limitations under the License.
 //
 // # Infra-VIP exemption (per-node resolver) — M3.3
 //
-// k3sm runs a per-node resolver (the in-process k3sm/pkg/netserve resolver; the
-// pkg/dns.PerNodeDNS Corefile is the unconsumed native-CoreDNS export) on every
-// node bound directly to the kube-dns VIP (10.43.0.10) for 53/TCP and 53/UDP, so
-// cluster DNS is always answered node-locally over loopback and never crosses the
-// mesh. WithInfraVIPExemptions registers that VIP so the proxy yields ownership of
-// it entirely — no lo0 alias, no socket, no routing entry — which is what keeps
-// the proxy from colliding with the resolver on 10.43.0.10:53 (EADDRINUSE). The exemption is keyed on the VIP
-// address, so it covers both 53/TCP and 53/UDP; a normal ClusterIP Service is
-// unaffected. The node-local kubernetes (10.43.0.1) endpoint uses the same
-// step-aside mechanism, but its endpoint rewrite is k3sm-owned (k3sm:M3.3) —
-// darwin-net supplies the per-node DNS Corefile render (pkg/dns.PerNodeDNS) and
-// this exemption seam.
+// k3sm runs a per-node resolver (the in-process k3sm/pkg/netserve resolver) on
+// every node bound directly to the kube-dns VIP (10.43.0.10) for 53/TCP and
+// 53/UDP, so cluster DNS is always answered node-locally over loopback and never
+// crosses the mesh. WithInfraVIPExemptions registers that VIP so the proxy yields
+// ownership of it entirely — no lo0 alias, no socket, no routing entry — which is
+// what keeps the proxy from colliding with the resolver on 10.43.0.10:53
+// (EADDRINUSE). The exemption is keyed on the VIP address, so it covers both
+// 53/TCP and 53/UDP; a normal ClusterIP Service is unaffected. The node-local
+// kubernetes (10.43.0.1) endpoint uses the same step-aside mechanism, but its
+// endpoint rewrite is k3sm-owned (k3sm:M3.3) — darwin-net supplies the DNS-VIP
+// default (pkg/dns.DefaultDNSVIP) and this exemption seam.
 //
 // # UDP datagram relay (ClusterIP) + idle-flow GC — B23
 //

@@ -183,7 +183,7 @@ func WithMeshEgressSource(src netip.Addr) Option {
 //
 // The node-local kubernetes (10.43.0.1) endpoint uses the same step-aside
 // mechanism, but its endpoint rewrite is k3sm-owned (k3sm:M3.3); darwin-net
-// supplies the per-node resolver (pkg/dns.PerNodeDNS) and this exemption seam.
+// supplies the DNS-VIP default (pkg/dns.DefaultDNSVIP) and this exemption seam.
 func WithInfraVIPExemptions(vips ...netip.Addr) Option {
 	return func(p *Proxy) {
 		for _, v := range vips {
