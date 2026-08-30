@@ -1,5 +1,16 @@
 /*
- * k3sm getaddrinfo DYLD interpose shim.
+ * k3sm pod DYLD interpose shim — getaddrinfo() AND bind().
+ *
+ * SCOPE BANNER (widened by B216). This file started life as the getaddrinfo
+ * interposer and now owns TWO interposes in ONE dylib: the cluster-DNS
+ * getaddrinfo() below, and the per-pod bind() discipline at the bottom of the
+ * file. They share nothing but the __DATA,__interpose table and the
+ * environment-configured, transparent-passthrough idiom; each reads its own
+ * K3SM_* env and is independently inert when that env is absent. The artifact is
+ * still named libk3sm_getaddrinfo_shim.dylib because the name is coupled to the
+ * install path and to the k3sm.io/dyld-insert-libraries annotation that injects
+ * it; renaming it is a deliberate non-goal here, so this banner carries the
+ * truth instead.
  *
  * macOS getaddrinfo() routes through mDNSResponder/configd and ignores
  * /etc/resolv.conf, so a pod cannot be pointed at the cluster resolver the
@@ -28,6 +39,8 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,10 +72,12 @@ typedef struct interpose_s {
 
 int k3sm_getaddrinfo(const char *node, const char *service,
                      const struct addrinfo *hints, struct addrinfo **res);
+int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len);
 
 __attribute__((used)) static const interpose_t k3sm_interposers[]
     __attribute__((section("__DATA,__interpose"))) = {
         {(const void *)k3sm_getaddrinfo, (const void *)getaddrinfo},
+        {(const void *)k3sm_bind, (const void *)bind},
 };
 
 /* -------- config from environment -------- */
@@ -1128,4 +1143,303 @@ int k3sm_getaddrinfo(const char *node, const char *service,
         fprintf(stderr, "k3sm-dns: DEFER node=%s — cluster resolver missed all %d candidate(s)\n", node, ncand);
     }
     return getaddrinfo(node, service, hints, res);
+}
+
+/* ==================================================================== */
+/* ============ bind() interpose — the per-pod bind discipline ========= */
+/* ==================================================================== */
+
+/*
+ * WHY THIS EXISTS. macOS has no network namespaces, so every same-node Pod
+ * shares one port space: two Pods that both `bind(0.0.0.0:8080)` collide with
+ * EADDRINUSE, and whichever binds second crash-loops. k3sm already gives each
+ * Pod its own routable /32 (a lo0 alias, ../pkg/podnet), but nothing made a Pod
+ * BIND that address — k3sm/docs/DESIGN.md §3/§5b calls this "source identity by
+ * bind discipline" and it was never built. This interpose is that discipline:
+ * a WILDCARD bind from a pod process is rewritten to the pod's own /32, so two
+ * Pods can both hold :8080 and each receives only its own traffic.
+ *
+ * IT IS A CORRECTNESS DISCIPLINE, NOT A SECURITY BOUNDARY. A pod can still
+ * bind another pod's /32 explicitly (a SPECIFIC bind is passed through
+ * untouched, by design — see the AF_INET branch), and a pod that sets its own
+ * DYLD_INSERT_LIBRARIES, or whose main executable is a platform/hardened binary,
+ * never loads this dylib at all (the DYLD-strip ceiling documented at the top of
+ * the file). Same-node Pods remain one OS trust domain; enforcement lives
+ * elsewhere (a pf anchor, or the `vm` RuntimeClass for untrusted workloads).
+ *
+ * WHY bind() IS INTERPOSABLE AT ALL, INCLUDING FOR A GO SERVER — the mechanism's
+ * whole premise, and the thing that is NOT obvious. Go on darwin does not issue
+ * raw `syscall` instructions for socket calls the way it does on Linux: Apple's
+ * only supported ABI is libSystem, so runtime/sys_darwin.go imports the libc
+ * entry points dynamically —
+ *
+ *     //go:cgo_import_dynamic libc_bind bind "/usr/lib/libSystem.B.dylib"
+ *
+ * — and every net.Listen ultimately calls through that normal dynamic binding,
+ * which dyld's __DATA,__interpose section can retarget exactly as it does for a
+ * C program. This is measured, not assumed: the B215 probe wave observed a real
+ * `net.Listen("tcp", ":18082")` land on the rewritten address (`lsof` showing
+ * `TCP 100.64.99.7:18082 (LISTEN)` under the shim vs `TCP *:18082` without it).
+ * If a future Go release ever emitted raw syscalls here, this interpose would go
+ * silently inert for Go pods — the K3SM_BIND_DEBUG trace is how you would find
+ * that out.
+ *
+ * THE DECISION ORDER BELOW IS LOAD-BEARING. Each step exists because a probe
+ * cell or a persona critique demanded it, in this order:
+ *   1. family + addrlen, BEFORE any sockaddr cast. bind(2) is domain-generic;
+ *      an AF_UNIX sockaddr reinterpreted as a sockaddr_in reads a filesystem
+ *      path as an address and a port.
+ *   2. K3SM_POD_IP. Unset OR set-but-unparseable => full passthrough, the
+ *      identical fail-safe polarity (pinned by the acceptance gate): a
+ *      malformed value must never surface an error to the workload.
+ *   3. wildcard only. A specific bind is the caller's explicit choice.
+ *   4. IPV6_V6ONLY for in6addr_any. A socket whose owner asked for v6-only
+ *      semantics must not be given a v4-mapped address (B215 P2-v6only).
+ *   5. the low-port carve (see K3SM_BIND_MIN_PORT).
+ *   6. SO_REUSEADDR before the rewritten bind, unconditionally (B215 P1a).
+ */
+
+/*
+ * K3SM_BIND_MIN_PORT is the ONE boundary below which a wildcard bind is passed
+ * through UNREWRITTEN. pkg/podnet's MinRewritablePort holds the Go-side copy and
+ * TestShimMinRewritablePortMatchesC binds the two mechanically.
+ *
+ * Ports 1..1023 — Darwin INVERTS the rule Linux trains you to expect. A WILDCARD
+ * bind needs no privilege at any port, while a SPECIFIC-address bind below 1024
+ * returns EACCES for a non-root uid, and k3sm pods never run as root. So
+ * rewriting `bind(0.0.0.0:80)` would convert a working nginx-shaped workload into
+ * a permission error — a regression, not a discipline. B215 cell P1c measured
+ * exactly this and pinned the cause to the uid (the same specific bind succeeds
+ * as root and fails unconfined-unprivileged, which clears both Seatbelt and this
+ * interposer). Low-port pods therefore keep today's shared wildcard behaviour;
+ * that is a NAMED residual, not an oversight.
+ *
+ * Port 0 — ALSO passed through, and deliberately so. An ephemeral wildcard bind
+ * is a CLIENT socket about to connect() somewhere this interpose cannot see;
+ * pinning its source to the pod /32 would break an en0-routed external dial,
+ * which is precisely the hazard the destination-scoped connect() rung (backlog
+ * B218) exists to handle and which bind() alone cannot evaluate. The B215 probe
+ * artifact rewrote port 0, but no probe cell measured that case, so the shipped
+ * shim declines it rather than inherit an unmeasured behaviour.
+ */
+#define K3SM_BIND_MIN_PORT 1024
+
+typedef struct {
+    int enabled;                    /* K3SM_POD_IP parsed as an IPv4 literal */
+    int debug;                      /* K3SM_BIND_DEBUG set and not "0"/"" */
+    struct in_addr podip;           /* network byte order, ready to memcpy */
+    char podip_s[INET_ADDRSTRLEN];  /* presentation form, for the trace only */
+} k3sm_bind_cfg_t;
+
+/*
+ * The bind config is read ONCE per process, under pthread_once. bind() is
+ * interposed onto arbitrary application threads (a Go program binds from
+ * whichever goroutine's thread runs the listener), so a plain "initialized?"
+ * flag would be a data race on first use; and unlike the DNS config there is
+ * nothing per-call to vary, so caching costs nothing. getenv() is read only
+ * inside the once-initializer, before any concurrent bind can observe the
+ * result.
+ */
+static k3sm_bind_cfg_t k3sm_bind_cfg;
+static pthread_once_t k3sm_bind_once = PTHREAD_ONCE_INIT;
+
+static void k3sm_bind_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/*
+ * The K3SM_BIND_DEBUG stderr trace, mirroring K3SM_DNS_DEBUG. This is the ONLY
+ * field diagnostic for the two silent-by-construction escapes (a v6-only socket
+ * and a pod whose binary never loaded the dylib), so an unexplained EADDRINUSE
+ * localizes to "the shim never ran" vs "the shim declined this bind".
+ *
+ * WORDING IS COUPLED: hack/acceptance/B216.sh parses these lines to read which
+ * branch fired, the same private-log coupling the DNS differential carries.
+ * Reword a line and update the gate in the same change.
+ */
+static void k3sm_bind_trace(const char *fmt, ...) {
+    if (!k3sm_bind_cfg.debug) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "k3sm-bind: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    fflush(stderr);
+}
+
+static void k3sm_bind_cfg_init(void) {
+    memset(&k3sm_bind_cfg, 0, sizeof k3sm_bind_cfg);
+
+    const char *dbg = getenv("K3SM_BIND_DEBUG");
+    k3sm_bind_cfg.debug = (dbg != NULL && dbg[0] != '\0' && strcmp(dbg, "0") != 0);
+
+    const char *ip = getenv("K3SM_POD_IP");
+    if (ip == NULL || ip[0] == '\0') {
+        k3sm_bind_trace("disabled: K3SM_POD_IP unset (passthrough)");
+        return;
+    }
+    if (inet_pton(AF_INET, ip, &k3sm_bind_cfg.podip) != 1) {
+        /*
+         * Set-but-unparseable behaves EXACTLY like unset: full passthrough, no
+         * error surfaced to the workload. Failing the bind here would turn a
+         * malformed env value into an unbootable pod, and the discipline is not
+         * worth that; pkg/podnet's BindDisciplineEnv is the encoder that makes a
+         * malformed value not happen in the first place.
+         */
+        k3sm_bind_trace("disabled: K3SM_POD_IP=%s unparseable (passthrough)", ip);
+        return;
+    }
+    snprintf(k3sm_bind_cfg.podip_s, sizeof k3sm_bind_cfg.podip_s, "%s", ip);
+    k3sm_bind_cfg.enabled = 1;
+    k3sm_bind_trace("enabled: pod ip %s (wildcard binds >= %d rewritten)",
+                    k3sm_bind_cfg.podip_s, K3SM_BIND_MIN_PORT);
+}
+
+/*
+ * SO_REUSEADDR on every socket this shim rewrites — UNCONDITIONAL, and set
+ * BEFORE the real bind. B215 cell P1a is the grounds and it is not a nicety:
+ * without it the rewritten bind returns EADDRINUSE against a standing wildcard
+ * listener (the node's svclb and the Service proxy both hold one) in every
+ * shape and both orders, AND against the socket's own TIME_WAIT after serving a
+ * single connection — an ordinary Pod restart. Go sets SO_REUSEADDR itself on
+ * stream listeners, but that is a Go fact: a C, JVM, or Python pod sets none,
+ * and Go's own net.ListenPacket (UDP) sets none either, where the omission is
+ * sharper still (a pod-first UDP bind would otherwise BLOCK the node's wildcard
+ * proxy listener). It is applied only on the rewrite path, so no passed-through
+ * bind changes behaviour.
+ *
+ * A setsockopt failure is traced, not fatal: the subsequent bind is still the
+ * caller's real bind and reports the real errno.
+ */
+static void k3sm_bind_set_reuseaddr(int fd) {
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0) {
+        k3sm_bind_trace("fd=%d SO_REUSEADDR failed errno=%d — the rewritten bind may hit EADDRINUSE",
+                        fd, errno);
+        return;
+    }
+    k3sm_bind_trace("fd=%d SO_REUSEADDR set", fd);
+}
+
+/*
+ * The interposed bind(). Every path returns the REAL bind()'s result, and no
+ * libc call is made between that bind() and the return, so the caller sees the
+ * kernel's errno untouched (a trace emitted after a failed bind would clobber
+ * it — the traces below are therefore all emitted BEFORE the call).
+ */
+int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len) {
+    pthread_once(&k3sm_bind_once, k3sm_bind_cfg_init);
+
+    if (addr == NULL) {
+        /* A NULL sockaddr is the kernel's EFAULT/EINVAL to report, not ours. */
+        return bind(fd, addr, len);
+    }
+
+    /*
+     * STEP 1 — family + addrlen, before any cast. bind(2) is domain-generic:
+     * AF_UNIX, AF_SYSTEM, AF_NDRV and anything else must reach the kernel
+     * byte-identical, and a short sockaddr for a family we DO handle is the
+     * kernel's EINVAL to raise, not an invitation to read past the buffer.
+     */
+    int rewritable_shape =
+        (addr->sa_family == AF_INET && len >= (socklen_t)sizeof(struct sockaddr_in)) ||
+        (addr->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6));
+    if (!rewritable_shape) {
+        k3sm_bind_trace("fd=%d family=%d len=%u -> passthrough (not a rewritable shape)",
+                        fd, (int)addr->sa_family, (unsigned)len);
+        return bind(fd, addr, len);
+    }
+
+    /* STEP 2 — the pod identity. Unset or unparseable => transparent passthrough. */
+    if (!k3sm_bind_cfg.enabled) {
+        k3sm_bind_trace("fd=%d -> passthrough (shim disabled)", fd);
+        return bind(fd, addr, len);
+    }
+
+    if (addr->sa_family == AF_INET) {
+        struct sockaddr_in in;
+        memcpy(&in, addr, sizeof in);
+
+        /* STEP 3 — wildcard only. A specific bind is the caller's explicit
+         * choice and is preserved untouched, INCLUDING another pod's /32: this
+         * shim is a discipline, not an enforcement boundary. */
+        if (in.sin_addr.s_addr != htonl(INADDR_ANY)) {
+            char buf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &in.sin_addr, buf, sizeof buf);
+            k3sm_bind_trace("fd=%d AF_INET specific %s:%u -> passthrough", fd, buf,
+                            (unsigned)ntohs(in.sin_port));
+            return bind(fd, addr, len);
+        }
+
+        /* STEP 5 — the low-port carve (see K3SM_BIND_MIN_PORT). */
+        unsigned port = (unsigned)ntohs(in.sin_port);
+        if (port < K3SM_BIND_MIN_PORT) {
+            k3sm_bind_trace("fd=%d AF_INET wildcard :%u -> PASSTHROUGH-LOWPORT", fd, port);
+            return bind(fd, addr, len);
+        }
+
+        in.sin_addr = k3sm_bind_cfg.podip;
+        /* STEP 6 — SO_REUSEADDR first, then the rewritten bind. */
+        k3sm_bind_set_reuseaddr(fd);
+        k3sm_bind_trace("fd=%d AF_INET wildcard :%u -> REWRITE %s:%u", fd, port,
+                        k3sm_bind_cfg.podip_s, port);
+        return bind(fd, (const struct sockaddr *)&in, (socklen_t)sizeof in);
+    }
+
+    /* AF_INET6. Go's net.Listen("tcp", ":8080") produces exactly this socket —
+     * an in6addr_any dual-stack listener — so the v6 arm is the COMMON case for
+     * a Go workload, not an exotic one. */
+    struct sockaddr_in6 in6;
+    memcpy(&in6, addr, sizeof in6);
+
+    if (!IN6_IS_ADDR_UNSPECIFIED(&in6.sin6_addr)) {
+        char buf[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, &in6.sin6_addr, buf, sizeof buf);
+        k3sm_bind_trace("fd=%d AF_INET6 specific [%s]:%u -> passthrough", fd, buf,
+                        (unsigned)ntohs(in6.sin6_port));
+        return bind(fd, addr, len);
+    }
+
+    /*
+     * STEP 4 — IPV6_V6ONLY. A v6-only socket is left ALONE: its owner asked for
+     * v6-only semantics, a v4-mapped address is not even bindable on it, and
+     * silently black-holing such a listener would be strictly worse than the
+     * loud EADDRINUSE this shim exists to remove. Go's "tcp6" network sets
+     * IPV6_V6ONLY=1, as may any C/JVM server (B215 P2-v6only). A getsockopt
+     * failure is treated as "do not touch it" — the fail-safe direction.
+     */
+    int v6only = -1;
+    socklen_t olen = (socklen_t)sizeof v6only;
+    if (getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &olen) != 0) {
+        k3sm_bind_trace("fd=%d AF_INET6 getsockopt(IPV6_V6ONLY) errno=%d -> passthrough",
+                        fd, errno);
+        return bind(fd, addr, len);
+    }
+    if (v6only != 0) {
+        k3sm_bind_trace("fd=%d AF_INET6 in6addr_any but IPV6_V6ONLY=1 -> PASSTHROUGH-V6ONLY", fd);
+        return bind(fd, addr, len);
+    }
+
+    unsigned port6 = (unsigned)ntohs(in6.sin6_port);
+    if (port6 < K3SM_BIND_MIN_PORT) {
+        k3sm_bind_trace("fd=%d AF_INET6 wildcard :%u -> PASSTHROUGH-LOWPORT", fd, port6);
+        return bind(fd, addr, len);
+    }
+
+    /*
+     * Rewrite to the v4-mapped form ::ffff:<podip>. B215 P2 proved this binds on
+     * a dual-stack socket and that v4 traffic to the alias arrives, while
+     * 127.0.0.1 and [::1] are refused — the rewrite genuinely narrows the
+     * socket rather than relabelling it — so the fallback path the plan held in
+     * reserve (separate v4 handling) is not needed.
+     */
+    memset(&in6.sin6_addr, 0, sizeof in6.sin6_addr);
+    in6.sin6_addr.s6_addr[10] = 0xff;
+    in6.sin6_addr.s6_addr[11] = 0xff;
+    memcpy(&in6.sin6_addr.s6_addr[12], &k3sm_bind_cfg.podip, sizeof k3sm_bind_cfg.podip);
+    k3sm_bind_set_reuseaddr(fd);
+    k3sm_bind_trace("fd=%d AF_INET6 wildcard :%u (v6only=0) -> REWRITE [::ffff:%s]:%u", fd, port6,
+                    k3sm_bind_cfg.podip_s, port6);
+    return bind(fd, (const struct sockaddr *)&in6, (socklen_t)sizeof in6);
 }
