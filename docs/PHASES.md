@@ -211,16 +211,16 @@ phases:
       - runtimed:M8.2
     subphases:
       - id: M8.1
-        title: egress-datapath host-listener address set for the M8.2 golden fixtures (verification obligation)
+        title: documented egress-datapath address set (input to the FUTURE PF enforcement item) + the S1 exit-criterion verification obligation
         status: todo
         deliverables:
           - id: M8.1-d1
             done: false
-            desc: "darwin-net has NO product work in M8 (the MLX serving milestone is apis/runtimed/k3sm — machine-checked by the S1 exit criterion). The ONE real obligation this entry carries — so the \"no work\" claim is honest rather than silent — is to provide + pin the production egress datapath's host-listener address set that runtimed's M8.2-d2 golden SBPL fixtures consume. darwin-net owns that datapath (DNS shim → Service-proxy dialer → egress), so it is the authority on which host-listener addresses the path legitimately touches: the DNS/apiserver VIPs, the pod's own lo0 alias, and the mesh-egress /32. runtimed's `allow_internet_egress` branch layers **range-based** host-local denies over the wide IP-scoped allow (deny 127/8, 169.254/16, all of 100.64.0.0/10, the node's RFC1918 subnets, with tier-3 re-allows for the pod's own IP + the cluster VIPs). This enumerated set is what the tier-3 re-allows are pinned against, so those denies do NOT sever the datapath the S1 exit criterion (HF weight download through the production path) must prove. Range-denies keep the set stale-proof against DHCP/mesh address churn. Cross-domain owner: the darwin-systems → pod-networking datapath boundary."
+            desc: "darwin-net still has NO product work in M8. The obligation is re-scoped (2026-08-29, operator-directed per m8-plan R21 — per-IP SBPL scoping does not compile on macOS 26, so no golden fixture consumes an address set): DOCUMENT the production egress datapath's host-listener address set (DNS shim → Service-proxy dialer → egress: the VIPs, the pod's lo0 alias, the mesh-egress /32) as the named input to the FUTURE network-layer (PF) egress enforcement item (backlog B188), in this repo's docs (the datapath authority record). The S1 exit-criterion verification obligation stands: the HF weight download through the production datapath must succeed under the generated egress profile. Cross-domain owner: the darwin-systems → pod-networking datapath boundary."
         acceptance:
           - id: M8.1-a1
             met: false
-            check: "the egress-datapath host-listener address set is committed and consumed by the M8.2 golden SBPL fixtures, and the S1 exit-criterion HF-weight download through the production datapath (DNS shim → proxy dialer → egress) succeeds under the FULL d2 egress profile — the range-based host-local denies do not sever it"
+            check: "the documented address set is committed (datapath-authority record) AND the k3sm:M8.0 S1 findings file records the HF-weight download through the production datapath (DNS shim → proxy dialer → egress) under the generated `allow_internet_egress` profile (rides the S1 evidence)"
             method: integration
 
   - id: M10
@@ -612,24 +612,27 @@ conversion.
 "darwin-net has no work" claim is **machine-checked** by the S1 exit criterion. The entry is
 kept honest (not silent) by carrying darwin-net's **one** real obligation.
 
-**Cross-repo deps:** `k3sm:M8.0` (the S1 spike) + `runtimed:M8.2` (the `allow_internet_egress` d2
-profile whose golden SBPL fixtures consume darwin-net's enumerated set).
+**Cross-repo deps:** `k3sm:M8.0` (the S1 spike, whose findings file carries this entry's evidence) +
+`runtimed:M8.2` (the `allow_internet_egress` d2 profile the S1 download runs under). *Re-scoped
+2026-08-29, operator-directed per m8-plan R21 — no golden fixture consumes an address set.*
 
-### M8.1 — egress-datapath host-listener address set for the M8.2 golden fixtures ⬜
+### M8.1 — documented egress-datapath address set (PF-future input) + the S1 verification obligation ⬜
 **Deliverables**
-- ⬜ `M8.1-d1` Provide + pin the production egress datapath's **host-listener address set** (DNS shim →
-  Service-proxy dialer → egress: the DNS/apiserver VIPs, the pod's own lo0 alias, the mesh-egress /32)
-  for runtimed's M8.2-d2 golden SBPL fixtures. runtimed's egress branch layers **range-based** host-local
-  denies (127/8, 169.254/16, all of 100.64.0.0/10, node RFC1918 subnets, with
-  tier-3 re-allows for the pod IP + cluster VIPs) over the wide IP-scoped allow; darwin-net's enumerated
-  set is what the tier-3 re-allows are pinned against, so the denies do **not** sever the datapath S1
-  must prove. Range-denies keep it stale-proof. (Cross-domain owner: the darwin-systems →
-  pod-networking datapath boundary.)
+- ⬜ `M8.1-d1` darwin-net still has **no product work** in M8. The obligation is re-scoped
+  (2026-08-29, operator-directed per **m8-plan R21** — per-IP SBPL scoping does not compile on macOS 26,
+  so no golden fixture consumes an address set): **DOCUMENT** the production egress datapath's
+  **host-listener address set** (DNS shim → Service-proxy dialer → egress: the VIPs, the pod's lo0 alias,
+  the mesh-egress /32) as the named input to the **FUTURE network-layer (PF) egress enforcement item**
+  (backlog B188), in this repo's docs (the datapath authority record). The S1 exit-criterion
+  verification obligation stands: the HF weight download through the production datapath must succeed
+  under the generated egress profile. (Cross-domain owner: the darwin-systems → pod-networking
+  datapath boundary.)
 
 **Acceptance (exit gate)**
-- ⬜ `M8.1-a1` the address set is committed and consumed by the M8.2 golden SBPL fixtures, and the S1
-  HF-weight download through the production datapath succeeds under the **full d2 profile** (the
-  range-based host-local denies do not sever it) — *method: integration*
+- ⬜ `M8.1-a1` the documented address set is committed (datapath-authority record) **and** the
+  `k3sm:M8.0` S1 findings file records the HF-weight download through the production datapath
+  (DNS shim → proxy dialer → egress) under the generated `allow_internet_egress` profile
+  (rides the S1 evidence) — *method: integration*
 
 ## M10 — Kubernetes conformance hardening ⬜
 
