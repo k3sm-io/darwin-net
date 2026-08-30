@@ -21,8 +21,10 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -399,17 +401,49 @@ func waitBackends(t *testing.T, tbl *RoutingTable, key PortKey, want int) {
 	t.Fatalf("routing table for %s never reached %d backends (have %d)", key, want, tbl.Len(key))
 }
 
-// freePort returns a TCP port currently free on ip by opening and closing a
-// listener; there is an inherent TOCTOU window but it is acceptable for tests.
+// Port windowing for freePort. Asking the kernel for :0 and immediately closing
+// the listener hands out a port that ANOTHER concurrently running copy of a test
+// binary can be handed too — and `go test ./...` runs one binary per package in
+// parallel, several of which bind loopback ports, while the B207 stress recipe
+// runs several copies of this very binary at once. A collision then surfaces as a
+// listener that never comes up, or as waitClosed finding somebody else's socket on
+// a port this test just released.
+//
+// So ports are drawn from a window derived from the process id and handed out
+// monotonically within it: two concurrent processes cannot be handed the same
+// port unless their pids collide modulo portWindows, and one process never reuses
+// a port while an earlier test still holds it. Each candidate is still verified
+// free by binding it, so an unrelated process squatting the window is skipped
+// rather than fatal.
+const (
+	portWindowBase = 20000
+	portWindowSize = 128
+	portWindows    = 300
+)
+
+// portCursor walks this process's window; it is never reset, so a port is not
+// handed out twice even across sequential tests in one binary.
+var portCursor atomic.Int32
+
+// freePort returns a TCP port currently free on ip, drawn from this process's
+// port window (see above). The bind-and-release TOCTOU against an unrelated
+// process on the box remains — it cannot be closed without holding the socket the
+// caller is about to bind — but the collision this package can actually cause,
+// between its own concurrent test binaries, is gone.
 func freePort(t *testing.T, ip string) int32 {
 	t.Helper()
-	ln, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
+	base := int32(portWindowBase + (os.Getpid()%portWindows)*portWindowSize)
+	for i := 0; i < portWindowSize; i++ {
+		port := base + portCursor.Add(1)%portWindowSize
+		ln, err := net.Listen("tcp", net.JoinHostPort(ip, strconv.Itoa(int(port))))
+		if err != nil {
+			continue // squatted by another process; try the next slot
+		}
+		_ = ln.Close()
+		return port
 	}
-	port := int32(ln.Addr().(*net.TCPAddr).Port)
-	_ = ln.Close()
-	return port
+	t.Fatalf("no free port in this process's window [%d,%d)", base, base+portWindowSize)
+	return 0
 }
 
 // waitAliasEnsured blocks until the alias manager has been asked to ensure ip.
