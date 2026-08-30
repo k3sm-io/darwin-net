@@ -20,6 +20,7 @@ import (
 	"context"
 	"log/slog"
 	"net/netip"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -455,6 +456,9 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 		client := fake.NewSimpleClientset(orderSlice("10.42.0.5", 8080))
 		px, tbl := newOrderProxy(t)
 		w := NewWatcher(client, px, slog.New(slog.DiscardHandler))
+		// Register the watch gate BEFORE Run so the reflector's own Watch call is the
+		// one observed (see waitWatchEstablished).
+		gate := watchGate(client, "services", "endpointslices")
 
 		ctx, cancel := context.WithCancel(context.Background())
 		runDone := make(chan struct{})
@@ -469,6 +473,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 		if !cache.WaitForCacheSync(ctx.Done(), w.svcs.HasSynced, w.slices.HasSynced) {
 			t.Fatal("informer cache sync failed")
 		}
+		gate.wait(t)
 		// The drop itself: the slice is cached but no reconcile has carried it,
 		// because its Service was not in the Service store when onSlice ran.
 		assertNoBackends(t, tbl, key, 200*time.Millisecond)
@@ -556,6 +561,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 			client := fake.NewSimpleClientset()
 			px, tbl := newOrderProxy(t)
 			w := NewWatcher(client, px, slog.New(slog.DiscardHandler))
+			gate := watchGate(client, "services", "endpointslices")
 
 			ctx, cancel := context.WithCancel(context.Background())
 			runDone := make(chan struct{})
@@ -565,6 +571,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 				<-runDone
 				t.Fatal("informer cache sync failed")
 			}
+			gate.wait(t)
 
 			var wg sync.WaitGroup
 			wg.Add(2)
@@ -585,7 +592,15 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 			}
 
 			waitBackends(t, tbl, key, 1)
-			if addr := tbl.Backends(key)[0].Addr().String(); addr != "10.42.0.5:8080" {
+			// Re-read rather than index blind: Len and Backends are two separate lock
+			// acquisitions, so a regression that lets a stale empty reconcile land
+			// between them must report itself, not panic with an index-out-of-range
+			// that buries the diagnosis (B207).
+			got := tbl.Backends(key)
+			if len(got) != 1 {
+				t.Fatalf("iteration %d: backends = %d, want 1 (a stale reconcile overtook a fresh one)", i, len(got))
+			}
+			if addr := got[0].Addr().String(); addr != "10.42.0.5:8080" {
 				t.Fatalf("iteration %d: backend = %s, want 10.42.0.5:8080", i, addr)
 			}
 			cancel()
@@ -610,4 +625,78 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 		w.onSlice(sl)
 		assertNoBackends(t, tbl, key, 200*time.Millisecond)
 	})
+}
+
+// TestReconcileSnapshotIsNotOvertaken pins the B207 mechanism: reconcileService
+// reads the EndpointSlice cache and THEN delivers the resulting backend set to the
+// per-VIP worker, and those two steps run on two different informer goroutines. If
+// they are not serialized per Service, a goroutine descheduled between them lands
+// an older snapshot on top of a newer one and the Service blackholes — the
+// informers run a 0 resync period, so nothing ever recomputes it.
+//
+// The test drives exactly that interleaving: one goroutine reconciles against a
+// slice cache that does NOT yet hold the Service's slice (so it snapshots an empty
+// backend set), while a second adds the slice and reconciles (snapshotting the real
+// backend). Whatever order they finish in, the table MUST end holding the backend,
+// because the second snapshot is strictly newer.
+//
+// The cache is padded with unrelated slices so slicesForService — an O(cache) list
+// and filter — takes long enough for the loser to be overtaken. That widens the
+// window; it does not create it.
+func TestReconcileSnapshotIsNotOvertaken(t *testing.T) {
+	t.Parallel()
+	const (
+		vip        = "127.0.0.1"
+		iterations = 50
+		padding    = 400
+	)
+
+	for i := 0; i < iterations; i++ {
+		port := freePort(t, vip)
+		key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
+
+		px, tbl := newOrderProxy(t)
+		w := NewWatcher(fake.NewSimpleClientset(), px, slog.New(slog.DiscardHandler))
+
+		svc := orderService(vip, port)
+		if err := w.svcs.GetStore().Add(svc); err != nil {
+			t.Fatalf("iteration %d: seed service store: %v", i, err)
+		}
+		// Unrelated slices: they widen the snapshot, and slicesForService must filter
+		// every one of them out (they carry a different service-name label).
+		for j := 0; j < padding; j++ {
+			pad := orderSlice("10.42.9.9", 8080)
+			pad.Name = "noise-" + strconv.Itoa(j)
+			pad.Labels[discoveryv1.LabelServiceName] = "other"
+			if err := w.slices.GetStore().Add(pad); err != nil {
+				t.Fatalf("iteration %d: seed padding: %v", i, err)
+			}
+		}
+
+		// The stale reconciler: it starts while the Service's own slice is absent, so
+		// its snapshot is empty.
+		entered := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			close(entered)
+			w.reconcileService(svc)
+		}()
+
+		// The fresh reconciler: the slice exists before it snapshots, so its snapshot
+		// carries the backend.
+		<-entered
+		if err := w.slices.GetStore().Add(orderSlice("10.42.0.5", 8080)); err != nil {
+			t.Fatalf("iteration %d: seed slice store: %v", i, err)
+		}
+		w.reconcileService(svc)
+		wg.Wait()
+
+		waitBackends(t, tbl, key, 1)
+		got := tbl.Backends(key)
+		if len(got) != 1 || got[0].Addr().String() != "10.42.0.5:8080" {
+			t.Fatalf("iteration %d: backends = %v, want [10.42.0.5:8080] (a stale snapshot overtook a fresh one)", i, got)
+		}
+	}
 }

@@ -35,8 +35,12 @@ import (
 // is the production watch seam: on every Service or EndpointSlice event it
 // recomputes the affected Service's desired state and calls Proxy.Reconcile,
 // which routes each port to its single per-VIP worker. The informers' shared
-// cache makes the recompute cheap; correctness comes from the proxy's per-key
-// serialization, not from event ordering here.
+// cache makes the recompute cheap; event ordering is irrelevant because every
+// recompute derives the FULL desired state from the caches rather than applying a
+// delta.
+//
+// That last property only holds if a recompute's snapshot cannot be overtaken by
+// an older one — see reconcileMu, which is what makes it true.
 type Watcher struct {
 	proxy   *Proxy
 	factory informers.SharedInformerFactory
@@ -56,6 +60,28 @@ type Watcher struct {
 	// the reliance on an un-contracted invariant.
 	eTPMu          sync.Mutex
 	eTPLocalWarned map[string]bool
+
+	// reconcileMu serializes each Service's SNAPSHOT-AND-DELIVER, striped by
+	// Service key (see serviceStripe). Both informer goroutines call
+	// reconcileService, and each one reads the EndpointSlice cache and THEN hands
+	// the resulting backend set to the per-VIP worker. Those two steps are not
+	// atomic, so without this lock a goroutine descheduled between them can deliver
+	// a STALE snapshot after a fresher one:
+	//
+	//	Service handler:  snapshot slices -> [] ......................... send []
+	//	Slice handler:            snapshot slices -> [pod] -> send [pod]
+	//
+	// The worker applies both in arrival order, so the table ends on the empty set
+	// and — the informers run a 0 resync period — nothing ever recomputes it. The
+	// Service blackholes until its next real event. The proxy's per-VIP worker
+	// serializes DELIVERY, which is not the same guarantee (B207).
+	//
+	// Striping bounds the contention: only Services that hash together wait on each
+	// other. The lock is held across ReconcilePolicy, whose sole blocking point is a
+	// buffered per-worker channel drained by a loop with no unbounded wait, so it is
+	// never held on a network round-trip. It is NOT held while onService runs the
+	// eTP Warn (eTPMu is taken and released before this one — the two never nest).
+	reconcileMu [reconcileStripes]sync.Mutex
 
 	// static maps "namespace/name" Service keys to a FIXED backend set that
 	// replaces the EndpointSlice-derived one for that Service (every port routes
@@ -211,6 +237,11 @@ func (w *Watcher) onServiceDelete(obj any) {
 	if !ok {
 		return
 	}
+	// Same stripe as reconcileService: a delete racing a slice-driven recompute
+	// must not be overtaken by that recompute's already-snapshotted backend set.
+	mu := w.serviceStripe(svc.Namespace + "/" + svc.Name)
+	mu.Lock()
+	defer mu.Unlock()
 	for _, p := range vip.Ports {
 		w.proxy.ReconcileDelete(PortKey{
 			ClusterIP: vip.ClusterIP,
@@ -253,6 +284,11 @@ func (w *Watcher) reconcileService(svc *corev1.Service) {
 		return
 	}
 	key := svc.Namespace + "/" + svc.Name
+	// Snapshot and deliver under the Service's stripe so a slower goroutine cannot
+	// land an older backend set on top of a newer one (see reconcileMu).
+	mu := w.serviceStripe(key)
+	mu.Lock()
+	defer mu.Unlock()
 	slices := w.slicesForService(svc.Namespace, svc.Name)
 	for i := range vip.Ports {
 		p := vip.Ports[i]
@@ -273,6 +309,29 @@ func (w *Watcher) backendsForPort(key string, slices []*discoveryv1.EndpointSlic
 		return eps
 	}
 	return endpointsForPort(slices, portName)
+}
+
+// reconcileStripes is the width of the per-Service reconcile lock table. It is a
+// power of two comfortably above the Service count of a k3sm node, so unrelated
+// Services almost never share a stripe, while the table stays a fixed-size array
+// with no per-Service allocation and no lifecycle to leak on Service delete.
+const reconcileStripes = 32
+
+// serviceStripe returns the reconcile lock guarding the Service key
+// "namespace/name". The hash is FNV-1a, inlined to keep the data path
+// allocation-free; a collision costs only mutual exclusion between two unrelated
+// Services, never correctness.
+func (w *Watcher) serviceStripe(key string) *sync.Mutex {
+	const (
+		fnvOffset32 = 2166136261
+		fnvPrime32  = 16777619
+	)
+	h := uint32(fnvOffset32)
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= fnvPrime32
+	}
+	return &w.reconcileMu[h%reconcileStripes]
 }
 
 // slicesForService returns the cached EndpointSlices labeled for the Service.

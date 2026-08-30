@@ -211,10 +211,24 @@ func TestUDPDatagramRelayRoundTrip(t *testing.T) {
 	<-runDone
 }
 
-// TestUDPRelayIdleFlowGC drives the relay directly with a short idle timeout and
-// asserts the sweeper reaps an idle flow: after one datagram a flow exists, and it
-// is gone once it has been silent past the idle timeout. It exercises the GC path
-// under -race.
+// TestUDPRelayIdleFlowGC asserts the relay idle-GCs a flow that falls silent, in
+// two phases that are deliberately NOT run against the same relay.
+//
+// Phase 1 uses a LONG idle timeout. With a short one the background sweeper races
+// the in-flight reply: it reaps the flow — closing the upstream socket, killing
+// that flow's reader — before the echo comes back, and the round-trip times out
+// through no fault of the relay. That is what a loaded box does to a 200ms idle
+// window, and it is the failure captured under B207. A GC test must not make its
+// own round-trip the thing being GC'd. The reap is then forced through
+// sweepExpired, the seam factored out for exactly this, with a clock past the
+// threshold — deterministic, no polling, no clock luck.
+//
+// Phase 2 is what phase 1 gives up: proof that the sweeper GOROUTINE performs that
+// reap on its own timer with nobody calling sweepExpired. It seeds a flow
+// synchronously through upstreamFor (a non-nil return IS the proof the flow
+// existed) and then asserts only that the count reaches zero. That claim is
+// monotone: load can delay it, never falsify it, and a reap that beats the first
+// observation is a pass, not a flake.
 func TestUDPRelayIdleFlowGC(t *testing.T) {
 	t.Parallel()
 
@@ -222,45 +236,65 @@ func TestUDPRelayIdleFlowGC(t *testing.T) {
 	defer be.close()
 	beIP, bePort := be.addrPort()
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen vip udp: %v", err)
-	}
-	vipAddr := pc.LocalAddr().(*net.UDPAddr)
-
-	key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
-	tbl := NewRoutingTable(netip.Prefix{})
-	tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
-
-	const idle = 200 * time.Millisecond
-	relay := newUDPRelay(pc, key, tbl, netip.Addr{}, idle, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), slog.Default())
-	relay.start()
-	defer relay.Close()
-
-	c, err := net.DialUDP("udp", nil, vipAddr)
-	if err != nil {
-		t.Fatalf("dial vip udp: %v", err)
-	}
-	defer c.Close()
-
-	// One datagram creates a flow and round-trips (the VIP socket is already bound,
-	// so no retry window).
-	if got := udpRoundTrip(t, c, "x", 2*time.Second); got != "x" {
-		t.Fatalf("datagram did not round-trip: got %q", got)
-	}
-	// The flow exists immediately after activity (idle timeout >> this check).
-	if got := relay.flowCount(); got != 1 {
-		t.Fatalf("flow count after first datagram = %d, want 1", got)
-	}
-	// The idle sweeper reaps the flow after it falls silent past the idle timeout.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if relay.flowCount() == 0 {
-			return // reaped
+	newRelay := func(t *testing.T, idle time.Duration) *udpRelay {
+		t.Helper()
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen vip udp: %v", err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		vipAddr := pc.LocalAddr().(*net.UDPAddr)
+		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
+		tbl := NewRoutingTable(netip.Prefix{})
+		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
+		r := newUDPRelay(pc, key, tbl, netip.Addr{}, idle, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), slog.Default())
+		r.start()
+		t.Cleanup(func() { _ = r.Close() })
+		return r
 	}
-	t.Fatalf("idle flow was not GC'd: flow count still %d", relay.flowCount())
+
+	t.Run("a silent flow is reaped, and its accounting with it", func(t *testing.T) {
+		const idle = time.Minute
+		relay := newRelay(t, idle)
+
+		c, err := net.DialUDP("udp", nil, relay.conn.LocalAddr().(*net.UDPAddr))
+		if err != nil {
+			t.Fatalf("dial vip udp: %v", err)
+		}
+		defer c.Close()
+
+		// The VIP socket is bound before this write, so the datagram is queued rather
+		// than dropped; the budget is a liveness backstop for a starved dispatcher,
+		// not a performance measurement.
+		if got := udpRoundTrip(t, c, "x", 10*time.Second); got != "x" {
+			t.Fatalf("datagram did not round-trip: got %q", got)
+		}
+		if got := relay.flowCount(); got != 1 {
+			t.Fatalf("flow count after first datagram = %d, want 1", got)
+		}
+
+		relay.sweepExpired(time.Now().Add(2 * idle))
+		if got := relay.flowCount(); got != 0 {
+			t.Fatalf("flow count after an expired sweep = %d, want 0", got)
+		}
+	})
+
+	t.Run("the sweeper goroutine drives the reap on its own timer", func(t *testing.T) {
+		const idle = 200 * time.Millisecond
+		relay := newRelay(t, idle)
+
+		var lastWarn time.Time
+		if up := relay.upstreamFor(&net.UDPAddr{IP: net.IPv4(10, 0, 5, 1), Port: 45000}, &lastWarn); up == nil {
+			t.Fatal("upstreamFor admitted no flow, so this test would assert nothing")
+		}
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if relay.flowCount() == 0 {
+				return // the sweeper's own timer reaped it
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("idle flow was not GC'd by the sweeper: flow count still %d", relay.flowCount())
+	})
 }
 
 // TestUDPRelayPerSourceFairShare is the B48 gate: it proves the per-source
@@ -725,13 +759,29 @@ func udpRoundTrip(t *testing.T, c *net.UDPConn, payload string, timeout time.Dur
 	if _, err := c.Write([]byte(payload)); err != nil {
 		t.Fatalf("write %q: %v", payload, err)
 	}
-	_ = c.SetReadDeadline(time.Now().Add(timeout))
+	deadline := time.Now().Add(timeout)
 	buf := make([]byte, maxUDPDatagram)
-	n, err := c.Read(buf)
-	if err != nil {
-		t.Fatalf("read reply for %q: %v", payload, err)
+	// Skip datagrams that echo an EARLIER payload. UDP has no request/reply
+	// correlation, and udpRoundTripRetry deliberately re-sends its payload until one
+	// reply arrives — so a slow relay can leave extra echoes of the previous phase
+	// queued on this socket. Reading the first datagram unconditionally attributes a
+	// stale echo to this send (B207: "got \"hello-udp\", want \"world-udp\"").
+	// A genuinely wrong reply still fails, on the deadline, naming what was seen.
+	var last string
+	for time.Now().Before(deadline) {
+		_ = c.SetReadDeadline(deadline)
+		n, err := c.Read(buf)
+		if err != nil {
+			t.Fatalf("read reply for %q: %v (last datagram %q)", payload, err, last)
+		}
+		last = string(buf[:n])
+		if last == payload {
+			return last
+		}
+		t.Logf("skipping stale echo %q while awaiting %q", last, payload)
 	}
-	return string(buf[:n])
+	t.Fatalf("no reply matching %q within %v (last datagram %q)", payload, timeout, last)
+	return ""
 }
 
 // udpRoundTripRetry repeatedly sends payload until it reads a reply or the overall
@@ -753,6 +803,9 @@ func udpRoundTripRetry(t *testing.T, c *net.UDPConn, payload string, overall tim
 		if err != nil {
 			continue // relay not up yet (timeout or ICMP refused) → retry
 		}
+		// NOTE: every retry that timed out may still have been relayed, so its echo
+		// can be in flight behind this one. Those duplicates are the caller's problem
+		// to skip — udpRoundTrip does, by matching the payload.
 		return string(buf[:n])
 	}
 	return ""

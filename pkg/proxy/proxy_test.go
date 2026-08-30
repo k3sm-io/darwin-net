@@ -21,8 +21,10 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -164,9 +166,11 @@ func TestProxyReconcileLoadBalances(t *testing.T) {
 	// Tear down: the worker must close the listener and remove the alias.
 	p.ReconcileDelete(PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP})
 	waitClosed(t, vip, port)
-	if alias.removes(netip.MustParseAddr(vip)) == 0 {
-		t.Fatalf("alias.Remove(%s) was never called on delete", vip)
-	}
+	// listener.Close closes the sockets BEFORE it calls alias.Remove, so the VIP
+	// refusing connections does NOT order the alias removal — waitClosed can win the
+	// race by the width of a deschedule. Wait on the fact being asserted instead.
+	// ctx is still live, so the delete path is the only thing that can remove it.
+	waitAliasRemoved(t, alias, netip.MustParseAddr(vip))
 
 	cancel()
 	<-runDone
@@ -363,15 +367,14 @@ func TestProxyUDPClusterIPRelay(t *testing.T) {
 		t.Fatalf("reconcile udp: %v", err)
 	}
 
-	// Wait for the worker to process the event (the relay socket binds in the same
-	// openListener call that records the backend).
+	// Wait for the worker to process the event. runWorker records the backends and
+	// only THEN calls openListener, so a full routing table does not imply the alias
+	// was ensured — the two facts need two waits.
 	key := PortKey{ClusterIP: vip, Port: udpPort, Protocol: netv1.ProtocolUDP}
 	waitBackends(t, tbl, key, 1)
 
-	// Alias ensured for the UDP VIP.
-	if alias.ensures(netip.MustParseAddr(vip)) == 0 {
-		t.Fatalf("UDP port did not ensure the lo0 alias")
-	}
+	// Alias ensured for the UDP VIP (openListener's first act, after the table write).
+	waitAliasEnsured(t, alias, netip.MustParseAddr(vip))
 	// No TCP stream listener was opened on the UDP port — the relay is a datagram
 	// socket, not a stream listener.
 	if c, err := net.DialTimeout("tcp", hostPort(vip, udpPort), 200*time.Millisecond); err == nil {
@@ -398,17 +401,81 @@ func waitBackends(t *testing.T, tbl *RoutingTable, key PortKey, want int) {
 	t.Fatalf("routing table for %s never reached %d backends (have %d)", key, want, tbl.Len(key))
 }
 
-// freePort returns a TCP port currently free on ip by opening and closing a
-// listener; there is an inherent TOCTOU window but it is acceptable for tests.
+// Port windowing for freePort. Asking the kernel for :0 and immediately closing
+// the listener hands out a port that ANOTHER concurrently running copy of a test
+// binary can be handed too — and `go test ./...` runs one binary per package in
+// parallel, several of which bind loopback ports, while the B207 stress recipe
+// runs several copies of this very binary at once. A collision then surfaces as a
+// listener that never comes up, or as waitClosed finding somebody else's socket on
+// a port this test just released.
+//
+// So ports are drawn from a window derived from the process id and handed out
+// monotonically within it: two concurrent processes cannot be handed the same
+// port unless their pids collide modulo portWindows, and one process never reuses
+// a port while an earlier test still holds it. Each candidate is still verified
+// free by binding it, so an unrelated process squatting the window is skipped
+// rather than fatal.
+const (
+	portWindowBase = 20000
+	portWindowSize = 128
+	portWindows    = 300
+)
+
+// portCursor walks this process's window; it is never reset, so a port is not
+// handed out twice even across sequential tests in one binary.
+var portCursor atomic.Int32
+
+// freePort returns a TCP port currently free on ip, drawn from this process's
+// port window (see above). The bind-and-release TOCTOU against an unrelated
+// process on the box remains — it cannot be closed without holding the socket the
+// caller is about to bind — but the collision this package can actually cause,
+// between its own concurrent test binaries, is gone.
 func freePort(t *testing.T, ip string) int32 {
 	t.Helper()
-	ln, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
+	base := int32(portWindowBase + (os.Getpid()%portWindows)*portWindowSize)
+	for i := 0; i < portWindowSize; i++ {
+		port := base + portCursor.Add(1)%portWindowSize
+		ln, err := net.Listen("tcp", net.JoinHostPort(ip, strconv.Itoa(int(port))))
+		if err != nil {
+			continue // squatted by another process; try the next slot
+		}
+		_ = ln.Close()
+		return port
 	}
-	port := int32(ln.Addr().(*net.TCPAddr).Port)
-	_ = ln.Close()
-	return port
+	t.Fatalf("no free port in this process's window [%d,%d)", base, base+portWindowSize)
+	return 0
+}
+
+// waitAliasEnsured blocks until the alias manager has been asked to ensure ip.
+// It exists because the reconcile path writes the routing table BEFORE it opens
+// the listener (runWorker), so waitBackends is not a readiness signal for the
+// alias having been ensured — asserting the counter directly off waitBackends is
+// a lost race under load (B207).
+func waitAliasEnsured(t *testing.T, m *noopAliasManager, ip netip.Addr) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.ensures(ip) > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("alias.Ensure(%s) was never called", ip)
+}
+
+// waitAliasRemoved blocks until the alias manager has been asked to remove ip.
+// Its counterpart to waitAliasEnsured: listener.Close closes the sockets before
+// it removes the alias, so waitClosed does not order the removal either (B207).
+func waitAliasRemoved(t *testing.T, m *noopAliasManager, ip netip.Addr) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.removes(ip) > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("alias.Remove(%s) was never called on delete", ip)
 }
 
 func waitListen(t *testing.T, ip string, port int32) {
