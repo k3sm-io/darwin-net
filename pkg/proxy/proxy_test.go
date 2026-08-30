@@ -164,9 +164,11 @@ func TestProxyReconcileLoadBalances(t *testing.T) {
 	// Tear down: the worker must close the listener and remove the alias.
 	p.ReconcileDelete(PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP})
 	waitClosed(t, vip, port)
-	if alias.removes(netip.MustParseAddr(vip)) == 0 {
-		t.Fatalf("alias.Remove(%s) was never called on delete", vip)
-	}
+	// listener.Close closes the sockets BEFORE it calls alias.Remove, so the VIP
+	// refusing connections does NOT order the alias removal — waitClosed can win the
+	// race by the width of a deschedule. Wait on the fact being asserted instead.
+	// ctx is still live, so the delete path is the only thing that can remove it.
+	waitAliasRemoved(t, alias, netip.MustParseAddr(vip))
 
 	cancel()
 	<-runDone
@@ -363,15 +365,14 @@ func TestProxyUDPClusterIPRelay(t *testing.T) {
 		t.Fatalf("reconcile udp: %v", err)
 	}
 
-	// Wait for the worker to process the event (the relay socket binds in the same
-	// openListener call that records the backend).
+	// Wait for the worker to process the event. runWorker records the backends and
+	// only THEN calls openListener, so a full routing table does not imply the alias
+	// was ensured — the two facts need two waits.
 	key := PortKey{ClusterIP: vip, Port: udpPort, Protocol: netv1.ProtocolUDP}
 	waitBackends(t, tbl, key, 1)
 
-	// Alias ensured for the UDP VIP.
-	if alias.ensures(netip.MustParseAddr(vip)) == 0 {
-		t.Fatalf("UDP port did not ensure the lo0 alias")
-	}
+	// Alias ensured for the UDP VIP (openListener's first act, after the table write).
+	waitAliasEnsured(t, alias, netip.MustParseAddr(vip))
 	// No TCP stream listener was opened on the UDP port — the relay is a datagram
 	// socket, not a stream listener.
 	if c, err := net.DialTimeout("tcp", hostPort(vip, udpPort), 200*time.Millisecond); err == nil {
@@ -409,6 +410,38 @@ func freePort(t *testing.T, ip string) int32 {
 	port := int32(ln.Addr().(*net.TCPAddr).Port)
 	_ = ln.Close()
 	return port
+}
+
+// waitAliasEnsured blocks until the alias manager has been asked to ensure ip.
+// It exists because the reconcile path writes the routing table BEFORE it opens
+// the listener (runWorker), so waitBackends is not a readiness signal for the
+// alias having been ensured — asserting the counter directly off waitBackends is
+// a lost race under load (B207).
+func waitAliasEnsured(t *testing.T, m *noopAliasManager, ip netip.Addr) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.ensures(ip) > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("alias.Ensure(%s) was never called", ip)
+}
+
+// waitAliasRemoved blocks until the alias manager has been asked to remove ip.
+// Its counterpart to waitAliasEnsured: listener.Close closes the sockets before
+// it removes the alias, so waitClosed does not order the removal either (B207).
+func waitAliasRemoved(t *testing.T, m *noopAliasManager, ip netip.Addr) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.removes(ip) > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("alias.Remove(%s) was never called on delete", ip)
 }
 
 func waitListen(t *testing.T, ip string, port int32) {

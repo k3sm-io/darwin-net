@@ -456,6 +456,9 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 		client := fake.NewSimpleClientset(orderSlice("10.42.0.5", 8080))
 		px, tbl := newOrderProxy(t)
 		w := NewWatcher(client, px, slog.New(slog.DiscardHandler))
+		// Register the watch gate BEFORE Run so the reflector's own Watch call is the
+		// one observed (see waitWatchEstablished).
+		gate := watchGate(client, "services", "endpointslices")
 
 		ctx, cancel := context.WithCancel(context.Background())
 		runDone := make(chan struct{})
@@ -470,6 +473,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 		if !cache.WaitForCacheSync(ctx.Done(), w.svcs.HasSynced, w.slices.HasSynced) {
 			t.Fatal("informer cache sync failed")
 		}
+		gate.wait(t)
 		// The drop itself: the slice is cached but no reconcile has carried it,
 		// because its Service was not in the Service store when onSlice ran.
 		assertNoBackends(t, tbl, key, 200*time.Millisecond)
@@ -557,6 +561,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 			client := fake.NewSimpleClientset()
 			px, tbl := newOrderProxy(t)
 			w := NewWatcher(client, px, slog.New(slog.DiscardHandler))
+			gate := watchGate(client, "services", "endpointslices")
 
 			ctx, cancel := context.WithCancel(context.Background())
 			runDone := make(chan struct{})
@@ -566,6 +571,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 				<-runDone
 				t.Fatal("informer cache sync failed")
 			}
+			gate.wait(t)
 
 			var wg sync.WaitGroup
 			wg.Add(2)

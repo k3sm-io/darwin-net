@@ -725,13 +725,29 @@ func udpRoundTrip(t *testing.T, c *net.UDPConn, payload string, timeout time.Dur
 	if _, err := c.Write([]byte(payload)); err != nil {
 		t.Fatalf("write %q: %v", payload, err)
 	}
-	_ = c.SetReadDeadline(time.Now().Add(timeout))
+	deadline := time.Now().Add(timeout)
 	buf := make([]byte, maxUDPDatagram)
-	n, err := c.Read(buf)
-	if err != nil {
-		t.Fatalf("read reply for %q: %v", payload, err)
+	// Skip datagrams that echo an EARLIER payload. UDP has no request/reply
+	// correlation, and udpRoundTripRetry deliberately re-sends its payload until one
+	// reply arrives — so a slow relay can leave extra echoes of the previous phase
+	// queued on this socket. Reading the first datagram unconditionally attributes a
+	// stale echo to this send (B207: "got \"hello-udp\", want \"world-udp\"").
+	// A genuinely wrong reply still fails, on the deadline, naming what was seen.
+	var last string
+	for time.Now().Before(deadline) {
+		_ = c.SetReadDeadline(deadline)
+		n, err := c.Read(buf)
+		if err != nil {
+			t.Fatalf("read reply for %q: %v (last datagram %q)", payload, err, last)
+		}
+		last = string(buf[:n])
+		if last == payload {
+			return last
+		}
+		t.Logf("skipping stale echo %q while awaiting %q", last, payload)
 	}
-	return string(buf[:n])
+	t.Fatalf("no reply matching %q within %v (last datagram %q)", payload, timeout, last)
+	return ""
 }
 
 // udpRoundTripRetry repeatedly sends payload until it reads a reply or the overall
@@ -753,6 +769,9 @@ func udpRoundTripRetry(t *testing.T, c *net.UDPConn, payload string, overall tim
 		if err != nil {
 			continue // relay not up yet (timeout or ICMP refused) → retry
 		}
+		// NOTE: every retry that timed out may still have been relayed, so its echo
+		// can be in flight behind this one. Those duplicates are the caller's problem
+		// to skip — udpRoundTrip does, by matching the payload.
 		return string(buf[:n])
 	}
 	return ""

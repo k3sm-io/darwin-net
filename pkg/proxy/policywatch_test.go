@@ -241,6 +241,10 @@ func TestPolicyWatcherRunConverges(t *testing.T) {
 		testPod("prod", "cli", cliIP.String(), map[string]string{"role": "cli"}),
 	)
 	pt := NewPolicyTable()
+	// Register the watch gate BEFORE Run: the NetworkPolicy below is created after
+	// the informers sync, and HasSynced does not order the reflector's Watch (see
+	// watchGate in watch_test.go).
+	gate := watchGate(client, "networkpolicies")
 	w := NewPolicyWatcher(client, pt, slog.New(&captureHandler{}))
 
 	// Pre-Run (pre-sync): fail-open.
@@ -251,6 +255,8 @@ func TestPolicyWatcherRunConverges(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	runDone := make(chan error, 1)
 	go func() { runDone <- w.Run(ctx) }()
+
+	gate.wait(t)
 
 	pol := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "deny-all-web"},
