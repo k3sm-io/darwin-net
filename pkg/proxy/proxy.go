@@ -70,9 +70,22 @@ const udpFlowIdleTimeout = 30 * time.Second
 //     Service event and an EndpointSlice event for the same port can never race
 //     two owners onto one socket or close a live listener: the single worker
 //     opens, updates, and closes that port's listener in order.
-//   - workers (the map of per-key workers) is guarded by mu. Only the run loop
-//     mutates it; reconcile callers send on a worker's channel without holding mu
-//     beyond the lookup.
+//   - workers (the map of per-key workers) is guarded by mu. worker() adds an
+//     entry under mu when it spawns a worker; removeWorker deletes it under mu
+//     when a worker exits on its own delete event (the ONLY other mutator besides
+//     shutdown(), which clears the whole map). Reconcile callers otherwise send on
+//     a worker's channel without holding mu beyond the lookup.
+//   - A worker that receives a delete event (nil port) removes itself from the
+//     map AND closes w.stop before it returns (removeWorker does both under one
+//     mu critical section). This closes the race where a caller already holds a
+//     reference to the dying worker (obtained via worker() a moment before the
+//     removal): its blocked send on w.ch is unblocked by the now-closed w.stop
+//     instead of hanging forever on a channel nobody reads anymore, and any
+//     caller that looks the key up AFTER the removal spawns a fresh worker
+//     instead of reaching the dead one. Without this, a delete-then-recreate of
+//     the same key leaves a stale map entry pointing at an exited worker, so a
+//     recreate's events queue into its unread 16-buffered channel and the 17th
+//     blocks the caller (the informer handler) permanently.
 //   - The RoutingTable has its own internal lock and is shared read-only by the
 //     accept paths and written by the workers.
 type Proxy struct {
@@ -475,6 +488,49 @@ func (p *Proxy) worker(key PortKey) *portWorker {
 	return w
 }
 
+// removeWorker deletes w from the workers map — a compare-and-delete against the
+// current entry for w.key, since shutdown() (the other map mutator) may have
+// already cleared the whole map concurrently — and, ONLY if this call is the one
+// that actually removed the entry, closes w.stop.
+//
+// Both the compare-and-delete and the close-iff-removed decision happen under
+// the same p.mu critical section that guards worker() and shutdown(), which is
+// what makes this race-free two ways over:
+//
+//   - Against worker(): either a concurrent worker() call observes w still in
+//     the map (and returns w, exactly as if the delete had not yet started) or
+//     it observes w already gone (and spawns a fresh worker for the key). The
+//     closed w.stop then covers the first case — a caller that got w BEFORE
+//     removeWorker's lock ran is blocked in ReconcilePolicy/ReconcileDelete's
+//     `select { case w.ch <- ev: ; case <-w.stop: }`; closing w.stop unblocks
+//     that select instead of leaving it to hang on w's unread, 16-buffered
+//     channel once runWorker has stopped reading it.
+//   - Against shutdown(): shutdown() clears the ENTIRE map under p.mu and then,
+//     outside the lock, closes w.stop for every worker it captured. If
+//     shutdown()'s critical section runs first, w is no longer in the map by
+//     the time removeWorker's compare-and-delete runs, so removeWorker finds no
+//     entry to remove and (critically) does NOT close w.stop a second time —
+//     shutdown()'s own loop is the sole closer. If removeWorker's critical
+//     section runs first, w is already gone from the map before shutdown()
+//     captures its worker list, so shutdown() never attempts to close it either
+//     — removeWorker is the sole closer. Either way exactly one close(w.stop)
+//     happens; skipping the close on a failed compare-and-delete is what
+//     prevents a close-of-closed-channel panic on the shutdown-race interleave.
+//
+// Called exactly once, from runWorker's own delete-event branch, immediately
+// before it returns.
+func (p *Proxy) removeWorker(w *portWorker) {
+	p.mu.Lock()
+	removed := p.workers[w.key] == w
+	if removed {
+		delete(p.workers, w.key)
+	}
+	p.mu.Unlock()
+	if removed {
+		close(w.stop)
+	}
+}
+
 // runWorker is the per-VIP serialized reconcile loop. It is the only goroutine
 // permitted to open or close key's listeners.
 //
@@ -530,6 +586,7 @@ func (p *Proxy) runWorker(w *portWorker) {
 					ln = nil
 				}
 				p.table.Delete(w.key)
+				p.removeWorker(w)
 				return
 			}
 			p.table.SetEndpointsPolicy(w.key, ev.endpoints, ev.policy, ev.affinity)
