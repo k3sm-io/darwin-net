@@ -205,21 +205,23 @@ phases:
 
   - id: M8
     title: MLX serving (no darwin-net product work — one S1 exit-criterion verification obligation)
-    status: todo
+    status: done
+    completed: 2026-08-30
     depends_on:
       - k3sm:M8.0
       - runtimed:M8.2
     subphases:
       - id: M8.1
         title: documented egress-datapath address set (input to the FUTURE PF enforcement item) + the S1 exit-criterion verification obligation
-        status: todo
+        status: done
+        completed: 2026-08-30
         deliverables:
           - id: M8.1-d1
-            done: false
+            done: true  # 2026-08-30 — the address-set record + the S1 verification, per a1
             desc: "darwin-net still has NO product work in M8. The obligation is re-scoped (2026-08-29, operator-directed per m8-plan R21 — per-IP SBPL scoping does not compile on macOS 26, so no golden fixture consumes an address set): DOCUMENT the production egress datapath's host-listener address set (DNS shim → Service-proxy dialer → egress: the VIPs, the pod's lo0 alias, the mesh-egress /32) as the named input to the FUTURE network-layer (PF) egress enforcement item (backlog B188), in this repo's docs (the datapath authority record). The S1 exit-criterion verification obligation stands: the HF weight download through the production datapath must succeed under the generated egress profile. Cross-domain owner: the darwin-systems → pod-networking datapath boundary."
         acceptance:
           - id: M8.1-a1
-            met: false
+            met: true  # 2026-08-30 run5 (rig logs run5-slice-b-egress.log): the probe pod under the generated egress profile fetched the pinned HF file through the production datapath — each link witnessed (cluster DNS via the shim where the host NXDOMAINs; the proxy dialer via the ClusterIP rungs; egress sha-identical to the staged file). The no-annotation counterfactual also succeeded — the documented ceiling, honestly recorded
             check: "the documented address set is committed (datapath-authority record) AND the k3sm:M8.0 S1 findings file records the HF-weight download through the production datapath (DNS shim → proxy dialer → egress) under the generated `allow_internet_egress` profile (rides the S1 evidence)"
             method: integration
 
