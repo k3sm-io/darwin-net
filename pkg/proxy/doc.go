@@ -47,7 +47,10 @@ limitations under the License.
 //     the watch→proxy mapping (including the Ready-condition handling) is
 //     table-testable without an apiserver.
 //   - Watcher (watch.go) is the production seam: client-go shared informers feed
-//     Service/EndpointSlice events into Proxy.Reconcile.
+//     Service/EndpointSlice events into Proxy.Reconcile. The per-VIP worker above
+//     serializes DELIVERY, not the recompute that produces what is delivered — the
+//     Watcher's own per-Service stripe lock is what keeps a stale snapshot from
+//     landing on top of a fresh one.
 //
 // # NodePort (M3.2)
 //
