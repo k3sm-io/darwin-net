@@ -283,7 +283,7 @@ phases:
 
   - id: M11
     title: Linux containers & multi-arch (darwin-net slice — vm-pod network identity, reachability, policy attribution)
-    status: todo
+    status: in-progress  # 2026-08-31 — the top-level row lagged its own sub-phases (the ledger-repair defect class)
     depends_on: []
     notes: >-
       First-class design work (upgraded from M5's "same-node open question" prose;
