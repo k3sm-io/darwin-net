@@ -156,3 +156,139 @@ func TestGuestResolvConfRejectsInjection(t *testing.T) {
 		}
 	})
 }
+
+// TestGuestResolvConfFieldsClampsAndNormalizes pins that GuestResolvConfFields
+// returns the NORMALIZED/CLAMPED values, never the raw cfg fields — the whole
+// point of exposing the structured result is that a caller reading it sees the
+// SAME data GuestResolvConf renders, not an unnormalized shortcut.
+func TestGuestResolvConfFieldsClampsAndNormalizes(t *testing.T) {
+	t.Parallel()
+
+	cfg := netv1.DNSConfig{
+		ClusterDNSIP:  "10.43.0.10",
+		ClusterDomain: "cluster.local",
+		// "prod svc" has an interior space and must be DROPPED (not stripped, not
+		// split) by normalizeSearch; "svc.cluster.local" survives unchanged.
+		SearchDomains: []string{"prod svc", "svc.cluster.local"},
+		// Above MaxNDots (15); the structured result must carry the CLAMPED value.
+		NDots: 1000,
+	}
+
+	fields, err := GuestResolvConfFields(cfg)
+	if err != nil {
+		t.Fatalf("GuestResolvConfFields: %v", err)
+	}
+
+	if got, want := fields.Search, []string{"svc.cluster.local"}; !slicesEqual(got, want) {
+		t.Fatalf("Search = %v, want the normalized list %v (raw input was %v)", got, want, cfg.SearchDomains)
+	}
+	if got, want := fields.Options, []string{"ndots:15"}; !slicesEqual(got, want) {
+		t.Fatalf("Options = %v, want the clamped %v (raw NDots was %d)", got, want, cfg.NDots)
+	}
+	if got, want := fields.Nameservers, []string{"10.43.0.10"}; !slicesEqual(got, want) {
+		t.Fatalf("Nameservers = %v, want %v", got, want)
+	}
+}
+
+// TestGuestResolvConfFieldsRenderEquivalence is the non-vacuous proof that
+// GuestResolvConf and GuestResolvConfFields share ONE normalization pass: for
+// every config below, rendering fields BY HAND (nameserver/search/options lines,
+// in that order) must reproduce GuestResolvConf's output byte-for-byte. If a
+// second, independent normalization path ever crept into either function, this
+// test is the one that would catch the divergence.
+func TestGuestResolvConfFieldsRenderEquivalence(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		cfg  netv1.DNSConfig
+	}{
+		{
+			name: "default DNSConfig, ndots defaulted",
+			cfg: netv1.DNSConfig{
+				ClusterDNSIP:  "10.43.0.10",
+				ClusterDomain: "cluster.local",
+			},
+		},
+		{
+			name: "explicit search list and ndots",
+			cfg: netv1.DNSConfig{
+				ClusterDNSIP:  "10.43.0.10",
+				ClusterDomain: "cluster.local",
+				SearchDomains: []string{"default.svc.cluster.local", "svc.cluster.local", "cluster.local"},
+				NDots:         2,
+			},
+		},
+		{
+			name: "interior-whitespace search domain dropped by normalization",
+			cfg: netv1.DNSConfig{
+				ClusterDNSIP:  "10.43.0.10",
+				ClusterDomain: "cluster.local",
+				SearchDomains: []string{"has space.example", "clean.example"},
+				NDots:         3,
+			},
+		},
+		{
+			name: "ndots above MaxNDots is clamped",
+			cfg: netv1.DNSConfig{
+				ClusterDNSIP:  "10.43.0.10",
+				ClusterDomain: "cluster.local",
+				SearchDomains: []string{"a.example"},
+				NDots:         9999,
+			},
+		},
+		{
+			name: "newline-injection search entry is dropped whole",
+			cfg: netv1.DNSConfig{
+				ClusterDNSIP:  "10.43.0.10",
+				ClusterDomain: "cluster.local",
+				SearchDomains: []string{"corp\nnameserver", "6.6.6.6", "svc.cluster.local"},
+				NDots:         2,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			want, wantErr := GuestResolvConf(tc.cfg)
+			fields, fieldsErr := GuestResolvConfFields(tc.cfg)
+
+			if (wantErr == nil) != (fieldsErr == nil) {
+				t.Fatalf("error mismatch: GuestResolvConf err=%v, GuestResolvConfFields err=%v", wantErr, fieldsErr)
+			}
+			if wantErr != nil {
+				return
+			}
+
+			var b strings.Builder
+			for _, ns := range fields.Nameservers {
+				b.WriteString("nameserver " + ns + "\n")
+			}
+			if len(fields.Search) > 0 {
+				b.WriteString("search " + strings.Join(fields.Search, " ") + "\n")
+			}
+			for _, opt := range fields.Options {
+				b.WriteString("options " + opt + "\n")
+			}
+
+			if got := b.String(); got != want {
+				t.Fatalf("rendering GuestResolvConfFields diverged from GuestResolvConf:\nfields-rendered: %q\nGuestResolvConf: %q", got, want)
+			}
+		})
+	}
+}
+
+// slicesEqual reports whether a and b hold the same strings in the same order.
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
