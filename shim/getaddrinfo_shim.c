@@ -1,16 +1,25 @@
 /*
- * k3sm pod DYLD interpose shim — getaddrinfo() AND bind().
+ * k3sm pod DYLD interpose shim — getaddrinfo(), bind() AND connect().
  *
- * SCOPE BANNER (widened by B216). This file started life as the getaddrinfo
- * interposer and now owns TWO interposes in ONE dylib: the cluster-DNS
- * getaddrinfo() below, and the per-pod bind() discipline at the bottom of the
- * file. They share nothing but the __DATA,__interpose table and the
- * environment-configured, transparent-passthrough idiom; each reads its own
- * K3SM_* env and is independently inert when that env is absent. The artifact is
- * still named libk3sm_getaddrinfo_shim.dylib because the name is coupled to the
- * install path and to the k3sm.io/dyld-insert-libraries annotation that injects
- * it; renaming it is a deliberate non-goal here, so this banner carries the
- * truth instead.
+ * SCOPE BANNER (widened by B216, widened again by B218). This file started life
+ * as the getaddrinfo interposer and now owns THREE interposes in ONE dylib: the
+ * cluster-DNS getaddrinfo() below, the per-pod bind() discipline, and the
+ * destination-scoped connect() source pinning — the last two at the bottom of
+ * the file, sharing one config and one pthread_once. They share nothing else but
+ * the __DATA,__interpose table and the environment-configured,
+ * transparent-passthrough idiom; each reads its own K3SM_* env and is
+ * independently inert when that env is absent. The artifact is still named
+ * libk3sm_getaddrinfo_shim.dylib because the name is coupled to the install path
+ * and to the k3sm.io/dyld-insert-libraries annotation that injects it; renaming
+ * it is a deliberate non-goal here, so this banner carries the truth instead.
+ *
+ * IPv6 SCOPE (v1, B218). The connect() rung handles AF_INET ONLY: k3sm's pod and
+ * Service CIDRs are IPv4 (../pkg/podnet's lo0-alias IPAM is v4-only and
+ * K3SM_POD_IP is parsed with inet_pton(AF_INET, …)), so there is no v6 cluster
+ * destination for a v6 dial to fall inside and no v6 source to pin it to. An
+ * AF_INET6 connect() is therefore passed through untouched, traced as such. The
+ * bind() rung's v6 arm is unaffected — it rewrites Go's in6addr_any dual-stack
+ * LISTENER to the v4-mapped pod address and keeps doing so.
  *
  * macOS getaddrinfo() routes through mDNSResponder/configd and ignores
  * /etc/resolv.conf, so a pod cannot be pointed at the cluster resolver the
@@ -73,11 +82,13 @@ typedef struct interpose_s {
 int k3sm_getaddrinfo(const char *node, const char *service,
                      const struct addrinfo *hints, struct addrinfo **res);
 int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len);
+int k3sm_connect(int fd, const struct sockaddr *addr, socklen_t len);
 
 __attribute__((used)) static const interpose_t k3sm_interposers[]
     __attribute__((section("__DATA,__interpose"))) = {
         {(const void *)k3sm_getaddrinfo, (const void *)getaddrinfo},
         {(const void *)k3sm_bind, (const void *)bind},
+        {(const void *)k3sm_connect, (const void *)connect},
 };
 
 /* -------- config from environment -------- */
@@ -1224,11 +1235,41 @@ int k3sm_getaddrinfo(const char *node, const char *service,
  */
 #define K3SM_BIND_MIN_PORT 1024
 
+/*
+ * K3SM_MAX_CLUSTER_CIDRS is the ONE ceiling on how many cluster CIDRs the
+ * connect() rung will scope against. pkg/podnet's MaxClusterCIDRs holds the
+ * Go-side copy and TestShimMaxClusterCIDRsMatchesC binds the two mechanically.
+ *
+ * 8 is generous for the shape k3sm actually has (a pod CIDR and a Service CIDR,
+ * plus room for a second pod CIDR per address family and a few operator
+ * additions) and small enough that the whole table is a fixed-size struct member
+ * — no allocation inside a function interposed onto arbitrary app threads, and
+ * no unbounded loop over attacker-influenced env. A list LONGER than this is
+ * treated as unparseable (the whole rung goes passthrough), never truncated:
+ * silently dropping the tail would narrow the pinned destination set without
+ * saying so, which is the one failure mode a destination-scoped rewrite must not
+ * have.
+ */
+#define K3SM_MAX_CLUSTER_CIDRS 8
+
+/* One parsed cluster CIDR. net/mask are HOST byte order so the containment test
+ * is a single compare; s is presentation form for the trace only. */
+typedef struct {
+    uint32_t net;
+    uint32_t mask;
+    char s[INET_ADDRSTRLEN + 4];
+} k3sm_cidr_t;
+
 typedef struct {
     int enabled;                    /* K3SM_POD_IP parsed as an IPv4 literal */
     int debug;                      /* K3SM_BIND_DEBUG set and not "0"/"" */
     struct in_addr podip;           /* network byte order, ready to memcpy */
     char podip_s[INET_ADDRSTRLEN];  /* presentation form, for the trace only */
+    /* The connect() rung's destination scope. ncidrs == 0 means the rung is
+     * OFF — K3SM_CLUSTER_CIDRS was unset, empty, or unparseable — and every
+     * connect() is passed through, which is the pre-B218 behaviour. */
+    int ncidrs;
+    k3sm_cidr_t cidrs[K3SM_MAX_CLUSTER_CIDRS];
 } k3sm_bind_cfg_t;
 
 /*
@@ -1268,6 +1309,108 @@ static void k3sm_bind_trace(const char *fmt, ...) {
     fflush(stderr);
 }
 
+/*
+ * Parse K3SM_CLUSTER_CIDRS — a comma-separated list of IPv4 CIDRs ("10.42.0.0/16,
+ * 10.43.0.0/16") naming the destinations the connect() rung may source-pin. On
+ * success it fills k3sm_bind_cfg.cidrs and returns the count; on ANY defect it
+ * returns -1 and the caller leaves ncidrs at 0, which disables the rung entirely.
+ *
+ * STRICT AND FAIL-SAFE, in that order. Every rejection below collapses to the
+ * same outcome as an unset value — no dial is pinned, which is exactly the
+ * pre-B218 behaviour — so a malformed value can only cost fidelity, never
+ * connectivity. The alternative (accept the entries that parsed, drop the rest)
+ * would silently shrink the pinned set, and a destination-scoped rewrite whose
+ * scope is quietly wrong is worse than one that is off.
+ *
+ * A /0 is REJECTED. It is syntactically a CIDR but it names every destination,
+ * so it would source-pin an en0-routed external dial onto a lo0 /32 — the exact
+ * hazard destination scoping exists to prevent, and unreachable through
+ * pkg/podnet's encoder, which never emits one. A hand-set /0 is far more likely
+ * to be a mistake than an intent, and this is the fail-safe reading of it.
+ */
+static int k3sm_parse_cluster_cidrs(const char *spec) {
+    char buf[K3SM_MAX_CLUSTER_CIDRS * (INET_ADDRSTRLEN + 4) + 8];
+    size_t n = spec == NULL ? 0 : strlen(spec);
+    if (n == 0 || n >= sizeof buf) {
+        return -1;
+    }
+    memcpy(buf, spec, n + 1);
+
+    int count = 0;
+    const char *cur = buf;
+    for (;;) {
+        const char *comma = strchr(cur, ',');
+        size_t tlen = comma != NULL ? (size_t)(comma - cur) : strlen(cur);
+        char tok[INET_ADDRSTRLEN + 8];
+        /* An empty token (a trailing or doubled comma) is a defect, not a
+         * no-op: it is the shape a mis-joined list takes, and treating it as
+         * skippable would let "10.42.0.0/16,," look healthy. */
+        if (tlen == 0 || tlen >= sizeof tok) {
+            return -1;
+        }
+        memcpy(tok, cur, tlen);
+        tok[tlen] = '\0';
+
+        char *slash = strchr(tok, '/');
+        if (slash == NULL || slash == tok) {
+            return -1;
+        }
+        *slash = '\0';
+        struct in_addr addr;
+        if (inet_pton(AF_INET, tok, &addr) != 1) {
+            return -1;
+        }
+        const char *bits_s = slash + 1;
+        if (bits_s[0] == '\0') {
+            return -1;
+        }
+        for (const char *q = bits_s; *q != '\0'; q++) {
+            /* strtoul would accept leading space and a sign; a prefix length
+             * has neither. Digits only, then the value check. */
+            if (*q < '0' || *q > '9') {
+                return -1;
+            }
+        }
+        unsigned long bits = strtoul(bits_s, NULL, 10);
+        if (bits < 1 || bits > 32) {
+            return -1;
+        }
+        if (count >= K3SM_MAX_CLUSTER_CIDRS) {
+            return -1;
+        }
+
+        uint32_t mask = bits == 32 ? 0xffffffffu : ~((1u << (32 - (unsigned)bits)) - 1u);
+        uint32_t net = ntohl(addr.s_addr) & mask;
+        k3sm_bind_cfg.cidrs[count].net = net;
+        k3sm_bind_cfg.cidrs[count].mask = mask;
+        struct in_addr masked;
+        masked.s_addr = htonl(net);
+        char abuf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &masked, abuf, sizeof abuf);
+        /* Store the MASKED form: the trace must show what is actually matched
+         * against, not the possibly-unmasked spelling the operator supplied. */
+        snprintf(k3sm_bind_cfg.cidrs[count].s, sizeof k3sm_bind_cfg.cidrs[count].s, "%s/%u", abuf,
+                 (unsigned)bits);
+        count++;
+
+        if (comma == NULL) {
+            break;
+        }
+        cur = comma + 1;
+    }
+    return count;
+}
+
+/* Containment test for a destination address in HOST byte order. */
+static int k3sm_dst_in_cluster(uint32_t dst_h) {
+    for (int i = 0; i < k3sm_bind_cfg.ncidrs; i++) {
+        if ((dst_h & k3sm_bind_cfg.cidrs[i].mask) == k3sm_bind_cfg.cidrs[i].net) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void k3sm_bind_cfg_init(void) {
     memset(&k3sm_bind_cfg, 0, sizeof k3sm_bind_cfg);
 
@@ -1294,6 +1437,41 @@ static void k3sm_bind_cfg_init(void) {
     k3sm_bind_cfg.enabled = 1;
     k3sm_bind_trace("enabled: pod ip %s (wildcard binds >= %d rewritten)",
                     k3sm_bind_cfg.podip_s, K3SM_BIND_MIN_PORT);
+
+    /*
+     * The connect() rung's destination scope, read in the SAME once-initializer:
+     * it is per-process configuration with nothing per-call to vary, and folding
+     * it in here means one pthread_once covers both rungs (a second one would be
+     * a second chance to get the ordering wrong for no benefit). The rung is
+     * strictly narrower than the bind rung — it needs K3SM_POD_IP *and* a usable
+     * CIDR list — so this runs only after the pod identity parsed.
+     */
+    const char *cidrs = getenv("K3SM_CLUSTER_CIDRS");
+    if (cidrs == NULL || cidrs[0] == '\0') {
+        k3sm_bind_trace("connect: K3SM_CLUSTER_CIDRS unset -> no dial is source-pinned");
+        return;
+    }
+    int ncidrs = k3sm_parse_cluster_cidrs(cidrs);
+    if (ncidrs <= 0) {
+        k3sm_bind_cfg.ncidrs = 0;
+        k3sm_bind_trace("connect: K3SM_CLUSTER_CIDRS=%s unparseable -> no dial is source-pinned",
+                        cidrs);
+        return;
+    }
+    k3sm_bind_cfg.ncidrs = ncidrs;
+    char joined[(INET_ADDRSTRLEN + 5) * K3SM_MAX_CLUSTER_CIDRS + 8];
+    size_t off = 0;
+    joined[0] = '\0';
+    for (int i = 0; i < ncidrs && off < sizeof joined; i++) {
+        int w = snprintf(joined + off, sizeof joined - off, "%s%s", i == 0 ? "" : ",",
+                         k3sm_bind_cfg.cidrs[i].s);
+        if (w < 0 || (size_t)w >= sizeof joined - off) {
+            break;
+        }
+        off += (size_t)w;
+    }
+    k3sm_bind_trace("connect: source-pin scope %s (unbound AF_INET dials into it get source %s)",
+                    joined, k3sm_bind_cfg.podip_s);
 }
 
 /*
@@ -1442,4 +1620,153 @@ int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len) {
     k3sm_bind_trace("fd=%d AF_INET6 wildcard :%u (v6only=0) -> REWRITE [::ffff:%s]:%u", fd, port6,
                     k3sm_bind_cfg.podip_s, port6);
     return bind(fd, (const struct sockaddr *)&in6, (socklen_t)sizeof in6);
+}
+
+/* ==================================================================== */
+/* ====== connect() interpose — destination-scoped source pinning ====== */
+/* ==================================================================== */
+
+/*
+ * WHY THIS EXISTS, AND WHY bind() ALONE CANNOT DO IT. A /32 lo0 alias installs a
+ * host route whose rt_ifa IS that alias, so XNU's source selection for an
+ * UNBOUND dial to another pod's /32 picks the DESTINATION's own address as the
+ * source. Measured, not inferred: the B215 P1d cells recorded a confined process
+ * holding K3SM_POD_IP=100.64.99.8 dialling 100.64.99.7 and the ACCEPTING side
+ * seeing peer=100.64.99.7 — the callee's own IP. Neither loopback (P1d.5 is a
+ * separate case) nor the caller's alias (P1d.4) wins; the destination does, and
+ * confinement (P1d.3) and language (P1d.2, a Go dialer) are not factors.
+ *
+ * The consequence is that every same-node pod-to-pod connection looks like it
+ * came from the callee, so anything keyed on the peer address — ../pkg/proxy's
+ * PolicyTable, an application allowlist, an access log — cannot tell caller A
+ * from caller B. P1d.6 measured the fix: bind(podIP:0) BEFORE connect() makes
+ * the accepting side see peer=100.64.99.8. This interpose is that bind, applied
+ * automatically and ONLY where it is safe.
+ *
+ * WHY IT IS DESTINATION-SCOPED, which is the whole design. Source-pinning is
+ * correct for a dial that stays inside the cluster and WRONG for one that
+ * leaves: binding a lo0 /32 as the source of an en0-routed dial to the internet
+ * produces a socket whose replies can never come back. So the rewrite fires only
+ * when the destination falls inside K3SM_CLUSTER_CIDRS. Unset or unparseable
+ * means NO destination qualifies and every dial is passed through — the rung is
+ * off by default and off on any doubt.
+ *
+ * THE DECISION ORDER IS LOAD-BEARING, and mirrors the bind rung's:
+ *   1. family + addrlen, BEFORE any sockaddr cast. connect(2) is domain-generic;
+ *      an AF_UNIX sockaddr reinterpreted as a sockaddr_in reads a filesystem
+ *      path as an address. AF_INET6 is out of scope in v1 (see the file banner).
+ *   2. K3SM_POD_IP. Unset or unparseable => full passthrough, the same fail-safe
+ *      polarity the bind rung has.
+ *   3. the socket must be UNBOUND. An application that bound its own source
+ *      address made an explicit choice — including a deliberate choice of
+ *      another address, or an explicit ephemeral bind — and this shim is a
+ *      discipline, not an enforcement boundary. It is also the correctness
+ *      guard for a re-connect (a UDP socket redirected to a new peer, or a
+ *      non-blocking connect retried after EINPROGRESS): those sockets are
+ *      already bound, and binding again would fail.
+ *   4. the DESTINATION must be in scope. This is the step that keeps external
+ *      egress working.
+ * Only then bind(podIP:0), and even that failing is not fatal — see below.
+ *
+ * TCP AND UDP ALIKE. Nothing here inspects SO_TYPE: a connected SOCK_DGRAM
+ * socket has exactly the same source-selection problem and the same fix, and
+ * B215 proved the sibling bind-rung claim is not TCP-scoped either.
+ *
+ * NO SO_REUSEADDR HERE, deliberately — unlike the bind rung. That option exists
+ * there because a rewritten LISTENER takes a fixed port that a standing wildcard
+ * listener or its own TIME_WAIT may already hold. This rung binds port 0 and
+ * lets the kernel choose a free ephemeral port, so the collision it guards
+ * against cannot arise, and setting it would change socket semantics the caller
+ * never asked to change.
+ */
+
+/*
+ * The interposed connect(). Every path returns the REAL connect()'s result, and
+ * every trace is emitted BEFORE that call, so the caller sees the kernel's errno
+ * untouched (a trace after the call would clobber it).
+ */
+int k3sm_connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    pthread_once(&k3sm_bind_once, k3sm_bind_cfg_init);
+
+    if (addr == NULL) {
+        /* A NULL sockaddr is the kernel's EFAULT/EINVAL to report, not ours. */
+        return connect(fd, addr, len);
+    }
+
+    /* STEP 1 — family + addrlen, before any cast. AF_INET6, AF_UNIX, AF_SYSTEM
+     * and a short sockaddr_in all leave here byte-identical. */
+    if (addr->sa_family != AF_INET || len < (socklen_t)sizeof(struct sockaddr_in)) {
+        k3sm_bind_trace("connect fd=%d family=%d len=%u -> passthrough (not a rewritable shape)",
+                        fd, (int)addr->sa_family, (unsigned)len);
+        return connect(fd, addr, len);
+    }
+
+    /* STEP 2 — the pod identity. Unset or unparseable => transparent passthrough. */
+    if (!k3sm_bind_cfg.enabled) {
+        k3sm_bind_trace("connect fd=%d -> passthrough (shim disabled)", fd);
+        return connect(fd, addr, len);
+    }
+    if (k3sm_bind_cfg.ncidrs == 0) {
+        k3sm_bind_trace("connect fd=%d -> PASSTHROUGH-NOSCOPE (no cluster CIDRs configured)", fd);
+        return connect(fd, addr, len);
+    }
+
+    struct sockaddr_in dst;
+    memcpy(&dst, addr, sizeof dst);
+    char dbuf[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &dst.sin_addr, dbuf, sizeof dbuf);
+    unsigned dport = (unsigned)ntohs(dst.sin_port);
+
+    /* STEP 3 — the socket must be unbound. getsockname on a fresh AF_INET socket
+     * reports 0.0.0.0:0; anything else (a specific address, or a port the kernel
+     * already assigned to an explicit bind — including an explicit port-0 bind,
+     * which assigns immediately on Darwin) means the caller already chose. A
+     * getsockname FAILURE is treated as "already bound" — the fail-safe
+     * direction, since the alternative is a bind that fails and a trace that
+     * lies. */
+    struct sockaddr_in local;
+    socklen_t llen = (socklen_t)sizeof local;
+    memset(&local, 0, sizeof local);
+    if (getsockname(fd, (struct sockaddr *)&local, &llen) != 0) {
+        k3sm_bind_trace("connect fd=%d -> PASSTHROUGH-BOUND (getsockname errno=%d)", fd, errno);
+        return connect(fd, addr, len);
+    }
+    if (llen < (socklen_t)sizeof local || local.sin_family != AF_INET ||
+        local.sin_port != 0 || local.sin_addr.s_addr != htonl(INADDR_ANY)) {
+        char lbuf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &local.sin_addr, lbuf, sizeof lbuf);
+        k3sm_bind_trace("connect fd=%d already bound %s:%u -> PASSTHROUGH-BOUND", fd, lbuf,
+                        (unsigned)ntohs(local.sin_port));
+        return connect(fd, addr, len);
+    }
+
+    /* STEP 4 — destination scope. An out-of-cluster dial is en0-routed and must
+     * NEVER be pinned to a lo0 /32; that is the entire point of the scoping. */
+    if (!k3sm_dst_in_cluster(ntohl(dst.sin_addr.s_addr))) {
+        k3sm_bind_trace("connect fd=%d dst %s:%u -> PASSTHROUGH-NOTCLUSTER", fd, dbuf, dport);
+        return connect(fd, addr, len);
+    }
+
+    struct sockaddr_in src;
+    memset(&src, 0, sizeof src);
+    src.sin_family = AF_INET;
+    src.sin_len = (unsigned char)sizeof src;
+    src.sin_port = 0;
+    src.sin_addr = k3sm_bind_cfg.podip;
+    if (bind(fd, (const struct sockaddr *)&src, (socklen_t)sizeof src) != 0) {
+        /*
+         * The alias raced away (EADDRNOTAVAIL after a pod teardown), or the
+         * ephemeral range is exhausted. A WORKING DIAL BEATS A PINNED FAILURE:
+         * fall through to the unpinned connect, which is exactly what the pod
+         * would have done before this rung existed. The cost is one connection
+         * whose source is the destination's address again — a fidelity loss the
+         * trace names, not an outage.
+         */
+        k3sm_bind_trace("connect fd=%d dst %s:%u -> PIN-FAILED errno=%d, dialling UNPINNED", fd,
+                        dbuf, dport, errno);
+        return connect(fd, addr, len);
+    }
+    k3sm_bind_trace("connect fd=%d dst %s:%u -> PIN source %s", fd, dbuf, dport,
+                    k3sm_bind_cfg.podip_s);
+    return connect(fd, addr, len);
 }
