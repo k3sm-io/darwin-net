@@ -17,10 +17,11 @@ limitations under the License.
 // Package podnet is k3sm's IP-per-pod CNI seam: the macOS-native analog of a CNI
 // plugin's ADD/DEL, giving each Pod (a native Darwin process, no network
 // namespace) its own IP. The IP is a /32 alias on lo0 carved from the node's
-// podCIDR; the runtime then binds the pod's processes to that source address
-// (IP_BOUND_IF / explicit bind), so same-node pod-to-pod traffic stays on
-// loopback with the source IP preserved by XNU and the address is the routable
-// identity reachable over the wireguard mesh in M3.
+// podCIDR; a DYLD-injected bind() interpose (shim/getaddrinfo_shim.c) then
+// rewrites the pod's own wildcard binds onto that /32, using this package's
+// env ABI (env.go) to learn which address, so same-node pod-to-pod traffic
+// stays on loopback with the source IP preserved by XNU and the address is
+// the routable identity reachable over the wireguard mesh in M3.
 //
 // # Layers
 //
@@ -43,13 +44,36 @@ limitations under the License.
 //     leak-free (tearing an unknown pod down is a no-op success), so a crash-
 //     recovery reconcile cannot leak addresses.
 //
-// # Bind discipline (paired with runtimed:M2)
+// # Bind discipline (shipped B216 — darwin-net#62)
 //
-// podnet only provisions the address; runtimed binds the pod's process to it via
-// IP_BOUND_IF (the returned IP flows into runtime/v1 PodBox.pod_ip, which is
-// documented as "the lo0 alias the runtime binds the pod's processes to"). The
-// lo0-alias + IP_BOUND_IF model is host-process-only; a vm-RuntimeClass guest gets
-// a NAT attachment instead (see "# Pod backends" below).
+// podnet only provisions the address (the returned IP flows into runtime/v1
+// PodBox.pod_ip); the bind rewrite itself happens IN the pod process, via a
+// DYLD bind() interpose (shim/getaddrinfo_shim.c, loaded through
+// DYLD_INSERT_LIBRARIES). podnet's own env ABI (env.go:
+// EnvPodIP / BindDisciplineEnv) is how the allocated /32 reaches it: the
+// runtime injects it as K3SM_POD_IP, and the C shim reads it with getenv() at
+// first bind. Once armed, the interpose rewrites a WILDCARD bind (0.0.0.0 or
+// in6addr_any; TCP and UDP alike) at a port >= MinRewritablePort (1024) onto
+// the pod's /32, so a workload that just does net.Listen(":8080") lands on
+// its own pod IP instead of the shared wildcard. Several classes pass through
+// UNREWRITTEN by design: a specific-address bind (the caller's explicit
+// choice — including another pod's /32), a low port (<1024 — Darwin requires
+// root for a SPECIFIC low-port bind but not a wildcard one, so rewriting
+// would turn a working low-port workload into EACCES), port 0 (an ephemeral
+// client bind whose destination this call cannot see), and a v6-only socket
+// (IPV6_V6ONLY=1, which cannot accept a v4-mapped address). K3SM_POD_IP unset
+// or unparseable disables the interpose entirely — fail-safe passthrough,
+// with no error surfaced to the workload.
+//
+// This is a CORRECTNESS discipline, not an isolation boundary: nothing stops
+// a process from an explicit bind onto another pod's /32 (the passthrough
+// above), or from never loading the dylib at all (the DYLD-strip ceiling
+// documented in the shim's banner). The `vm` RuntimeClass is the actual
+// isolation boundary for an untrusted tenant (k3sm/docs/privilege-model.md); this
+// discipline only keeps well-behaved same-node wildcard-binding workloads off
+// each other's ports. The bind-interpose model above is host-process-only; a
+// vm-RuntimeClass guest gets a NAT attachment instead (see "# Pod backends"
+// below).
 //
 // # Pod backends: the path-selection fork (M5.1)
 //
@@ -57,7 +81,8 @@ limitations under the License.
 // from the pod's RuntimeClass — apis runtimev1.HandlerVM => SANDBOX_BACKEND_VM):
 //
 //   - BackendHostProcess (Setup) — a native Darwin process. It gets a /32 lo0 alias
-//     the host owns and the runtime binds to (IP_BOUND_IF). This path is unchanged.
+//     the host owns, and its own wildcard binds are rewritten onto it by the
+//     bind() interpose (see "# Bind discipline" above). This path is unchanged.
 //   - BackendVM (SetupGuest) — a Virtualization.framework micro-VM guest. A VZ guest
 //     has its OWN network stack reached over a VZNATNetworkDeviceAttachment, so it
 //     gets NO lo0 alias: aliasing the guest's IP on the host's lo0 would make the
