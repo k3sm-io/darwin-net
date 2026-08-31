@@ -72,6 +72,10 @@ type PolicyRule struct {
 //     → ALLOW with a throttled Warn naming the unattributable source. This is the
 //     hint contract: the subset restricts attributable pod traffic and fails open
 //     on anything it cannot attribute.
+//   - EXCEPT on a vm-hosting node, for an unknown source inside the configured
+//     vmnet prefix: that one case FAILS CLOSED (M11.3-d3a). See vmnet below and the
+//     branch in Allow — it is scoped to exactly that source class, so every other
+//     transient-unknown source keeps the fail-open above.
 //   - An empty table (pre-informer-sync, or no policies) allows everything, and a
 //     nil *PolicyTable allows everything — the feature is strictly additive.
 //
@@ -86,6 +90,14 @@ type PolicyTable struct {
 	// alwaysAllow is the constructor-seeded never-deny source set (node InternalIP,
 	// mesh-egress /32s). Read-only after construction, so no lock.
 	alwaysAllow map[netip.Addr]struct{}
+
+	// vmnet is the vmnet NAT segment this node's vm-RuntimeClass guests are attached
+	// to (e.g. 192.168.64.0/24), seeded at construction by NewPolicyTableVMNet and
+	// read-only thereafter, exactly like alwaysAllow. The ZERO/invalid Prefix means
+	// "this node hosts no vm pods", which is every node NewPolicyTable builds a table
+	// for, and it is inert: the unknown-source path then behaves exactly as it did
+	// before M11.3-d3a. Its ONLY use is scoping that fail-closed branch in Allow.
+	vmnet netip.Prefix
 
 	mu sync.RWMutex
 	// selected maps a policy-selected backend pod IP to its resolved ingress rules.
@@ -104,9 +116,10 @@ type PolicyTable struct {
 
 	// warnMu guards the two throttle timestamps below (a leaf: taken with no other
 	// lock held, never inverted with mu — Allow releases mu before warning).
-	warnMu          sync.Mutex
-	lastUnknownWarn time.Time
-	lastDenyLog     time.Time
+	warnMu           sync.Mutex
+	lastUnknownWarn  time.Time
+	lastVMUnknownLog time.Time
+	lastDenyLog      time.Time
 
 	// evalCount counts Allow evaluations (atomically). It exists for the M10.4
 	// gate's asserted-bypass subtest: a direct pod-IP→pod-IP connection never
@@ -120,6 +133,22 @@ type PolicyTable struct {
 // allowed implicitly and needs no seed. Invalid (zero) addresses are skipped so a
 // single-node caller can pass its unset mesh-egress Addr unconditionally.
 func NewPolicyTable(alwaysAllow ...netip.Addr) *PolicyTable {
+	return NewPolicyTableVMNet(netip.Prefix{}, alwaysAllow...)
+}
+
+// NewPolicyTableVMNet is NewPolicyTable for a node that HOSTS vm-RuntimeClass pods:
+// vmnet is the NAT segment those guests are attached to (the vmnet subnet, e.g.
+// 192.168.64.0/24). It seeds the ONE extra thing that distinguishes such a node —
+// the fail-closed unknown-vm-source branch in Allow (M11.3-d3a) — and changes
+// nothing else. Passing the zero Prefix is exactly NewPolicyTable, so a node that
+// runs no guests keeps the unconditional unknown-source fail-open.
+//
+// The prefix is deliberately a CONSTRUCTOR seed rather than a setter: like
+// alwaysAllow it is read lock-free on the hot path, which is only sound because it
+// never changes after construction. It is also why the branch cannot be switched on
+// at runtime — a vm-hosting node is decided when the node's networking is
+// assembled, not per connection.
+func NewPolicyTableVMNet(vmnet netip.Prefix, alwaysAllow ...netip.Addr) *PolicyTable {
 	aa := make(map[netip.Addr]struct{}, len(alwaysAllow))
 	for _, a := range alwaysAllow {
 		if a.IsValid() {
@@ -128,6 +157,7 @@ func NewPolicyTable(alwaysAllow ...netip.Addr) *PolicyTable {
 	}
 	return &PolicyTable{
 		alwaysAllow: aa,
+		vmnet:       vmnet,
 		selected:    make(map[netip.Addr][]PolicyRule),
 		known:       make(map[netip.Addr]struct{}),
 		log:         slog.Default(),
@@ -165,8 +195,9 @@ func (t *PolicyTable) Update(selected map[netip.Addr][]PolicyRule, knownPodIPs m
 // A nil receiver allows everything (the proxy runs policy-free unless the
 // assembler wires a table via WithPolicyTable), as does an empty table
 // (pre-informer-sync fail-open). See the type comment for the full verdict order:
-// loopback/always-allow → unselected-backend allow → rule match → unknown-source
-// fail-open (throttled Warn) → deny.
+// loopback/always-allow → unselected-backend allow → rule match → unknown source
+// (fail CLOSED inside a configured vmnet prefix, else fail open with a throttled
+// Warn) → deny.
 func (t *PolicyTable) Allow(src, backend netip.Addr, port uint16) bool {
 	if t == nil {
 		return true
@@ -202,9 +233,40 @@ func (t *PolicyTable) Allow(src, backend netip.Addr, port uint16) bool {
 		return true // union of allows: any matching rule admits
 	}
 	if !srcKnown {
-		// The source is unattributable (not a resolved pod IP, not always-allowed):
-		// fail open per the hint contract, but say so loudly (throttled) — a silent
-		// allow here would masquerade as enforcement.
+		// The source is unattributable (not a resolved pod IP, not always-allowed).
+		// Two verdicts, and the discriminator is deliberately NARROW.
+		//
+		// FAIL CLOSED for a source inside this node's vmnet segment. A vm guest's
+		// live transport address is its macOS-assigned vmnet DHCP lease, and NOTHING
+		// maps that lease back to a pod today: the lease->pod registry (the deferred
+		// half of the M11.3-d3a/d3b split) is not built. So a vm pod's traffic
+		// arrives here as an unknown source, and under the fail-open below it would
+		// be ALLOWED past a policy that selects the destination — a NetworkPolicy
+		// bypass for exactly the pod class NetworkPolicy is most needed for, and one
+		// this slice would be INTRODUCING by making vm pods work. It is denied
+		// instead.
+		//
+		// Read this before relaxing a policy because of the deny: until lease->pod
+		// attribution lands, a NetworkPolicy `from` rule that names a vm pod's
+		// PUBLISHED /32 CANNOT admit that pod's live traffic, because the packet
+		// carries the lease address and the /32 is live on no interface (see the
+		// two-address model on RoutingTable.SetTransportOverrides). This deny is what
+		// that gap looks like on the wire. The fix is the registry, not a widened
+		// policy — widening the policy to admit the whole vmnet segment would admit
+		// EVERY guest on the node, which is strictly worse than the deny.
+		//
+		// FAIL OPEN, unchanged, for every other unknown source. The scoping is the
+		// point: an unconditional deny-unknown would convert every transient-unknown
+		// source cluster-wide — a pre-informer-sync race, an unseeded node address,
+		// an off-cluster client — into a deny. A node that hosts no vm pods carries
+		// the zero Prefix and never reaches the branch at all.
+		if t.vmnet.IsValid() && t.vmnet.Contains(src) {
+			t.warnUnknownVMSource(src, backend, port)
+			return false
+		}
+		// The source is unattributable but not a vm-segment address: fail open per
+		// the hint contract, and say so loudly (throttled) — a silent allow here
+		// would masquerade as enforcement.
 		t.warnUnknownSource(src, backend, port)
 		return true
 	}
@@ -225,6 +287,31 @@ func (t *PolicyTable) warnUnknownSource(src, backend netip.Addr, port uint16) {
 	}
 	t.logger().Warn("networkpolicy: allowing connection from UNKNOWN source (not a resolved pod IP, not always-allowed) — fail-open per the VIP-mediated hint contract",
 		"src", src.String(), "backend", backend.String(), "port", port)
+}
+
+// warnUnknownVMSource emits the throttled fail-closed Warn for an unattributable
+// source inside this node's vmnet segment. It is a SEPARATE message from both
+// warnUnknownSource (which reports the opposite verdict) and logDenied (which
+// reports a deny the operator's own policy asked for), because the three are
+// different events an operator must be able to tell apart mechanically: this one is
+// a deny NO policy asked for, produced by a known missing piece.
+//
+// Warn, not Info: unlike logDenied's rule-mismatch deny, this refuses traffic the
+// operator may well have intended to allow, so it must be visible without being
+// grepped for. It names the structural reason so the remediation is "the registry
+// is not built yet, this is tracked" and never "delete the NetworkPolicy".
+func (t *PolicyTable) warnUnknownVMSource(src, backend netip.Addr, port uint16) {
+	t.warnMu.Lock()
+	throttled := time.Since(t.lastVMUnknownLog) < policyLogThrottle
+	if !throttled {
+		t.lastVMUnknownLog = time.Now()
+	}
+	t.warnMu.Unlock()
+	if throttled {
+		return
+	}
+	t.logger().Warn("networkpolicy: DENIED an unattributable source inside the vm (vmnet) segment — vm-pod lease-to-pod attribution is not implemented, so a policy `from` rule naming this pod's published /32 cannot admit its live traffic; this is a known gap, NOT a policy misconfiguration (do not relax the NetworkPolicy)",
+		"src", src.String(), "backend", backend.String(), "port", port, "vmnet", t.vmnet.String())
 }
 
 // logDenied emits the throttled connection-denied Info shared by both accept

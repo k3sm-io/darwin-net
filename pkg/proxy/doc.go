@@ -345,4 +345,16 @@ limitations under the License.
 // with a throttled Warn naming it; a deny is a throttled Info. A nil PolicyTable
 // (the default — the k3sm assembler opts in via WithPolicyTable) allows
 // everything: the feature is strictly additive.
+//
+// ONE scoped exception to that fail-open (M11.3-d3a): on a node built with
+// NewPolicyTableVMNet, an unknown source INSIDE the configured vmnet segment whose
+// destination a policy selects is DENIED, with its own throttled Warn. That source
+// class is the vm pods this node hosts, whose live vmnet lease nothing maps back to
+// a pod yet — under the fail-open they would walk past a policy that selects the
+// destination, which is a bypass for exactly the pod class the vm RuntimeClass
+// exists to contain, introduced by making vm pods work rather than inherited. The
+// scoping is what keeps it a vm-only decision: every other unknown source, and
+// every node with no vmnet prefix, keeps the fail-open verbatim. Until the
+// lease-to-pod registry lands, a policy `from` rule naming a vm pod's published /32
+// cannot admit that pod's live traffic — this deny is what that gap looks like.
 package proxy
