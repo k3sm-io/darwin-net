@@ -145,6 +145,14 @@ type RoutingTable struct {
 	// set when the global ceiling first engages and cleared by PickSticky once the count
 	// falls back below the cap, so a later re-saturation is logged again, not silent.
 	affinityWarned bool
+	// transport maps a backend's PUBLISHED address (the identity in the routing
+	// table, the EndpointSlice, DNS and status.podIP) to the LIVE TRANSPORT address
+	// the dial must actually use. It is empty on every node that hosts no vm pod, so
+	// the resolution is a single map miss on the ordinary path. Guarded by mu and
+	// replaced wholesale by SetTransportOverrides (the same atomic-swap lifecycle
+	// SetEndpointsPolicy and PolicyTable.Update use), so a generation of overrides can
+	// never leak into the next one. See SetTransportOverrides for the full contract.
+	transport map[netip.Addr]netip.Addr
 
 	// log records the fail-open degradation when internalTrafficPolicy: Local meets
 	// an unknown podCIDR (a loud, throttled Warn so the misconfig is observable). It
@@ -223,6 +231,7 @@ func NewRoutingTable(podCIDR netip.Prefix) *RoutingTable {
 	return &RoutingTable{
 		podCIDR:            podCIDR,
 		states:             make(map[PortKey]*portState),
+		transport:          make(map[netip.Addr]netip.Addr),
 		affinity:           make(map[PortKey]map[netip.Addr]*affinityBinding),
 		maxAffinityPerPort: maxAffinityBindingsPerPort,
 		maxAffinityTotal:   maxAffinityBindingsTotal,
@@ -350,6 +359,89 @@ func (t *RoutingTable) Delete(key PortKey) {
 	defer t.mu.Unlock()
 	delete(t.states, key)
 	t.dropAffinity(key)
+}
+
+// SetTransportOverrides atomically replaces the published-to-live TRANSPORT
+// address map, the seam the two-address vm-pod identity model needs (M11.3-d2).
+//
+// # The two addresses
+//
+// A vm-RuntimeClass pod has TWO addresses and they are never the same one. The /32
+// carved from the node podCIDR is its PUBLISHED identity — what EndpointSlices,
+// cluster DNS and status.podIP carry, and the address every NetworkPolicy names.
+// It is deliberately live on NO interface for a vm pod: the host must not alias the
+// guest's identity on lo0 or it would answer for it. The address that actually
+// carries bytes is the guest's macOS-assigned vmnet DHCP lease, which is never
+// published. This map is the ONLY place the two meet: keys are published addresses,
+// values are the live lease addresses to dial instead. The PORT is not overridden —
+// a backend's port is the guest's real listening port, which the lease does not
+// change.
+//
+// # Who feeds it (nobody yet — stated honestly)
+//
+// The feeder is the k3sm assembler, from the guest agent's Health lease report: it
+// is the only component that may hold both the runtimed-side guest view and this
+// darwin-net table (darwin-net cannot reach for a runtimed type — see the repo DAG),
+// so darwin-net exposes the seam and holds no opinion about the source. THAT
+// HOST-SIDE CONSUMER DOES NOT EXIST YET. Until it is built, no override is ever
+// installed and every backend is dialed exactly as it is today.
+//
+// # The liveness contract (the feeder's obligation, not this table's)
+//
+// A DHCP lease is not an identity. The feeder MUST replace an override when the
+// pod's lease changes and MUST drop it when the pod dies — a stale override dials a
+// live address that now belongs to a DIFFERENT guest, which is a cross-pod
+// misdelivery, not a failed dial. This table cannot detect that: it has no lease
+// watch and no liveness signal, and it deliberately does not invent one. Wholesale
+// replacement is what makes the obligation cheap to discharge: pass the full current
+// map on every lease report and the previous generation is dropped entire.
+//
+// # No fallback, by design
+//
+// A backend with NO override is dialed at its published address — byte-identical to
+// today's behavior, which is what keeps every host-process pod untouched. For a vm
+// pod that is the /32 that is live on no interface, so the dial fails the way any
+// unreachable backend's dial fails today (a refusal or a dialTimeout, logged at
+// Debug). That is the intended outcome: an absent override means UNDIALABLE. The
+// table never substitutes some other address to paper over a missing override,
+// because the only candidates are wrong — the published /32 XNU will blackhole, or a
+// stale lease pointing at another tenant's guest.
+//
+// overrides is defensively copied and normalized (v4-mapped-v6 unmapped on both
+// sides; entries with an invalid key or value skipped, mirroring NewPolicyTable's
+// invalid-seed skip), so the caller may retain and reuse its map. A nil or empty map
+// clears every override.
+func (t *RoutingTable) SetTransportOverrides(overrides map[netip.Addr]netip.Addr) {
+	next := make(map[netip.Addr]netip.Addr, len(overrides))
+	for published, live := range overrides {
+		if !published.IsValid() || !live.IsValid() {
+			continue
+		}
+		next[published.Unmap()] = live.Unmap()
+	}
+	t.mu.Lock()
+	t.transport = next
+	t.mu.Unlock()
+}
+
+// transportAddr resolves a picked backend's PUBLISHED address to the address the
+// dial must use: the live transport override when one is installed for it (keeping
+// the published port), otherwise the published address unchanged.
+//
+// It is called at the dial sites ONLY — proxy.handle for TCP and udpRelay.upstreamFor
+// for UDP — never at pick, policy, or affinity time. That split is load-bearing: the
+// NetworkPolicy verdict, the deny log, the ClientIP affinity binding and the
+// endpoint-set membership all key on the PUBLISHED identity, which is the address
+// policies and Services name and the one that survives a lease change. Only the
+// packet needs the lease.
+func (t *RoutingTable) transportAddr(published netip.AddrPort) netip.AddrPort {
+	t.mu.RLock()
+	live, ok := t.transport[published.Addr().Unmap()]
+	t.mu.RUnlock()
+	if !ok {
+		return published
+	}
+	return netip.AddrPortFrom(live, published.Port())
 }
 
 // classify computes a backend's locality from the node podCIDR. A zero podCIDR

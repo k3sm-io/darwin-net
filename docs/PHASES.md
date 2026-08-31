@@ -2,8 +2,8 @@
 repo: darwin-net
 schema: phases/v1
 current_phase: M5
-updated: 2026-08-30
-updated_by: M14 encoded from docs/m14-plan.md (M14.2-d1 — destination-scoped mesh-egress source binding, the server-mesh enabler)
+updated: 2026-08-31
+updated_by: orchestrator
 
 phases:
   - id: M0
@@ -304,23 +304,23 @@ phases:
     subphases:
       - id: M11.3
         title: guest→VIP reachability + vm-pod identity + source attribution + network-trust ceiling
-        status: todo
+        status: in-progress  # 2026-08-31 — d1/d3a done, d2/d4 partial (see rows); d3b deferred to v0.1.x (the deferral premise was falsified by the sitting — the operator re-decides the window); the live legs ride the milestone lab gate
         depends_on: [apis:M11.1]
         deliverables:
           - id: M11.3-d1
-            done: false
+            done: true  # 2026-08-31 — ANSWERED by the root sitting: delivery works with the guest's bare NAT default route (all four arrangements, TCP+UDP/53), so there is nothing to build — the conditional route-verb item is tombstoned per its own branch clause, the stale OPEN doc comments are retired in this wave, and the live regression leg rides the milestone lab gate
             desc: "guest→VIP reachability: resolve S5(1) — does XNU weak-host-deliver a vmnet-NAT guest packet to a host lo0-alias VIP (every ClusterIP incl. the DNS VIP the guest resolv.conf points at)? If delivery fails, the fix is a NEW netd route verb (root-helper surface — security-critiqued, its own small deliverable) or a host route installed by the unprivileged daemon if sufficient. The M5.1 open question, finally owned."
           - id: M11.3-d2
-            done: false
+            done: false  # 2026-08-31 PARTIAL — the TWO-ADDRESS model is adopted (see a1); the PodIP-as-guest-eth0-alias branch is NOT ADOPTED (proven workable in the sitting but its host-route half is root-only and the model needs no live /32 — do not build it). The darwin-net half LANDED: the proxy transport-override seam (SetTransportOverrides; both TCP and UDP dial sites; absent override = undialable, never a silent /32 fallback). The LIVE half waits on the guest-lease chain (an additive runtime/v1 transport field + host-side Health poller + assembler feed — tracked as a consumer-first apis increment needing a human plan); podIP()'s placeholder retires only when the /32 flows end to end
             desc: "vm-pod identity: implement the S5(3)-decided podIP model (PodIP-as-guest-eth0-alias + host route, or NAT-address-published) with the consumer matrix reconciled to the ONE authority (EndpointSlices the Service proxy dials, M10 per-pod DNS A/PTR synthesis, downward-API status.podIP in-guest, host-side probe/port-forward dialing); the provider podIP() vm branch retires its nodeIP placeholder. Whichever address is published must be DELIVERABLE — an EndpointSlice/DNS identity nothing can dial is worse than none."
           - id: M11.3-d3a
-            done: false
+            done: true  # 2026-08-31 — landed with the wave: the deny is SCOPED by a configured vmnet prefix (a naive deny-all-unknown flip is pinned red by the fail-open-regression and inert-prefix rows, plus the pre-existing L4 table), carries its own machine-distinguishable throttled reason telling the operator this is a known attribution gap and NOT a policy misconfiguration, and the zero/invalid prefix is pinned inert
             desc: "B113a — FAIL-CLOSED unknown vm source (SPLIT 2026-08-30; the in-slice half). This slice CREATES the exposure: today vm pods do not run, so the proxy policy engine's fail-open UNKNOWN-source path is theoretical; making vm pods work turns it into a live NetworkPolicy BYPASS for exactly the pod class NetworkPolicy is most needed for — a regression we introduce, not an inherited ceiling. On a vm-hosting node a source in the vmnet subnet that resolves to no pod is DENIED, but ONLY where a NetworkPolicy actually selects the destination; no-policy destinations stay allowed (upstream semantics), so the m11-core legs are unaffected. Mechanical, unit-testable on the existing table, no hardware. Converts a fail-open into a fail-closed."
           - id: M11.3-d3b
             done: false
             desc: "B113b — real source ATTRIBUTION (SPLIT 2026-08-30; DEFERRED to v0.1.x). B113 NetworkPolicy source attribution: register the guest address→pod mapping with the Service-proxy policy engine on agent-Health lease report WITH a lease-change liveness contract (DHCP addresses move across guest restarts; the deterministic MAC makes leases semi-stable — S5(5) verifies), or flip unknown-source to deny on vm-hosting nodes. Closes the fail-open UNKNOWN path (proxy policy.go ALLOW+Warn) for the one pod class NetworkPolicy most needs to constrain. Depends on S5(5) lease stability and S5(6) source-address observation; if S5(6) records that vmnet rewrites the source to the gateway address, per-pod attribution is IMPOSSIBLE as specified and d3a's fail-closed becomes the permanent answer."
           - id: M11.3-d4
-            done: false
+            done: false  # 2026-08-31 PARTIAL — the darwin-net doc half landed with the wave using the sitting's hedged wording (guest<->guest unreachable on the tested rig; we neither rely on reachability nor promise its absence). The user-facing limitations text and the register wording ride the milestone docs deliverable; the MTU<=1380 clamp stays a conditional forward-marker
             desc: "Network-trust ceiling recorded: the S5(4) guest↔guest + guest→LAN reachability matrix is a SECURITY fact — guests share one vmnet NAT segment (guest↔guest at NAT addresses bypasses Services/policy; unfiltered L3 to the gateway/LAN). Lands in docs/user/limitations.md + the register wording, or a pf-filter-on-the-vmnet-member follow-up is scoped as its own forward-marker. Guest link MTU ≤1380 in the DHCP/init plan if cross-node is ever claimed (the mesh mss-clamp is utun-scoped and does not cover non-TCP guest traffic)."
         acceptance:
           - id: M11.3-a1
