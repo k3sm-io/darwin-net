@@ -2,8 +2,8 @@
 repo: darwin-net
 schema: phases/v1
 current_phase: M5
-updated: 2026-07-02
-updated_by: roadmap/m10
+updated: 2026-08-30
+updated_by: M14 encoded from docs/m14-plan.md (M14.2-d1 — destination-scoped mesh-egress source binding, the server-mesh enabler)
 
 phases:
   - id: M0
@@ -326,6 +326,37 @@ phases:
           - id: M11.3-a1
             met: false
             check: "the identity/attribution logic is unit-proven at the seams (B113a's fail-closed table incl. the fail-open-regression negative and the no-policy-destination-still-allowed row — the IN-SLICE half of the 2026-08-30 d3a/d3b split; B113b's TestVMPodSourceAttribution stale-lease table rides d3b at v0.1.x; the podIP-authority consumer matrix as pure translation tables, encoding the TWO-ADDRESS model: the podCIDR /32 is the PUBLISHED identity (box.PodIp, downward-API status.podIP, EndpointSlice, DNS) and the agent-Health vmnet lease is the LIVE TRANSPORT address (host->guest dial, attribution), never published — R2 and R3 cannot both govern one address, since the lease exists only after boot and the env is baked before it); the LIVE legs — guest→VIP delivery, host→guest dial, guest DNS resolution, the Service-consumed leg — ride hack/lab/m11.sh (K3SM_LAB=1, human-run), never auto-greened"
+            method: unit
+
+  - id: M14
+    title: Destination-scoped mesh-egress source binding (the server-mesh enabler)
+    status: todo
+    strategy: hard cut
+    depends_on: []
+    note: "darwin-net's single slice of the workspace M14 program (authoritative input: docs/m14-plan.md, sub-phase M14.2-d1; the rest of M14 is k3sm-side and lab work). It exists because k3sm CANNOT bring the server onto the mesh until this lands: the server's proxy would otherwise source-bind EVERY backend dial to a mesh-egress address, which is the documented 'breaks ALL backend dials' hazard and the reason k3sm leaves netserve.Config.MeshEgressIP deliberately empty today. Scoping the bind at the DIALER is what keeps the whole program hard cut — it is a unilateral per-node decision no peer observes, so no MeshPeer/AllowedIPs protocol change (and no named exception) is triggered."
+    subphases:
+      - id: M14.0
+        title: bind the mesh-egress source only for foreign pod-CIDR destinations
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        deliverables:
+          - id: M14.0-d1
+            done: false
+            desc: "Select the dial source PER CONNECTION from the already-precomputed backend.Locality(): bind the mesh-egress source only when the destination is inside podnet.ClusterPodCIDR AND outside this node's own /24. Every other destination — loopback, a ClusterIP VIP splicing to a local backend, a node LAN address, upstream — keeps kernel default source selection. LocalityUnknown NEVER binds (the zero/invalid-podCIDR state that classify() fails open for in the ROUTING decision must fail to the kernel default here, not to a bind; the two decisions have opposite safe directions). IMPLEMENTATION IS CONSTRAINED, not free: use two IMMUTABLE dialers chosen per dial, or a connection-local dialer value — NEVER mutate the shared p.dialer.LocalAddr, which is a data race across the per-connection handle() goroutines and would reintroduce the wrong-source blackhole non-deterministically instead of uniformly. The UDP relay already does this correctly with a per-flow local; mirror that shape."
+          - id: M14.0-d2
+            done: false
+            desc: "BOTH protocols get identical scoping. The TCP dial path and the UDP relay's per-flow source must apply the same predicate — the UDP half is exactly the half a TCP-only functional test cannot see, so an asymmetry here ships as UDP Services silently failing against hostNetwork/LAN backends."
+          - id: M14.0-d3
+            done: false
+            desc: "This also closes a LATENT WORKER-SIDE defect, not just the server enabler: today's unconditional bind blackholes any dial whose destination is a node LAN address (a hostprocess pod reports podIP == nodeIP), because the reply routes back over the peer's utun and wireguard drops it as outside the sender's AllowedIPs. Rejected alternative, recorded: widening AllowedIPs to include node LAN /32s would break the AllowedIPs == podCIDR equality invariant pkg/mesh/doc.go asserts AND trip the phased MeshPeer-protocol named exception."
+          - id: M14.0-d4
+            done: false
+            desc: "Retire or rewrite pkg/proxy/meshegress_test.go's TestWithMeshEgressSourceBindsDialer, which asserts the construction-time 'bind once, unconditionally' contract this deliberately replaces. Left in place it either goes red for the right reason or — worse — stays green while asserting nothing about production behaviour, because WithMeshEgressSource would keep setting a field the new dial path no longer reads."
+        acceptance:
+          - id: M14.0-a1
+            met: false
+            check: "unit tables over the scoping decision for BOTH TCP and UDP (foreign /24 => bound; own /24, loopback, node LAN, ClusterIP VIP, and LocalityUnknown => unbound), run under -race with concurrent local- and remote-destination dials so the per-connection shared-state property is actually exercised rather than assumed; the construction-time bind test is rewritten. The cross-node datapath proof rides the k3sm two-Mac lab (hack/lab/m3.sh, K3SM_LAB=1), never auto-greened here"
             method: unit
 ---
 
