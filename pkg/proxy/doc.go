@@ -271,6 +271,29 @@ limitations under the License.
 //     NOT per-client-IP sessionAffinity: it keys on the full 5-tuple (not the IP
 //     alone) and does not span reconnects. udprelay.go still calls Pick, unchanged.
 //
+// # Published identity vs live transport — the vm-pod two-address seam (M11.3)
+//
+// A backend's address in the routing table is its PUBLISHED identity: what the
+// EndpointSlice carries, what cluster DNS answers, what status.podIP reports, and
+// what a NetworkPolicy names. For a host-process pod that address is also where the
+// bytes go — it is a /32 alias the host owns on lo0. For a vm-RuntimeClass pod it is
+// NOT: the guest owns its address inside its own netstack behind a NAT attachment,
+// the host never aliases the pod /32, and the address that actually carries bytes is
+// the guest's macOS-assigned vmnet DHCP lease, which is never published.
+//
+// RoutingTable.SetTransportOverrides is the one seam where those two meet — a
+// published-to-live address map, replaced wholesale, consulted at the DIAL SITES
+// ONLY (proxy.handle for TCP, udpRelay.upstreamFor for UDP; both protocols, so a vm
+// backend cannot be reachable over one and blackholed over the other). Pick, the
+// NetworkPolicy verdict, the deny log and the ClientIP affinity binding all keep
+// using the PUBLISHED address, because that is the stable identity a lease change
+// must not disturb. A backend with no override is dialed exactly as before, which is
+// what leaves every host-process pod untouched; for a vm pod an absent override
+// means UNDIALABLE, and the dial fails as any unreachable backend's does — the table
+// never substitutes an address to paper over a missing lease. The feeder is the k3sm
+// assembler (from the guest agent's Health lease report) and it does not exist yet,
+// so no override is installed today.
+//
 // # NetworkPolicy L4 subset — VIP-mediated ingress hint, NOT isolation (M10.4)
 //
 // PolicyTable (policy.go) + PolicyWatcher (policywatch.go) add an
@@ -322,4 +345,16 @@ limitations under the License.
 // with a throttled Warn naming it; a deny is a throttled Info. A nil PolicyTable
 // (the default — the k3sm assembler opts in via WithPolicyTable) allows
 // everything: the feature is strictly additive.
+//
+// ONE scoped exception to that fail-open (M11.3-d3a): on a node built with
+// NewPolicyTableVMNet, an unknown source INSIDE the configured vmnet segment whose
+// destination a policy selects is DENIED, with its own throttled Warn. That source
+// class is the vm pods this node hosts, whose live vmnet lease nothing maps back to
+// a pod yet — under the fail-open they would walk past a policy that selects the
+// destination, which is a bypass for exactly the pod class the vm RuntimeClass
+// exists to contain, introduced by making vm pods work rather than inherited. The
+// scoping is what keeps it a vm-only decision: every other unknown source, and
+// every node with no vmnet prefix, keeps the fail-open verbatim. Until the
+// lease-to-pod registry lands, a policy `from` rule naming a vm pod's published /32
+// cannot admit that pod's live traffic — this deny is what that gap looks like.
 package proxy

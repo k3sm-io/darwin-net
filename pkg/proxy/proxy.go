@@ -778,9 +778,16 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		p.policy.logDenied("tcp", key, src, be.Addr())
 		return
 	}
-	backendConn, err := p.dialer.Dial("tcp", be.Addr().String())
+	// Resolve the PUBLISHED backend identity to its live transport address (the
+	// two-address vm-pod model, M11.3-d2). For a host-process pod — and for every
+	// backend on a node hosting no vm pod — this is a map miss that returns the
+	// published address unchanged, so the dial below is byte-identical to what it
+	// was. The policy verdict above deliberately ran on the PUBLISHED address, which
+	// is the identity a NetworkPolicy names; only the packet follows the lease.
+	dst := p.table.transportAddr(be.Addr())
+	backendConn, err := p.dialer.Dial("tcp", dst.String())
 	if err != nil {
-		p.logger().Debug("dial backend", "vip", key.String(), "backend", be.Addr().String(), "err", err)
+		p.logger().Debug("dial backend", "vip", key.String(), "backend", be.Addr().String(), "transport", dst.String(), "err", err)
 		return
 	}
 	defer backendConn.Close()
