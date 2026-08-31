@@ -455,10 +455,14 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 		// *net.UDPAddr built from this Addr instead of reusing the TCP dialer.
 		laddr = &net.UDPAddr{IP: r.meshEgress.AsSlice()}
 	}
-	raddr := net.UDPAddrFromAddrPort(be.Addr())
+	// Same published-to-live transport resolution the TCP dial does (M11.3-d2): the
+	// datagram path must not diverge, or a vm-pod backend would be reachable over a
+	// TCP Service and silently blackholed over a UDP one. A backend with no override
+	// resolves to itself, so this is unchanged for every host-process pod.
+	raddr := net.UDPAddrFromAddrPort(r.table.transportAddr(be.Addr()))
 	up, err := r.dial(laddr, raddr)
 	if err != nil {
-		r.log.Debug("udp relay dial backend", "vip", r.key.String(), "backend", raddr.String(), "err", err)
+		r.log.Debug("udp relay dial backend", "vip", r.key.String(), "backend", be.Addr().String(), "transport", raddr.String(), "err", err)
 		return nil
 	}
 
