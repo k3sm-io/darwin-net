@@ -23,6 +23,65 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 )
 
+// ResolvConfFields is the structured, NORMALIZED result of GuestResolvConfFields:
+// the exact nameserver(s), search list, and resolv.conf-style options
+// GuestResolvConf renders verbatim into text. The shape mirrors what
+// apis/guest/v1's ResolvConf proto carries (Nameservers/Searches/Options), so a
+// caller that needs the guest DNS wiring as data — rather than as pre-rendered
+// text — can consume this directly instead of re-parsing GuestResolvConf's output.
+type ResolvConfFields struct {
+	// Nameservers are the resolv.conf "nameserver" entries, in the order they
+	// should be emitted.
+	Nameservers []string
+	// Search is the NORMALIZED resolv.conf "search" list — already passed
+	// through normalizeSearch, so it is trimmed, charset-filtered, and
+	// prefix-capped. Empty means no "search" line should be rendered.
+	Search []string
+	// Options are the resolv.conf-style "options" entries (e.g. "ndots:5"),
+	// already reflecting any clamp (ndots capped to MaxNDots).
+	Options []string
+}
+
+// GuestResolvConfFields derives the NORMALIZED nameserver/search/options triple for
+// a vm-RuntimeClass Linux guest from cfg — the SAME netv1.DNSConfig the Darwin
+// getaddrinfo shim consumes for a host-process pod (M1). It is the SINGLE place
+// that normalizes cfg for guest DNS: the only normalizeSearch call and the only
+// ndots clamp for this path live here. GuestResolvConf renders this result to
+// text and performs no independent normalization of its own, so the two views can
+// never diverge.
+//
+// It returns an error if cfg is not usable (missing cluster DNS VIP or domain) —
+// the same validity check GuestResolvConf applies.
+func GuestResolvConfFields(cfg netv1.DNSConfig) (ResolvConfFields, error) {
+	if err := cfg.Validate(); err != nil {
+		return ResolvConfFields{}, fmt.Errorf("guest resolv.conf: %w", err)
+	}
+	cfg = cfg.WithDefaults()
+
+	// Normalize the search list through the SAME helper the host-process shim env
+	// (ConfigToEnv) and the Go reference resolver (candidateNames) use, so the
+	// untrusted vm-guest path is at least as hardened as the host path: an
+	// interior-whitespace domain would otherwise break a glibc/musl resolv.conf
+	// `search` line the same way it breaks the shim's strtok_r split. A no-op for
+	// admission-valid input.
+	search := normalizeSearch(cfg.SearchDomains)
+
+	// Clamp ndots to the resolv.conf ceiling (MaxNDots == RES_MAXNDOTS) for parity with
+	// ConfigToEnv, so the guest and host emit the SAME ndots. A %d of an int32 cannot
+	// inject (glibc clamps to RES_MAXNDOTS, musl ignores ndots), so this is a consistency
+	// guard, not a safety one — a no-op for admission-valid input (ndots <= MaxNDots).
+	ndots := cfg.NDots
+	if ndots > MaxNDots {
+		ndots = MaxNDots
+	}
+
+	return ResolvConfFields{
+		Nameservers: []string{cfg.ClusterDNSIP},
+		Search:      search,
+		Options:     []string{fmt.Sprintf("ndots:%d", ndots)},
+	}, nil
+}
+
 // GuestResolvConf renders the /etc/resolv.conf content for a vm-RuntimeClass Linux
 // guest from cfg — the SAME netv1.DNSConfig the Darwin getaddrinfo shim consumes for
 // a host-process pod (M1). Only the injection mechanism differs: the Darwin
@@ -51,34 +110,24 @@ import (
 //     FQDNs in the guest where the distinction matters.
 //
 // It returns an error if cfg is not usable (missing cluster DNS VIP or domain).
+//
+// GuestResolvConf performs NO normalization of its own — it renders exactly the
+// ResolvConfFields GuestResolvConfFields derives, so the two can never diverge.
 func GuestResolvConf(cfg netv1.DNSConfig) (string, error) {
-	if err := cfg.Validate(); err != nil {
-		return "", fmt.Errorf("guest resolv.conf: %w", err)
-	}
-	cfg = cfg.WithDefaults()
-
-	// Normalize the search list through the SAME helper the host-process shim env
-	// (ConfigToEnv) and the Go reference resolver (candidateNames) use, so the
-	// untrusted vm-guest path is at least as hardened as the host path: an
-	// interior-whitespace domain would otherwise break a glibc/musl resolv.conf
-	// `search` line the same way it breaks the shim's strtok_r split. A no-op for
-	// admission-valid input.
-	search := normalizeSearch(cfg.SearchDomains)
-
-	// Clamp ndots to the resolv.conf ceiling (MaxNDots == RES_MAXNDOTS) for parity with
-	// ConfigToEnv, so the guest and host emit the SAME ndots. A %d of an int32 cannot
-	// inject (glibc clamps to RES_MAXNDOTS, musl ignores ndots), so this is a consistency
-	// guard, not a safety one — a no-op for admission-valid input (ndots <= MaxNDots).
-	ndots := cfg.NDots
-	if ndots > MaxNDots {
-		ndots = MaxNDots
+	fields, err := GuestResolvConfFields(cfg)
+	if err != nil {
+		return "", err
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "nameserver %s\n", cfg.ClusterDNSIP)
-	if len(search) > 0 {
-		fmt.Fprintf(&b, "search %s\n", strings.Join(search, " "))
+	for _, ns := range fields.Nameservers {
+		fmt.Fprintf(&b, "nameserver %s\n", ns)
 	}
-	fmt.Fprintf(&b, "options ndots:%d\n", ndots)
+	if len(fields.Search) > 0 {
+		fmt.Fprintf(&b, "search %s\n", strings.Join(fields.Search, " "))
+	}
+	for _, opt := range fields.Options {
+		fmt.Fprintf(&b, "options %s\n", opt)
+	}
 	return b.String(), nil
 }
