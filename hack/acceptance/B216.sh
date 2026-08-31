@@ -2,7 +2,7 @@
 #
 # darwin-net B216 acceptance gate — the bind() interpose in the pod shim.
 #
-# THE ITEM (docs/BACKLOG.md B216, plan W2): extend shim/getaddrinfo_shim.c with
+# THE ITEM (B216): extend shim/getaddrinfo_shim.c with
 # an interposed bind() that rewrites a pod's WILDCARD bind onto the pod's own
 # /32, so two same-node Pods can both hold :8080 instead of colliding with
 # EADDRINUSE. Every branch of that interpose is a BINDING resolution of the plan

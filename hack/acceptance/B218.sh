@@ -2,7 +2,7 @@
 #
 # darwin-net B218 acceptance gate — the connect() source-pinning rung.
 #
-# THE ITEM (docs/BACKLOG.md B218): a /32 lo0 alias installs a host route whose
+# THE ITEM (B218): a /32 lo0 alias installs a host route whose
 # rt_ifa IS that alias, so XNU source-selects the DESTINATION's own address for an
 # UNBOUND dial to another pod. B215 cell P1d measured it: a pod holding
 # K3SM_POD_IP=100.64.99.8 dialling 100.64.99.7 was seen by the ACCEPTING side as
