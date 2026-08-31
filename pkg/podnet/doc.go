@@ -98,18 +98,72 @@ limitations under the License.
 // Teardown is shared: it releases the pod IP for both backends and removes the lo0
 // alias ONLY for a host-process pod (a guest never had one).
 //
-// Lab-gated open questions (scaffolded, not built — they need a VZ-capable Mac):
+// # Guest VIP reachability — ANSWERED, and it needs nothing (2026-08-31)
 //
-//   - GUEST VIP REACHABILITY: can a guest behind a NAT attachment reach a ClusterIP
-//     VIP that lives on a host lo0 alias? macOS NAT may only expose the gateway to
-//     the guest and not weak-host-deliver a guest datagram to a host lo0-alias VIP.
-//     If it does not, a host-side route or a NEW netd route-verb is needed (the netd
-//     verb set has none today). OPEN — answer empirically on the lab Mac, then design.
-//   - POD-IP vs NAT-IP: the guest's on-the-wire address is macOS-assigned (vmnet
-//     DHCP) and differs from the allocated PodIP; reconciling them (so the guest is
-//     reachable AT its pod IP, and so it can be a Service backend) is unsolved. For
-//     M5 a guest pod is SAME-NODE-SCOPED and is NOT yet a cross-node Service backend
-//     (its NAT-private IP is in no peer's mesh AllowedIPs).
+// This was the M5.1 open question: can a guest behind a NAT attachment reach a
+// ClusterIP VIP that lives on a host lo0 alias, or does macOS expose only the
+// gateway to the guest? It was answered empirically by the M11 guest-networking lab
+// findings, against a real lo0-alias VIP with a listener bound to the VIP itself
+// (not the wildcard, so what XNU does with the destination address is observed
+// rather than assumed), for both TCP and UDP/53.
+//
+// It delivers, and it delivers with NOTHING added. The measured baseline — no
+// guest-side route for the service CIDR, host net.inet.ip.forwarding forced to 0,
+// no host route for the VIP — already carries the packet to the VIP, and three
+// further arrangements that added each of those in turn changed nothing. The
+// guest's ordinary default NAT route is sufficient on its own; XNU weak-host-
+// delivers to the lo0 alias. So the guest DNS VIP the guest resolv.conf points at
+// (see pkg/dns.GuestResolvConf) needs no special handling either.
+//
+// Concretely, three things that were staged as fallbacks are NOT built and are not
+// needed: no route data pushed into GuestNetwork, no new netd route verb (the netd
+// verb set still has none, deliberately), and no host forwarding or host route. The
+// host also observes the guest's OWN vmnet lease as the source address — there is no
+// NAT rewrite to the gateway on this path, which is what makes the two-address model
+// below workable at all.
+//
+// Scope of the claim: one rig, one macOS version, one attachment type
+// (VZNATNetworkDeviceAttachment). The live datapath legs stay lab-gated and are
+// never auto-greened by this package's unit tests.
+//
+// # Pod IP vs lease address — the TWO-ADDRESS model
+//
+// The guest's on-the-wire address is macOS-assigned (vmnet DHCP) and differs from
+// the allocated PodIP. These are not reconciled into one address, because they
+// cannot be: the lease exists only after the guest boots, and the pod's published
+// identity is baked before that. They are kept as two, with a single authority each.
+//
+//   - The podCIDR /32 (GuestNetwork.PodIP) is the PUBLISHED identity: status.podIP,
+//     the EndpointSlice, cluster DNS. For a vm pod it is live on NO interface — the
+//     host must never alias it, or the host would answer for the guest.
+//   - The guest's DHCP lease is the LIVE TRANSPORT address: it is what host-to-guest
+//     dials (probes, port-forward, the Service-proxy backend dial) must actually
+//     target, and it is never published. The guest agent's Health lease report is its
+//     single authority; darwin-net does not observe it.
+//
+// The Service-proxy seam where the two meet is RoutingTable.SetTransportOverrides in
+// pkg/proxy: a published-to-live map consulted at the dial sites only, so the policy
+// verdict and the endpoint identity keep using the published /32 while the packet
+// follows the lease. A vm pod stays SAME-NODE-SCOPED and is not a cross-node Service
+// backend: its lease address is in no peer's mesh AllowedIPs, and vmnet source-NAT is
+// structurally incompatible with the mesh's symmetric AllowedIPs, so cross-node never
+// "just works" and is not claimed.
+//
+// # Guest-to-guest — an observation, not a guarantee, in either direction
+//
+// On the tested rig, guest-to-guest was UNREACHABLE at both L2 and L3: ARP for a
+// peer guest reached FAILED while ARP for the gateway resolved, ICMP saw 100% loss,
+// and TCP was unreachable — with both guests independently proven live to the host in
+// the same boot, so this is a controlled negative and not a broken guest.
+//
+// We neither rely on guest-to-guest reachability nor promise its absence. Apple
+// documents no isolation guarantee for VZNATNetworkDeviceAttachment, so a claim that
+// vm pods are isolated from one another would be a security claim resting on
+// undocumented behaviour that a point release may change — and a design that assumed
+// guests CAN reach each other would be equally unfounded here. Real tenant isolation
+// is the vm boundary itself (k3sm/docs/privilege-model.md), not the NAT segment's
+// topology. A bridged or file-handle attachment is a different question and is
+// untested.
 //
 // # Daemon boundary
 //

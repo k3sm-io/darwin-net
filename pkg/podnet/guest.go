@@ -70,13 +70,18 @@ func (b Backend) String() string {
 // project ruled unobtainable — so the guest is always NAT-attached.
 type VMNetworkConfig struct {
 	// NATSubnet is the subnet the guest's interface address sits in behind the
-	// VZNATNetworkDeviceAttachment. macOS's vmnet assigns the guest address via its
-	// own DHCP, so this is the EXPECTED/intended subnet; runtimed's VZ backend
-	// reconciles the live value from the attachment (lab-gated).
+	// VZNATNetworkDeviceAttachment. It is ADVISORY: macOS's vmnet assigns the guest's
+	// actual address by its own DHCP, and that lease — reported by the guest agent's
+	// Health, never derived from this value — is the single authority for the guest's
+	// live transport address. This field is the expected/intended subnet, useful for
+	// scoping decisions made before any guest boots (the Service proxy's fail-closed
+	// vm-source predicate is one), not a statement about where a given guest landed.
 	NATSubnet netip.Prefix
 	// Gateway is the NAT gateway (the host side of the attachment) the guest routes
-	// through. As with NATSubnet it is macOS-assigned and carried here as the
-	// intended value for runtimed to confirm against the live attachment.
+	// through. Advisory for the same reason as NATSubnet: macOS assigns it, and this
+	// is the intended value carried alongside the config. Note the guest needs no
+	// route beyond its ordinary default route through this gateway to reach a
+	// ClusterIP VIP — see doc.go.
 	Gateway netip.Addr
 	// DNSVIP is the cluster DNS VIP (kube-dns, e.g. 10.43.0.10) the guest's
 	// /etc/resolv.conf points at (see pkg/dns.GuestResolvConf). It is a cluster fact
@@ -97,12 +102,15 @@ func WithVMNetwork(cfg VMNetworkConfig) Option {
 // alias — the host must never own the guest's address.
 type GuestNetwork struct {
 	// PodIP is the pod's cluster identity, allocated from the node podCIDR by the
-	// same Allocator host-process pods use (unified, leak-free IPAM). NOTE: under a
-	// NAT attachment the guest's on-the-wire interface address is macOS-assigned and
-	// differs from PodIP; reconciling the two (so the guest is reachable AT its pod
-	// IP, and so it can be a Service backend) is the lab-gated open question — see
-	// doc.go. For M5 a guest pod is same-node-scoped and not yet a cross-node
-	// Service backend (its NAT-private IP is in no peer's mesh AllowedIPs).
+	// same Allocator host-process pods use (unified, leak-free IPAM). It is the
+	// PUBLISHED half of the two-address model (doc.go): status.podIP, the
+	// EndpointSlice and cluster DNS carry it, and for a vm pod it is live on NO
+	// interface — the host must never alias it. The guest's macOS-assigned vmnet
+	// lease is the other half, the LIVE TRANSPORT address that host-to-guest dials
+	// target; it is never published, and the two are deliberately NOT reconciled into
+	// one address (the lease exists only after boot, the identity is baked before).
+	// A guest pod stays same-node-scoped and is not a cross-node Service backend: its
+	// lease address is in no peer's mesh AllowedIPs.
 	PodIP netip.Addr
 	// Gateway is the NAT gateway the guest routes through (from VMNetworkConfig).
 	Gateway netip.Addr
@@ -119,7 +127,8 @@ type GuestNetwork struct {
 // lo0 alias (the not-taken branch of the path-selection fork). It is idempotent per
 // podID and returns ErrBackendMismatch if podID was already set up as a host
 // process. The returned GuestNetwork is for runtimed's VZ backend to apply; the live
-// NAT attach and guest VIP reachability are lab-gated (see doc.go).
+// NAT attach stays lab-gated, while guest VIP reachability is answered and needs
+// nothing added (see doc.go).
 func (n *Network) SetupGuest(ctx context.Context, podID string) (GuestNetwork, error) {
 	ip, err := n.setup(ctx, podID, BackendVM)
 	if err != nil {
