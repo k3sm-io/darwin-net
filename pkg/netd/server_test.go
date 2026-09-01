@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -612,5 +613,99 @@ func TestServerPerConnectionAliasCap(t *testing.T) {
 	}
 	if !rejected {
 		t.Fatal("per-connection alias cap (3) was never enforced across 6 aliases")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Connection lifetime — shutdown must not wait on a peer, and a dead peer must
+// not hold a handler forever.
+// ---------------------------------------------------------------------------
+
+// TestServerShutdownWithStalledPeer proves cancelling Serve's context returns
+// promptly even while an authenticated peer sits mid-conversation with the socket
+// open and no further frames coming. Serve closes the listener on cancellation but
+// a handler blocked in ReadFrame never observes ctx, so without the per-connection
+// watcher that closes the conn, the drain (wg.Wait) waits for a peer that will
+// never speak again — a daemon that cannot be shut down.
+func TestServerShutdownWithStalledPeer(t *testing.T) {
+	sock := tempSock(t)
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix %s: %v", sock, err)
+	}
+	srv := netd.NewServer(netd.Config{
+		NodePodCIDR: netip.MustParsePrefix("100.64.0.0/24"),
+		ServiceUID:  uint32(os.Getuid()),
+		Privileged:  &fakePriv{},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(ctx, l) }()
+
+	conn, err := net.DialTimeout("unix", sock, 2*time.Second)
+	if err != nil {
+		cancel()
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// One completed round trip proves the handler is past peer auth and parked in
+	// ReadFrame — the exact state the watcher has to interrupt.
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	req := wire.Request{
+		Version:     wire.CurrentVersion(),
+		Verb:        wire.VerbEnsureAlias,
+		EnsureAlias: &wire.EnsureAliasArgs{IP: "100.64.0.2"},
+	}
+	if err := wire.WriteFrame(conn, mustJSON(t, req)); err != nil {
+		cancel()
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := wire.ReadFrame(conn, wire.DefaultMaxRequestBytes); err != nil {
+		cancel()
+		t.Fatalf("read: %v", err)
+	}
+	// Now stall: never send another frame, never close the socket.
+	_ = conn.SetDeadline(time.Time{})
+
+	cancel()
+	select {
+	case err := <-served:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Serve returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return within 5s of cancellation while a peer stalled mid-conversation; shutdown is blocked on the in-flight handler")
+	}
+}
+
+// TestServerReapsIdleConnection proves an authenticated connection that goes quiet
+// is closed once IdleTimeout elapses, with no cancellation involved: a peer that
+// dies without closing its end (a crashed client, a vanished forwarded socket)
+// leaves a unix-socket read that would otherwise block for the life of the daemon,
+// pinning a goroutine and its per-connection accounting. The timeout is injected
+// short here; production uses netd.DefaultIdleTimeout.
+func TestServerReapsIdleConnection(t *testing.T) {
+	sock, _ := startServer(t, netd.Config{
+		NodePodCIDR: netip.MustParsePrefix("100.64.0.0/24"),
+		IdleTimeout: 200 * time.Millisecond,
+	})
+	conn, err := net.DialTimeout("unix", sock, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Read with a deadline far beyond IdleTimeout: the server, not this deadline,
+	// must be what ends the read.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	start := time.Now()
+	if _, err := wire.ReadFrame(conn, wire.DefaultMaxRequestBytes); err == nil {
+		t.Fatal("read on an idle connection returned a frame, want the server's close")
+	} else if errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("idle connection still open after %s; the server never reaped it", time.Since(start))
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("idle connection reaped after %s, want ≈200ms", elapsed)
 	}
 }
