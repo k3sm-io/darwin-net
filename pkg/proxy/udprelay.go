@@ -27,17 +27,17 @@ import (
 // maxUDPFlows bounds the relay's per-VIP flow table. Same-node pods share one
 // trust domain with no per-pod uid isolation, so a single pod cycling ephemeral
 // source ports must not exhaust file descriptors and goroutines for every Service
-// the proxy owns. On saturation a NEW flow is dropped (a live flow is never
+// the proxy owns. On saturation a new flow is dropped (a live flow is never
 // evicted); the cap is generous so legitimate fan-in is unaffected.
 const maxUDPFlows = 8192
 
 // maxUDPFlowsPerSource is the per-VIP fair-share sub-cap: no single source IP may
-// hold more than this many concurrent flows PER VIP. It is strictly less than the
+// hold more than this many concurrent flows per VIP. It is strictly less than the
 // per-VIP maxUDPFlows so the fair share is not vacuous — one same-node pod cycling
 // ephemeral source ports cannot monopolize a VIP's whole flow table and starve
 // every other pod's access to that Service (the caps mirror flows membership, so a
-// dropped flow never counted and a reaped flow un-counts). Fairness HERE is PER VIP;
-// the per-source-GLOBAL fair share — one source IP's flows across ALL VIPs — is the
+// dropped flow never counted and a reaped flow un-counts). Fairness here is per VIP;
+// the per-source-global fair share — one source IP's flows across all VIPs — is the
 // shared udpBudget's maxPerSource (B52), so a pod fanning flows across N distinct VIPs
 // cannot consume the whole relay-global budget and starve every VIP either.
 const maxUDPFlowsPerSource = maxUDPFlows / 4
@@ -57,7 +57,7 @@ const udpSaturationWarnInterval = 10 * time.Second
 // logs the actionable cause. rejectGlobalFull means the shared fd ceiling (maxTotal)
 // is reached — a subsystem-wide shortage, so add fd capacity (raise the budget /
 // RLIMIT). rejectPerSourceGlobal means one source IP reached its share of the global
-// budget across ALL VIPs — one greedy source, not a shortage. rejectNone is admitted.
+// budget across all VIPs — one greedy source, not a shortage. rejectNone is admitted.
 type udpRejectReason int
 
 const (
@@ -66,53 +66,53 @@ const (
 	rejectPerSourceGlobal
 )
 
-// udpBudget is the relay-GLOBAL admission gate shared by every per-VIP UDP relay. It
-// enforces TWO caps under ONE mutex so the two counters can never diverge:
+// udpBudget is the relay-global admission gate shared by every per-VIP UDP relay. It
+// enforces two caps under one mutex so the two counters can never diverge:
 //
-//   - maxTotal bounds live upstream sockets across ALL relays (B48's fd ceiling), so
+//   - maxTotal bounds live upstream sockets across all relays (B48's fd ceiling), so
 //     the datagram relays cannot jointly exhaust the process fd table the co-resident
 //     control plane spends from.
-//   - maxPerSource bounds any ONE source IP's live flows across ALL VIPs (B52's
-//     per-source-GLOBAL fair share). The per-VIP maxUDPFlowsPerSource bounds a source
-//     PER VIP, but a pod fanning flows across N distinct UDP VIPs could still consume
+//   - maxPerSource bounds any one source IP's live flows across all VIPs (B52's
+//     per-source-global fair share). The per-VIP maxUDPFlowsPerSource bounds a source
+//     per VIP, but a pod fanning flows across N distinct UDP VIPs could still consume
 //     the whole global budget and starve every other pod on every VIP; this cap is
 //     that source's fraction of the global budget.
 //
-// Locking / conservation: mu guards total and bySource TOGETHER. reserve and release
-// are the only mutators and each moves BOTH counters atomically — reserve is
+// Locking / conservation: mu guards total and bySource together. reserve and release
+// are the only mutators and each moves both counters atomically — reserve is
 // all-or-nothing (it checks both caps, then increments both, or touches neither),
 // release is symmetric (decrements both, pruning the source bucket at zero). The two
-// moves are NEVER split (no reserve-total-then-per-source with a rollback): a
+// moves are never split (no reserve-total-then-per-source with a rollback): a
 // partial-reserve rollback is the leak shape, and a leaked per-source count never
-// resets, so that source IP would be refused on EVERY VIP — a permanent cluster-wide
-// UDP lockout of one pod. reserve++ happens ONLY at the authoritative second-lock
-// insert and release-- ONLY at a flow delete, so both counters are an exact function
+// resets, so that source IP would be refused on every VIP — a permanent cluster-wide
+// UDP lockout of one pod. reserve++ happens only at the authoritative second-lock
+// insert and release-- only at a flow delete, so both counters are an exact function
 // of live flows and the caps can never silently stop firing.
 //
-// Lock order: it is a strict LEAF. reserve/release take budget.mu and NOTHING else,
+// Lock order: it is a strict leaf. reserve/release take budget.mu and nothing else,
 // and never call back into a relay. A relay calls them while holding its own mu
 // (relay.mu → budget.mu, never inverted), so the ordering is deadlock-free. Admission
-// is DROP-NEW: a UDP flow pins an fd, so a refused newcomer is dropped and a live flow
-// is NEVER evicted — evict-on-admit would have to re-enter a relay to close a flow,
+// is drop-new: a UDP flow pins an fd, so a refused newcomer is dropped and a live flow
+// is never evicted — evict-on-admit would have to re-enter a relay to close a flow,
 // inverting the lock order into an AB-BA deadlock.
 //
-// Scope: this is DoS-resistance / FAIRNESS within the same-node shared trust domain,
-// NOT tenant isolation. Same-node pods share one trust domain (no per-pod uid), and a
+// Scope: this is DoS-resistance / fairness within the same-node shared trust domain,
+// not tenant isolation. Same-node pods share one trust domain (no per-pod uid), and a
 // pod that spoofs its L3 source evades the per-source bucket — untrusted workloads
 // belong in a vm RuntimeClass, not behind this cap. maxTotal and maxPerSource are set
 // once by newUDPBudget and read-only thereafter; total and bySource are mutated only
 // under mu.
 type udpBudget struct {
 	mu           sync.Mutex
-	total        int64              // live upstream flows across ALL VIPs, guarded by mu
+	total        int64              // live upstream flows across all VIPs, guarded by mu
 	maxTotal     int64              // the relay-global fd ceiling (B48), read-only after construction
-	bySource     map[netip.Addr]int // live flows per source IP across ALL VIPs, guarded by mu
+	bySource     map[netip.Addr]int // live flows per source IP across all VIPs, guarded by mu
 	maxPerSource int                // one source IP's share of maxTotal (B52), read-only after construction
 }
 
 // newUDPBudget builds the relay-global UDP admission budget: maxTotal is the fd
-// ceiling across ALL relays and maxPerSource is one source IP's share of it across ALL
-// VIPs. It is the ONE construction site for a udpBudget — a raw literal risks a nil
+// ceiling across all relays and maxPerSource is one source IP's share of it across all
+// VIPs. It is the one construction site for a udpBudget — a raw literal risks a nil
 // bySource map (panic on the first reserve) or a zero maxPerSource (every flow
 // rejected), so every production and test site routes through it. maxPerSource is
 // floored at 1 so a tiny budget still admits at least one flow per source.
@@ -130,7 +130,7 @@ func newUDPBudget(maxTotal int64, maxPerSource int) *udpBudget {
 
 // udpPerSourceGlobalCap derives one source IP's share of the relay-global budget as
 // maxTotal/4 (floored at 1). It is /4 — not /8 — so at the floor budget (maxUDPFlows)
-// the per-source-GLOBAL cap (maxUDPFlows/4) coincides with the per-VIP
+// the per-source-global cap (maxUDPFlows/4) coincides with the per-VIP
 // maxUDPFlowsPerSource (also maxUDPFlows/4) rather than dropping below it, which would
 // make the per-VIP sub-cap vacuous; it scales up with a larger RLIMIT-derived budget.
 func udpPerSourceGlobalCap(maxTotal int64) int {
@@ -141,11 +141,11 @@ func udpPerSourceGlobalCap(maxTotal int64) int {
 	return c
 }
 
-// reserve admits one upstream socket iff BOTH the relay-global total is below maxTotal
-// AND srcIP is below its per-source-GLOBAL share. It is ALL-OR-NOTHING under mu: it
+// reserve admits one upstream socket iff both the relay-global total is below maxTotal
+// and srcIP is below its per-source-global share. It is all-or-nothing under mu: it
 // checks both caps first, then increments both counters together, or returns false
 // having mutated neither, with the reason so the caller logs the actionable cause. It
-// NEVER splits the two increments — a partial reserve with a rollback is the leak
+// never splits the two increments — a partial reserve with a rollback is the leak
 // shape, and a leaked per-source count would refuse that source on every VIP forever.
 func (b *udpBudget) reserve(srcIP netip.Addr) (ok bool, reason udpRejectReason) {
 	b.mu.Lock()
@@ -161,13 +161,13 @@ func (b *udpBudget) reserve(srcIP netip.Addr) (ok bool, reason udpRejectReason) 
 	return true, rejectNone
 }
 
-// peekAtCap is a READ-ONLY best-effort probe of the SAME two caps reserve enforces,
-// in the SAME order (global fd total first, then srcIP's per-source-GLOBAL share), so
-// the relay's first-lock early reject can drop a globally-capped new flow BEFORE the
+// peekAtCap is a read-only best-effort probe of the same two caps reserve enforces,
+// in the same order (global fd total first, then srcIP's per-source-global share), so
+// the relay's first-lock early reject can drop a globally-capped new flow before the
 // dial. It holds b.mu because total and bySource are plain (mutex-guarded) fields — a
 // lock-free read of bySource (a map[netip.Addr]int) would race the reserve/release
-// writers (a runtime-fatal concurrent map read/write). It mutates NOTHING: the
-// second-lock reserve stays the SOLE authority over the counters, so the
+// writers (a runtime-fatal concurrent map read/write). It mutates nothing: the
+// second-lock reserve stays the sole authority over the counters, so the
 // conservation invariant is untouched. A stale-high read may drop one datagram the
 // authoritative reserve would have admitted — acceptable on lossy UDP, symmetric with
 // the relay's per-VIP peek.
@@ -185,8 +185,8 @@ func (b *udpBudget) peekAtCap(srcIP netip.Addr) (atCap bool, reason udpRejectRea
 
 // release returns one reserved slot: under mu it decrements total and srcIP's
 // per-source count together, pruning the source bucket at zero so an idle source
-// leaks no map slot. It MUST be called exactly once per successful reserve (i.e. once
-// per flow removed from a relay's table) with the SAME srcIP that reserve counted, so
+// leaks no map slot. It must be called exactly once per successful reserve (i.e. once
+// per flow removed from a relay's table) with the same srcIP that reserve counted, so
 // both counters stay an exact function of live flows.
 func (b *udpBudget) release(srcIP netip.Addr) {
 	b.mu.Lock()
@@ -219,17 +219,17 @@ type udpFlow struct {
 
 // udpRelay is the connectionless ClusterIP UDP data path — the macOS-native analog
 // of kube-proxy's userspace UDP proxy. One dispatcher goroutine reads datagrams on
-// the VIP PacketConn and, per client 5-tuple, selects a backend ONCE (via
+// the VIP PacketConn and, per client 5-tuple, selects a backend once (via
 // RoutingTable.Pick — the single iTP/round-robin/fail-open selector; the relay
 // never re-picks per datagram), opens a connected per-flow upstream socket,
 // forwards the datagram, and spawns one reader goroutine that writes each backend
 // response back to the client with the VIP as the source. A sweeper goroutine
 // idle-GCs flows. Like the TCP splice the relay re-originates traffic (Cluster
-// policy): it does NOT preserve the client pod source IP, and on a multi-node mesh
+// policy): it does not preserve the client pod source IP, and on a multi-node mesh
 // each upstream socket is source-bound to the node's mesh-egress /32 so the
 // wireguard return path is not blackholed.
 //
-// Non-reflection invariant: a backend response is written back ONLY to the client
+// Non-reflection invariant: a backend response is written back only to the client
 // address the inbound datagram carried (conn.WriteTo to fl.clientAddr). The relay
 // does not self-enforce non-reflection — that safety rests on the same anti-spoofing
 // the TCP splice and upstream kube-proxy userspace already assume: unprivileged pods
@@ -238,24 +238,24 @@ type udpFlow struct {
 //
 // Fair-share + budget (B48/B52): the per-VIP cap (maxUDPFlows) bounds total flows but
 // is not a per-source quota, so admission adds more gates. perSourceCap
-// (maxUDPFlowsPerSource) bounds any single source IP's flows PER VIP so one pod
+// (maxUDPFlowsPerSource) bounds any single source IP's flows per VIP so one pod
 // cycling ephemeral ports cannot monopolize a VIP's table; the shared budget (a
-// udpBudget) bounds BOTH concurrent upstream sockets across ALL relays (so the relay
-// subsystem cannot exhaust the co-resident control plane's fds) AND any one source
-// IP's flows across ALL VIPs (B52's per-source-GLOBAL fair share, so a pod fanning
+// udpBudget) bounds both concurrent upstream sockets across all relays (so the relay
+// subsystem cannot exhaust the co-resident control plane's fds) and any one source
+// IP's flows across all VIPs (B52's per-source-global fair share, so a pod fanning
 // flows across N VIPs cannot consume the whole global budget and starve every other
-// pod on every VIP). perSource and the budget's counters are an EXACT function of
+// pod on every VIP). perSource and the budget's counters are an exact function of
 // flows membership: incremented only at the authoritative insert and decremented only
 // at a flow delete (see upstreamFor, sweepExpired, Close) — no admission early-return
 // ever touches them, so the counts never drift and the caps can never silently stop
 // firing.
 //
 // Locking discipline: mu guards flows, perSource, closed, and each flow's
-// lastActivity. The dispatcher is the SOLE inserter; the sweeper and Close are the
+// lastActivity. The dispatcher is the sole inserter; the sweeper and Close are the
 // only removers; readers only update lastActivity. Pick and all socket I/O run
-// OUTSIDE mu (Pick has its own lock; a blocking Read/Write must never hold mu). The
-// budget is a strict LEAF, mutex-guarded (not lock-free): reserve/release take
-// budget.mu and NOTHING else, are reached under mu (relay.mu → budget.mu, never
+// outside mu (Pick has its own lock; a blocking Read/Write must never hold mu). The
+// budget is a strict leaf, mutex-guarded (not lock-free): reserve/release take
+// budget.mu and nothing else, are reached under mu (relay.mu → budget.mu, never
 // inverted), and never re-enter the relay. Close joins the dispatcher, the sweeper,
 // and every reader through wg before returning, so teardown strands no goroutine.
 type udpRelay struct {
@@ -269,14 +269,14 @@ type udpRelay struct {
 	log          *slog.Logger
 
 	// policy is the optional NetworkPolicy L4-subset verdict table (M10.4), shared
-	// with the owning Proxy and consulted ONCE per flow at admission (upstreamFor,
+	// with the owning Proxy and consulted once per flow at admission (upstreamFor,
 	// after the once-per-flow Pick, before the dial) — a denied flow is never
 	// created. Nil allows everything (Allow is nil-receiver-safe). Set before
 	// start (goroutine-start happens-before) and read-only thereafter.
 	policy *PolicyTable
 
 	// dial opens a connected per-flow upstream socket. It defaults to net.DialUDP
-	// (wired once in newUDPRelay) and is an intra-package TEST SEAM ONLY — a test
+	// (wired once in newUDPRelay) and is an intra-package test seam only — a test
 	// injects a counting dialer to assert a globally-capped source never reaches the
 	// dial. It is never exported and never a runtime-flippable knob.
 	dial func(laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
@@ -284,8 +284,8 @@ type udpRelay struct {
 	mu     sync.Mutex
 	closed bool
 	flows  map[string]*udpFlow
-	// perSource counts live flows per source IP ON THIS VIP, guarded by mu (distinct
-	// from the shared budget's bySource, which counts a source across ALL VIPs). It
+	// perSource counts live flows per source IP on this VIP, guarded by mu (distinct
+	// from the shared budget's bySource, which counts a source across all VIPs). It
 	// mirrors flows exactly (summed, it equals len(flows)); an entry is pruned at zero
 	// so an idle source leaks no map slot. It is the per-VIP fair-share sub-cap's counter.
 	perSource map[netip.Addr]int
@@ -300,7 +300,7 @@ type udpRelay struct {
 // kernel's default source selection (single node). idleTimeout is the flow GC
 // idle timeout. perSourceCap bounds any one source IP's concurrent flows on this
 // VIP (the per-VIP fair share); budget is the shared relay-global admission budget
-// (global fd total + per-source-GLOBAL share) — a nil budget is defensively replaced
+// (global fd total + per-source-global share) — a nil budget is defensively replaced
 // via newUDPBudget with a private one sized to the per-VIP cap, so reserve/release
 // never nil-panic and bySource is never nil (no cross-VIP coupling, the pre-B48
 // bound). Call start to run it and Close to tear it down.
@@ -356,7 +356,7 @@ func (r *udpRelay) dispatch() {
 }
 
 // upstreamFor returns the connected upstream socket for clientAddr's flow,
-// creating the flow on first sight: it picks a backend ONCE (RoutingTable.Pick),
+// creating the flow on first sight: it picks a backend once (RoutingTable.Pick),
 // dials a connected upstream socket source-bound to the mesh-egress address when
 // set, records the flow, and starts its reader goroutine. It returns nil — the
 // datagram is dropped — when there is no Ready backend, an admission cap is reached,
@@ -365,22 +365,23 @@ func (r *udpRelay) dispatch() {
 // throttle (the dispatcher is the only caller).
 //
 // Admission is a first-lock best-effort reject → dial → second-lock authoritative
-// admit. The FIRST lock is a read-only early reject (per-VIP full OR this source at
-// its per-VIP cap) that skips a doomed dial but reserves and increments NOTHING.
-// After r.mu is released, a second read-only best-effort PEEK of the shared budget
-// (budget.peekAtCap, under budget.mu — taken only AFTER r.mu is released, preserving
+// admit. The first lock is a read-only early reject (per-VIP full or this source at
+// its per-VIP cap) that skips a doomed dial but reserves and increments nothing.
+// After r.mu is released, a second read-only best-effort peek of the shared budget
+// (budget.peekAtCap, under budget.mu — taken only after r.mu is released, preserving
 // the relay.mu → budget.mu leaf order) drops a new flow whose source is already at
-// its per-source-GLOBAL share OR whose budget is fd-full, BEFORE the Pick+dial. Like
+// its per-source-global share or whose budget is fd-full, before the Pick+dial. Like
 // the per-VIP peek it is best-effort: a stale-high read may falsely drop one datagram,
 // acceptable on lossy UDP and symmetric with the per-VIP peek — the second lock stays
-// authoritative. The SECOND lock, at the insert site, is authoritative: it re-checks per-VIP, then
-// per-source-per-VIP, then reserves the shared budget LAST — which enforces BOTH the
-// global fd total AND this source's per-source-GLOBAL share across all VIPs (so a
-// successful reservation is always immediately paired with an insert — nothing can
-// fail after it, so there is no release-on-reject path). The counters (perSource,
-// budget) are incremented ONLY here at the successful insert and decremented ONLY at a
-// flow delete, so they are an exact function of flows membership. EVERY second-lock
-// rejection Close()s the dialed socket so a rejected upstream fd never leaks.
+// authoritative. The second lock, at the insert site, is authoritative: it re-checks
+// per-VIP, then per-source-per-VIP, then reserves the shared budget last — which
+// enforces both the global fd total and this source's per-source-global share across
+// all VIPs (so a successful reservation is always immediately paired with an insert —
+// nothing can fail after it, so there is no release-on-reject path). The counters
+// (perSource, budget) are incremented only here at the successful insert and
+// decremented only at a flow delete, so they are an exact function of flows
+// membership. Every second-lock rejection Close()s the dialed socket so a rejected
+// upstream fd never leaks.
 func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UDPConn {
 	clientKey := clientAddr.String()
 	srcIP := srcIPOf(clientAddr)
@@ -416,10 +417,10 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 	}
 	r.mu.Unlock()
 
-	// Second best-effort early reject, now against the SHARED budget: budget.mu is
-	// taken only AFTER r.mu is released (relay.mu → budget.mu leaf order preserved), so
-	// a source already at its per-source-GLOBAL share, or a budget that is fd-full, is
-	// dropped BEFORE the Pick+dial. Read-only (peekAtCap reserves nothing); the
+	// Second best-effort early reject, now against the shared budget: budget.mu is
+	// taken only after r.mu is released (relay.mu → budget.mu leaf order preserved), so
+	// a source already at its per-source-global share, or a budget that is fd-full, is
+	// dropped before the Pick+dial. Read-only (peekAtCap reserves nothing); the
 	// second-lock reserve below remains authoritative, so a race here costs at worst a
 	// wasted early drop, never an over-admit. Mirrors the second-lock warn shapes.
 	if atCap, reason := r.budget.peekAtCap(srcIP); atCap {
@@ -439,9 +440,9 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 		r.log.Debug("udp relay no backend", "vip", r.key.String(), "err", err)
 		return nil
 	}
-	// NetworkPolicy L4-subset verdict (M10.4) at flow admission, AFTER the
+	// NetworkPolicy L4-subset verdict (M10.4) at flow admission, after the
 	// once-per-flow pick (the verdict is per picked backend, never per VIP) and
-	// BEFORE the dial: a denied flow is never created — no upstream socket, no
+	// before the dial: a denied flow is never created — no upstream socket, no
 	// reader, no flow-table entry, and the datagram is dropped.
 	if !r.policy.Allow(srcIP, be.Addr().Addr(), be.Addr().Port()) {
 		r.policy.logDenied("udp", r.key, srcIP, be.Addr())
@@ -482,9 +483,9 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 		_ = up.Close()
 		return nil
 	}
-	// Reserve the shared budget LAST — only now that per-VIP and per-source-per-VIP
-	// pass. reserve is authoritative for BOTH the global fd total AND this source's
-	// per-source-GLOBAL share (across ALL VIPs), all-or-nothing under budget.mu: a
+	// Reserve the shared budget last — only now that per-VIP and per-source-per-VIP
+	// pass. reserve is authoritative for both the global fd total and this source's
+	// per-source-global share (across all VIPs), all-or-nothing under budget.mu: a
 	// refusal increments nothing, a success is immediately paired with the insert
 	// below, so no release-on-reject path is ever reachable. The reason splits the
 	// throttled Warn (a global shortage vs one greedy source), mirroring the per-VIP
@@ -590,7 +591,7 @@ func (r *udpRelay) sweepExpired(now time.Time) {
 // releaseFlowLocked un-counts one flow being removed from r.flows: it decrements the
 // per-VIP per-source count (pruning the entry at zero so an idle source leaks no map
 // slot) and releases the flow's slot in the shared budget (both its global-total and
-// its per-source-GLOBAL count, keyed on fl.srcIP). It MUST be called exactly once per
+// its per-source-global count, keyed on fl.srcIP). It must be called exactly once per
 // flow deleted from r.flows, and only while holding mu (it mutates perSource; the
 // budget is a leaf, safe under mu). Pairing it 1:1 with a flow delete is what keeps
 // every counter an exact function of flows membership.

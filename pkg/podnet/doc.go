@@ -117,7 +117,7 @@ limitations under the License.
 //
 // Concretely, three things that were staged as fallbacks are NOT built and are not
 // needed: no route data pushed into GuestNetwork, no new netd route verb (the netd
-// verb set still has none, deliberately), and no host forwarding or host route. The
+// verb set still has none), and no host forwarding or host route. The
 // host also observes the guest's OWN vmnet lease as the source address — there is no
 // NAT rewrite to the gateway on this path, which is what makes the two-address model
 // below workable at all.

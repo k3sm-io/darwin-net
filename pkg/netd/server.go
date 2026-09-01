@@ -70,7 +70,7 @@ type PortAuthorizer interface {
 }
 
 // MeshKeyResolver resolves the opaque ConfigureMesh reference to the node's
-// wireguard PRIVATE key (base64), root-side. The key never crosses the socket; the
+// wireguard private key (base64), root-side. The key never crosses the socket; the
 // daemon resolves the ref here (e.g. a root-only key path or keyring handle). A nil
 // resolver makes ConfigureMesh fail fast — there is no embedded-key default.
 type MeshKeyResolver interface {
@@ -492,15 +492,15 @@ func (s *Server) validateAliasIP(ip netip.Addr) error {
 		ErrPolicy, ip, s.cfg.NodePodCIDR, s.cfg.ClusterAggregate)
 }
 
-// authorizePort applies the BindPort policy to a SPECIFIC-address bind (handleBindPort
+// authorizePort applies the BindPort policy to a specific-address bind (handleBindPort
 // has already rejected the wildcard). The contract is self-consistent with the real
 // consumers: a privileged (<1024) port — the infra VIPs 10.43.0.1:443 / 10.43.0.10:53,
-// which are the proxy's ONLY helper-bound ports (pkg/proxy netdBinder routes only
+// which are the proxy's only helper-bound ports (pkg/proxy netdBinder routes only
 // <1024 here, binding >=1024 itself) — is the escalation-sensitive case and must be
 // confirmed against the authoritative Service set by the PortAuthorizer (a nil
 // authorizer denies it, fail-safe). A non-privileged (>=1024) specific-address VIP
 // port grants no more than the unprivileged service uid could bind itself, so it is
-// allowed. There is deliberately no NodePort-range branch: a NodePort is reached on
+// allowed. There is no NodePort-range branch: a NodePort is reached on
 // the wildcard *:nodePort, which the proxy binds in-process (it needs no privilege)
 // and which this daemon rejects as a wildcard — the helper has no NodePort path.
 func (s *Server) authorizePort(ctx context.Context, port int, nodeAddr string) error {
