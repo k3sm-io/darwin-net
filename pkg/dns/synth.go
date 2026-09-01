@@ -27,7 +27,7 @@ import (
 
 // This file is the pure record-synthesis library the in-process cluster
 // resolver (k3sm/pkg/netserve) consumes for headless / StatefulSet-identity /
-// SRV / PTR answers (M10.1, backlog B81). It is deliberately watch-free and
+// SRV / PTR answers (M10.1, backlog B81). It is watch-free and
 // dependency-light: the INPUTS are already-fetched Service/EndpointSlice-shaped
 // values (SynthService / SynthEndpoint — small consumer-side structs, NOT
 // k8s.io/api types, so the layer stays table-testable and import-cheap), and

@@ -59,7 +59,7 @@ var ErrNotFound = errors.New("dns: no address found for name")
 
 // ErrTempFail is returned by Resolver.LookupHost when a candidate query kept
 // failing transiently (timeout, network error, SERVFAIL) after queryAttempts.
-// It is deliberately distinct from ErrNotFound: "the resolver did not answer"
+// It is distinct from ErrNotFound: "the resolver did not answer"
 // must never be collapsed into "the name does not exist". The C shim mirrors
 // this outcome as EAI_AGAIN.
 var ErrTempFail = errors.New("dns: cluster resolver temporarily unavailable")

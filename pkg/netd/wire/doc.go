@@ -18,7 +18,7 @@ limitations under the License.
 // unprivileged k3sm processes (the pod network, the Service proxy, the wireguard
 // mesh controller) and the root k3sm-netd daemon (k3sm.io/darwin-net/pkg/netd).
 //
-// It is a deliberately small, auditable leaf package: it imports nothing from
+// It is a small, auditable leaf package: it imports nothing from
 // k3sm.io/* so both the daemon (which also imports pkg/podnet and pkg/mesh to
 // re-validate every request) and its clients (pkg/podnet, pkg/proxy, pkg/mesh) can
 // depend on it without an import cycle.

@@ -31,21 +31,21 @@ const affinityDefaultTimeout = 3 * time.Hour
 // maxAffinityBindingsPerPort bounds a single Service port's ClientIP binding table
 // so a peer churning source IPs cannot grow it without limit. Same-node pods share
 // one trust domain with no per-pod uid isolation, so this is a hard safety bound on
-// top of the TTL sweep. It is generous, and an evicted binding pins NO live resource
+// top of the TTL sweep. It is generous, and an evicted binding pins no live resource
 // (unlike B23's per-flow UDP socket), so over-cap eviction only degrades that client
-// to a fresh round-robin pick; on saturation ONE existing binding is evicted in O(1)
+// to a fresh round-robin pick; on saturation one existing binding is evicted in O(1)
 // — a pseudo-random victim (Go map iteration is randomized), since a best-effort
 // affinity overlay needs no true-LRU victim and this avoids an O(cap) scan under the
-// table write lock. The relay-GLOBAL aggregate ceiling (maxAffinityBindingsTotal)
-// bounds the sum across ALL ports on top of this per-port cap.
+// table write lock. The relay-global aggregate ceiling (maxAffinityBindingsTotal)
+// bounds the sum across all ports on top of this per-port cap.
 const maxAffinityBindingsPerPort = 8192
 
-// maxAffinityBindingsTotal is the relay-GLOBAL ceiling on live ClientIP bindings
-// summed across ALL Service ports (RoutingTable.affinityCount). The per-port cap bounds
+// maxAffinityBindingsTotal is the relay-global ceiling on live ClientIP bindings
+// summed across all Service ports (RoutingTable.affinityCount). The per-port cap bounds
 // any single port, but a peer fanning source-IP churn across many Services could still
 // grow the aggregate map unbounded; this caps node-wide affinity memory. It is 8x the
 // per-port cap — sized well above a legitimate multi-Service steady state, so only
-// pathological churn reaches it. On saturation PickSticky degrades a NEW client to
+// pathological churn reaches it. On saturation PickSticky degrades a new client to
 // round-robin (a valid backend, no binding recorded), never rejecting the connection:
 // affinity is a fail-open overlay, so the worst realized effect is loss of stickiness,
 // never a reachability break.
@@ -53,9 +53,9 @@ const maxAffinityBindingsTotal = 8 * maxAffinityBindingsPerPort
 
 // affinityMode is the proxy-internal analog of corev1.ServiceAffinity for the one
 // mode the userspace proxy implements: ClientIP. Like trafficPolicy it is consumed
-// ONLY by this proxy (the Watcher reads svc.Spec.SessionAffinity in serviceToVIP and
-// threads it to the routing table), so it is deliberately NOT a field on the apis
-// netv1 contract — no cross-repo type carries session affinity.
+// only by this proxy (the Watcher reads svc.Spec.SessionAffinity in serviceToVIP and
+// threads it to the routing table), so it is not a field on the apis netv1
+// contract — no cross-repo type carries session affinity.
 type affinityMode uint8
 
 const (
@@ -97,12 +97,12 @@ func (t *RoutingTable) PickSticky(key PortKey, client netip.Addr, now time.Time)
 }
 
 // PickStickyCluster selects a backend for key honoring ClientIP session affinity on
-// the EXTERNAL (*:NodePort) accept path. It is a thin wrapper over pickStickyScoped
-// with the external scope (external=true), so affinity is applied over the FULL Ready
+// the external (*:NodePort) accept path. It is a thin wrapper over pickStickyScoped
+// with the external scope (external=true), so affinity is applied over the full Ready
 // (Cluster) pool: externalTrafficPolicy governs NodePort and its default (Cluster)
-// routes to ALL backends, and internalTrafficPolicy:Local is IGNORED here (KEP-2086) —
+// routes to all backends, and internalTrafficPolicy:Local is ignored here (KEP-2086) —
 // a NodePort connection is never dropped for lack of a node-local backend, and a
-// binding is always re-validated against the FULL Ready set (allSet), never the
+// binding is always re-validated against the full Ready set (allSet), never the
 // iTP:Local subset. It replaces the old non-sticky PickCluster: NodePort now honors
 // ClientIP affinity over the Cluster pool. See pickStickyScoped for the mechanics.
 func (t *RoutingTable) PickStickyCluster(key PortKey, client netip.Addr, now time.Time) (backend, error) {
@@ -117,60 +117,59 @@ func (t *RoutingTable) PickStickyCluster(key PortKey, client netip.Addr, now tim
 // internalTrafficPolicy-filtered pool (with the iTP:Local drop/fail-open), true forces
 // the full Ready (Cluster) pool.
 //
-// The pool and its membership set are CONSUMED from the single activePool call, so
+// The pool and its membership set are consumed from the single activePool call, so
 // every downstream step is scope-agnostic: the cached binding is re-validated against
-// the set RETURNED by activePool (for external=true that is allSet, NOT st.localSet),
+// the set returned by activePool (for external=true that is allSet, not st.localSet),
 // so the iTP:Local filter can never spill onto the NodePort surface, and the round-
 // robin/evict/ceiling/record steps operate on whichever pool the scope selected.
 //
-// When the port's affinity mode is not ClientIP, pickStickyScoped is EXACTLY Pick over
+// When the port's affinity mode is not ClientIP, pickStickyScoped is exactly Pick over
 // the scope's pool: round-robin (so handle can call either wrapper unconditionally).
-// Under ClientIP it reuses a client's existing binding ONLY when that backend is still
-// in the current active pool (O(1) membership in the returned set) AND the binding is
+// Under ClientIP it reuses a client's existing binding only when that backend is still
+// in the current active pool (O(1) membership in the returned set) and the binding is
 // within the port's idle timeout; otherwise it round-robins a fresh backend and
-// (re)binds. Re-validating against the LIVE pool on every hit is load-bearing: a
+// (re)binds. Re-validating against the live pool on every hit is load-bearing: a
 // backend that went unready, or (internal scope) under iTP:Local left the node-local
 // subset, is re-picked, never reused — so affinity never dials a dead backend nor (on
 // the internal path) spills node-local traffic across the mesh. An internal-scope
 // iTP:Local port with no node-local backend propagates ErrNoLocalBackends (a drop),
 // never a stale/remote fallback; the external scope never returns it.
 //
-// The round-robin cursor is advanced ONLY on a miss/expiry/invalidation, so a steady
+// The round-robin cursor is advanced only on a miss/expiry/invalidation, so a steady
 // sticky client does not perturb the fan-out of new clients. pickStickyScoped takes
 // the table write lock (it may create or refresh a binding, and shares Pick's
 // locking).
 //
 // Trust model: the binding key is the client's source IP alone. On the internal
-// (ClusterIP) surface, stickiness integrity inherits the SAME substrate anti-spoofing
+// (ClusterIP) surface, stickiness integrity inherits the same substrate anti-spoofing
 // the TCP splice and iTP:Local locality already assume — a pod that could forge
 // another's lo0 source IP could share, or (by churning IPs to the cap) evict, that
-// client's binding. On the external (*:NodePort) surface B55 adds, there is NO such
+// client's binding. On the external (*:NodePort) surface B55 adds, there is no such
 // substrate: an off-cluster client presents an arbitrary, unauthenticated source IP
-// (it is not a mesh pod and is not confined to the pod CIDR), so it can deliberately
-// collide with an internal client's key (share a binding) or churn source IPs to
-// consume the shared per-port/global budget (see "Shared budget" below). This still
-// opens NO new isolation boundary: there is no path to OBSERVE another client's
-// binding, every reuse is re-validated against the live Ready set (backends behind one
-// Service are fungible endpoints of that Service), and the worst realized effect is
-// loss of stickiness → a fresh, still-revalidated round-robin pick — never a routing,
+// (it is not a mesh pod and is not confined to the pod CIDR), so it can collide with
+// an internal client's key (share a binding) or churn source IPs to consume the
+// shared per-port/global budget (see "Shared budget" below). This opens no new
+// isolation boundary: there is no path to observe another client's binding, every
+// reuse is re-validated against the live Ready set (backends behind one Service are
+// fungible endpoints of that Service), and the worst realized effect is loss of
+// stickiness — a fresh, still-revalidated round-robin pick, never a routing,
 // reachability, or observation break. It is fail-open by construction, not a
 // containment control.
 //
 // Cross-scope couplings of the shared table-level t.affinity[key] map. The ClusterIP
-// and *:NodePort listeners are opened with the SAME PortKey (proxy.go:562 and :577),
-// so the binding sub-map for a port is SHARED across both scopes. This is INTENTIONAL
-// (the sub-map is deliberately NOT namespaced by scope), and has three consequences,
-// all self-correcting:
+// and *:NodePort listeners are opened with the same PortKey (proxy.go:562 and :577),
+// so the binding sub-map for a port is shared across both scopes — the sub-map is
+// intentionally not namespaced by scope — with three self-correcting consequences:
 //
-//   - Shared binding across surfaces: a client IP that hits BOTH the ClusterIP and the
-//     NodePort surface of one Service shares ONE binding, re-validated against each
+//   - Shared binding across surfaces: a client IP that hits both the ClusterIP and the
+//     NodePort surface of one Service shares one binding, re-validated against each
 //     scope's set on every hit. If a backend is eligible under one scope but not the
 //     other (an iTP:Local Service whose bound backend is node-local: eligible on the
 //     internal path, and still eligible on the external path since external uses the
 //     full set), the mismatch only ever forces a drop-and-re-pick — never a wrong route.
 //     Worst case is stickiness thrash between the two surfaces, never a reachability or
 //     isolation break.
-//   - Shared budget: external NodePort source-IP churn consumes the SAME
+//   - Shared budget: external NodePort source-IP churn consumes the same
 //     maxAffinityPerPort and relay-global affinityCount budget as east-west ClusterIP
 //     bindings, so internet-facing churn on a port can evict on-node ClusterIP
 //     stickiness for that same port (per-port cap) or, at the global ceiling, degrade
@@ -178,8 +177,8 @@ func (t *RoutingTable) PickStickyCluster(key PortKey, client netip.Addr, now tim
 //     only loses stickiness, never reachability.
 //   - Mesh-egress /32 collapse: cross-node mesh-forwarded NodePort traffic is
 //     re-originated from the peer node's mesh-egress /32 (the userspace splice does not
-//     preserve the external client's source IP — DESIGN §5b), so ALL such clients
-//     behind one peer collapse to a SINGLE binding = coarse stickiness. But that one
+//     preserve the external client's source IP — DESIGN §5b), so all such clients
+//     behind one peer collapse to a single binding — coarse stickiness. But that one
 //     binding is still re-validated against the live Cluster pool on every hit, so it
 //     always resolves to a Ready backend — coarse, never wrong-routing.
 func (t *RoutingTable) pickStickyScoped(key PortKey, client netip.Addr, now time.Time, external bool) (backend, error) {
@@ -226,7 +225,7 @@ func (t *RoutingTable) pickStickyScoped(key PortKey, client netip.Addr, now time
 	perPortCap := max(1, t.maxAffinityPerPort)
 	totalCap := max(1, t.maxAffinityTotal)
 
-	// Per-port eviction runs BEFORE the global ceiling check: evicting one of THIS
+	// Per-port eviction runs before the global ceiling check: evicting one of this
 	// port's own bindings to admit another is net-zero to affinityCount, so a port at
 	// its per-port cap keeps rotating its bindings even under global saturation.
 	if len(binds) >= perPortCap {
@@ -239,9 +238,9 @@ func (t *RoutingTable) pickStickyScoped(key PortKey, client netip.Addr, now time
 		}
 	}
 
-	// Relay-GLOBAL aggregate ceiling. When the live-binding total across ALL ports is at
-	// the cap, DEGRADE this new client to round-robin: return the picked backend but
-	// record NO binding, so reachability is preserved and only stickiness is lost — this
+	// Relay-global aggregate ceiling. When the live-binding total across all ports is at
+	// the cap, degrade this new client to round-robin: return the picked backend but
+	// record no binding, so reachability is preserved and only stickiness is lost — this
 	// is a fail-open overlay, never a reject or a closed connection. Warn once (throttled
 	// by affinityWarned) so node-wide stickiness degradation is observable, not silent.
 	if t.affinityCount >= totalCap {
@@ -265,7 +264,7 @@ func (t *RoutingTable) pickStickyScoped(key PortKey, client netip.Addr, now time
 }
 
 // SweepExpired evicts every ClientIP affinity binding idle at least its port's
-// timeout as of now. It is a PURE, clock-injected method — no time.Now, no ticker,
+// timeout as of now. It is a pure, clock-injected method — no time.Now, no ticker,
 // no goroutine inside the RoutingTable — so the table stays hermetic and
 // table-testable; the owning Proxy drives it from a single sweeper goroutine
 // (proxy.sweepAffinity), the affinity TTL's lifetime owner. An expired binding pins
@@ -296,9 +295,9 @@ func (t *RoutingTable) SweepExpired(now time.Time) {
 	}
 }
 
-// dropBinding removes ONE client's binding from binds and decrements the global
+// dropBinding removes one client's binding from binds and decrements the global
 // affinityCount by one, keeping affinityCount an exact function of the affinity map. It
-// is the single counter-aware SINGLE-KEY removal site: the stale-binding refresh drop,
+// is the single counter-aware single-key removal site: the stale-binding refresh drop,
 // the per-port O(1) eviction, and the idle sweep all route through it, so a single-key
 // delete can never leak the count (the wholesale sibling is dropAffinity). The caller
 // holds t.mu and guarantees client is present in binds.
@@ -308,7 +307,7 @@ func (t *RoutingTable) dropBinding(binds map[netip.Addr]*affinityBinding, client
 }
 
 // dropAffinity removes key's entire ClientIP binding sub-map and decrements the global
-// affinityCount by that sub-map's CARDINALITY, keeping affinityCount an exact function
+// affinityCount by that sub-map's cardinality, keeping affinityCount an exact function
 // of the affinity map. It is the single counter-aware wholesale-purge site: every place
 // that drops a whole port's bindings — SetEndpointsPolicy (no Ready backends, or
 // ClientIP toggled off), Delete, and SweepExpired's orphaned/empty-state drops — routes

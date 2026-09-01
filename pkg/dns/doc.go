@@ -16,11 +16,11 @@ limitations under the License.
 
 // Package dns is k3sm's pod DNS: it carries the pure-Go reference resolver whose
 // algorithm the getaddrinfo DYLD shim mirrors inside pods, plus the per-pod
-// DNSConfig that shim consumes. The cluster resolver that actually RUNS is k3sm's
-// in-process A-record + upstream-forward resolver (k3sm/pkg/netserve), NOT
+// DNSConfig that shim consumes. The cluster resolver that actually runs is k3sm's
+// in-process A-record + upstream-forward resolver (k3sm/pkg/netserve), not
 // CoreDNS-the-binary. (Corrected 2026-06 upstream-alignment audit: earlier prose
 // here wrongly said k3sm runs CoreDNS per-node. This package formerly also carried
-// an UNCONSUMED CoreDNS Corefile renderer, CorefileOptions/PerNodeDNS, exported
+// an unconsumed CoreDNS Corefile renderer, CorefileOptions/PerNodeDNS, exported
 // for a deferred "native CoreDNS" follow-up (DESIGN §5b); it was deleted 2026-08-29
 // (B33, operator decision: nothing ever consumed it) — a future native-CoreDNS
 // effort re-derives it from git history rather than reviving dead code.)
@@ -37,7 +37,7 @@ limitations under the License.
 // # The pieces
 //
 //   - expand.go — candidateNames: the pure ndots/search expansion. A short name
-//     like "web" (0 dots) is expanded through the search domains FIRST, so it
+//     like "web" (0 dots) is expanded through the search domains first, so it
 //     resolves as a Service without the caller qualifying it; an absolute name
 //     (trailing dot) skips the search list. This is unit-tested directly.
 //   - resolver.go — Resolver: the Go reference implementation of pod resolution
@@ -46,11 +46,11 @@ limitations under the License.
 //     mirrors this algorithm; sharing the expansion semantics here keeps the two
 //     in lockstep and lets the hard part (ndots/search) be tested in Go.
 //   - dnsconfig.go — DefaultDNSVIP / DefaultClusterDomain / PodDNSConfig:
-//     PodDNSConfig hands each pod the DNSConfig the shim consumes (LIVE), built
+//     PodDNSConfig hands each pod the DNSConfig the shim consumes (live), built
 //     around the same VIP/domain defaults the per-node resolver (the in-process
 //     k3sm/pkg/netserve resolver) binds. See the M3.3 section below.
 //   - merge.go — MergeDNSConfig / MaxSearchDomains: the pure ClusterFirst additive
-//     dnsConfig merge — a pod's search domains APPEND to the cluster search list
+//     dnsConfig merge — a pod's search domains append to the cluster search list
 //     (cluster-first, deduped, capped) and its ndots overrides the cluster
 //     default, never the cluster server. See the B20a section below.
 //
@@ -58,7 +58,7 @@ limitations under the License.
 //
 // The interposer itself is a small C dylib in ../../shim/getaddrinfo_shim.c,
 // built by ../../hack/build-shim.sh with clang into
-// libk3sm_getaddrinfo_shim.dylib. It is deliberately NOT Go cgo: darwin-net's Go
+// libk3sm_getaddrinfo_shim.dylib. It is not Go cgo: darwin-net's Go
 // stays CGO_ENABLED=0, and a DYLD interposer must be a plain C dylib with a
 // __DATA,__interpose section anyway. The shim reads its DNSConfig from the
 // environment (K3SM_DNS_* variables the runtime sets per pod) and talks UDP DNS
@@ -66,10 +66,10 @@ limitations under the License.
 //
 // # Test tiers (and the cross-repo caveat)
 //
-// The shim only takes effect when the pod is spawned by runtimed's NON-platform
+// The shim only takes effect when the pod is spawned by runtimed's non-platform
 // exec-shim: Apple's sandbox-exec strips DYLD_* from the environment, so the true
 // end-to-end test (a pod under Seatbelt resolving a Service) is an integration-
-// tier test that depends on runtimed and lives in that slice. For THIS repo the
+// tier test that depends on runtimed and lives in that slice. For this repo the
 // shim is proven by:
 //
 //   - the pure-Go resolver/ndots unit tests (expand_test.go, resolver_test.go),
@@ -82,31 +82,31 @@ limitations under the License.
 // # In-pod kube-apiserver resolution (M2.2)
 //
 // In-pod kubectl / client-go reach the apiserver via kubernetes.default.svc — a
-// Service the apiserver auto-creates (its ClusterIP, e.g. 10.43.0.1). It needs NO
+// Service the apiserver auto-creates (its ClusterIP, e.g. 10.43.0.1). It needs no
 // special-casing here: it is just a Service name, so the same ndots/search
 // expansion resolves it. From a pod in any namespace, the partial form
 // "kubernetes.default.svc" expands through the search list to the canonical
 // kubernetes.default.svc.cluster.local (the third candidate under the default
 // ndots:5), and the bare/FQDN forms work the same way. Cross-namespace access
 // follows the standard contract: a "<svc>.<ns>" form resolves to
-// <svc>.<ns>.svc.cluster.local, while a BARE name expands only within the pod's
-// OWN namespace and never crosses namespaces. This is exercised by
+// <svc>.<ns>.svc.cluster.local, while a bare name expands only within the pod's
+// own namespace and never crosses namespaces. This is exercised by
 // resolution_test.go (TestInPodKubernetesAndCrossNamespaceResolution,
 // TestCandidateNamesCrossNamespaceContract).
 //
 // Decision (M2.2): because resolution rides the getaddrinfo shim and Apple's
 // sandbox-exec strips DYLD_* from the child environment, the in-pod-API path
-// REQUIRES runtimed's NON-platform exec-shim backend — the one backend under
+// requires runtimed's non-platform exec-shim backend — the one backend under
 // which DYLD_INSERT_LIBRARIES survives into the pod. The runtime pins that
 // backend for pods that need in-pod API access (coordinated with runtimed:M2);
-// there is no new darwin-net component. The documented ALTERNATIVE, for a future
+// there is no new darwin-net component. The documented alternative, for a future
 // platform/confined backend where DYLD_* cannot survive, is a machine-wide DNS
 // proxy (an mDNSResponder resolver scoped to the cluster domain) injected via
 // /etc/resolver — out of scope for M2.2, which pins the exec-shim backend.
 //
 // # Per-node DNS and the infra-VIP exemption (M3.3)
 //
-// On a multi-node mesh the kube-dns VIP (10.43.0.10) is NOT in any pod's podCIDR,
+// On a multi-node mesh the kube-dns VIP (10.43.0.10) is not in any pod's podCIDR,
 // so a podCIDR classifier would call it remote and a podCIDR router would steer
 // it over the wireguard mesh — where no peer's symmetric AllowedIPs (= podCIDR)
 // cover it, blackholing in-pod DNS. The fix is to keep DNS node-local: k3sm runs
@@ -117,7 +117,7 @@ limitations under the License.
 // hint, not a routing input.
 //
 // Because the per-node resolver binds 10.43.0.10:53 (TCP and UDP) directly, the
-// Service proxy must NOT also try to own that VIP, or the two collide
+// Service proxy must not also try to own that VIP, or the two collide
 // (EADDRINUSE). The proxy exempts the kube-dns VIP via proxy.WithInfraVIPExemptions;
 // the per-node resolver launch (k3sm, root-gated netd boundary) ensures the
 // 10.43.0.10/32 lo0 alias the proxy no longer creates for it.
@@ -133,35 +133,35 @@ limitations under the License.
 // The DYLD getaddrinfo shim is Darwin-only: inside a Linux micro-VM guest there is
 // no dyld (glibc/musl NSS instead), so cluster names are pointed at the resolver
 // the standard Linux way. GuestResolvConf (resolvconf.go) renders the guest's
-// /etc/resolv.conf content from the SAME netv1.DNSConfig a host-process pod uses
+// /etc/resolv.conf content from the same netv1.DNSConfig a host-process pod uses
 // (nameserver = the cluster DNS VIP, search + ndots from the config) — only the
-// injection mechanism differs. It returns the content as DATA: darwin-net does not
+// injection mechanism differs. It returns the content as data: darwin-net does not
 // write into runtimed's guest rootfs (the DAG forbids it), so runtimed / the k3sm
 // guest provisioner injects it. Two caveats the injector owns (flagged on
 // GuestResolvConf, not solved here): a Linux guest's DHCP/systemd-resolved will
-// CLOBBER resolv.conf on the NAT interface unless it is pinned static/immutable,
-// and musl (Alpine) largely IGNORES `options ndots:` where glibc honors it.
+// clobber resolv.conf on the NAT interface unless it is pinned static/immutable,
+// and musl (Alpine) largely ignores `options ndots:` where glibc honors it.
 //
 // # Additive dnsConfig merge under ClusterFirst (B20a)
 //
-// A ClusterFirst pod may set spec.dnsConfig to AUGMENT — never replace — the
+// A ClusterFirst pod may set spec.dnsConfig to augment — never replace — the
 // cluster DNS settings: its search domains append to the cluster search list and
 // its ndots overrides the cluster default. MergeDNSConfig (merge.go) is the pure
-// darwin-net primitive for that merge: cluster searches FIRST, the pod's appended,
-// deduped first-seen (the cluster WINS a collision, so a pod search equal to a
+// darwin-net primitive for that merge: cluster searches first, the pod's appended,
+// deduped first-seen (the cluster wins a collision, so a pod search equal to a
 // cluster one is dropped), sanitized (interior-whitespace domains dropped), then
 // capped at MaxSearchDomains. A strictly-positive pod ndots overrides the cluster
 // default; otherwise the cluster default stays. It returns the merged config plus
-// the count of valid searches DROPPED BY THE CAP (the k3sm caller logs a Warn with
+// the count of valid searches dropped by the cap (the k3sm caller logs a Warn with
 // pod identity when non-zero; the primitive itself never logs).
 //
 // # Search-list normalization is single-homed (B47)
 //
 // Four consumers read a DNSConfig's SearchDomains: ConfigToEnv (the host-process
 // shim env), GuestResolvConf (the vm-guest /etc/resolv.conf), candidateNames (the Go
-// reference resolver), and MergeDNSConfig itself. They all normalize through ONE
+// reference resolver), and MergeDNSConfig itself. They all normalize through one
 // helper, normalizeSearch (normalize.go) = sanitizeSearch + capSearch: it TrimSpaces
-// each entry, DROPS any holding a byte outside the RFC-1123 subdomain charset
+// each entry, drops any holding a byte outside the RFC-1123 subdomain charset
 // [a-zA-Z0-9.-] (a positive allowlist — the C shim's strtok_r would otherwise split
 // "a b" into two fabricated in-pod tokens, and a separator byte could inject into the
 // line-structured vm-guest resolv.conf; dropping is safer than fusing or splitting),
@@ -174,15 +174,15 @@ limitations under the License.
 // GuestResolvConf additionally clamp ndots to the exported RES_MAXNDOTS ceiling
 // (MaxNDots == 15).
 //
-// MergeDNSConfig takes DISCRETE searches/ndots rather than a full netv1.DNSConfig
+// MergeDNSConfig takes discrete searches/ndots rather than a full netv1.DNSConfig
 // "extra" on purpose: a full extra carries ClusterDNSIP, and a later edit that
 // populated it from a pod's nameservers would override the cluster VIP — inverting
 // B18's infra-wins. Discrete params type-enforce "augment search + ndots, never the
 // server." k3sm wave 2 (B20b) extracts the pod-spec dnsConfig fields and calls this;
-// THIS repo owns the merge mechanics and the shared MaxSearchDomains cap.
+// this repo owns the merge mechanics and the shared MaxSearchDomains cap.
 //
 // Honest gaps (each deferred to B20b):
-//   - The search list caps at MaxSearchDomains (8), NOT upstream's 32 — a pod's
+//   - The search list caps at MaxSearchDomains (8), not upstream's 32 — a pod's
 //     6th-and-later added search beyond the three cluster defaults is silently
 //     dropped. The cap mirrors the C shim's K3SM_MAX_SEARCH so the emitted env, the
 //     shim's effective list, and the Go resolver agree; TestShimMaxSearchMatchesC
@@ -190,7 +190,7 @@ limitations under the License.
 //   - An explicit `ndots: 0` is treated as unset (→ cluster default): the int32
 //     NDots field cannot distinguish an explicit 0 from absent. Honoring an explicit
 //     0 is deferred to B20b.
-//   - dnsConfig.nameservers and non-ndots dnsConfig.options are NOT honored under
+//   - dnsConfig.nameservers and non-ndots dnsConfig.options are not honored under
 //     ClusterFirst: the getaddrinfo shim is single-server (one cluster VIP), so a
 //     pod can neither add nameservers nor set arbitrary resolver options here.
 package dns

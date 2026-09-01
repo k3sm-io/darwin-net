@@ -95,19 +95,19 @@ func WithVMNetwork(cfg VMNetworkConfig) Option {
 }
 
 // GuestNetwork is the config darwin-net hands runtimed's VZ backend to network a
-// vm-RuntimeClass guest. darwin-net DECIDES and ALLOCATES (the pod's cluster IP and
-// the NAT/DNS parameters) but does NOT attach: the live VZNATNetworkDeviceAttachment
+// vm-RuntimeClass guest. darwin-net decides and allocates (the pod's cluster IP and
+// the NAT/DNS parameters) but does not attach: the live VZNATNetworkDeviceAttachment
 // wiring is runtimed's (the DAG forbids darwin-net touching the VZ backend or the
-// guest rootfs), so this flows guest-ward as data. Crucially it carries NO lo0
-// alias — the host must never own the guest's address.
+// guest rootfs), so this flows guest-ward as data. It carries no lo0 alias — the
+// host must never own the guest's address.
 type GuestNetwork struct {
 	// PodIP is the pod's cluster identity, allocated from the node podCIDR by the
 	// same Allocator host-process pods use (unified, leak-free IPAM). It is the
-	// PUBLISHED half of the two-address model (doc.go): status.podIP, the
-	// EndpointSlice and cluster DNS carry it, and for a vm pod it is live on NO
+	// published half of the two-address model (doc.go): status.podIP, the
+	// EndpointSlice and cluster DNS carry it, and for a vm pod it is live on no
 	// interface — the host must never alias it. The guest's macOS-assigned vmnet
-	// lease is the other half, the LIVE TRANSPORT address that host-to-guest dials
-	// target; it is never published, and the two are deliberately NOT reconciled into
+	// lease is the other half, the live transport address that host-to-guest dials
+	// target; it is never published, and the two are not reconciled into
 	// one address (the lease exists only after boot, the identity is baked before).
 	// A guest pod stays same-node-scoped and is not a cross-node Service backend: its
 	// lease address is in no peer's mesh AllowedIPs.

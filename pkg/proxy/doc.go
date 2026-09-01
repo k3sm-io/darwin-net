@@ -27,10 +27,9 @@ limitations under the License.
 //     Ready backends, with a deterministic round-robin picker (Pick), an
 //     explicit-index picker (PickAt) for table-assertable distribution, and a
 //     ClientIP-session-affinity picker (PickSticky, affinity.go) layered over the
-//     same activePool policy. Only Ready endpoints are ever admitted (SetEndpoints
-//     filters at the single admission point), so an unready endpoint can never be
-//     selected. It carries no sockets and no client-go types, so its behavior is
-//     fully unit-tested.
+//     same activePool policy. Only Ready endpoints are admitted (SetEndpoints
+//     filters at the single admission point). It carries no sockets and no
+//     client-go types, so its behavior is fully unit-tested.
 //   - aliasManager (alias.go) abstracts lo0 alias create/teardown. The production
 //     lo0AliasManager shells out to `ifconfig lo0 alias <ip>/32`; it is root-gated,
 //     so in deployment the proxy plumbs VIP aliases through the root netd daemon
@@ -48,61 +47,57 @@ limitations under the License.
 //     table-testable without an apiserver.
 //   - Watcher (watch.go) is the production seam: client-go shared informers feed
 //     Service/EndpointSlice events into Proxy.Reconcile. The per-VIP worker above
-//     serializes DELIVERY, not the recompute that produces what is delivered — the
-//     Watcher's own per-Service stripe lock is what keeps a stale snapshot from
-//     landing on top of a fresh one.
+//     serializes delivery, not the recompute that produces what is delivered — the
+//     Watcher's own per-Service stripe lock keeps a stale snapshot from landing on
+//     top of a fresh one.
 //
 // # NodePort (M3.2)
 //
 // A Service port with a non-zero NodePort additionally opens a node-wide
 // *:NodePort TCP listener (bound to the wildcard so every node interface answers)
-// that L4-load-balances to ALL Ready backends. The NodePort listener is bound
-// IN-PROCESS (a plain net.Listen on the wildcard); it never goes through the root
+// that L4-load-balances to all Ready backends. The NodePort listener is bound
+// in-process (a plain net.Listen on the wildcard); it never goes through the root
 // netd helper, which binds only specific-address ports and rejects the wildcard — a
 // >=1024 wildcard needs no privilege, so there is no helper NodePort path.
 //
-// The NodePort path is externalTrafficPolicy: Cluster and is a DISTINCT selector from
+// The NodePort path is externalTrafficPolicy: Cluster and is a distinct selector from
 // the ClusterIP path: it calls RoutingTable.PickStickyCluster (the external scope of
-// the shared activePool), which routes to every Ready backend and IGNORES
+// the shared activePool), which routes to every Ready backend and ignores
 // internalTrafficPolicy: Local. internalTrafficPolicy governs the ClusterIP
-// (east-west) path ONLY, externalTrafficPolicy governs NodePort (KEP-2086), so an
+// (east-west) path only, externalTrafficPolicy governs NodePort (KEP-2086), so an
 // iTP:Local Service still serves its NodePort to all backends rather than dropping
 // when the node has no local endpoint — the *:NodePort listener no longer shares the
-// ClusterIP's iTP:Local filter (a plain external listener would otherwise inherit the
-// key's iTP and blackhole NodePort traffic on a node with only remote backends).
+// ClusterIP's iTP:Local filter.
 //
-// ClientIP session affinity IS applied on the NodePort path (B55), over the CLUSTER
-// pool: PickStickyCluster is PickSticky's external-scope sibling (both are thin
-// wrappers over pickStickyScoped), so a sessionAffinity: ClientIP Service pins each
-// client IP to a backend from the FULL Ready set — the iTP:Local subset is never
-// applied to NodePort, so external stickiness cannot spill the east-west locality
-// filter. The bindings share the port's table-level sub-map with the ClusterIP path
-// (same PortKey), a deliberate coupling documented on pickStickyScoped. One deliberate
-// divergence remains:
+// ClientIP session affinity is applied on the NodePort path too (B55), over the
+// Cluster pool: PickStickyCluster is PickSticky's external-scope sibling (both are
+// thin wrappers over pickStickyScoped), so a sessionAffinity: ClientIP Service pins
+// each client IP to a backend from the full Ready set — the iTP:Local subset never
+// applies to NodePort. The bindings share the port's table-level sub-map with the
+// ClusterIP path (same PortKey; see pickStickyScoped). One divergence remains:
 //
-//   - externalTrafficPolicy: Local is NOT honored — the userspace splice opens a
+//   - externalTrafficPolicy: Local is not honored — the userspace splice opens a
 //     fresh backend connection and so does not preserve the external client's source
 //     IP (the precondition Local relies on), so an eTP:Local Service gets Cluster
-//     behavior on its NodePort. The Watcher surfaces this divergence at the datapath:
-//     onService reads eTP SOLELY to emit a once-per-episode throttled Warn (B56) when
-//     a Service requests eTP:Local on a served NodePort — it never changes routing.
-//     That datapath Warn is COMPLEMENTARY to k3sm's admission-side VAP
-//     pkg/policy.EnsureExternalTrafficPolicyLocalWarn: it gives node-local
-//     observability at the exact point traffic diverges and is defense-in-depth for
-//     this independent module, which must not assume the control plane installed the
-//     VAP. It is not the sole surfacing.
+//     behavior on its NodePort. The Watcher surfaces this at the datapath: onService
+//     reads eTP only to emit a once-per-episode throttled Warn (B56) when a Service
+//     requests eTP:Local on a served NodePort — it never changes routing. That
+//     datapath Warn complements k3sm's admission-side VAP
+//     pkg/policy.EnsureExternalTrafficPolicyLocalWarn, giving node-local
+//     observability at the exact point traffic diverges as defense-in-depth for this
+//     independent module.
 //
-// SECURITY CAVEAT: internalTrafficPolicy:Local is NOT a mesh-containment boundary for a
-// Service that ALSO exposes a NodePort. The *:NodePort listener binds the wildcard
+// Security caveat: internalTrafficPolicy:Local is not a mesh-containment boundary for
+// a Service that also exposes a NodePort. The *:NodePort listener binds the wildcard
 // (reachable over the wireguard mesh and lo0), and PickStickyCluster routes to remote
 // backends, so any pod that can dial nodeIP:NodePort reaches remote backends the
 // iTP:Local ClusterIP path would drop. iTP:Local bounds only the ClusterIP (east-west)
 // selector, never the NodePort surface — treat it as a routing policy, not an isolation
 // control.
 //
-// A note on the iTP:Local fail-open (ClusterIP path): the degrade-to-Cluster fires on
-// !podCIDR.IsValid() ONLY (an unset/malformed podCIDR) — a VALID but wrong prefix
-// still DROPS, because podCIDR drives lo0 alias allocation, so a valid prefix that
+// A note on the iTP:Local fail-open (ClusterIP path): the degrade-to-Cluster fires
+// only on !podCIDR.IsValid() (an unset/malformed podCIDR) — a valid but wrong prefix
+// still drops, because podCIDR drives lo0 alias allocation, so a valid prefix that
 // misclassifies every backend as remote is precluded by construction.
 //
 // NodePort is TCP only: the ClusterIP UDP datagram relay (below) is built, but the
@@ -124,15 +119,15 @@ limitations under the License.
 // node-local for free because the mesh routes only peer pod /24s to the utun, so
 // 10.43.0.10 / 10.43.0.1 are never steered over it.
 //
-// Locality becomes load-bearing for exactly ONE decision: internalTrafficPolicy:
-// Local backend selection under a VALID node podCIDR (routing.go Pick). There the
+// Locality is load-bearing for exactly one decision: internalTrafficPolicy:
+// Local backend selection under a valid node podCIDR (routing.go Pick). There the
 // table filters to the LocalityLocal subset, dropping (ErrNoLocalBackends → the
 // listener closes the accepted conn) when no backend is node-local — the faithful
 // upstream no-fallback. Under a zero/invalid podCIDR (locality is unknowable) Pick
 // fails open to all backends with a loud Warn rather than blackhole the Service.
-// Two divergences from upstream kube-proxy are deliberate and documented:
+// Two divergences from upstream kube-proxy are documented:
 //
-//   - k3sm derives locality from podCIDR.Contains(endpointIP), NOT upstream's
+//   - k3sm derives locality from podCIDR.Contains(endpointIP), not upstream's
 //     endpoint.nodeName == thisNode. This is faithful for k3sm's pod-backed
 //     Services — every pod is an lo0 alias IP inside the node podCIDR by
 //     construction, so "IP in podCIDR" is equivalent to "on this node" — but it
@@ -167,7 +162,7 @@ limitations under the License.
 // A ClusterIP UDP Service is served by a connectionless datagram relay
 // (udprelay.go); there is no Accept/CloseWrite. One dispatcher goroutine reads
 // datagrams on the VIP PacketConn (bound on the specific lo0 alias, mirroring the
-// TCP specific-bind) and, per client 5-tuple: (a) selects a backend ONCE via the
+// TCP specific-bind) and, per client 5-tuple: (a) selects a backend once via the
 // routing table (Pick — the relay never re-picks per datagram), (b) opens a
 // connected per-flow upstream UDP socket, (c) forwards the datagram, and (d) spawns
 // a reader that writes each backend response back to the client with the VIP as the
@@ -184,35 +179,34 @@ limitations under the License.
 // Further admission gates harden the relay against one same-node pod monopolizing a
 // VIP or exhausting the co-resident control plane's fds. A per-source sub-cap
 // (maxUDPFlowsPerSource = maxUDPFlows/4) bounds any single source IP's concurrent
-// flows PER VIP, so a pod cycling ephemeral source ports cannot fill a VIP's whole
-// table and starve every other pod's access to that Service. A relay-GLOBAL budget (a
-// mutex-guarded udpBudget shared by every per-VIP relay via New) then enforces TWO
-// more caps under one lock: it bounds concurrent upstream sockets across ALL relays
-// (so the datagram relays cannot jointly exhaust the process fd table) AND bounds any
-// one source IP's flows across ALL VIPs (maxPerSource = maxTotal/4, B52's
-// per-source-GLOBAL fair share), so a pod fanning flows across N distinct VIPs cannot
-// consume the whole global budget and starve every other pod on every VIP. All
-// counters are an EXACT function of flows membership — incremented only at the
-// authoritative second-lock insert, decremented only at a flow delete (idle sweep or
-// Close) — so an admission that drops a flow never mis-accounts and the caps can never
-// silently stop firing; a doomed dial is still rejected with the socket closed so no
-// fd leaks on rejection. reserve is all-or-nothing (it moves the global-total and
-// per-source counts together, never split), because a partial reserve with a rollback
-// would be the counter-leak shape that permanently locks a source out on every VIP.
+// flows per VIP, so a pod cycling ephemeral source ports cannot fill a VIP's whole
+// table and starve every other pod's access to that Service. A relay-global budget (a
+// mutex-guarded udpBudget shared by every per-VIP relay via New) then enforces two
+// more caps under one lock: it bounds concurrent upstream sockets across all relays
+// (so the datagram relays cannot jointly exhaust the process fd table) and bounds any
+// one source IP's flows across all VIPs (maxPerSource = maxTotal/4, B52's
+// per-source-global fair share), so a pod fanning flows across N distinct VIPs cannot
+// consume the whole global budget and starve every other pod on every VIP. Every
+// counter is incremented only at the authoritative second-lock insert and decremented
+// only at a flow delete (idle sweep or Close), so an admission that drops a flow never
+// mis-accounts and a doomed dial is still rejected with the socket closed (no fd leak
+// on rejection). reserve is all-or-nothing (it moves the global-total and per-source
+// counts together, never split), because a partial reserve with a rollback would be
+// the counter-leak shape that permanently locks a source out on every VIP.
 //
-// The budget is an OPEN-LOOP static reservation of the relay's fd slice, NOT a live
-// whole-daemon governor: TCP proxy handles and the kine/apiserver clients spend from
-// the same process fd table UNCOUNTED. Its default is half the enforced soft
+// The budget is a static reservation of the relay's fd slice, not a live whole-daemon
+// governor: TCP proxy handles and the kine/apiserver clients spend from the same
+// process fd table, uncounted here. Its default is half the enforced soft
 // RLIMIT_NOFILE, floored at maxUDPFlows so a low launchd soft limit never regresses a
 // single VIP below its B23 per-VIP capacity; the k3sm assembler — which alone sees
-// the whole process fd table — sizes it deliberately via WithUDPFlowBudget, because a
-// leaf subsystem must not unilaterally partition a process-global resource. The
-// per-source caps are DoS-resistance / FAIRNESS within the same-node shared trust
-// domain, NOT tenant isolation: same-node pods share one trust domain (no per-pod
+// the whole process fd table — sizes it via WithUDPFlowBudget, because a leaf
+// subsystem must not unilaterally partition a process-global resource. The
+// per-source caps are DoS-resistance / fairness within the same-node shared trust
+// domain, not tenant isolation: same-node pods share one trust domain (no per-pod
 // uid) and a source-spoofing pod evades the per-source bucket — untrusted workloads
 // belong in a vm RuntimeClass.
 //
-// Like the TCP splice the relay RE-ORIGINATES traffic (Cluster policy): it does NOT
+// Like the TCP splice the relay re-originates traffic (Cluster policy): it does not
 // preserve the client pod source IP. On a multi-node mesh each upstream socket is
 // source-bound to the node's mesh-egress /32 (WithMeshEgressSource) — the UDP path
 // cannot reuse p.dialer because a *net.TCPAddr LocalAddr fails to dial "udp", so it
@@ -220,7 +214,7 @@ limitations under the License.
 // B23 has no conntrack-style flush, so a flow stays pinned to its picked backend
 // until idle GC reaps it, even if that endpoint is removed mid-flow.
 //
-// DEFERRED in B23: UDP NodePort (a wildcard *:NodePort UDP reply re-selects its
+// Deferred in B23: UDP NodePort (a wildcard *:NodePort UDP reply re-selects its
 // source by route lookup on a multi-homed node → wrong source IP → the client drops
 // it; honoring it needs IP_RECVDSTADDR/IP_SENDSRCADDR) and privileged (<1024) UDP
 // via the netd helper (the binder seam returns net.Listener/FileListener — stream
@@ -228,7 +222,7 @@ limitations under the License.
 // surfaces an honest net.ListenPacket EACCES rather than a helper-bound socket).
 // The cluster-DNS VIP (10.43.0.10:53) never reaches the relay: the address-keyed
 // infra-VIP exemption (WithInfraVIPExemptions) steps the proxy aside before any
-// worker is created, so a legitimate USER UDP Service on a non-exempt VIP is relayed
+// worker is created, so a legitimate user UDP Service on a non-exempt VIP is relayed
 // while kube-dns stays node-local on its own resolver.
 //
 // # ClientIP session affinity (TCP) — B22
@@ -240,56 +234,56 @@ limitations under the License.
 // routing table; netv1 carries no SessionAffinity field (only the proxy consumes it).
 // The TCP accept path calls RoutingTable.PickSticky (proxy.handle) instead of Pick.
 //
-// PickSticky is a cache OVER Pick, not a replacement for its policy: it shares the
+// PickSticky is a cache over Pick, not a replacement for its policy: it shares the
 // same activePool (the Ready + internalTrafficPolicy:Local-filtered pool with the B21
 // fail-open/ErrNoLocalBackends semantics), so a sticky pick and a round-robin pick can
 // never disagree on which backends are eligible. A binding is reused only when the
-// bound backend is STILL in the live active pool (re-validated in O(1) against a
-// precomputed membership set) AND within the idle TTL; a backend that went unready or
+// bound backend is still in the live active pool (re-validated in O(1) against a
+// precomputed membership set) and within the idle TTL; a backend that went unready or
 // (under iTP:Local) left the node-local subset is re-picked, never reused, so affinity
 // never dials a dead backend nor spills node-local traffic across the mesh, and a
-// port with no node-local backend left DROPS (ErrNoLocalBackends). The binding map is
-// TABLE-level (guarded by the routing lock, folded in so there is no second lock to
-// order), so it SURVIVES endpoint churn — SetEndpointsPolicy replaces the portState on
+// port with no node-local backend left drops (ErrNoLocalBackends). The binding map is
+// table-level (guarded by the routing lock, folded in so there is no second lock to
+// order), so it survives endpoint churn — SetEndpointsPolicy replaces the portState on
 // every reconcile, which would wipe a per-portState map. Bindings are idle-swept by a
 // single Proxy-owned ticker (SweepExpired is a pure, clock-injected table method — the
 // table stays goroutine-free) and bounded per port, and are purged when affinity is
 // toggled off or the port is deleted so a re-enable never resurrects stale stickiness.
 //
-// Two limitations are deliberate and documented:
+// Two limitations are documented:
 //
-//   - Cross-node fidelity: affinity keys on the source IP THIS proxy sees. Same-node
+//   - Cross-node fidelity: affinity keys on the source IP this proxy sees. Same-node
 //     ClusterIP traffic arrives on loopback carrying the real pod lo0 IP (faithful),
-//     and the NodePort path applies the SAME ClientIP affinity over the Cluster pool
+//     and the NodePort path applies the same ClientIP affinity over the Cluster pool
 //     (B55). But cross-node mesh-forwarded traffic is re-originated from the peer
 //     node's mesh-egress /32 (the userspace splice does not preserve the client src IP
-//     — DESIGN §5b), so all cross-node clients behind one peer collapse to a SINGLE
-//     affinity binding = COARSE stickiness (still re-validated to a Ready backend on
-//     every hit, never a wrong route). This is a userspace-L4 limitation, not a bug.
-//   - UDP affinity is DEFERRED (TCP-only). The ClusterIP UDP relay (B23) reuses a
+//     — DESIGN §5b), so all cross-node clients behind one peer collapse to a single,
+//     coarse affinity binding (still re-validated to a Ready backend on every hit,
+//     never a wrong route). This is a userspace-L4 limitation, not a bug.
+//   - UDP affinity is deferred (TCP-only). The ClusterIP UDP relay (B23) reuses a
 //     backend per client 5-tuple for the life of a flow, but that is flow-affinity,
-//     NOT per-client-IP sessionAffinity: it keys on the full 5-tuple (not the IP
+//     not per-client-IP sessionAffinity: it keys on the full 5-tuple (not the IP
 //     alone) and does not span reconnects. udprelay.go still calls Pick, unchanged.
 //
 // # Published identity vs live transport — the vm-pod two-address seam (M11.3)
 //
-// A backend's address in the routing table is its PUBLISHED identity: what the
+// A backend's address in the routing table is its published identity: what the
 // EndpointSlice carries, what cluster DNS answers, what status.podIP reports, and
 // what a NetworkPolicy names. For a host-process pod that address is also where the
 // bytes go — it is a /32 alias the host owns on lo0. For a vm-RuntimeClass pod it is
-// NOT: the guest owns its address inside its own netstack behind a NAT attachment,
+// not: the guest owns its address inside its own netstack behind a NAT attachment,
 // the host never aliases the pod /32, and the address that actually carries bytes is
 // the guest's macOS-assigned vmnet DHCP lease, which is never published.
 //
 // RoutingTable.SetTransportOverrides is the one seam where those two meet — a
-// published-to-live address map, replaced wholesale, consulted at the DIAL SITES
-// ONLY (proxy.handle for TCP, udpRelay.upstreamFor for UDP; both protocols, so a vm
+// published-to-live address map, replaced wholesale, consulted only at the dial
+// sites (proxy.handle for TCP, udpRelay.upstreamFor for UDP; both protocols, so a vm
 // backend cannot be reachable over one and blackholed over the other). Pick, the
 // NetworkPolicy verdict, the deny log and the ClientIP affinity binding all keep
-// using the PUBLISHED address, because that is the stable identity a lease change
+// using the published address, because that is the stable identity a lease change
 // must not disturb. A backend with no override is dialed exactly as before, which is
 // what leaves every host-process pod untouched; for a vm pod an absent override
-// means UNDIALABLE, and the dial fails as any unreachable backend's does — the table
+// means undialable, and the dial fails as any unreachable backend's does — the table
 // never substitutes an address to paper over a missing lease. The feeder is the k3sm
 // assembler (from the guest agent's Health lease report) and it does not exist yet,
 // so no override is installed today.
@@ -297,63 +291,62 @@ limitations under the License.
 // # NetworkPolicy L4 subset — VIP-mediated ingress hint, NOT isolation (M10.4)
 //
 // PolicyTable (policy.go) + PolicyWatcher (policywatch.go) add an
-// upstream-faithful RESTRICTION of NetworkPolicy ingress enforcement at the
-// userspace proxy's accept paths. The verdict is per (source addr, PICKED backend
-// pod IP, backend port), evaluated AFTER the routing table picks the backend —
+// upstream-faithful restriction of NetworkPolicy ingress enforcement at the
+// userspace proxy's accept paths. The verdict is per (source addr, picked backend
+// pod IP, backend port), evaluated after the routing table picks the backend —
 // TCP in handle post-Pick, UDP at relay flow admission (the once-per-flow pick in
 // upstreamFor; a denied flow is never created) — never per VIP/Service, because
 // one Service can front policy-heterogeneous pods. Semantics: a backend no policy
 // selects is allowed (default-allow-unless-selected); a selected backend admits a
-// source iff ANY policy's resolved ingress rule matches source AND port (union of
+// source iff any policy's resolved ingress rule matches source and port (union of
 // allows); otherwise deny. The PolicyWatcher resolves selectors (NetworkPolicy +
-// Pod + NAMESPACE informers — namespaceSelector matches namespace labels) into
-// concrete /32 source sets and port sets via a debounced FULL recompute
+// Pod + Namespace informers — namespaceSelector matches namespace labels) into
+// concrete /32 source sets and port sets via a debounced full recompute
 // (policyRecomputeDebounce; O(policies × pods) is microseconds at k3sm scale and
 // wholesale replacement keeps the table trivially consistent), installed
 // atomically via PolicyTable.Update. Convergence after an API change is bounded
-// by informer latency + the debounce window; the table is EMPTY (allow
+// by informer latency plus the debounce window; the table is empty (allow
 // everything) until WaitForCacheSync — fail-open, never a partial-cache deny.
 //
-// THE HONEST CEILING (the per-pod-/32 causal link): once each pod has its own
-// /32, direct pod-IP→pod-IP traffic bypasses the userspace proxy ENTIRELY — the
-// proxy is no longer an L4 chokepoint — so this subset
-// enforces ONLY on traffic that transits a Service VIP. ALL headless/StatefulSet
-// traffic (which resolves to pod IPs, never a VIP) bypasses it, as does any
-// direct pod-IP dial. The PolicyWatcher Warns once per policy about exactly this.
-// Policies aimed at infra VIPs the proxy yields via WithInfraVIPExemptions (the
-// kube-dns VIP, the rewritten kubernetes endpoint) are likewise unenforceable —
-// exempt VIPs never transit the hooked accept paths. Real tenant isolation
-// (shared lo0 trust domain, single _k3sm uid) routes to the vm RuntimeClass (M5),
-// never to this hint.
+// The honest ceiling (the per-pod-/32 causal link): once each pod has its own
+// /32, direct pod-IP→pod-IP traffic bypasses the userspace proxy entirely — the
+// proxy is no longer an L4 chokepoint — so this subset enforces only on traffic
+// that transits a Service VIP. All headless/StatefulSet traffic (which resolves
+// to pod IPs, never a VIP) bypasses it, as does any direct pod-IP dial. The
+// PolicyWatcher Warns once per policy about exactly this. Policies aimed at infra
+// VIPs the proxy yields via WithInfraVIPExemptions (the kube-dns VIP, the
+// rewritten kubernetes endpoint) are likewise unenforceable — exempt VIPs never
+// transit the hooked accept paths. Real tenant isolation (shared lo0 trust
+// domain, single _k3sm uid) routes to the vm RuntimeClass (M5), never to this
+// hint.
 //
-// Widen-only discipline: an inexpressible clause may only WIDEN allows, never
-// manufacture a deny upstream would not have. DEFERRED (widened or ignored
-// accordingly): ipBlock peers (widen the rule to any-source), ALL egress rules
+// Widen-only discipline: an inexpressible clause may only widen allows, never
+// manufacture a deny upstream would not have. Deferred (widened or ignored
+// accordingly): ipBlock peers (widen the rule to any-source), all egress rules
 // (policyTypes: Egress is ignored entirely; an egress-only policy selects nothing
 // for ingress), named ports / endPort ranges / protocol-only port entries (widen
 // the rule to any-port), and the rule's protocol field (ignored — a TCP-only
 // allow also admits UDP on that port).
 //
 // Availability guardrails (fail-open by design): loopback sources and the
-// constructor-seeded always-allow /32s (node InternalIP, this node's + every
+// constructor-seeded always-allow /32s (node InternalIP, this node's and every
 // peer's mesh-egress /32) always pass, so node-origin dialers — the in-process
 // Ingress datapath, apiserver webhooks, hostNetwork clients — and re-originated
 // cross-node mesh traffic are never locked out by a pod policy (cross-node
 // sources collapse to the peer's mesh-egress /32, the same L4 fidelity limit
 // session affinity documents, so per-pod cross-node attribution is impossible
-// here). An UNKNOWN source (not a resolved pod IP, not always-allowed) is ALLOWED
+// here). An unknown source (not a resolved pod IP, not always-allowed) is allowed
 // with a throttled Warn naming it; a deny is a throttled Info. A nil PolicyTable
 // (the default — the k3sm assembler opts in via WithPolicyTable) allows
 // everything: the feature is strictly additive.
 //
-// ONE scoped exception to that fail-open (M11.3-d3a): on a node built with
-// NewPolicyTableVMNet, an unknown source INSIDE the configured vmnet segment whose
-// destination a policy selects is DENIED, with its own throttled Warn. That source
+// One scoped exception to that fail-open (M11.3-d3a): on a node built with
+// NewPolicyTableVMNet, an unknown source inside the configured vmnet segment whose
+// destination a policy selects is denied, with its own throttled Warn. That source
 // class is the vm pods this node hosts, whose live vmnet lease nothing maps back to
 // a pod yet — under the fail-open they would walk past a policy that selects the
-// destination, which is a bypass for exactly the pod class the vm RuntimeClass
-// exists to contain, introduced by making vm pods work rather than inherited. The
-// scoping is what keeps it a vm-only decision: every other unknown source, and
+// destination, a bypass for exactly the pod class the vm RuntimeClass exists to
+// contain. The scoping keeps it a vm-only decision: every other unknown source, and
 // every node with no vmnet prefix, keeps the fail-open verbatim. Until the
 // lease-to-pod registry lands, a policy `from` rule naming a vm pod's published /32
 // cannot admit that pod's live traffic — this deny is what that gap looks like.
