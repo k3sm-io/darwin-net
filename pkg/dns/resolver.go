@@ -231,7 +231,7 @@ func (r *Resolver) lookupCandidate(ctx context.Context, fqdn string) ([]netip.Ad
 	var lastErr error
 	for range queryAttempts {
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrTempFail, err)
+			return nil, fmt.Errorf("%w: %w", ErrTempFail, err)
 		}
 		res, err := r.queryA(ctx, fqdn)
 		if err != nil {

@@ -509,7 +509,7 @@ func (s *Server) authorizePort(ctx context.Context, port int, nodeAddr string) e
 			return fmt.Errorf("%w: privileged port %d denied (no port authorizer configured)", ErrPolicy, port)
 		}
 		if err := s.cfg.PortAuthorizer.Authorize(ctx, port, nodeAddr); err != nil {
-			return fmt.Errorf("%w: privileged port %d not authorized: %v", ErrPolicy, port, err)
+			return fmt.Errorf("%w: privileged port %d not authorized: %w", ErrPolicy, port, err)
 		}
 		return nil
 	}
