@@ -186,10 +186,14 @@ func (m *Mesh) Start(ctx context.Context) error {
 }
 
 // Reconcile programs the full mesh state from the current MeshPeer snapshot. It is
-// the continuous reconcile entry point the watcher calls on every MeshPeer change,
-// so an endpoint move (DHCP/roam/wake) or a key rotation reconverges without a
-// restart rather than being read once at startup. Per-peer problems are logged
-// (Plan.Skipped) but do not fail the reconcile. It is idempotent.
+// the continuous reconcile entry point the watcher calls on every MeshPeer change
+// and on its periodic resync, so a CR endpoint move or a key rotation reconverges
+// without a restart rather than being read once at startup. The Plan carries the
+// CR endpoint for every peer; whether that endpoint is actually (re)written is the
+// applier's endpoint-roaming decision (Plan.UAPIUpdate), so a periodic resync
+// re-asserts the mesh without stomping an endpoint wireguard has roamed. Per-peer
+// problems are logged (Plan.Skipped) but do not fail the reconcile. It is
+// idempotent.
 func (m *Mesh) Reconcile(ctx context.Context, peers []netv1.MeshPeerSpec) error {
 	plan, err := BuildPlan(m.self, peers)
 	if err != nil {
