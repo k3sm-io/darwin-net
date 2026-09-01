@@ -40,18 +40,12 @@ import (
 // (loopback) or one mesh hop away.
 const dialTimeout = 5 * time.Second
 
-// udpFlowIdleTimeout is the idle-flow GC timeout for the UDP datagram relay: a
-// flow (a client 5-tuple bound to a connected upstream socket and the backend
-// picked once for it) is reaped after this much two-way silence, so a cached
-// socket and backend selection do not pin to a dead client. It mirrors Linux
-// conntrack-UDP (30s) and kube-proxy's userspace udpIdleTimeout. It is
-// deliberately distinct in MAGNITUDE from a future sessionAffinity: ClientIP
-// timeout: a session-affinity TTL outlives many idle gaps, so the two must not be
-// collapsed into one constant. B22 reuses the named-const + idle-sweeper PATTERN
-// (and may share this GC cadence), NOT this flow map itself: ClientIP affinity keys
-// on the client IP alone — not the 5-tuple this relay keys on — and spans TCP
-// Services too (which never enter this UDP relay), so it needs its own IP-keyed
-// affinity table at the Pick layer.
+// udpFlowIdleTimeout reaps a UDP relay flow (a client 5-tuple bound to a
+// connected upstream socket and its picked backend) after this much two-way
+// silence, mirroring Linux conntrack-UDP (30s) and kube-proxy's userspace
+// udpIdleTimeout. Kept distinct from a future ClientIP sessionAffinity TTL,
+// which outlives many idle gaps: B22 needs its own IP-keyed affinity table,
+// not this 5-tuple flow map.
 const udpFlowIdleTimeout = 30 * time.Second
 
 // Proxy is the userspace Service proxy: it owns one listening socket per bound
@@ -72,20 +66,14 @@ const udpFlowIdleTimeout = 30 * time.Second
 //     opens, updates, and closes that port's listener in order.
 //   - workers (the map of per-key workers) is guarded by mu. worker() adds an
 //     entry under mu when it spawns a worker; removeWorker deletes it under mu
-//     when a worker exits on its own delete event (the ONLY other mutator besides
+//     when a worker exits on its own delete event (the only other mutator besides
 //     shutdown(), which clears the whole map). Reconcile callers otherwise send on
 //     a worker's channel without holding mu beyond the lookup.
 //   - A worker that receives a delete event (nil port) removes itself from the
-//     map AND closes w.stop before it returns (removeWorker does both under one
-//     mu critical section). This closes the race where a caller already holds a
-//     reference to the dying worker (obtained via worker() a moment before the
-//     removal): its blocked send on w.ch is unblocked by the now-closed w.stop
-//     instead of hanging forever on a channel nobody reads anymore, and any
-//     caller that looks the key up AFTER the removal spawns a fresh worker
-//     instead of reaching the dead one. Without this, a delete-then-recreate of
-//     the same key leaves a stale map entry pointing at an exited worker, so a
-//     recreate's events queue into its unread 16-buffered channel and the 17th
-//     blocks the caller (the informer handler) permanently.
+//     map and closes w.stop before it returns, under one removeWorker critical
+//     section, so a caller blocked mid-send to a dying worker unblocks instead
+//     of hanging, and a caller arriving after removal spawns a fresh worker
+//     instead of reaching a dead one (see removeWorker for the race proof).
 //   - The RoutingTable has its own internal lock and is shared read-only by the
 //     accept paths and written by the workers.
 type Proxy struct {
@@ -95,12 +83,11 @@ type Proxy struct {
 	log    *slog.Logger
 	dialer *net.Dialer
 	// meshEgress is the node's reserved mesh-egress /32, retained from
-	// WithMeshEgressSource for the UDP relay's per-flow upstream source-bind. The TCP
-	// path source-binds via p.dialer.LocalAddr, but the UDP path cannot reuse it: a
-	// net.Dialer whose LocalAddr is a *net.TCPAddr fails to dial "udp" (mismatched
-	// local address type), so the datagram path builds a *net.UDPAddr from this Addr
-	// instead. The zero Addr (single node, no utun) means the kernel default source.
-	// Set once at construction, read-only thereafter.
+	// WithMeshEgressSource for the UDP relay's per-flow upstream source-bind. The
+	// TCP path source-binds via p.dialer.LocalAddr, but a net.Dialer whose
+	// LocalAddr is a *net.TCPAddr cannot dial "udp", so the datagram path builds
+	// a *net.UDPAddr from this Addr instead. The zero Addr (single node, no utun)
+	// means the kernel default source. Set once at construction, read-only after.
 	meshEgress netip.Addr
 	// exemptVIPs are infra VIPs owned by a node-local binder (per-node resolver on
 	// the kube-dns VIP) rather than by the proxy: the proxy never aliases, binds,
@@ -112,15 +99,15 @@ type Proxy struct {
 	// allows everything — PolicyTable.Allow is nil-receiver-safe, so the hooks are
 	// unconditional. Set once by WithPolicyTable and read-only thereafter.
 	policy *PolicyTable
-	// udpBudget is the relay-GLOBAL admission budget shared by every per-VIP UDP relay:
-	// it caps concurrent upstream sockets across ALL relays (so the datagram relays
-	// cannot jointly exhaust the process fd table the co-resident control plane spends
-	// from) AND caps any one source IP's flows across ALL VIPs (the per-source-GLOBAL
-	// fair share, B52). Constructed once in New (RLIMIT_NOFILE-derived total, floored at
-	// maxUDPFlows) or overridden by WithUDPFlowBudget; its maxTotal/maxPerSource are
-	// read-only after construction, and it is a mutex-guarded LEAF that mutates its own
-	// total/bySource under its OWN lock and never calls back into a relay, so it needs
-	// no proxy lock.
+	// udpBudget is the relay-global admission budget shared by every per-VIP UDP
+	// relay: it caps concurrent upstream sockets across all relays (so they cannot
+	// jointly exhaust the process fd table the co-resident control plane spends
+	// from) and caps any one source IP's flows across all VIPs (the
+	// per-source-global fair share, B52). Constructed once in New (RLIMIT_NOFILE
+	// -derived total, floored at maxUDPFlows) or overridden by WithUDPFlowBudget;
+	// read-only after construction, and a mutex-guarded leaf that mutates its own
+	// state under its own lock and never calls back into a relay — no proxy lock
+	// needed.
 	udpBudget *udpBudget
 
 	mu      sync.Mutex
@@ -137,13 +124,13 @@ func WithLogger(l *slog.Logger) Option {
 	return func(p *Proxy) { p.log = l }
 }
 
-// WithUDPFlowBudget overrides the relay-GLOBAL cap on concurrent UDP upstream
+// WithUDPFlowBudget overrides the relay-global cap on concurrent UDP upstream
 // sockets shared by every per-VIP UDP relay. The default is derived from
-// RLIMIT_NOFILE (see New); the k3sm assembler — which alone sees the whole process
-// fd table (the TCP proxy, kine, and the apiserver client all spend from it) — passes
-// this to partition the relay subsystem's fd slice deliberately, since a leaf
-// subsystem must not unilaterally claim a process-global resource. A non-positive
-// max is ignored, so the RLIMIT-derived default stands.
+// RLIMIT_NOFILE (see New); the k3sm assembler — which alone sees the whole
+// process fd table (the TCP proxy, kine, and the apiserver client all spend
+// from it) — passes this to partition the relay subsystem's fd slice, since a
+// leaf subsystem must not unilaterally claim a process-global resource. A
+// non-positive max is ignored, so the RLIMIT-derived default stands.
 func WithUDPFlowBudget(max int64) Option {
 	return func(p *Proxy) {
 		if max > 0 {
@@ -166,10 +153,8 @@ func WithUDPFlowBudget(max int64) Option {
 // source selection (the single-node path, where no utun exists to bind to).
 func WithMeshEgressSource(src netip.Addr) Option {
 	return func(p *Proxy) {
-		// Retain the address for the UDP relay's per-flow upstream source-bind (it
-		// builds a *net.UDPAddr from this, since a *net.TCPAddr LocalAddr cannot dial
-		// "udp"). The zero Addr stays invalid, so the relay keeps the kernel default
-		// source on a single node — matching the TCP dialer below.
+		// Retained for the UDP relay's per-flow source bind (see the meshEgress
+		// field doc); the zero Addr stays invalid, matching the TCP dialer below.
 		p.meshEgress = src
 		if src.IsValid() {
 			p.dialer.LocalAddr = &net.TCPAddr{IP: src.AsSlice()}
@@ -278,16 +263,16 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 }
 
 // defaultUDPFlowBudget is the relay-global UDP upstream-socket budget when the
-// assembler sets none (WithUDPFlowBudget). It is half the process's ENFORCED soft fd
+// assembler sets none (WithUDPFlowBudget). It is half the process's enforced soft fd
 // limit (RLIMIT_NOFILE.Cur — not Max, which may be unlimited), leaving the other half
 // for the TCP proxy, the listeners, and the co-resident control plane, but floored at
 // maxUDPFlows so a low launchd soft limit never regresses a single VIP's capacity
 // below the B23 per-VIP bound. A Getrlimit error falls back to the floor.
 //
-// NOTE (deployment): the reservation only leaves REAL headroom for the co-resident
-// control plane when the daemon's soft RLIMIT_NOFILE is provisioned above 2*maxUDPFlows
-// (the launchd plist NumberOfFiles) OR the k3sm assembler passes WithUDPFlowBudget.
-// Below that the floor dominates and the budget bounds only a single VIP — tracked in B52.
+// The reservation only leaves real headroom for the co-resident control plane when
+// the daemon's soft RLIMIT_NOFILE is provisioned above 2*maxUDPFlows (the launchd
+// plist NumberOfFiles) or the k3sm assembler passes WithUDPFlowBudget; below that
+// the floor dominates and the budget bounds only a single VIP (tracked in B52).
 func defaultUDPFlowBudget() int64 {
 	var rl unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rl); err != nil {
@@ -321,16 +306,13 @@ type portEvent struct {
 }
 
 // openRetryInitial and openRetryMax bound the exponential backoff runWorker uses to
-// re-attempt a listener open that FAILED. A failure is routinely transient: the
-// ClusterIP path first ensures the lo0 alias, which shells out to ifconfig (or
-// crosses the netd socket) under a bounded context, and a loaded host can blow that
-// deadline; a bind can also lose a port race. Retrying here is load-bearing rather
-// than defensive, because nothing else re-attempts the open — the only other trigger
-// is the arrival of another portEvent, and one is NOT guaranteed: the Service and
-// EndpointSlice informers are independent, Watcher.onSlice drops a slice whose
-// Service is not yet in the Service store, and both factories run with resync 0. So
-// without this the FIRST transient failure leaves the Service's ClusterIP and
-// NodePort sockets unbound for the process's lifetime, with one Error log to say so.
+// re-attempt a failed listener open. A failure is routinely transient (ifconfig/netd
+// under a bounded context on a loaded host, or a lost bind race), and nothing else
+// re-attempts it: the Service and EndpointSlice informers are independent,
+// Watcher.onSlice drops a slice whose Service isn't yet in the Service store, and
+// both factories run with resync 0 — so a next portEvent is not guaranteed. Without
+// this retry, the first transient failure leaves the Service's sockets unbound for
+// the process's lifetime.
 const (
 	openRetryInitial = 250 * time.Millisecond
 	openRetryMax     = 30 * time.Second
@@ -363,8 +345,8 @@ func (p *Proxy) Run(ctx context.Context) error {
 
 // sweepAffinity is the single owner of the routing table's ClientIP affinity idle
 // GC: every affinitySweepInterval it calls RoutingTable.SweepExpired(now). The table
-// itself is deliberately clock-injected and goroutine-free (SweepExpired is pure), so
-// this proxy-owned ticker is where the TTL's lifetime lives. It returns when ctx is
+// itself is clock-injected and goroutine-free (SweepExpired is pure), so this
+// proxy-owned ticker is where the TTL's lifetime lives. It returns when ctx is
 // cancelled; Run joins it after shutdown so it never outlives the Proxy.
 func (p *Proxy) sweepAffinity(ctx context.Context) {
 	ticker := time.NewTicker(affinitySweepInterval)
@@ -429,11 +411,8 @@ func (p *Proxy) ReconcilePolicy(clusterIP string, port *netv1.ServicePort, polic
 	}
 	key := PortKey{ClusterIP: clusterIP, Port: port.Port, Protocol: defaultProto(port.Protocol)}
 	if p.isExemptVIP(addr) {
-		// An infra VIP a node-local binder owns (per-node resolver on the kube-dns
-		// VIP, the rewritten kubernetes endpoint). Step aside entirely — no worker,
-		// no lo0 alias, no listener, no routing entry — so the proxy never contends
-		// for the socket (EADDRINUSE). The exemption covers every port/protocol on
-		// the VIP, so this fires for both 53/TCP and 53/UDP on the kube-dns VIP.
+		// A node-local binder owns this VIP (see WithInfraVIPExemptions) — step
+		// aside entirely, no worker/alias/listener/routing entry.
 		p.log.Debug("infra VIP exempt from proxy ownership (node-local binder owns it)", "vip", key.String())
 		return nil
 	}
@@ -490,32 +469,25 @@ func (p *Proxy) worker(key PortKey) *portWorker {
 
 // removeWorker deletes w from the workers map — a compare-and-delete against the
 // current entry for w.key, since shutdown() (the other map mutator) may have
-// already cleared the whole map concurrently — and, ONLY if this call is the one
-// that actually removed the entry, closes w.stop.
+// already cleared the whole map concurrently — and, only if this call actually
+// removed the entry, closes w.stop.
 //
-// Both the compare-and-delete and the close-iff-removed decision happen under
-// the same p.mu critical section that guards worker() and shutdown(), which is
-// what makes this race-free two ways over:
+// The compare-and-delete and the close-iff-removed decision share the p.mu
+// critical section that guards worker() and shutdown(), which makes this
+// race-free two ways:
 //
-//   - Against worker(): either a concurrent worker() call observes w still in
-//     the map (and returns w, exactly as if the delete had not yet started) or
-//     it observes w already gone (and spawns a fresh worker for the key). The
-//     closed w.stop then covers the first case — a caller that got w BEFORE
-//     removeWorker's lock ran is blocked in ReconcilePolicy/ReconcileDelete's
-//     `select { case w.ch <- ev: ; case <-w.stop: }`; closing w.stop unblocks
-//     that select instead of leaving it to hang on w's unread, 16-buffered
-//     channel once runWorker has stopped reading it.
-//   - Against shutdown(): shutdown() clears the ENTIRE map under p.mu and then,
-//     outside the lock, closes w.stop for every worker it captured. If
-//     shutdown()'s critical section runs first, w is no longer in the map by
-//     the time removeWorker's compare-and-delete runs, so removeWorker finds no
-//     entry to remove and (critically) does NOT close w.stop a second time —
-//     shutdown()'s own loop is the sole closer. If removeWorker's critical
-//     section runs first, w is already gone from the map before shutdown()
-//     captures its worker list, so shutdown() never attempts to close it either
-//     — removeWorker is the sole closer. Either way exactly one close(w.stop)
-//     happens; skipping the close on a failed compare-and-delete is what
-//     prevents a close-of-closed-channel panic on the shutdown-race interleave.
+//   - Against worker(): a concurrent worker() call either observes w still in
+//     the map (returns w, as if the delete hadn't started) or observes it
+//     already gone (spawns a fresh worker). The closed w.stop covers the first
+//     case — a caller that got w before removeWorker's lock ran is blocked in
+//     ReconcilePolicy/ReconcileDelete's `select { case w.ch <- ev: ; case
+//     <-w.stop: }`; closing w.stop unblocks it instead of leaving it to hang on
+//     w's unread, 16-buffered channel once runWorker has stopped reading it.
+//   - Against shutdown(): shutdown() clears the whole map under p.mu, then
+//     closes w.stop for every worker it captured, outside the lock. Whichever
+//     critical section runs first empties the map for the other, so exactly
+//     one of the two closes w.stop — skipping the close on a failed
+//     compare-and-delete is what prevents a double-close panic on the race.
 //
 // Called exactly once, from runWorker's own delete-event branch, immediately
 // before it returns.
@@ -534,7 +506,7 @@ func (p *Proxy) removeWorker(w *portWorker) {
 // runWorker is the per-VIP serialized reconcile loop. It is the only goroutine
 // permitted to open or close key's listeners.
 //
-// A failed open is RETRIED here on its own timer (openRetryInitial..openRetryMax),
+// A failed open is retried here on its own timer (openRetryInitial..openRetryMax),
 // not left to the next informer event: an event may never come, and a Service whose
 // sockets are unbound serves nothing. The retry re-uses the last desired port, so it
 // converges on the current desired state; an event arriving mid-backoff supersedes it.
@@ -601,37 +573,16 @@ func (p *Proxy) runWorker(w *portWorker) {
 // ClusterIP stream listener on the specific lo0 alias address (net.Listen on
 // clusterIP:port, never :port, so the bound source identity is the VIP) and, when
 // NodePort is set, a node-wide *:NodePort stream listener. For UDP it opens the
-// ClusterIP datagram relay (net.ListenPacket on the specific clusterIP:port,
-// mirroring the TCP specific-bind) and runs its dispatcher + idle-flow sweeper. It
-// ensures the lo0 alias exists first.
+// ClusterIP datagram relay (see the UDP branch below and udprelay.go); UDP
+// NodePort is deferred (B23). It ensures the lo0 alias exists first.
 //
-// NodePort semantics (TCP): the *:NodePort listener accepts on every node interface
-// and L4-load-balances to ALL Ready backends (the Cluster pool via PickStickyCluster,
-// which also applies ClientIP session affinity over that pool) —
-// externalTrafficPolicy: Cluster. internalTrafficPolicy:Local is IGNORED on the
-// NodePort path: iTP governs the ClusterIP (east-west) path only (KEP-2086), so an
-// iTP:Local Service still serves its NodePort to every backend rather than dropping
-// when no backend is node-local — the *:NodePort listener no longer shares the
-// ClusterIP's iTP:Local filter. externalTrafficPolicy: Local is NOT honored either,
-// because the userspace splice (see splice) opens a fresh backend connection and
-// therefore does NOT preserve the external client's source IP (the backend sees
-// the proxy/mesh-egress source, not the client) — the precondition Local relies on —
-// so an eTP:Local Service gets Cluster behavior on its NodePort (a documented divergence).
-//
-// UDP: the ClusterIP datagram relay IS built (connectionless — a dispatcher reads
-// the VIP socket, picks a backend ONCE per client flow, opens a connected upstream
-// socket, relays both ways, and idle-GCs the flow; see udprelay.go and doc.go).
-// Like the TCP splice it re-originates traffic (Cluster policy: the upstream socket
-// is source-bound to the node's mesh-egress /32 on a multi-node mesh, never the
-// client pod IP), and a flow stays pinned to its picked backend until idle GC reaps
-// it (no conntrack-style flush in B23). UDP NodePort is DEFERRED: a wildcard-bound
-// *:NodePort UDP reply re-selects its source by route lookup on a multi-homed node,
-// so the client would see the reply from the wrong source IP and drop it; honoring
-// it needs IP_RECVDSTADDR/IP_SENDSRCADDR, out of scope for B23. Privileged (<1024)
-// UDP binds directly via net.ListenPacket (the binder seam is stream-only — a
-// net.Listener/FileListener cannot adopt a datagram fd), so a <1024 UDP ClusterIP
-// without root surfaces an honest net.ListenPacket EACCES; a netd FilePacketConn
-// path is deferred, not dead-ended.
+// NodePort semantics (TCP): the *:NodePort listener load-balances to all Ready
+// backends via PickStickyCluster — externalTrafficPolicy: Cluster.
+// internalTrafficPolicy:Local is ignored on this path (KEP-2086: iTP governs the
+// ClusterIP path only). externalTrafficPolicy: Local is also not honored: the
+// userspace splice opens a fresh backend connection, so the backend never sees
+// the client's real source IP — the precondition Local relies on — so an
+// eTP:Local Service gets Cluster behavior on its NodePort (documented divergence).
 func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
@@ -647,16 +598,16 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	l := &listener{key: key, alias: p.alias, aliasIP: ip, log: p.log}
 
 	if key.Protocol == netv1.ProtocolUDP {
-		// ClusterIP UDP: bind the SPECIFIC alias-address datagram socket (mirroring
+		// ClusterIP UDP: bind the specific alias-address datagram socket (mirroring
 		// the TCP specific-bind below) and run the connectionless relay — a dispatcher
-		// reads the VIP socket, picks a backend once per client flow, opens a connected
-		// per-flow upstream socket, and idle-GCs the flow (see udprelay.go). The relay
-		// binds directly via net.ListenPacket, NOT through p.binder: that seam is
-		// stream-only (net.Listener/FileListener), so a privileged (<1024) UDP VIP
-		// without root surfaces an honest EACCES here; the netd datagram path is
-		// deferred. NodePort UDP is deferred too: a wildcard *:NodePort UDP reply
-		// re-selects its source on a multi-homed node (wrong src IP → client drops it),
-		// needing IP_RECVDSTADDR/IP_SENDSRCADDR — out of scope for B23.
+		// reads the VIP socket, picks a backend once per client flow, opens a
+		// connected upstream socket, relays both ways, and idle-GCs the flow (see
+		// udprelay.go); the socket stays pinned to that backend, no conntrack-style
+		// flush. Binds directly via net.ListenPacket, not through p.binder (that seam
+		// is stream-only), so a privileged (<1024) VIP without root gets an honest
+		// EACCES; the netd datagram path is deferred. NodePort UDP is deferred too: a
+		// wildcard reply re-selects its source on a multi-homed node (wrong src IP,
+		// client drops it), needing IP_RECVDSTADDR/IP_SENDSRCADDR (out of scope, B23).
 		clusterAP := netip.AddrPortFrom(ip, uint16(port.Port))
 		pc, err := net.ListenPacket("udp", clusterAP.String())
 		if err != nil {
@@ -724,7 +675,7 @@ const (
 // serve accepts TCP connections on ln and proxies each to a backend chosen by the
 // routing table. external selects the accept-path scope: the ClusterIP listener
 // passes internalListener (iTP:Local + ClientIP affinity honored); the *:NodePort
-// listener passes externalListener (externalTrafficPolicy:Cluster — route to ALL
+// listener passes externalListener (externalTrafficPolicy:Cluster — route to all
 // Ready backends). It returns when ln is closed (Accept errors).
 func (p *Proxy) serve(ln net.Listener, key PortKey, external bool) {
 	for {
@@ -738,9 +689,9 @@ func (p *Proxy) serve(ln net.Listener, key PortKey, external bool) {
 
 // handle proxies one accepted client connection to a Ready backend. external selects
 // the picker: the external (*:NodePort) path uses PickStickyCluster
-// (externalTrafficPolicy:Cluster — ClientIP session affinity over ALL Ready backends,
+// (externalTrafficPolicy:Cluster — ClientIP session affinity over all Ready backends,
 // ignoring iTP:Local); the internal (ClusterIP) path uses PickSticky, honoring
-// iTP:Local and ClientIP session affinity. BOTH paths extract the client IP with its
+// iTP:Local and ClientIP session affinity. Both paths extract the client IP with its
 // ephemeral source port stripped (clientAddr), because affinity keys on the source IP
 // alone; both pickers degrade to plain round-robin over their scope's pool for a
 // non-affinity port, so either path is unconditional.
@@ -757,8 +708,8 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		be, err = p.table.PickSticky(key, src, time.Now())
 	}
 	if err != nil {
-		// Distinct messages so the two drop reasons are greppable, but BOTH stay at
-		// Debug: handle logs per-connection, so Info here would FLOOD a steady-state
+		// Distinct messages so the two drop reasons are greppable, but both stay at
+		// Debug: handle logs per-connection, so Info here would flood a steady-state
 		// iTP:Local-starved Service; the throttled activePool Warn (once per backend
 		// set) is the observable signal. The ErrNoLocalBackends arm is ClusterIP-only —
 		// PickStickyCluster (external) forces the Cluster pool and never returns it.
@@ -769,7 +720,7 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		}
 		return
 	}
-	// NetworkPolicy L4-subset verdict (M10.4), AFTER the pick — per (source,
+	// NetworkPolicy L4-subset verdict (M10.4), after the pick — per (source,
 	// picked-backend pod IP, backend port), never per VIP, because one Service can
 	// front policy-heterogeneous pods. A deny closes the accepted connection
 	// (deferred Close → client sees RST/EOF) before any backend dial; nil p.policy
@@ -778,12 +729,12 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		p.policy.logDenied("tcp", key, src, be.Addr())
 		return
 	}
-	// Resolve the PUBLISHED backend identity to its live transport address (the
+	// Resolve the published backend identity to its live transport address (the
 	// two-address vm-pod model, M11.3-d2). For a host-process pod — and for every
 	// backend on a node hosting no vm pod — this is a map miss that returns the
 	// published address unchanged, so the dial below is byte-identical to what it
-	// was. The policy verdict above deliberately ran on the PUBLISHED address, which
-	// is the identity a NetworkPolicy names; only the packet follows the lease.
+	// was. The policy verdict above ran on the published address, which is the
+	// identity a NetworkPolicy names; only the packet follows the lease.
 	dst := p.table.transportAddr(be.Addr())
 	backendConn, err := p.dialer.Dial("tcp", dst.String())
 	if err != nil {
@@ -795,12 +746,10 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 }
 
 // logger returns p.log, or slog.Default() when it is nil. New copies the (possibly nil)
-// option-supplied logger into p.log AFTER the options run, so WithLogger(nil) would
+// option-supplied logger into p.log after the options run, so WithLogger(nil) would
 // otherwise nil-deref on the per-connection handle drop/dial-fail path — a bare
-// `go p.handle` goroutine with no recover, i.e. a daemon crash on the exact no-backend
-// input this path handles. Mirrors RoutingTable.logger (the table's fail-open Warn), so
-// BOTH nil-log sinks on the no-backend data path are guarded (go-standards: never panic
-// in library code).
+// `go p.handle` goroutine with no recover. Mirrors RoutingTable.logger (never panic
+// in library code, per go-standards).
 func (p *Proxy) logger() *slog.Logger {
 	if p.log == nil {
 		return slog.Default()
@@ -810,16 +759,16 @@ func (p *Proxy) logger() *slog.Logger {
 
 // clientAddr extracts the client's IP — with the ephemeral source port stripped —
 // from a connection's remote address, for ClientIP session affinity: affinity keys
-// on the source IP ALONE, so keying on the full IP:port would silently degrade
-// stickiness to per-connection (no stickiness at all). A remote address that is nil
-// or does not parse yields the zero Addr, which is harmless: that client just shares
-// one affinity bucket (and for a non-affinity port the IP is ignored entirely).
+// on the source IP alone, so keying on the full IP:port would silently degrade
+// stickiness to per-connection. A remote address that is nil or does not parse
+// yields the zero Addr: that client just shares one affinity bucket (and for a
+// non-affinity port the IP is ignored entirely).
 //
-// Cross-node fidelity caveat: this is the source IP THIS proxy sees. Same-node
-// ClusterIP traffic arrives on loopback carrying the real pod lo0 IP (faithful), but
-// cross-node / NodePort traffic is re-originated from the peer node's mesh-egress /32
-// (the splice does not preserve the client src IP — DESIGN §5b), so all cross-node
-// clients behind one peer collapse to a single affinity binding — a userspace-L4
+// Cross-node fidelity caveat: this is the source IP this proxy sees. Same-node
+// ClusterIP traffic arrives on loopback carrying the real pod lo0 IP, but cross-node
+// / NodePort traffic is re-originated from the peer node's mesh-egress /32 (the
+// splice does not preserve the client src IP — DESIGN §5b), so cross-node clients
+// behind one peer collapse to a single affinity binding — a userspace-L4
 // limitation, not a bug.
 func clientAddr(remote net.Addr) netip.Addr {
 	if remote == nil {

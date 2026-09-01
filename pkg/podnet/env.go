@@ -129,7 +129,7 @@ func BindDisciplineEnv(podIP netip.Addr) map[string]string {
 //
 // It is ADDITIVE, never a replacement: BindDisciplineEnv keeps its signature and
 // its exact output, so a caller with no CIDRs to declare (or one that
-// deliberately wants the connect rung off) keeps working unchanged and gets the
+// wants the connect rung off) keeps working unchanged and gets the
 // pre-B218 behaviour — the shim pins nothing.
 //
 // The nil-means-inject-nothing polarity governs the pod IP first: if

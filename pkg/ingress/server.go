@@ -42,7 +42,7 @@ var ErrBind = errors.New("ingress: bind listener")
 const drainTimeout = 5 * time.Second
 
 // Config configures a Server. The HOST decides the port policy (80/443 vs a
-// high-port dev config) — there is deliberately NO fallback logic here: the
+// high-port dev config) — there is no fallback logic here: the
 // configured ports are bound or Run fails with ErrBind.
 type Config struct {
 	// Addr is the node address to bind. It must be a valid address; the

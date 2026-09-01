@@ -88,7 +88,7 @@ func sanitizeSearch(searches []string) []string {
 
 // hasOnlyRFC1123Chars reports whether every rune of s lies in the RFC-1123 subdomain
 // CHARSET [a-zA-Z0-9.-]. It is a flat per-rune charset scan, NOT an RFC-1123 label
-// grammar check: it deliberately ACCEPTS structurally-invalid strings like "-foo",
+// grammar check: it accepts structurally-invalid strings like "-foo",
 // "a..b", a trailing-dot FQDN, or uppercase — validating label length, hyphen
 // position, and non-empty labels is the apiserver's admission job (k3sm's
 // validatePodDNSConfig / IsDNS1123Subdomain). sanitizeSearch uses it only to DROP a
