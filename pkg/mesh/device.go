@@ -38,10 +38,15 @@ type Device interface {
 	// utun-scoped MSS-clamp pf anchor. It is idempotent. Root-only — it returns an
 	// error without privilege.
 	Up(ctx context.Context) error
-	// Apply programs the desired state: it sets the wireguard peers from plan.UAPI
-	// (a full replacement, so endpoint moves and removals converge) and reconciles
-	// the kernel routes to exactly plan.Routes, each routed to the utun. It is
-	// idempotent and safe to call on every MeshPeer change.
+	// Apply programs the desired state: it sets the wireguard peers from the plan
+	// (Plan.UAPIUpdate — a full replacement on the first apply, an incremental
+	// update afterwards, so additions, removals, AllowedIPs and key rotations
+	// converge WITHOUT re-stamping an already-configured peer's endpoint over the
+	// one wireguard roamed onto) and reconciles the kernel routes to exactly
+	// plan.Routes, each routed to the utun. An implementation therefore keeps the
+	// endpoint memory alongside the wireguard state it programs, so a device that
+	// is re-created programs every endpoint again. It is idempotent and safe to
+	// call on every MeshPeer change.
 	Apply(ctx context.Context, plan Plan) error
 	// Down tears the mesh down leak-free: it removes every route it installed,
 	// unloads the pf anchor, removes the mesh-egress alias, and closes the

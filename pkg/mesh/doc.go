@@ -53,6 +53,17 @@ limitations under the License.
 //     utun, blackholing large-payload cross-node TCP; a minimal pf scrub anchor
 //     (pulled forward from M4) clamps max-mss on the utun only, never lo0.
 //
+// # The endpoint-roaming contract
+//
+// A peer's endpoint is owned by wireguard once that peer has been heard from: the
+// handshake roams the endpoint to the real underlay source the peer's packets
+// arrive from, which is authenticated ground truth, while the MeshPeer CR endpoint
+// is only a hint for making first contact. So the reconcile programs the CR
+// endpoint exactly three times — when the peer is new to the device, when its
+// public key changed, and when the operator changed the CR endpoint itself — and
+// otherwise leaves it alone (Plan.UAPIUpdate), because re-stamping a stale CR
+// endpoint over a roamed one blackholes every reply until the peer re-handshakes.
+//
 // # Scope (M3.1)
 //
 // No relay: endpoints must be mutually routable / same-L2 (the MeshPeer carries a
