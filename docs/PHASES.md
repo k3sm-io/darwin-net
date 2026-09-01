@@ -304,7 +304,7 @@ phases:
     subphases:
       - id: M11.3
         title: guest→VIP reachability + vm-pod identity + source attribution + network-trust ceiling
-        status: in-progress  # 2026-08-31 — d1/d3a done, d2/d4 partial (see rows); d3b deferred to v0.1.x (the deferral premise was falsified by the sitting — the operator re-decides the window); the live legs ride the milestone lab gate
+        status: in-progress  # 2026-09-01 (M11 validation): d1/d2/d3a/d4 now DONE — d2's consumer half landed in runtimed and d4's ceiling is recorded as a measurement (guest<->guest and guest->LAN both BLOCKED, narrower than assumed). d3b stays deferred to v0.1.x. Only a1 keeps this row open.
         depends_on: [apis:M11.1]
         deliverables:
           - id: M11.3-d1
