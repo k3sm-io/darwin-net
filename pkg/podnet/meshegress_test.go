@@ -114,3 +114,84 @@ func TestMeshEgressSourceReserved(t *testing.T) {
 		}
 	})
 }
+
+// TestMeshLinkAddressReserved is the acceptance for the mesh utun's own
+// point-to-point address: it is derived from the node podCIDR (the .255 the
+// allocator already reserves as the broadcast address), it is distinct from the
+// mesh-egress source, and reusing the standing reservation costs no pod capacity —
+// the pool is still the 253 addresses .2 through .254.
+//
+// The distinctness is the load-bearing half. macOS refuses an interface-bound
+// route on an addressless utun, so the tunnel needs an address of its own; but an
+// address that lives on the utun is reached OVER the utun, so it cannot be the
+// mesh-egress source the node's own processes bind and dial.
+func TestMeshLinkAddressReserved(t *testing.T) {
+	t.Run("derived from node podCIDR (.255)", func(t *testing.T) {
+		cases := []struct {
+			cidr string
+			want string
+		}{
+			{"100.64.0.0/24", "100.64.0.255"},
+			{"100.64.7.0/24", "100.64.7.255"},
+			{"100.127.255.0/24", "100.127.255.255"},
+			{"10.0.5.0/24", "10.0.5.255"},
+		}
+		for _, tc := range cases {
+			got, err := MeshLinkIP(netip.MustParsePrefix(tc.cidr))
+			if err != nil {
+				t.Fatalf("MeshLinkIP(%s): %v", tc.cidr, err)
+			}
+			if got.String() != tc.want {
+				t.Fatalf("MeshLinkIP(%s) = %s, want %s", tc.cidr, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("rejects a non-/24 or non-IPv4 CIDR", func(t *testing.T) {
+		for _, bad := range []netip.Prefix{
+			netip.MustParsePrefix("100.64.0.0/16"),
+			netip.MustParsePrefix("100.64.0.0/25"),
+			netip.MustParsePrefix("fd00::/24"),
+			{},
+		} {
+			if _, err := MeshLinkIP(bad); !errors.Is(err, ErrOutOfRange) {
+				t.Fatalf("MeshLinkIP(%s) err = %v, want ErrOutOfRange", bad, err)
+			}
+		}
+	})
+
+	t.Run("distinct from the mesh-egress source and never allocated", func(t *testing.T) {
+		cidr := netip.MustParsePrefix("100.64.0.0/24")
+		link, err := MeshLinkIP(cidr)
+		if err != nil {
+			t.Fatalf("MeshLinkIP: %v", err)
+		}
+		egress, err := MeshEgressIP(cidr)
+		if err != nil {
+			t.Fatalf("MeshEgressIP: %v", err)
+		}
+		if link == egress {
+			t.Fatalf("mesh link address == mesh-egress source (%s): an address on the utun is reached over the utun, so a same-node dial of the mesh IP would be tunnelled and dropped", link)
+		}
+
+		a, err := NewAllocator(cidr)
+		if err != nil {
+			t.Fatalf("NewAllocator: %v", err)
+		}
+		if got := a.Capacity(); got != 253 {
+			t.Fatalf("Capacity = %d, want 253: the link address reuses the standing .255 reservation and must cost no pod capacity", got)
+		}
+		for i := 0; i < 253; i++ {
+			ip, err := a.Allocate()
+			if err != nil {
+				t.Fatalf("Allocate #%d: %v", i, err)
+			}
+			if ip == link {
+				t.Fatalf("Allocate handed out the mesh link address %s", ip)
+			}
+		}
+		if _, err := a.AllocateSpecific(link); !errors.Is(err, ErrOutOfRange) {
+			t.Fatalf("AllocateSpecific(%s) err = %v, want ErrOutOfRange", link, err)
+		}
+	})
+}

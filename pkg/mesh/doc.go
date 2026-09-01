@@ -36,11 +36,18 @@ limitations under the License.
 //
 //   - Per-peer kernel routes, distinct from wireguard AllowedIPs. wireguard-go is
 //     the library over a raw utun; unlike wg-quick it installs NO kernel routes,
-//     so the mesh adds one route per peer podCIDR -> utun itself (Device.SetRoutes,
+//     so the mesh adds one route per peer podCIDR -> utun itself (Device.Apply,
 //     fed by RouteSet). RouteSet NEVER includes this node's own /24 or the
 //     100.64.0.0/10 aggregate — routing either to the utun would steal same-node
-//     lo0 loopback traffic.
-//   - A reserved mesh-egress source (podnet.MeshEgressIP, the .1 of the node /24).
+//     lo0 loopback traffic. Two macOS facts make installing them a real step
+//     rather than a formality, and dropping either one blackholes every peer while
+//     the logs report success: the kernel refuses an interface-bound route on an
+//     ADDRESSLESS utun (hence the mesh-link address, podnet.MeshLinkIP, on the
+//     tunnel itself), and route(8) exits 0 even when that refusal happened (hence
+//     the read-back: every apply verifies its routes against the kernel routing
+//     table and fails loudly on divergence, routeTable/reconcileRoutes).
+//   - A reserved mesh-egress source (podnet.MeshEgressIP, the .1 of the node /24),
+//     which stays an lo0 alias and is never moved onto the utun.
 //     The Service proxy binds its backend dialer to it (proxy.WithMeshEgressSource)
 //     so a cross-node dial egresses the utun from an address inside this node's
 //     AllowedIPs; wireguard drops a packet whose source no peer's AllowedIPs covers,
