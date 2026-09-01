@@ -231,7 +231,7 @@ func (r *Resolver) lookupCandidate(ctx context.Context, fqdn string) ([]netip.Ad
 	var lastErr error
 	for range queryAttempts {
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrTempFail, err)
+			return nil, fmt.Errorf("%w: %w", ErrTempFail, err)
 		}
 		res, err := r.queryA(ctx, fqdn)
 		if err != nil {
@@ -247,7 +247,7 @@ func (r *Resolver) lookupCandidate(ctx context.Context, fqdn string) ([]netip.Ad
 			lastErr = fmt.Errorf("server returned %v", res.rcode)
 		}
 	}
-	return nil, fmt.Errorf("%w after %d attempts: %v", ErrTempFail, queryAttempts, lastErr)
+	return nil, fmt.Errorf("%w after %d attempts: %w", ErrTempFail, queryAttempts, lastErr)
 }
 
 // aResult is one candidate query's decoded outcome: the rcode distinguishes a

@@ -142,7 +142,7 @@ func RouteSet(self netip.Prefix, peers []netv1.MeshPeerSpec) ([]netip.Prefix, er
 func AllowedIPsMatchCIDR(spec netv1.MeshPeerSpec) error {
 	pc, err := netip.ParsePrefix(spec.PodCIDR)
 	if err != nil {
-		return fmt.Errorf("%w: peer %q podCIDR %q: %v", ErrPeerConfig, spec.NodeName, spec.PodCIDR, err)
+		return fmt.Errorf("%w: peer %q podCIDR %q: %w", ErrPeerConfig, spec.NodeName, spec.PodCIDR, err)
 	}
 	pc = pc.Masked()
 	if len(spec.AllowedIPs) == 0 {
@@ -151,7 +151,7 @@ func AllowedIPsMatchCIDR(spec netv1.MeshPeerSpec) error {
 	for _, s := range spec.AllowedIPs {
 		a, err := netip.ParsePrefix(s)
 		if err != nil {
-			return fmt.Errorf("%w: peer %q allowedIP %q: %v", ErrPeerConfig, spec.NodeName, s, err)
+			return fmt.Errorf("%w: peer %q allowedIP %q: %w", ErrPeerConfig, spec.NodeName, s, err)
 		}
 		if a.Masked() != pc {
 			return fmt.Errorf("%w: peer %q allowedIP %s != podCIDR %s (equality required, not just symmetry)", ErrPeerConfig, spec.NodeName, a.Masked(), pc)
@@ -278,13 +278,13 @@ func (p Plan) UAPI() string {
 func peerConfigFromSpec(spec netv1.MeshPeerSpec) (PeerConfig, error) {
 	keyHex, err := wgKeyHex(spec.PublicKey)
 	if err != nil {
-		return PeerConfig{}, fmt.Errorf("%w: peer %q publicKey: %v", ErrPeerConfig, spec.NodeName, err)
+		return PeerConfig{}, fmt.Errorf("%w: peer %q publicKey: %w", ErrPeerConfig, spec.NodeName, err)
 	}
 	allowed := make([]netip.Prefix, 0, len(spec.AllowedIPs))
 	for _, s := range spec.AllowedIPs {
 		a, err := netip.ParsePrefix(s)
 		if err != nil {
-			return PeerConfig{}, fmt.Errorf("%w: peer %q allowedIP %q: %v", ErrPeerConfig, spec.NodeName, s, err)
+			return PeerConfig{}, fmt.Errorf("%w: peer %q allowedIP %q: %w", ErrPeerConfig, spec.NodeName, s, err)
 		}
 		allowed = append(allowed, a.Masked())
 	}
