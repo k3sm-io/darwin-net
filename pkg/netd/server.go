@@ -27,6 +27,7 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -39,6 +40,16 @@ import (
 // DefaultSocketPath is the unix socket the daemon listens on (re-exported from the
 // wire contract so callers can reference it as netd.DefaultSocketPath).
 const DefaultSocketPath = wire.DefaultSocketPath
+
+// DefaultIdleTimeout bounds how long an authenticated connection may sit between
+// frames before the daemon reaps it. A unix-socket read blocks forever, so a peer
+// that dies without closing its end (a crashed client, a wedged VM, a forwarded
+// socket whose far side vanished) would otherwise pin a handler goroutine — and
+// its per-connection accounting — for the lifetime of the daemon. Two minutes is
+// far longer than any legitimate pause: the wire client dials a fresh connection
+// per RPC and arms a 10s deadline on it (wire.defaultRPCTimeout), so nothing that
+// is still alive waits this long between frames.
+const DefaultIdleTimeout = 2 * time.Minute
 
 // minMSSClamp is the smallest TCP MSS the daemon will load into the clamp anchor.
 // A clamp below this is nonsensical (smaller than the headers leave room for) and
@@ -89,6 +100,10 @@ type Config struct {
 	// MaxPerConn caps the live aliases / mesh routes / bound ports one connection
 	// may drive (default DefaultMaxPerConn, ≈ a node's /24 pod capacity).
 	MaxPerConn int
+	// IdleTimeout caps the gap between two frames on one connection before the
+	// daemon reaps it (default DefaultIdleTimeout). It bounds the goroutine and
+	// accounting a dead-but-unclosed peer can hold.
+	IdleTimeout time.Duration
 
 	// PortAuthorizer confirms a <1024 bind; nil denies every <1024 bind.
 	PortAuthorizer PortAuthorizer
@@ -129,6 +144,9 @@ func NewServer(cfg Config) *Server {
 	if cfg.MaxPerConn <= 0 {
 		cfg.MaxPerConn = wire.DefaultMaxPerConn
 	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = DefaultIdleTimeout
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -145,7 +163,9 @@ func NewServer(cfg Config) *Server {
 
 // Serve accepts connections on l until ctx is cancelled, handling each in its own
 // goroutine. It closes l on cancellation (which unblocks Accept) and waits for
-// in-flight connections to drain before returning ctx.Err().
+// in-flight connections to drain before returning ctx.Err(); each handler closes
+// its own connection on cancellation, so a peer blocked mid-conversation cannot
+// hold the drain open.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	done := make(chan struct{})
 	defer close(done)
@@ -182,15 +202,36 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 }
 
 // handleConn authenticates the peer and serves framed requests on conn until the
-// peer disconnects, a frame is unreadable, or ctx is cancelled. A recover guards
-// the whole connection so no malformed input can ever crash the daemon (the
-// robust, allocation-bounded decoder returns errors rather than panicking; the
-// recover is the belt-and-suspenders backstop).
+// peer disconnects, a frame is unreadable, the connection sits idle past
+// IdleTimeout, or ctx is cancelled. A recover guards the whole connection so no
+// malformed input can ever crash the daemon (the robust, allocation-bounded
+// decoder returns errors rather than panicking; the recover is the
+// belt-and-suspenders backstop).
+//
+// Two mechanisms bound the handler's lifetime, and both are needed. A blocking
+// read does not observe ctx, so cancellation reaches it only through the fd: a
+// watcher goroutine closes conn on ctx.Done, which fails the in-flight read and
+// lets Serve's drain complete. That covers shutdown; it does not cover a daemon
+// that keeps running while a peer dies silently, so every read is additionally
+// armed with an IdleTimeout deadline.
 func (s *Server) handleConn(ctx context.Context, conn *net.UnixConn) {
 	defer conn.Close()
 	defer func() {
 		if r := recover(); r != nil {
 			s.log.Error("netd: recovered from handler panic", "panic", r)
+		}
+	}()
+
+	// stop retires the watcher when the handler returns on its own. The deferred
+	// close runs before the deferred conn.Close (defers are LIFO), so the watcher
+	// is gone before the fd is; a double Close is harmless in any case.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stop:
 		}
 	}()
 
@@ -207,9 +248,17 @@ func (s *Server) handleConn(ctx context.Context, conn *net.UnixConn) {
 			return
 		default:
 		}
+		if err := conn.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout)); err != nil {
+			s.log.Debug("netd: arming read deadline", "err", err)
+			return
+		}
 		payload, err := wire.ReadFrame(conn, s.cfg.MaxRequestBytes)
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			switch {
+			case errors.Is(err, os.ErrDeadlineExceeded):
+				s.log.Debug("netd: reaping idle connection", "idle", s.cfg.IdleTimeout)
+			case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+			default:
 				s.log.Debug("netd: connection closed", "err", err)
 			}
 			return
@@ -460,7 +509,7 @@ func (s *Server) authorizePort(ctx context.Context, port int, nodeAddr string) e
 			return fmt.Errorf("%w: privileged port %d denied (no port authorizer configured)", ErrPolicy, port)
 		}
 		if err := s.cfg.PortAuthorizer.Authorize(ctx, port, nodeAddr); err != nil {
-			return fmt.Errorf("%w: privileged port %d not authorized: %v", ErrPolicy, port, err)
+			return fmt.Errorf("%w: privileged port %d not authorized: %w", ErrPolicy, port, err)
 		}
 		return nil
 	}
