@@ -344,7 +344,7 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 		if err != nil {
 			t.Fatalf("listen vip socket: %v", err)
 		}
-		r := newUDPRelay(vip, key, table, netip.Addr{}, time.Minute, maxUDPFlowsPerSource, nil, slog.New(slog.DiscardHandler))
+		r := newUDPRelay(vip, key, table, egressScope{}, time.Minute, maxUDPFlowsPerSource, nil, slog.New(slog.DiscardHandler))
 		r.policy = pt
 		defer func() { _ = r.Close() }()
 

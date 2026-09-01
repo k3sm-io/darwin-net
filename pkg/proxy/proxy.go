@@ -33,6 +33,7 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/netbind"
 	"k3sm.io/darwin-net/pkg/netd/wire"
+	"k3sm.io/darwin-net/pkg/podnet"
 )
 
 // dialTimeout bounds how long the proxy waits to connect to a chosen backend
@@ -81,14 +82,24 @@ type Proxy struct {
 	alias  aliasManager
 	binder binder
 	log    *slog.Logger
+	// dialer is the default-source backend dialer: it carries no LocalAddr, so the
+	// kernel selects the source. It is built once in New and NEVER mutated — the
+	// per-connection handle goroutines share it, so writing LocalAddr on it would
+	// be a data race, and a race that silently applies one connection's source to
+	// another connection's dial (see Proxy.dialerFor).
 	dialer *net.Dialer
-	// meshEgress is the node's reserved mesh-egress /32, retained from
-	// WithMeshEgressSource for the UDP relay's per-flow upstream source-bind. The
-	// TCP path source-binds via p.dialer.LocalAddr, but a net.Dialer whose
-	// LocalAddr is a *net.TCPAddr cannot dial "udp", so the datagram path builds
-	// a *net.UDPAddr from this Addr instead. The zero Addr (single node, no utun)
-	// means the kernel default source. Set once at construction, read-only after.
-	meshEgress netip.Addr
+	// meshDialer is the mesh-source-bound sibling of dialer, built once by
+	// WithMeshEgressSource on a multi-node mesh and nil on a single node. handle
+	// selects between the two per connection via dialerFor; neither is mutated
+	// after construction.
+	meshDialer *net.Dialer
+	// egress is the destination-scoped mesh-egress source decision — the node's
+	// reserved mesh-egress /32 plus the cluster pod aggregate that scopes the bind
+	// — shared read-only by the TCP dial path and by every per-VIP UDP relay (the
+	// datagram path cannot reuse a *net.TCPAddr LocalAddr, so it builds a
+	// *net.UDPAddr from the same decision). Its zero value binds nothing, which is
+	// the single-node posture. Set once at construction; see egressScope.
+	egress egressScope
 	// exemptVIPs are infra VIPs owned by a node-local binder (per-node resolver on
 	// the kube-dns VIP) rather than by the proxy: the proxy never aliases, binds,
 	// or routes them. It is set once by WithInfraVIPExemptions and read-only
@@ -139,25 +150,66 @@ func WithUDPFlowBudget(max int64) Option {
 	}
 }
 
-// WithMeshEgressSource binds the backend dialer's source address (LocalAddr) to
-// the node's reserved mesh-egress /32 (podnet.MeshEgressIP). It is REQUIRED on a
-// multi-node mesh and MUST be left unset on a single node:
+// WithMeshEgressSource sets the node's reserved mesh-egress /32
+// (podnet.MeshEgressIP) as the source address for backend dials that leave over
+// the wireguard mesh. It is REQUIRED on a multi-node mesh and MUST be left unset
+// on a single node.
 //
-// wireguard accepts an inbound packet only when its source falls within some
-// peer's AllowedIPs (= the sending node's podCIDR). A backend on another node is
-// reached by a dial that egresses the utun, so that dial must be sourced from this
-// node's mesh-egress address (which is inside this node's podCIDR by construction)
-// or the peer drops the return packet — a one-way blackhole. Same-node backends
-// stay on loopback and are unaffected because the mesh-egress address is a local
-// lo0 alias. When src is the zero Addr the dialer keeps the kernel's default
-// source selection (the single-node path, where no utun exists to bind to).
+// # The contract (destination-scoped, not construction-wide)
+//
+// The bind is DESTINATION-SCOPED: it applies per dial, and only to a backend that
+// is LocalityRemote (outside this node's own pod /24) at a destination inside the
+// cluster pod aggregate — that is, a pod hosted on another node, the one case
+// whose reply actually returns over the utun. Every other destination keeps the
+// kernel's default source selection: a same-node (loopback) backend, a ClusterIP
+// VIP splicing to a local backend, a node LAN address (a hostNetwork pod reports
+// podIP == nodeIP), an upstream host, and any backend whose locality is unknown
+// because no node podCIDR was configured. See egressScope for the predicate and
+// why LocalityUnknown must fail to the kernel default rather than to a bind.
+//
+// That scoping is what makes this option safe to set on a node that also serves
+// node-local traffic — the control-plane node's own proxy, ingress and svclb
+// included. It replaces an earlier construction-time contract that bound the
+// source for EVERY dial, which is why setting a mesh-egress source used to break
+// all backend dials that were not cross-node pod dials.
+//
+// Mechanically: wireguard admits an inbound packet only when its source falls
+// inside some peer's AllowedIPs (= the sending node's pod /24), so a cross-node
+// dial must egress from this node's mesh-egress address (inside this node's
+// podCIDR by construction) or the peer drops the reply — a one-way blackhole. The
+// option builds a second, immutable mesh-bound dialer rather than mutating the
+// shared one; both TCP and the UDP relay apply the same per-dial decision. When
+// src is the zero Addr nothing is bound anywhere (the single-node path, where no
+// utun exists to bind to).
+//
+// The aggregate that scopes the bind defaults to podnet.ClusterPodCIDR; override
+// it with WithClusterPodCIDR when the cluster runs a non-default pod CIDR.
 func WithMeshEgressSource(src netip.Addr) Option {
 	return func(p *Proxy) {
-		// Retained for the UDP relay's per-flow source bind (see the meshEgress
-		// field doc); the zero Addr stays invalid, matching the TCP dialer below.
-		p.meshEgress = src
+		// The scope is shared with every UDP relay (a *net.TCPAddr LocalAddr cannot
+		// dial "udp", so the datagram path re-derives its own *net.UDPAddr from the
+		// same decision); the zero Addr stays invalid and binds nothing.
+		p.egress.src = src
 		if src.IsValid() {
-			p.dialer.LocalAddr = &net.TCPAddr{IP: src.AsSlice()}
+			p.meshDialer = &net.Dialer{Timeout: dialTimeout, LocalAddr: &net.TCPAddr{IP: src.AsSlice()}}
+		}
+	}
+}
+
+// WithClusterPodCIDR sets the cluster pod aggregate that scopes the mesh-egress
+// source bind: a backend dial binds the mesh source only when its destination
+// falls inside this prefix (and the backend is outside this node's own /24). It
+// defaults to podnet.ClusterPodCIDR (100.64.0.0/10), so only a cluster running a
+// non-default pod CIDR needs it — and such a cluster MUST pass it, or every
+// cross-node dial silently reverts to the kernel default source and is blackholed
+// by the peer's AllowedIPs check.
+//
+// An invalid prefix is ignored, leaving the default in place. Mirrors the
+// netd.Config.ClusterAggregate default.
+func WithClusterPodCIDR(cidr netip.Prefix) Option {
+	return func(p *Proxy) {
+		if cidr.IsValid() {
+			p.egress.clusterCIDR = cidr.Masked()
 		}
 	}
 }
@@ -238,6 +290,7 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 		binder:     directBinder{},
 		log:        slog.Default(),
 		dialer:     &net.Dialer{Timeout: dialTimeout},
+		egress:     egressScope{clusterCIDR: podnet.ClusterPodCIDR},
 		exemptVIPs: make(map[netip.Addr]struct{}),
 		udpBudget:  newUDPBudget(maxTotal, udpPerSourceGlobalCap(maxTotal)),
 		workers:    make(map[PortKey]*portWorker),
@@ -245,6 +298,13 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 	}
 	for _, o := range opts {
 		o(p)
+	}
+	// An option cannot leave the aggregate invalid (WithClusterPodCIDR ignores an
+	// invalid prefix), but a zero-value Proxy assembled another way could: restore
+	// the default so the scoping predicate never degrades to "never bind" silently
+	// on a mesh node.
+	if !p.egress.clusterCIDR.IsValid() {
+		p.egress.clusterCIDR = podnet.ClusterPodCIDR
 	}
 	// Propagate the (possibly WithLogger-overridden) logger to the routing table so
 	// its fail-open Warn (internalTrafficPolicy: Local under an unknown podCIDR)
@@ -614,7 +674,7 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 			_ = p.alias.Remove(ctx, ip)
 			return nil, fmt.Errorf("listen udp clusterIP %s: %w", clusterAP, err)
 		}
-		relay := newUDPRelay(pc, key, p.table, p.meshEgress, udpFlowIdleTimeout, maxUDPFlowsPerSource, p.udpBudget, p.log)
+		relay := newUDPRelay(pc, key, p.table, p.egress, udpFlowIdleTimeout, maxUDPFlowsPerSource, p.udpBudget, p.log)
 		// NetworkPolicy L4 subset (M10.4): the relay consults the shared verdict
 		// table at flow admission (upstreamFor, after its once-per-flow Pick). Set
 		// before start so the dispatcher's read is covered by the goroutine-start
@@ -736,7 +796,12 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 	// was. The policy verdict above ran on the published address, which is the
 	// identity a NetworkPolicy names; only the packet follows the lease.
 	dst := p.table.transportAddr(be.Addr())
-	backendConn, err := p.dialer.Dial("tcp", dst.String())
+	// Destination-scoped mesh-egress source (M14.2-d1): a cross-node pod dial is
+	// sourced from this node's mesh-egress /32 so the peer's AllowedIPs check
+	// admits the reply; every other destination keeps kernel default source
+	// selection. dialerFor picks between two immutable dialers — nothing here
+	// mutates shared state, because handle runs once per accepted connection.
+	backendConn, err := p.dialerFor(be.Locality(), dst.Addr()).Dial("tcp", dst.String())
 	if err != nil {
 		p.logger().Debug("dial backend", "vip", key.String(), "backend", be.Addr().String(), "transport", dst.String(), "err", err)
 		return

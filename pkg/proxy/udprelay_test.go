@@ -246,7 +246,7 @@ func TestUDPRelayIdleFlowGC(t *testing.T) {
 		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
 		tbl := NewRoutingTable(netip.Prefix{})
 		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
-		r := newUDPRelay(pc, key, tbl, netip.Addr{}, idle, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), slog.Default())
+		r := newUDPRelay(pc, key, tbl, egressScope{}, idle, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), slog.Default())
 		r.start()
 		t.Cleanup(func() { _ = r.Close() })
 		return r
@@ -327,7 +327,7 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
 		tbl := NewRoutingTable(netip.Prefix{})
 		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
-		return newUDPRelay(pc, key, tbl, netip.Addr{}, time.Hour, perSourceCap, budget, slog.Default())
+		return newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, perSourceCap, budget, slog.Default())
 	}
 	// client fabricates a distinct client address; the per-source counter keys on the
 	// parsed IP, decoupled from any real loopback bind.
@@ -504,7 +504,7 @@ func TestUDPRelayPerSourceGlobalCap(t *testing.T) {
 		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
 		tbl := NewRoutingTable(netip.Prefix{})
 		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
-		return newUDPRelay(pc, key, tbl, netip.Addr{}, time.Hour, 100, budget, slog.Default())
+		return newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, 100, budget, slog.Default())
 	}
 	client := func(a, b, c, d byte, port int) net.Addr {
 		return &net.UDPAddr{IP: net.IPv4(a, b, c, d), Port: port}
@@ -657,7 +657,7 @@ func TestUDPRelayFirstLockPerSourceGlobalReject(t *testing.T) {
 		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
 		tbl := NewRoutingTable(netip.Prefix{})
 		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
-		r := newUDPRelay(pc, key, tbl, netip.Addr{}, time.Hour, 100, budget, slog.Default())
+		r := newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, 100, budget, slog.Default())
 		cd := &countingDialer{inner: r.dial}
 		r.dial = cd.dial
 		return r, cd
