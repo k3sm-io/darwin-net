@@ -67,6 +67,7 @@ type Privileged interface {
 type darwinApplier struct {
 	nodePodCIDR netip.Prefix
 	meshIP      netip.Addr // derived from nodePodCIDR; invalid if the CIDR is bad
+	linkIP      netip.Addr // the mesh utun's own p2p address; same derivation contract
 	utunName    string
 	log         *slog.Logger
 
@@ -84,9 +85,11 @@ func newDarwinApplier(nodePodCIDR netip.Prefix, log *slog.Logger) *darwinApplier
 		log = slog.Default()
 	}
 	meshIP, _ := podnet.MeshEgressIP(nodePodCIDR)
+	linkIP, _ := podnet.MeshLinkIP(nodePodCIDR)
 	return &darwinApplier{
 		nodePodCIDR: nodePodCIDR,
 		meshIP:      meshIP,
+		linkIP:      linkIP,
 		utunName:    "utun",
 		log:         log,
 	}
@@ -115,12 +118,13 @@ func (a *darwinApplier) ConfigureMesh(ctx context.Context, privKeyB64 string, li
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.dev == nil {
-		if !a.meshIP.IsValid() {
-			return fmt.Errorf("configure mesh: node podCIDR %s has no mesh-egress source", a.nodePodCIDR)
+		if !a.meshIP.IsValid() || !a.linkIP.IsValid() {
+			return fmt.Errorf("configure mesh: node podCIDR %s has no mesh-egress source or utun link address", a.nodePodCIDR)
 		}
 		a.dev = mesh.NewDevice(mesh.DeviceConfig{
 			UTUNName:      a.utunName,
 			MeshIP:        a.meshIP,
+			LinkIP:        a.linkIP,
 			PrivateKeyB64: privKeyB64,
 			ListenPort:    listenPort,
 		}, a.log)

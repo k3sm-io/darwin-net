@@ -93,9 +93,10 @@ func NodeCIDR(clusterCIDR netip.Prefix, index int) (netip.Prefix, error) {
 // /24). It is the pure-logic IPAM core: no interface, no syscalls, no privilege,
 // so its allocate/release behavior is fully table-tested. Three addresses in the
 // /24 are reserved and never handed out: the network address (.0), the broadcast
-// address (.255), and the mesh-egress /32 (.1, see MeshEgressIP) the wireguard
-// mesh uses as this node's tunnel-egress source. A /24 therefore yields 253 usable
-// pod addresses (.2 through .254).
+// address (.255, which the mesh also carries as its utun's point-to-point link
+// address — see MeshLinkIP), and the mesh-egress /32 (.1, see MeshEgressIP) the
+// wireguard mesh uses as this node's tunnel-egress source. A /24 therefore yields
+// 253 usable pod addresses (.2 through .254).
 //
 // Locking discipline: all state is guarded by mu. Allocate and Release take the
 // write lock; the read-only accessors take the read lock. The allocator is safe
@@ -267,5 +268,14 @@ func (a *Allocator) inHostRange(ip netip.Addr) bool {
 func lastHostInSlash24(network netip.Addr) netip.Addr {
 	b := network.As4()
 	b[3] = 254
+	return netip.AddrFrom4(b)
+}
+
+// broadcastInSlash24 returns the broadcast (.255) address of the /24 whose network
+// address is network. It is never handed to a pod; MeshLinkIP reuses that standing
+// reservation for the mesh utun's point-to-point interface address.
+func broadcastInSlash24(network netip.Addr) netip.Addr {
+	b := network.As4()
+	b[3] = 255
 	return netip.AddrFrom4(b)
 }
