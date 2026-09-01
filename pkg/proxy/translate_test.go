@@ -28,10 +28,9 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 )
 
-func ptrBool(b bool) *bool                        { return &b }
-func ptrStr(s string) *string                     { return &s }
-func ptrInt32(i int32) *int32                     { return &i }
-func ptrProto(p corev1.Protocol) *corev1.Protocol { return &p }
+func ptrBool(b bool) *bool    { return &b }
+func ptrStr(s string) *string { return &s }
+func ptrInt32(i int32) *int32 { return &i }
 
 // TestServiceToVIP asserts the pure Service translator: ClusterIP services map to
 // a netv1.ServiceVIP; headless / ExternalName / portless services are not served.
