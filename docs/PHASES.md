@@ -130,11 +130,11 @@ phases:
         deliverables:
           - id: M3.3-d1
             done: true
-            desc: "Keep the infra VIPs — the `kubernetes` ClusterIP (10.43.0.1) and the kube-dns VIP (10.43.0.10) — node-local so they are never steered over the wireguard mesh (no peer's symmetric AllowedIPs = podCIDR covers them → a mesh-steered infra VIP blackholes in-pod kubectl + DNS on multi-node). darwin-net's half: (1) PER-NODE CoreDNS bound to the DNS VIP — pkg/dns.PerNodeDNS renders a Corefile with `bind <DefaultDNSVIP=10.43.0.10>` on :53, so every node answers cluster DNS over loopback, never the mesh; (2) the kube-dns VIP EXEMPTION from proxy ownership for BOTH 53/TCP and 53/UDP — proxy.WithInfraVIPExemptions registers the VIP and Proxy.Reconcile steps aside (no worker, no lo0 alias, no listener, no routing entry) so CoreDNS (which binds 10.43.0.10:53 directly) never hits EADDRINUSE (the M1 UDP path only dodged the collision by accident; TCP had no exemption). Locality STAYS A HINT: classify() is NOT made load-bearing for steering (it mislabels loopback/node-local as remote) — infra VIPs stay off the utun because the mesh installs kernel routes for peer pod /24s ONLY (M3.1 RouteSet), never the 10.43/16 infra range. The `kubernetes` 10.43.0.1 endpoint rewrite to a node-local apiserver/proxy address is k3sm-owned (k3sm:M3.3, the depends_on edge); darwin-net provides the per-node CoreDNS + the exemption seam, and k3sm ensures the 10.43.0.10/32 lo0 alias for its per-node CoreDNS (root/netd boundary)."
+            desc: "Keep the infra VIPs — the `kubernetes` ClusterIP (10.43.0.1) and the kube-dns VIP (10.43.0.10) — node-local so they are never steered over the wireguard mesh (no peer's symmetric AllowedIPs = podCIDR covers them → a mesh-steered infra VIP blackholes in-pod kubectl + DNS on multi-node). darwin-net's half: (1) a PER-NODE resolver bound to the DNS VIP — the in-process k3sm/pkg/netserve resolver binds `<DefaultDNSVIP=10.43.0.10>` on :53, so every node answers cluster DNS over loopback, never the mesh (renderer deleted 2026-08-29; row reconciled 2026-08-31: darwin-net formerly carried an unconsumed Corefile-rendering exported type for a deferred native-CoreDNS follow-up, deleted 2026-08-29 as unconsumed — see pkg/dns/doc.go); (2) the kube-dns VIP EXEMPTION from proxy ownership for BOTH 53/TCP and 53/UDP — proxy.WithInfraVIPExemptions registers the VIP and Proxy.Reconcile steps aside (no worker, no lo0 alias, no listener, no routing entry) so the per-node resolver (which binds 10.43.0.10:53 directly) never hits EADDRINUSE (the M1 UDP path only dodged the collision by accident; TCP had no exemption). Locality STAYS A HINT: classify() is NOT made load-bearing for steering (it mislabels loopback/node-local as remote) — infra VIPs stay off the utun because the mesh installs kernel routes for peer pod /24s ONLY (M3.1 RouteSet), never the 10.43/16 infra range. The `kubernetes` 10.43.0.1 endpoint rewrite to a node-local apiserver/proxy address is k3sm-owned (k3sm:M3.3, the depends_on edge); darwin-net provides the per-node CoreDNS + the exemption seam, and k3sm ensures the 10.43.0.10/32 lo0 alias for its per-node CoreDNS (root/netd boundary)."
         acceptance:
           - id: M3.3-a1
             met: true
-            check: "the darwin-net half is proven by named pure-logic/faked unit tests (no root): TestKubeDNSVIPExemptFromProxy (with WithInfraVIPExemptions the proxy owns the kube-dns VIP for NEITHER 53/TCP nor 53/UDP — no worker, no alias-ensure, no routing entry — while a normal ClusterIP Service IS still claimed, so the exemption is VIP-specific) and TestCoreDNSBoundToDNSVIP (PerNodeDNS renders a Corefile bound to the DNS VIP on :53). The full two-node leg (in-pod resolution of + connection to 10.43.0.1 and 10.43.0.10 from a pod on the NON-control-plane node) is the K3SM_LAB=1 two-Mac gate and needs k3sm:M3.3 (the node-local `kubernetes` endpoint rewrite)."
+            check: "the darwin-net half is proven by the named pure-logic/faked unit test (no root): TestKubeDNSVIPExemptFromProxy (with WithInfraVIPExemptions the proxy owns the kube-dns VIP for NEITHER 53/TCP nor 53/UDP — no worker, no alias-ensure, no routing entry — while a normal ClusterIP Service IS still claimed, so the exemption is VIP-specific); TestKubeDNSVIPExemptFromProxy is now the surviving proof of the M3.3 darwin-net half (renderer deleted 2026-08-29; row reconciled 2026-08-31 — the retired unit test that proved the now-deleted Corefile-rendering type is removed along with it). The full two-node leg (in-pod resolution of + connection to 10.43.0.1 and 10.43.0.10 from a pod on the NON-control-plane node) is the K3SM_LAB=1 two-Mac gate and needs k3sm:M3.3 (the node-local `kubernetes` endpoint rewrite)."
             method: unit+integration
 
   - id: M4
@@ -247,7 +247,7 @@ phases:
         acceptance:
           - id: M10.1-a1
             met: true
-            check: "server-side record synthesis is proven by pure-logic/faked-watch unit tests (no root, the unit-testable half): `TestHeadlessServiceReturnsAllPodIPs` (a headless Service returns the A set of ALL ready backend pod IPs, not a single VIP) plus per-pod-A / SRV / PTR synthesis from a faked EndpointSlice watch — each record type derived from the distinct per-pod /32s the M10.1 podnet wiring now assigns"
+            check: "server-side record synthesis is proven by pure-logic/faked-watch unit tests (no root, the unit-testable half): `TestHeadlessAndSRVRecordSynthesis` (a headless Service returns the A set of ALL ready backend pod IPs, not a single VIP) plus per-pod-A / SRV / PTR synthesis from a faked EndpointSlice watch — each record type derived from the distinct per-pod /32s the M10.1 podnet wiring now assigns"
             method: unit
           - id: M10.1-a2
             met: false  # LAB-PENDING: code delivered (mesh AllowedIPs already carry pod /24s); the cross-node two-Mac per-pod-IP leg is hack/lab/m10.sh, never auto-greened
@@ -530,26 +530,31 @@ out of storage `apis:M3.1` into `apis:M3.2`, which darwin-net's mesh depends on)
 - ✅ `M3.3-d1` Keep the **infra VIPs** — the `kubernetes` ClusterIP (`10.43.0.1`) and the kube-dns
   VIP (`10.43.0.10`) — node-local so they are **never steered over the mesh** (they are **not** in
   any pod's podCIDR, so no peer's symmetric `AllowedIPs` = podCIDR covers them → a mesh-steered infra
-  VIP blackholes in-pod kubectl + DNS on multi-node). darwin-net's half: **(1)** per-node CoreDNS
-  bound to the DNS VIP — `pkg/dns.PerNodeDNS` renders a Corefile with `bind <DefaultDNSVIP=10.43.0.10>`
-  on `:53`, so every node answers cluster DNS over loopback, never the mesh; **(2)** the **kube-dns
+  VIP blackholes in-pod kubectl + DNS on multi-node). darwin-net's half: **(1)** a per-node resolver
+  bound to the DNS VIP — the in-process `k3sm/pkg/netserve` resolver binds `<DefaultDNSVIP=10.43.0.10>`
+  on `:53`, so every node answers cluster DNS over loopback, never the mesh (renderer deleted
+  2026-08-29; row reconciled 2026-08-31: darwin-net formerly carried an unconsumed
+  Corefile-rendering exported type for a deferred native-CoreDNS follow-up, deleted 2026-08-29 as
+  unconsumed — see `pkg/dns/doc.go`); **(2)** the **kube-dns
   VIP exemption** from proxy ownership for **both `53/TCP` and `53/UDP`** —
   `proxy.WithInfraVIPExemptions` + `Proxy.Reconcile` step aside (no worker, no lo0 alias, no listener,
-  no routing entry) so CoreDNS (which binds `10.43.0.10:53` directly) never hits `EADDRINUSE` (the M1
+  no routing entry) so the per-node resolver (which binds `10.43.0.10:53` directly) never hits `EADDRINUSE` (the M1
   UDP path only dodged it by accident; TCP had no exemption). **Locality stays a hint** — `classify()`
   is **not** made load-bearing for steering (it mislabels loopback/node-local as remote); infra VIPs
   stay off the utun because the mesh installs kernel routes for peer pod /24s **only** (M3.1
   `RouteSet`), never the `10.43/16` infra range. The `kubernetes` `10.43.0.1` **endpoint rewrite** to
   a node-local apiserver/proxy address is **k3sm-owned** (`k3sm:M3.3`, the `depends_on` edge);
-  darwin-net provides the per-node CoreDNS + the exemption seam, and k3sm ensures the `10.43.0.10/32`
-  lo0 alias for its per-node CoreDNS (root/netd boundary).
+  darwin-net provides the per-node resolver + the exemption seam, and k3sm ensures the `10.43.0.10/32`
+  lo0 alias for its per-node resolver (root/netd boundary).
 
 **Acceptance (exit gate)**
-- ✅ `M3.3-a1` the darwin-net half is proven by named pure-logic/faked unit tests (no root):
+- ✅ `M3.3-a1` the darwin-net half is proven by the named pure-logic/faked unit test (no root):
   `TestKubeDNSVIPExemptFromProxy` (with `WithInfraVIPExemptions` the proxy owns the kube-dns VIP for
   **neither** `53/TCP` nor `53/UDP` — no worker, no alias-ensure, no routing entry — while a normal
-  ClusterIP Service **is** still claimed, so the exemption is VIP-specific) and
-  `TestCoreDNSBoundToDNSVIP` (`PerNodeDNS` renders a Corefile bound to the DNS VIP on `:53`). The full
+  ClusterIP Service **is** still claimed, so the exemption is VIP-specific); `TestKubeDNSVIPExemptFromProxy`
+  is now the surviving proof of the M3.3 darwin-net half (renderer deleted 2026-08-29; row reconciled
+  2026-08-31 — the retired unit test that proved the now-deleted Corefile-rendering type is removed
+  along with it). The full
   two-node leg (in-pod resolution of + connection to `10.43.0.1` and `10.43.0.10` from a pod on the
   **non-control-plane** node) is the `K3SM_LAB=1` two-Mac gate and needs `k3sm:M3.3` (the node-local
   `kubernetes` endpoint rewrite) — *method: unit + integration*
@@ -665,7 +670,9 @@ kept honest (not silent) by carrying darwin-net's **one** real obligation.
   datapath boundary.)
 
 **Acceptance (exit gate)**
-- ⬜ `M8.1-a1` the documented address set is committed (datapath-authority record) **and** the
+- ✅ `M8.1-a1` record committed 2026-08-31 (`docs/EGRESS-DATAPATH.md`); the S1-findings half rides
+  the k3sm findings file as recorded. The documented address set is committed (datapath-authority
+  record) **and** the
   `k3sm:M8.0` S1 findings file records the HF-weight download through the production datapath
   (DNS shim → proxy dialer → egress) under the generated `allow_internet_egress` profile
   (rides the S1 evidence) — *method: integration*
@@ -695,7 +702,7 @@ darwin-net product code.
 
 **Acceptance (exit gate)**
 - ⬜ `M10.1-a1` server-side synthesis proven by pure-logic/faked-watch unit tests —
-  `TestHeadlessServiceReturnsAllPodIPs` (all ready backend pod IPs, not one VIP) + per-pod-A/SRV/PTR
+  `TestHeadlessAndSRVRecordSynthesis` (all ready backend pod IPs, not one VIP) + per-pod-A/SRV/PTR
   from a faked EndpointSlice watch — *method: unit* (the unit-testable half)
 - ⬜ `M10.1-a2` in-pod SRV/PTR resolution via the getaddrinfo-shim `res_query` extension (an SRV +
   a PTR reverse of a pod `/32`) — *method: integration* (lab; the follow-on gate)
