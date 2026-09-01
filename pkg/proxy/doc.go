@@ -207,12 +207,17 @@ limitations under the License.
 // belong in a vm RuntimeClass.
 //
 // Like the TCP splice the relay re-originates traffic (Cluster policy): it does not
-// preserve the client pod source IP. On a multi-node mesh each upstream socket is
-// source-bound to the node's mesh-egress /32 (WithMeshEgressSource) — the UDP path
-// cannot reuse p.dialer because a *net.TCPAddr LocalAddr fails to dial "udp", so it
-// builds a *net.UDPAddr — or wireguard would drop the cross-node return datagram.
-// B23 has no conntrack-style flush, so a flow stays pinned to its picked backend
-// until idle GC reaps it, even if that endpoint is removed mid-flow.
+// preserve the client pod source IP. On a multi-node mesh an upstream socket is
+// source-bound to the node's mesh-egress /32 (WithMeshEgressSource) — or wireguard
+// would drop the cross-node return datagram — but only for a cross-node pod
+// destination: the bind is destination-scoped and both protocols share one
+// predicate (egressScope.sourceFor), so a same-node, node-LAN, loopback or
+// unclassifiable destination keeps kernel default source selection on the datagram
+// path exactly as it does on the stream path. The UDP path cannot reuse the mesh
+// *net.Dialer because a *net.TCPAddr LocalAddr fails to dial "udp", so it builds a
+// *net.UDPAddr from that same verdict. B23 has no conntrack-style flush, so a flow
+// stays pinned to its picked backend until idle GC reaps it, even if that endpoint
+// is removed mid-flow.
 //
 // Deferred in B23: UDP NodePort (a wildcard *:NodePort UDP reply re-selects its
 // source by route lookup on a multi-homed node → wrong source IP → the client drops
