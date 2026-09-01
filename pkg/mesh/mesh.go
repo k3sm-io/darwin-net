@@ -134,6 +134,10 @@ func New(self netip.Prefix, opts ...Option) (*Mesh, error) {
 	if err != nil {
 		return nil, fmt.Errorf("derive mesh-egress source: %w", err)
 	}
+	linkIP, err := podnet.MeshLinkIP(s)
+	if err != nil {
+		return nil, fmt.Errorf("derive mesh link address: %w", err)
+	}
 	m := &Mesh{
 		self:       s,
 		meshIP:     meshIP,
@@ -153,6 +157,7 @@ func New(self netip.Prefix, opts ...Option) (*Mesh, error) {
 				MTU:           MTU,
 				MSS:           MSSClamp,
 				MeshIP:        meshIP,
+				LinkIP:        linkIP,
 				PrivateKeyB64: m.privateKeyB64,
 				ListenPort:    m.listenPort,
 			}, m.log)

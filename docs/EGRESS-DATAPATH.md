@@ -59,10 +59,21 @@ not itself an enforcement mechanism.
   `MeshEgressIP`; `pkg/podnet/allocator.go:135` reservation of `.1`;
   `pkg/proxy/proxy.go:167` `WithMeshEgressSource` binds the proxy's dialer to
   it).
+- **The node's mesh-link `/32`** — the last address (`.255`) of the node's pod
+  `/24`, assigned as the utun's own point-to-point interface address
+  (`pkg/podnet/meshegress.go` `MeshLinkIP`; `pkg/mesh/device_wireguard.go`
+  `WGDevice.Up`). It reuses the address the allocator already reserves as the
+  broadcast address, so it costs no pod capacity. macOS will not install an
+  interface-bound route on an addressless utun, so this address is what makes
+  the per-peer routes installable; the kernel also selects it as the source for
+  host traffic to a peer pod `/24` that binds no source of its own, which is why
+  it is drawn from the node's own `/24` (inside every peer's `AllowedIPs`).
 - **The utun device** — the wireguard mesh interface that carries cross-node
   pod `/24` traffic per the per-peer kernel routes computed by
-  `pkg/mesh/plan.go:105` `RouteSet`; it never carries this node's own `/24` or
-  the `100.64.0.0/10` cluster aggregate (loopback traffic stays on lo0).
+  `pkg/mesh/plan.go` `RouteSet` and verified against the kernel routing table by
+  `pkg/mesh/device_wireguard.go` `WGDevice.reconcileRoutes`; it never carries
+  this node's own `/24` or the `100.64.0.0/10` cluster aggregate (loopback
+  traffic stays on lo0).
 
 ## Purpose
 
