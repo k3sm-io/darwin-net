@@ -78,7 +78,9 @@ type PeerSkip struct {
 // applies it (IpcSet of UAPI + route reconcile). It is a value type with no I/O so
 // it is fully table-tested.
 type Plan struct {
-	// Peers is the wireguard peer set (a full replacement — see UAPI).
+	// Peers is the desired wireguard peer set (see UAPI/UAPIUpdate for how it is
+	// programmed: a full replacement on the first apply, an incremental update
+	// afterwards so roamed endpoints and live sessions survive a reconcile).
 	Peers []PeerConfig
 	// Routes is the kernel route set: one prefix per peer podCIDR, each routed to
 	// the utun. It NEVER contains this node's own /24 or the cluster aggregate.
@@ -248,18 +250,69 @@ func ValidatePlan(self netip.Prefix, peers []netv1.MeshPeerSpec) (Plan, error) {
 	return plan, nil
 }
 
+// AppliedEndpoints is the applier's memory of the endpoint it last programmed for
+// each peer, keyed by the peer's hex public key — the state UAPIUpdate diffs the
+// next Plan against. It is deliberately the applier's OWN record of what it wrote,
+// never a read-back of the device: wireguard roams a peer's endpoint to whatever
+// source its last authenticated packet came from, so device state answers "where
+// is the peer now", which is exactly the answer a reconcile must not overwrite.
+// Its lifetime is the wireguard device's: a device that is (re)created has no
+// peers, so its applier starts from an empty map and programs every endpoint.
+type AppliedEndpoints map[string]string
+
 // UAPI renders the wireguard userspace-API configuration that programs this plan's
 // peer set as a FULL replacement (replace_peers=true), the form IpcSet consumes.
-// A full resync is idempotent and naturally handles an endpoint move, a key
-// rotation, or a peer removal between reconciles — the next snapshot simply
-// replaces the set. Per peer it sets the endpoint, the keepalive, and the
-// AllowedIPs (also as a replacement). It excludes private material entirely.
+// It is the first-apply form — the one an applier with no prior state uses, where
+// replacing peers loses nothing — and is UAPIUpdate(nil). Use UAPIUpdate for every
+// subsequent reconcile: replace_peers tears down and re-creates every peer, which
+// discards both the live session and the roamed endpoint.
 func (p Plan) UAPI() string {
+	uapi, _ := p.UAPIUpdate(nil)
+	return uapi
+}
+
+// UAPIUpdate renders the wireguard UAPI that moves the device from the peer set
+// the applier last programmed (prev, keyed by hex public key) to this plan, and
+// returns the applier's new memory. It is the endpoint-roaming contract in code:
+// a peer whose public key is already configured keeps the endpoint wireguard
+// itself roamed onto, and the CR endpoint is (re)programmed only when the peer is
+// new to the device, when its key changed (a fresh peer needs a first endpoint),
+// or when the CR endpoint differs from the value this applier last wrote (an
+// operator deliberately moved the node). AllowedIPs, the keepalive, and peer
+// removal reconcile on every call as before.
+//
+// With no prior state (len(prev) == 0) it emits the full-replacement form: there
+// is no live peer state to protect, and a clean slate is the safe first write.
+// Otherwise it emits an incremental update — never replace_peers, which would
+// delete and re-create every peer and so discard the very roamed endpoints and
+// handshakes this contract exists to preserve — plus an explicit remove=true for
+// each key the plan no longer carries (a departed peer, or the old half of a key
+// rotation). It excludes private material entirely.
+func (p Plan) UAPIUpdate(prev AppliedEndpoints) (string, AppliedEndpoints) {
 	var b strings.Builder
-	b.WriteString("replace_peers=true\n")
+	if len(prev) == 0 {
+		b.WriteString("replace_peers=true\n")
+	} else {
+		keep := make(map[string]struct{}, len(p.Peers))
+		for _, pc := range p.Peers {
+			keep[pc.PublicKeyHex] = struct{}{}
+		}
+		gone := make([]string, 0, len(prev))
+		for k := range prev {
+			if _, ok := keep[k]; !ok {
+				gone = append(gone, k)
+			}
+		}
+		sort.Strings(gone) // deterministic output for the table tests
+		for _, k := range gone {
+			fmt.Fprintf(&b, "public_key=%s\nremove=true\n", k)
+		}
+	}
+	next := make(AppliedEndpoints, len(p.Peers))
 	for _, pc := range p.Peers {
 		fmt.Fprintf(&b, "public_key=%s\n", pc.PublicKeyHex)
-		if pc.Endpoint != "" {
+		last, configured := prev[pc.PublicKeyHex]
+		if pc.Endpoint != "" && (!configured || last != pc.Endpoint) {
 			fmt.Fprintf(&b, "endpoint=%s\n", pc.Endpoint)
 		}
 		fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", pc.KeepaliveSeconds)
@@ -267,8 +320,9 @@ func (p Plan) UAPI() string {
 		for _, a := range pc.AllowedIPs {
 			fmt.Fprintf(&b, "allowed_ip=%s\n", a.String())
 		}
+		next[pc.PublicKeyHex] = pc.Endpoint
 	}
-	return b.String()
+	return b.String(), next
 }
 
 // peerConfigFromSpec resolves a validated MeshPeerSpec into a PeerConfig: it

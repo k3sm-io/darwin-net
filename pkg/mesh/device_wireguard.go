@@ -93,6 +93,7 @@ type WGDevice struct {
 	dev       *device.Device
 	tun       tun.Device
 	routes    map[netip.Prefix]struct{}
+	applied   AppliedEndpoints // endpoints this device last programmed, per peer key
 	pfApplied bool
 }
 
@@ -198,23 +199,37 @@ func (d *WGDevice) Up(ctx context.Context) error {
 	d.iface = name
 	d.dev = dev
 	d.tun = tunDev
+	// A freshly created wireguard device has no peers, so the applier's
+	// endpoint memory starts empty: the next Apply is a full resync that
+	// programs every peer's CR endpoint.
+	d.applied = nil
 	d.pfApplied = true
 	d.log.Info("mesh device up", "iface", name, "meshIP", d.cfg.meshIP.String(), "mtu", d.cfg.mtu, "mss", d.cfg.mss, "listenPort", d.cfg.listenPort)
 	return nil
 }
 
-// Apply sets the wireguard peers (full replacement) and reconciles the kernel
-// routes to exactly plan.Routes, each routed to the utun. It must be called after
-// Up.
+// Apply programs the wireguard peers and reconciles the kernel routes to exactly
+// plan.Routes, each routed to the utun. It must be called after Up.
+//
+// The peer write honours the endpoint-roaming contract (Plan.UAPIUpdate): the
+// first apply after Up is a full resync that programs every CR endpoint, and each
+// later apply is an incremental update that leaves an already-configured peer's
+// endpoint alone — wireguard owns it once the peer has been heard from — while
+// still reconciling AllowedIPs, keepalives, additions, and removals. A failed
+// IpcSet leaves the device in an unknown state, so the memory is dropped and the
+// next apply is a full resync again.
 func (d *WGDevice) Apply(ctx context.Context, plan Plan) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.dev == nil {
 		return fmt.Errorf("%w: mesh device not up", ErrPeerConfig)
 	}
-	if err := d.dev.IpcSet(plan.UAPI()); err != nil {
+	uapi, next := plan.UAPIUpdate(d.applied)
+	if err := d.dev.IpcSet(uapi); err != nil {
+		d.applied = nil
 		return fmt.Errorf("apply wireguard peers: %w", err)
 	}
+	d.applied = next
 
 	want := make(map[netip.Prefix]struct{}, len(plan.Routes))
 	for _, r := range plan.Routes {
@@ -271,6 +286,9 @@ func (d *WGDevice) Down(ctx context.Context) error {
 		d.dev = nil
 		d.tun = nil
 	}
+	// The peers died with the device; forget what was programmed so a later Up +
+	// Apply re-programs every endpoint rather than suppressing them all.
+	d.applied = nil
 	d.log.Info("mesh device down", "iface", d.iface)
 	return nil
 }
