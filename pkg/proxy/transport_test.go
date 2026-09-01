@@ -258,7 +258,7 @@ func TestTransportOverrideDialTarget(t *testing.T) {
 		if err != nil {
 			t.Fatalf("listen vip socket: %v", err)
 		}
-		r := newUDPRelay(vip, key, table, netip.Addr{}, time.Minute, maxUDPFlowsPerSource, nil, slog.New(slog.DiscardHandler))
+		r := newUDPRelay(vip, key, table, egressScope{}, time.Minute, maxUDPFlowsPerSource, nil, slog.New(slog.DiscardHandler))
 		defer func() { _ = r.Close() }()
 
 		var lastWarn time.Time

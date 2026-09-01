@@ -259,10 +259,15 @@ type udpFlow struct {
 // inverted), and never re-enter the relay. Close joins the dispatcher, the sweeper,
 // and every reader through wg before returning, so teardown strands no goroutine.
 type udpRelay struct {
-	conn         net.PacketConn
-	key          PortKey
-	table        *RoutingTable
-	meshEgress   netip.Addr
+	conn  net.PacketConn
+	key   PortKey
+	table *RoutingTable
+	// egress is the destination-scoped mesh-egress source decision, shared
+	// immutably with the owning Proxy (and therefore identical to the TCP path's).
+	// The relay cannot reuse the proxy's mesh-bound *net.Dialer — a *net.TCPAddr
+	// LocalAddr fails to dial "udp" — so it re-derives a *net.UDPAddr from the same
+	// egressScope.sourceFor verdict rather than carrying a second predicate.
+	egress       egressScope
 	idleTimeout  time.Duration
 	perSourceCap int
 	budget       *udpBudget
@@ -295,16 +300,18 @@ type udpRelay struct {
 }
 
 // newUDPRelay builds a relay serving conn (the VIP datagram socket) for key,
-// selecting backends from table. meshEgress, when valid, source-binds each
-// per-flow upstream socket (the multi-node mesh path); the zero Addr keeps the
-// kernel's default source selection (single node). idleTimeout is the flow GC
-// idle timeout. perSourceCap bounds any one source IP's concurrent flows on this
-// VIP (the per-VIP fair share); budget is the shared relay-global admission budget
+// selecting backends from table. egress carries the destination-scoped mesh-egress
+// decision: a per-flow upstream socket is source-bound to the node's mesh-egress
+// /32 only for a cross-node pod backend (the multi-node mesh path), and the zero
+// value — like every non-cross-node destination — keeps the kernel's default
+// source selection. idleTimeout is the flow GC idle timeout. perSourceCap bounds
+// any one source IP's concurrent flows on this VIP (the per-VIP fair share);
+// budget is the shared relay-global admission budget
 // (global fd total + per-source-global share) — a nil budget is defensively replaced
 // via newUDPBudget with a private one sized to the per-VIP cap, so reserve/release
 // never nil-panic and bySource is never nil (no cross-VIP coupling, the pre-B48
 // bound). Call start to run it and Close to tear it down.
-func newUDPRelay(conn net.PacketConn, key PortKey, table *RoutingTable, meshEgress netip.Addr, idleTimeout time.Duration, perSourceCap int, budget *udpBudget, log *slog.Logger) *udpRelay {
+func newUDPRelay(conn net.PacketConn, key PortKey, table *RoutingTable, egress egressScope, idleTimeout time.Duration, perSourceCap int, budget *udpBudget, log *slog.Logger) *udpRelay {
 	if budget == nil {
 		budget = newUDPBudget(maxUDPFlows, udpPerSourceGlobalCap(maxUDPFlows))
 	}
@@ -312,7 +319,7 @@ func newUDPRelay(conn net.PacketConn, key PortKey, table *RoutingTable, meshEgre
 		conn:         conn,
 		key:          key,
 		table:        table,
-		meshEgress:   meshEgress,
+		egress:       egress,
 		idleTimeout:  idleTimeout,
 		perSourceCap: perSourceCap,
 		budget:       budget,
@@ -448,19 +455,23 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 		r.policy.logDenied("udp", r.key, srcIP, be.Addr())
 		return nil
 	}
-	var laddr *net.UDPAddr
-	if r.meshEgress.IsValid() {
-		// Re-originate from the node's mesh-egress /32 so a cross-node (utun) reply
-		// falls inside this node's wireguard AllowedIPs and is not blackholed. A
-		// *net.TCPAddr LocalAddr (p.dialer's) cannot dial "udp", so the relay binds a
-		// *net.UDPAddr built from this Addr instead of reusing the TCP dialer.
-		laddr = &net.UDPAddr{IP: r.meshEgress.AsSlice()}
-	}
 	// Same published-to-live transport resolution the TCP dial does (M11.3-d2): the
 	// datagram path must not diverge, or a vm-pod backend would be reachable over a
 	// TCP Service and silently blackholed over a UDP one. A backend with no override
 	// resolves to itself, so this is unchanged for every host-process pod.
-	raddr := net.UDPAddrFromAddrPort(r.table.transportAddr(be.Addr()))
+	dst := r.table.transportAddr(be.Addr())
+	raddr := net.UDPAddrFromAddrPort(dst)
+	// Destination-scoped mesh-egress source (M14.2-d1), the identical decision the
+	// TCP path applies: re-originate from the node's mesh-egress /32 only for a
+	// cross-node pod backend, so a utun reply falls inside this node's wireguard
+	// AllowedIPs and is not blackholed — while a same-node, node-LAN, loopback or
+	// unclassifiable destination keeps the kernel default source. A *net.TCPAddr
+	// LocalAddr (the proxy's mesh dialer) cannot dial "udp", so the relay binds a
+	// *net.UDPAddr built from the elected source instead of reusing that dialer.
+	var laddr *net.UDPAddr
+	if src := r.egress.sourceFor(be.Locality(), dst.Addr()); src.IsValid() {
+		laddr = &net.UDPAddr{IP: src.AsSlice()}
+	}
 	up, err := r.dial(laddr, raddr)
 	if err != nil {
 		r.log.Debug("udp relay dial backend", "vip", r.key.String(), "backend", be.Addr().String(), "transport", raddr.String(), "err", err)
