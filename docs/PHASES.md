@@ -283,7 +283,8 @@ phases:
 
   - id: M11
     title: Linux containers & multi-arch (darwin-net slice — vm-pod network identity, reachability, policy attribution)
-    status: in-progress  # 2026-08-31 — the top-level row lagged its own sub-phases (the ledger-repair defect class)
+    status: done  # 2026-09-01 — M11.3 done; a1 closed by the recorded operator sign-off
+    completed: 2026-09-01
     depends_on: []
     notes: >-
       First-class design work (upgraded from M5's "same-node open question" prose;
@@ -304,7 +305,8 @@ phases:
     subphases:
       - id: M11.3
         title: guest→VIP reachability + vm-pod identity + source attribution + network-trust ceiling
-        status: in-progress  # 2026-09-01 (M11 validation): d1/d2/d3a/d4 now DONE — d2's consumer half landed in runtimed and d4's ceiling is recorded as a measurement (guest<->guest and guest->LAN both BLOCKED, narrower than assumed). d3b stays deferred to v0.1.x. Only a1 keeps this row open.
+        status: done  # 2026-09-01 — d1/d2/d3a/d4 done; d3b is the recorded v0.1.x deferral (B113b, the 2026-08-30 split), not an open hold; a1 closed by the operator sign-off on the row.
+        completed: 2026-09-01
         depends_on: [apis:M11.1]
         deliverables:
           - id: M11.3-d1
@@ -324,7 +326,7 @@ phases:
             desc: "Network-trust ceiling recorded: the S5(4) guest↔guest + guest→LAN reachability matrix is a SECURITY fact — guests share one vmnet NAT segment (guest↔guest at NAT addresses bypasses Services/policy; unfiltered L3 to the gateway/LAN). Lands in docs/user/limitations.md + the register wording, or a pf-filter-on-the-vmnet-member follow-up is scoped as its own forward-marker. Guest link MTU ≤1380 in the DHCP/init plan if cross-node is ever claimed (the mesh mss-clamp is utun-scoped and does not cover non-TCP guest traffic)."
         acceptance:
           - id: M11.3-a1
-            met: false
+            met: true  # 2026-09-01 OPERATOR SIGN-OFF, recorded in-session: the unit half is landed (B113a fail-closed table + the two-address consumer matrix), the live legs rode hack/lab/m11.sh green on an entitled M1 Ultra (M11-core 21/0/1, M11-lab 26/0/1 — the human-run reserve), and the operator directed the validation closed against that committed evidence. B113b's attribution table rides d3b at v0.1.x per the recorded split, outside this acceptance.
             check: "the identity/attribution logic is unit-proven at the seams (B113a's fail-closed table incl. the fail-open-regression negative and the no-policy-destination-still-allowed row — the IN-SLICE half of the 2026-08-30 d3a/d3b split; B113b's TestVMPodSourceAttribution stale-lease table rides d3b at v0.1.x; the podIP-authority consumer matrix as pure translation tables, encoding the TWO-ADDRESS model: the podCIDR /32 is the PUBLISHED identity (box.PodIp, downward-API status.podIP, EndpointSlice, DNS) and the agent-Health vmnet lease is the LIVE TRANSPORT address (host->guest dial, attribution), never published — R2 and R3 cannot both govern one address, since the lease exists only after boot and the env is baked before it); the LIVE legs — guest→VIP delivery, host→guest dial, guest DNS resolution, the Service-consumed leg — ride hack/lab/m11.sh (K3SM_LAB=1, human-run), never auto-greened"
             method: unit
 
