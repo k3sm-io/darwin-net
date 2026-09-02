@@ -1,8 +1,8 @@
 ---
 repo: darwin-net
 schema: phases/v1
-current_phase: M5
-updated: 2026-08-31
+current_phase: M7
+updated: 2026-09-01
 updated_by: orchestrator
 
 phases:
@@ -145,20 +145,22 @@ phases:
 
   - id: M5
     title: vm RuntimeClass networking — NAT (VZNATNetworkDeviceAttachment) guest path + guest-side resolver
-    status: in-progress
+    status: done  # 2026-09-01 — every M5 row true; the lab remainder was delivered under M11.3 and proven by the M11 lab gate
+    completed: 2026-09-01
     depends_on:
       - apis:M5.1
     subphases:
       - id: M5.1
         title: Guest networking for the vm RuntimeClass (Virtualization.framework)
-        status: in-progress
+        status: done
+        completed: 2026-09-01
         deliverables:
           - id: M5.1-d1
-            done: false
+            done: true  # 2026-09-01 — delivered by M11.3: the NAT guest path is live (M11.3-d1 answered the delivery question with the guest's bare NAT default route; M11.3-d2 landed the two-address identity so the vm pod's podIP reaches EndpointSlices); proven by the M11 lab gate
             desc: "Guest networking for the `vm` RuntimeClass (Linux micro-VM behind the existing swappable sandbox.Backend seam — runtimed:M5). The lo0-alias + IP_BOUND_IF bind-discipline model is HOST-PROCESS-ONLY: a Virtualization.framework guest has its OWN network stack, so pod connectivity comes from a VZNATNetworkDeviceAttachment (NAT, not bridged — bridged/raw-vmnet needs the Apple-restricted com.apple.vm.networking entitlement, ruled unobtainable; NAT needs only com.apple.security.virtualization), NOT an lo0 alias. LANDED (darwin-net, unit-verifiable): (1) the PATH-SELECTION FORK in pkg/podnet — Network.SetupGuest (BackendVM) allocates the pod IP from the same Allocator but plumbs NO lo0 alias and returns a GuestNetwork (PodIP, NAT gateway/subnet, cluster DNS VIP) for runtimed's VZ backend to apply; Setup (BackendHostProcess) is byte-unchanged; Teardown removes the lo0 alias only for host-process pods. darwin-net provides the config/decision as DATA — the live VZNATNetworkDeviceAttachment wiring is runtimed's (the DAG keeps the VZ backend out of darwin-net). LAB-GATED (scaffold + report, K3SM_LAB=1): the live NAT attach + guest→ClusterIP-VIP reachability (OPEN empirical question: does macOS NAT weak-host-deliver a guest datagram to a host lo0-alias VIP, or only expose the gateway? if not, a host route / a NEW netd route-verb is needed) + cross-node routing. A NAT-private guest IP is NOT yet a cross-node Service backend (same-node scope for M5). Deps apis:M5.1 (the runtime.k3sm.io handler-config mapping runtimeClassName: vm → SANDBOX_BACKEND_VM)."
         acceptance:
           - id: M5.1-a1
-            met: false
+            met: true  # 2026-09-01 — the M11 lab gate on the entitled rig: a vm pod gets its guest IP over NAT, reaches a ClusterIP Service and the cluster DNS VIP from inside the guest, and is reachable through its own ClusterIP (M11-lab 26/0/1, 2026-09-01)
             check: a pod under runtimeClassName vm is assigned a guest IP via the VZNATNetworkDeviceAttachment and is reachable + can reach a ClusterIP Service and the cluster resolver (lab tier, K3SM_LAB=1)
             method: integration
           - id: M5.1-a2
@@ -167,14 +169,15 @@ phases:
             method: unit
       - id: M5.2
         title: Guest-side cluster resolver (the DYLD shim is Darwin-only)
-        status: in-progress
+        status: done
+        completed: 2026-09-01
         deliverables:
           - id: M5.2-d1
-            done: false
+            done: true  # 2026-09-01 — pkg/dns.GuestResolvConf is consumed by runtimed's guest-spec writer, and the M11 lab gate resolved the cluster DNS VIP from inside a guest through the guest's own resolver; delivered under M11.3
             desc: "A guest-side resolver so cluster names (`<svc>.<ns>.svc.cluster.local`, `kubernetes.default.svc`) resolve INSIDE the Linux guest. The Darwin `DYLD_INSERT_LIBRARIES` getaddrinfo shim is meaningless in a Linux guest (no dyld; glibc/musl NSS instead). Point the guest at the cluster resolver via standard Linux mechanisms — render the guest's `/etc/resolv.conf` (nameserver = the kube-dns VIP, search/ndots from the pod DNSConfig). LANDED (darwin-net, unit-verifiable): pkg/dns.GuestResolvConf renders the resolv.conf CONTENT from the M1 netv1.DNSConfig and returns it as DATA for runtimed/k3sm to inject (darwin-net must NOT write the guest rootfs — the DAG forbids it). Two caveats flagged for the injector (not solved here): (a) a Linux guest's DHCP/systemd-resolved will CLOBBER resolv.conf on the NAT interface unless pinned static/immutable; (b) musl (Alpine) largely ignores `options ndots:` where glibc honors it. Reuses the M1 DNSConfig data; replaces only the injection mechanism."
         acceptance:
           - id: M5.2-a1
-            met: false
+            met: true  # 2026-09-01 — the M11 lab gate: a process in the vm guest resolved a Service name via the cluster resolver using the guest's native resolver, no DYLD shim (M11-lab 26/0/1)
             check: a process inside the vm guest resolves a Service name and kubernetes.default.svc via the cluster resolver using the guest's native resolver (resolv.conf/NSS), with no DYLD shim involved (lab tier, K3SM_LAB=1)
             method: integration
 
