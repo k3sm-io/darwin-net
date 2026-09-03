@@ -104,6 +104,11 @@ type Config struct {
 	// daemon reaps it (default DefaultIdleTimeout). It bounds the goroutine and
 	// accounting a dead-but-unclosed peer can hold.
 	IdleTimeout time.Duration
+	// SocketCheckInterval is how often Serve re-stats the unix socket path it is
+	// listening on to confirm the daemon is still reachable there (default
+	// DefaultSocketCheckInterval). It is the injection seam for the crash-only
+	// socket watchdog; see Serve.
+	SocketCheckInterval time.Duration
 
 	// PortAuthorizer confirms a <1024 bind; nil denies every <1024 bind.
 	PortAuthorizer PortAuthorizer
@@ -147,6 +152,9 @@ func NewServer(cfg Config) *Server {
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = DefaultIdleTimeout
 	}
+	if cfg.SocketCheckInterval <= 0 {
+		cfg.SocketCheckInterval = DefaultSocketCheckInterval
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -166,6 +174,30 @@ func NewServer(cfg Config) *Server {
 // in-flight connections to drain before returning ctx.Err(); each handler closes
 // its own connection on cancellation, so a peer blocked mid-conversation cannot
 // hold the drain open.
+//
+// # The crash-only socket watchdog
+//
+// A unix listener survives the removal of the socket file it is bound to: the
+// kernel keeps serving the (now unlinked) inode the fd refers to, while every new
+// dial of the path fails with ENOENT. So if anything removes or replaces the
+// socket under a live daemon — a stray rm, a run-directory cleanup, a second netd
+// instance that unlinks and rebinds the same path — this daemon keeps running and
+// accepting on an inode nobody can reach: launchd reports it healthy, every client
+// dial fails, and nothing self-heals.
+//
+// Serve therefore polls its own socket path every Config.SocketCheckInterval and
+// compares the (device, inode) it finds against the identity recorded at start. On
+// removal or an identity mismatch it logs one line and returns an error wrapping
+// ErrSocketLost, so the process exits and launchd's KeepAlive restarts it with a
+// freshly bound socket. It deliberately does NOT re-listen in place: a lost socket
+// usually means another process is binding the same path, and racing it would leave
+// two root daemons fighting over which one clients reach.
+//
+// What this does not cover: a job REMOVED from the launchd domain (bootout,
+// uninstall, a failed reinstall). KeepAlive cannot restart a job that is no longer
+// loaded, so exiting there is terminal rather than self-healing. Keeping the job
+// loaded is the installer's contract, not this daemon's; the watchdog closes the
+// removed/replaced-socket class only.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	done := make(chan struct{})
 	defer close(done)
@@ -177,11 +209,22 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 		_ = l.Close()
 	}()
 
+	// Buffered so the watchdog never blocks reporting, and read only after Accept
+	// has failed — the watchdog sends before it closes the listener, so the report
+	// is always in hand by the time the failed Accept looks for it.
+	lost := make(chan error, 1)
+	s.startSocketWatchdog(ctx, l, done, lost)
+
 	var wg sync.WaitGroup
 	for {
 		conn, err := l.Accept()
 		if err != nil {
 			wg.Wait()
+			select {
+			case werr := <-lost:
+				return werr
+			default:
+			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
