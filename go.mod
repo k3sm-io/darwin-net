@@ -4,7 +4,7 @@ go 1.25.8
 
 require (
 	golang.org/x/net v0.51.0
-	// golang.zx2c4.com/wireguard is userspace WireGuard — the M3 mesh datapath over
+	// golang.zx2c4.com/wireguard is userspace WireGuard — the node-mesh datapath over
 	// a root-created utun (pkg/mesh). It publishes no semver tags, so it is pinned to
 	// a commit pseudo-version (never @latest); it transitively pulls the pure-Go
 	// golang.org/x/crypto (AEAD/curve25519). Builds CGO_ENABLED=0 on darwin/arm64.
