@@ -44,7 +44,7 @@ type ResolvConfFields struct {
 
 // GuestResolvConfFields derives the NORMALIZED nameserver/search/options triple for
 // a vm-RuntimeClass Linux guest from cfg — the SAME netv1.DNSConfig the Darwin
-// getaddrinfo shim consumes for a host-process pod (M1). It is the SINGLE place
+// getaddrinfo shim consumes for a host-process pod. It is the SINGLE place
 // that normalizes cfg for guest DNS: the only normalizeSearch call and the only
 // ndots clamp for this path live here. GuestResolvConf renders this result to
 // text and performs no independent normalization of its own, so the two views can
@@ -84,7 +84,7 @@ func GuestResolvConfFields(cfg netv1.DNSConfig) (ResolvConfFields, error) {
 
 // GuestResolvConf renders the /etc/resolv.conf content for a vm-RuntimeClass Linux
 // guest from cfg — the SAME netv1.DNSConfig the Darwin getaddrinfo shim consumes for
-// a host-process pod (M1). Only the injection mechanism differs: the Darwin
+// a host-process pod. Only the injection mechanism differs: the Darwin
 // DYLD_INSERT_LIBRARIES shim is meaningless in a Linux guest (no dyld; glibc/musl
 // NSS instead), so the guest is pointed at the cluster resolver the standard Linux
 // way — nameserver = the cluster DNS VIP (cfg.ClusterDNSIP), with search + ndots

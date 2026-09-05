@@ -21,7 +21,7 @@ limitations under the License.
 // rewrites the pod's own wildcard binds onto that /32, using this package's
 // env ABI (env.go) to learn which address, so same-node pod-to-pod traffic
 // stays on loopback with the source IP preserved by XNU and the address is
-// the routable identity reachable over the wireguard mesh in M3.
+// the routable identity reachable over the wireguard mesh.
 //
 // # Layers
 //
@@ -44,7 +44,7 @@ limitations under the License.
 //     leak-free (tearing an unknown pod down is a no-op success), so a crash-
 //     recovery reconcile cannot leak addresses.
 //
-// # Bind discipline (shipped B216 — darwin-net#62)
+// # Bind discipline
 //
 // podnet only provisions the address (the returned IP flows into runtime/v1
 // PodBox.pod_ip); the bind rewrite itself happens IN the pod process, via a
@@ -75,7 +75,7 @@ limitations under the License.
 // vm-RuntimeClass guest gets a NAT attachment instead (see "# Pod backends"
 // below).
 //
-// # Pod backends: the path-selection fork (M5.1)
+// # Pod backends: the path-selection fork
 //
 // Network serves two backends from one Allocator, chosen by the caller (runtimed,
 // from the pod's RuntimeClass — apis runtimev1.HandlerVM => SANDBOX_BACKEND_VM):
@@ -100,9 +100,9 @@ limitations under the License.
 //
 // # Guest VIP reachability — ANSWERED, and it needs nothing (2026-08-31)
 //
-// This was the M5.1 open question: can a guest behind a NAT attachment reach a
+// This was an open question: can a guest behind a NAT attachment reach a
 // ClusterIP VIP that lives on a host lo0 alias, or does macOS expose only the
-// gateway to the guest? It was answered empirically by the M11 guest-networking lab
+// gateway to the guest? It was answered empirically by guest-networking lab
 // findings, against a real lo0-alias VIP with a listener bound to the VIP itself
 // (not the wildcard, so what XNU does with the destination address is observed
 // rather than assumed), for both TCP and UDP/53.

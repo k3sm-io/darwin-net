@@ -57,7 +57,7 @@ const (
 	// the caller's own /32; every other dial is passed through untouched.
 	//
 	// Scoping is the safety property here, not an optimisation. XNU source-selects
-	// the DESTINATION's address for an unbound dial to a /32 lo0 alias (B215 P1d),
+	// the DESTINATION's address for an unbound dial to a /32 lo0 alias (measured directly),
 	// so without the pin every same-node pod-to-pod connection appears to come from
 	// the callee — but with an UNSCOPED pin, an en0-routed external dial would
 	// carry a loopback source and never see a reply. Unset or unparseable therefore
@@ -129,8 +129,7 @@ func BindDisciplineEnv(podIP netip.Addr) map[string]string {
 //
 // It is ADDITIVE, never a replacement: BindDisciplineEnv keeps its signature and
 // its exact output, so a caller with no CIDRs to declare (or one that
-// wants the connect rung off) keeps working unchanged and gets the
-// pre-B218 behaviour — the shim pins nothing.
+// wants the connect rung off) keeps working unchanged — the shim pins nothing.
 //
 // The nil-means-inject-nothing polarity governs the pod IP first: if
 // BindDisciplineEnv rejects podIP, this returns nil too, because a destination

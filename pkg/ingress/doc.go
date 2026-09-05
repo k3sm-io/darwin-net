@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package ingress is k3sm's L7 HTTP(S) datapath (M10.3): an in-process userspace
+// Package ingress is k3sm's L7 HTTP(S) datapath: an in-process userspace
 // reverse proxy fronting the ClusterIP VIPs the L4 Service proxy (pkg/proxy)
 // already owns. It is its own package — the L4 splice and the L7
 // router are distinct concerns — and it dials Service ClusterIP

@@ -45,7 +45,7 @@ const dialTimeout = 5 * time.Second
 // connected upstream socket and its picked backend) after this much two-way
 // silence, mirroring Linux conntrack-UDP (30s) and kube-proxy's userspace
 // udpIdleTimeout. Kept distinct from a future ClientIP sessionAffinity TTL,
-// which outlives many idle gaps: B22 needs its own IP-keyed affinity table,
+// which outlives many idle gaps: ClientIP session affinity needs its own IP-keyed affinity table,
 // not this 5-tuple flow map.
 const udpFlowIdleTimeout = 30 * time.Second
 
@@ -105,7 +105,7 @@ type Proxy struct {
 	// or routes them. It is set once by WithInfraVIPExemptions and read-only
 	// thereafter, so it needs no lock.
 	exemptVIPs map[netip.Addr]struct{}
-	// policy is the optional NetworkPolicy L4-subset verdict table (M10.4),
+	// policy is the optional NetworkPolicy L4-subset verdict table,
 	// consulted on the accept paths AFTER the backend pick. Nil (the default)
 	// allows everything — PolicyTable.Allow is nil-receiver-safe, so the hooks are
 	// unconditional. Set once by WithPolicyTable and read-only thereafter.
@@ -114,7 +114,7 @@ type Proxy struct {
 	// relay: it caps concurrent upstream sockets across all relays (so they cannot
 	// jointly exhaust the process fd table the co-resident control plane spends
 	// from) and caps any one source IP's flows across all VIPs (the
-	// per-source-global fair share, B52). Constructed once in New (RLIMIT_NOFILE
+	// per-source-global fair share). Constructed once in New (RLIMIT_NOFILE
 	// -derived total, floored at maxUDPFlows) or overridden by WithUDPFlowBudget;
 	// read-only after construction, and a mutex-guarded leaf that mutates its own
 	// state under its own lock and never calls back into a relay — no proxy lock
@@ -218,21 +218,21 @@ func WithClusterPodCIDR(cidr netip.Prefix) Option {
 // binder rather than the Service proxy, so the proxy never takes ownership of
 // them: no lo0 alias, no listening socket, no routing-table entry.
 //
-// It is the fix for the per-node resolver collision (M3.3). k3sm runs a per-node
+// It is the fix for the per-node resolver collision. k3sm runs a per-node
 // resolver (the in-process k3sm/pkg/netserve resolver) on every node bound
 // directly to the kube-dns VIP (10.43.0.10) for 53/TCP and 53/UDP, so cluster DNS
 // is always answered node-locally over loopback and never
 // steered over the wireguard mesh (which carries only pod /24s — a mesh-steered
 // DNS VIP would blackhole). Without this exemption the proxy's kube-dns Service
 // reconcile would try to bind 10.43.0.10:53 and fail with EADDRINUSE — for TCP and,
-// since B23 built the ClusterIP UDP datagram relay, for 53/UDP too (it no longer
+// since the ClusterIP UDP datagram relay was built, for 53/UDP too (it no longer
 // dodges the collision by opening no datagram socket). The exemption is keyed on the
 // VIP address, so it covers every port and protocol on that VIP, and that
 // address-keyed seam is what keeps cluster DNS node-local while a legitimate USER
 // UDP Service on a different (non-exempt) VIP is still claimed and relayed.
 //
 // The node-local kubernetes (10.43.0.1) endpoint uses the same step-aside
-// mechanism, but its endpoint rewrite is k3sm-owned (k3sm:M3.3); darwin-net
+// mechanism, but its endpoint rewrite is k3sm-owned; darwin-net
 // supplies the DNS-VIP default (pkg/dns.DefaultDNSVIP) and this exemption seam.
 func WithInfraVIPExemptions(vips ...netip.Addr) Option {
 	return func(p *Proxy) {
@@ -244,7 +244,7 @@ func WithInfraVIPExemptions(vips ...netip.Addr) Option {
 	}
 }
 
-// WithPolicyTable wires the NetworkPolicy L4-subset verdict table (M10.4): the
+// WithPolicyTable wires the NetworkPolicy L4-subset verdict table: the
 // accept paths consult it per (source, PICKED backend pod IP, backend port) —
 // TCP in handle after the pick, UDP at relay flow admission — and refuse a denied
 // connection/flow. Unset (nil) the proxy is policy-free: everything is allowed.
@@ -279,7 +279,7 @@ func WithNetdHelper(socketPath string) Option {
 //
 // The relay-global UDP fd budget defaults to half the process's enforced soft fd
 // limit (RLIMIT_NOFILE.Cur), floored at maxUDPFlows so a low launchd soft limit
-// never regresses a single VIP below its B23 per-VIP capacity; WithUDPFlowBudget
+// never regresses a single VIP below its per-VIP capacity; WithUDPFlowBudget
 // lets the k3sm assembler size the relay subsystem's fd slice against the whole
 // process (the TCP proxy + control plane spend from the same table).
 func New(table *RoutingTable, opts ...Option) *Proxy {
@@ -327,12 +327,12 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 // limit (RLIMIT_NOFILE.Cur — not Max, which may be unlimited), leaving the other half
 // for the TCP proxy, the listeners, and the co-resident control plane, but floored at
 // maxUDPFlows so a low launchd soft limit never regresses a single VIP's capacity
-// below the B23 per-VIP bound. A Getrlimit error falls back to the floor.
+// below its per-VIP bound. A Getrlimit error falls back to the floor.
 //
 // The reservation only leaves real headroom for the co-resident control plane when
 // the daemon's soft RLIMIT_NOFILE is provisioned above 2*maxUDPFlows (the launchd
 // plist NumberOfFiles) or the k3sm assembler passes WithUDPFlowBudget; below that
-// the floor dominates and the budget bounds only a single VIP (tracked in B52).
+// the floor dominates and the budget bounds only a single VIP.
 func defaultUDPFlowBudget() int64 {
 	var rl unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rl); err != nil {
@@ -634,7 +634,7 @@ func (p *Proxy) runWorker(w *portWorker) {
 // clusterIP:port, never :port, so the bound source identity is the VIP) and, when
 // NodePort is set, a node-wide *:NodePort stream listener. For UDP it opens the
 // ClusterIP datagram relay (see the UDP branch below and udprelay.go); UDP
-// NodePort is deferred (B23). It ensures the lo0 alias exists first.
+// NodePort is deferred. It ensures the lo0 alias exists first.
 //
 // NodePort semantics (TCP): the *:NodePort listener load-balances to all Ready
 // backends via PickStickyCluster — externalTrafficPolicy: Cluster.
@@ -667,7 +667,7 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 		// is stream-only), so a privileged (<1024) VIP without root gets an honest
 		// EACCES; the netd datagram path is deferred. NodePort UDP is deferred too: a
 		// wildcard reply re-selects its source on a multi-homed node (wrong src IP,
-		// client drops it), needing IP_RECVDSTADDR/IP_SENDSRCADDR (out of scope, B23).
+		// client drops it), needing IP_RECVDSTADDR/IP_SENDSRCADDR (out of scope).
 		clusterAP := netip.AddrPortFrom(ip, uint16(port.Port))
 		pc, err := net.ListenPacket("udp", clusterAP.String())
 		if err != nil {
@@ -675,7 +675,7 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 			return nil, fmt.Errorf("listen udp clusterIP %s: %w", clusterAP, err)
 		}
 		relay := newUDPRelay(pc, key, p.table, p.egress, udpFlowIdleTimeout, maxUDPFlowsPerSource, p.udpBudget, p.log)
-		// NetworkPolicy L4 subset (M10.4): the relay consults the shared verdict
+		// NetworkPolicy L4 subset: the relay consults the shared verdict
 		// table at flow admission (upstreamFor, after its once-per-flow Pick). Set
 		// before start so the dispatcher's read is covered by the goroutine-start
 		// happens-before; nil means policy-free.
@@ -780,7 +780,7 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		}
 		return
 	}
-	// NetworkPolicy L4-subset verdict (M10.4), after the pick — per (source,
+	// NetworkPolicy L4-subset verdict, after the pick — per (source,
 	// picked-backend pod IP, backend port), never per VIP, because one Service can
 	// front policy-heterogeneous pods. A deny closes the accepted connection
 	// (deferred Close → client sees RST/EOF) before any backend dial; nil p.policy
@@ -790,13 +790,13 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		return
 	}
 	// Resolve the published backend identity to its live transport address (the
-	// two-address vm-pod model, M11.3-d2). For a host-process pod — and for every
+	// two-address vm-pod model). For a host-process pod — and for every
 	// backend on a node hosting no vm pod — this is a map miss that returns the
 	// published address unchanged, so the dial below is byte-identical to what it
 	// was. The policy verdict above ran on the published address, which is the
 	// identity a NetworkPolicy names; only the packet follows the lease.
 	dst := p.table.transportAddr(be.Addr())
-	// Destination-scoped mesh-egress source (M14.2-d1): a cross-node pod dial is
+	// Destination-scoped mesh-egress source: a cross-node pod dial is
 	// sourced from this node's mesh-egress /32 so the peer's AllowedIPs check
 	// admits the reply; every other destination keeps kernel default source
 	// selection. dialerFor picks between two immutable dialers — nothing here

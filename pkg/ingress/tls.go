@@ -101,7 +101,7 @@ func ParseKeyPair(secretName string, certPEM, keyPEM []byte) (*tls.Certificate, 
 //
 // NextProtos is DELIBERATELY pinned to http/1.1: h2 (and gRPC over it) through
 // the L7 datapath is untested and therefore deferred — do not add "h2" here
-// without an M10.3 follow-up that tests it end-to-end.
+// without an end-to-end test that verifies it first.
 func serverTLSConfig(r CertResolver) *tls.Config {
 	return &tls.Config{
 		NextProtos: []string{"http/1.1"},

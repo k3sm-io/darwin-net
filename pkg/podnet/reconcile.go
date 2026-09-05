@@ -23,7 +23,7 @@ import (
 	"net/netip"
 )
 
-// This file is the crash-reconcile surface (M10.1): the Network's IPAM state is
+// This file is the crash-reconcile surface: the Network's IPAM state is
 // in-memory while the lo0 aliases it plumbs are durable kernel state, so a
 // daemon crash (`launchctl kickstart -k`) leaves the two divergent — the new
 // process would re-allocate addresses still aliased for running pods

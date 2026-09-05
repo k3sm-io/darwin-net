@@ -27,8 +27,8 @@ import (
 // ClusterPodCIDR is k3sm's default cluster pod CIDR: 100.64.0.0/10 (the RFC 6598
 // shared address space, as in DESIGN.md §5b). Each node carves a unique /24 out
 // of it by node index, giving up to 2^14 nodes of 254 usable pod IPs each; the
-// unique-per-node /24 is what lets the wireguard mesh route (not NAT) pod IPs in
-// M3. It is exposed so callers that do not override the CIDR get the canonical
+// unique-per-node /24 is what lets the wireguard mesh route (not NAT) pod IPs.
+// It is exposed so callers that do not override the CIDR get the canonical
 // default.
 var ClusterPodCIDR = netip.MustParsePrefix("100.64.0.0/10")
 

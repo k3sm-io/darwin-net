@@ -1,8 +1,9 @@
 /*
  * k3sm pod DYLD interpose shim — getaddrinfo(), bind() AND connect().
  *
- * SCOPE BANNER (widened by B216, widened again by B218). This file started life
- * as the getaddrinfo interposer and now owns THREE interposes in ONE dylib: the
+ * SCOPE BANNER (widened as the bind() discipline, then the connect()
+ * source-pinning rung, were added). This file started life as the getaddrinfo
+ * interposer and now owns THREE interposes in ONE dylib: the
  * cluster-DNS getaddrinfo() below, the per-pod bind() discipline, and the
  * destination-scoped connect() source pinning — the last two at the bottom of
  * the file, sharing one config and one pthread_once. They share nothing else but
@@ -13,7 +14,7 @@
  * and to the k3sm.io/dyld-insert-libraries annotation that injects it; renaming
  * it is a deliberate non-goal here, so this banner carries the truth instead.
  *
- * IPv6 SCOPE (v1, B218). The connect() rung handles AF_INET ONLY: k3sm's pod and
+ * IPv6 SCOPE (v1). The connect() rung handles AF_INET ONLY: k3sm's pod and
  * Service CIDRs are IPv4 (../pkg/podnet's lo0-alias IPAM is v4-only and
  * K3SM_POD_IP is parsed with inet_pton(AF_INET, …)), so there is no v6 cluster
  * destination for a v6 dial to fall inside and no v6 source to pin it to. An
@@ -1188,7 +1189,7 @@ int k3sm_getaddrinfo(const char *node, const char *service,
  *
  * — and every net.Listen ultimately calls through that normal dynamic binding,
  * which dyld's __DATA,__interpose section can retarget exactly as it does for a
- * C program. This is measured, not assumed: the B215 probe wave observed a real
+ * C program. This is measured, not assumed: direct observation of a real
  * `net.Listen("tcp", ":18082")` land on the rewritten address (`lsof` showing
  * `TCP 100.64.99.7:18082 (LISTEN)` under the shim vs `TCP *:18082` without it).
  * If a future Go release ever emitted raw syscalls here, this interpose would go
@@ -1205,9 +1206,9 @@ int k3sm_getaddrinfo(const char *node, const char *service,
  *      malformed value must never surface an error to the workload.
  *   3. wildcard only. A specific bind is the caller's explicit choice.
  *   4. IPV6_V6ONLY for in6addr_any. A socket whose owner asked for v6-only
- *      semantics must not be given a v4-mapped address (B215 P2-v6only).
+ *      semantics must not be given a v4-mapped address (measured directly).
  *   5. the low-port carve (see K3SM_BIND_MIN_PORT).
- *   6. SO_REUSEADDR before the rewritten bind, unconditionally (B215 P1a).
+ *   6. SO_REUSEADDR before the rewritten bind, unconditionally (measured directly).
  */
 
 /*
@@ -1219,7 +1220,7 @@ int k3sm_getaddrinfo(const char *node, const char *service,
  * bind needs no privilege at any port, while a SPECIFIC-address bind below 1024
  * returns EACCES for a non-root uid, and k3sm pods never run as root. So
  * rewriting `bind(0.0.0.0:80)` would convert a working nginx-shaped workload into
- * a permission error — a regression, not a discipline. B215 cell P1c measured
+ * a permission error — a regression, not a discipline. Direct measurement confirmed
  * exactly this and pinned the cause to the uid (the same specific bind succeeds
  * as root and fails unconfined-unprivileged, which clears both Seatbelt and this
  * interposer). Low-port pods therefore keep today's shared wildcard behaviour;
@@ -1228,10 +1229,10 @@ int k3sm_getaddrinfo(const char *node, const char *service,
  * Port 0 — ALSO passed through, and deliberately so. An ephemeral wildcard bind
  * is a CLIENT socket about to connect() somewhere this interpose cannot see;
  * pinning its source to the pod /32 would break an en0-routed external dial,
- * which is precisely the hazard the destination-scoped connect() rung (backlog
- * B218) exists to handle and which bind() alone cannot evaluate. The B215 probe
- * artifact rewrote port 0, but no probe cell measured that case, so the shipped
- * shim declines it rather than inherit an unmeasured behaviour.
+ * which is precisely the hazard the destination-scoped connect() rung exists
+ * to handle and which bind() alone cannot evaluate. An earlier probe artifact
+ * rewrote port 0, but no measurement covered that case, so the shipped shim
+ * declines it rather than inherit an unmeasured behaviour.
  */
 #define K3SM_BIND_MIN_PORT 1024
 
@@ -1267,7 +1268,8 @@ typedef struct {
     char podip_s[INET_ADDRSTRLEN];  /* presentation form, for the trace only */
     /* The connect() rung's destination scope. ncidrs == 0 means the rung is
      * OFF — K3SM_CLUSTER_CIDRS was unset, empty, or unparseable — and every
-     * connect() is passed through, which is the pre-B218 behaviour. */
+     * connect() is passed through, which is the behaviour before the connect()
+     * rung existed. */
     int ncidrs;
     k3sm_cidr_t cidrs[K3SM_MAX_CLUSTER_CIDRS];
 } k3sm_bind_cfg_t;
@@ -1317,7 +1319,7 @@ static void k3sm_bind_trace(const char *fmt, ...) {
  *
  * STRICT AND FAIL-SAFE, in that order. Every rejection below collapses to the
  * same outcome as an unset value — no dial is pinned, which is exactly the
- * pre-B218 behaviour — so a malformed value can only cost fidelity, never
+ * behaviour before the connect() rung existed — so a malformed value can only cost fidelity, never
  * connectivity. The alternative (accept the entries that parsed, drop the rest)
  * would silently shrink the pinned set, and a destination-scoped rewrite whose
  * scope is quietly wrong is worse than one that is off.
@@ -1476,7 +1478,7 @@ static void k3sm_bind_cfg_init(void) {
 
 /*
  * SO_REUSEADDR on every socket this shim rewrites — UNCONDITIONAL, and set
- * BEFORE the real bind. B215 cell P1a is the grounds and it is not a nicety:
+ * BEFORE the real bind. Direct measurement is the grounds and it is not a nicety:
  * without it the rewritten bind returns EADDRINUSE against a standing wildcard
  * listener (the node's svclb and the Service proxy both hold one) in every
  * shape and both orders, AND against the socket's own TIME_WAIT after serving a
@@ -1584,7 +1586,7 @@ int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len) {
      * v6-only semantics, a v4-mapped address is not even bindable on it, and
      * silently black-holing such a listener would be strictly worse than the
      * loud EADDRINUSE this shim exists to remove. Go's "tcp6" network sets
-     * IPV6_V6ONLY=1, as may any C/JVM server (B215 P2-v6only). A getsockopt
+     * IPV6_V6ONLY=1, as may any C/JVM server (measured directly). A getsockopt
      * failure is treated as "do not touch it" — the fail-safe direction.
      */
     int v6only = -1;
@@ -1606,7 +1608,7 @@ int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len) {
     }
 
     /*
-     * Rewrite to the v4-mapped form ::ffff:<podip>. B215 P2 proved this binds on
+     * Rewrite to the v4-mapped form ::ffff:<podip>. Direct measurement proved this binds on
      * a dual-stack socket and that v4 traffic to the alias arrives, while
      * 127.0.0.1 and [::1] are refused — the rewrite genuinely narrows the
      * socket rather than relabelling it — so the fallback path the plan held in
@@ -1630,7 +1632,7 @@ int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len) {
  * WHY THIS EXISTS, AND WHY bind() ALONE CANNOT DO IT. A /32 lo0 alias installs a
  * host route whose rt_ifa IS that alias, so XNU's source selection for an
  * UNBOUND dial to another pod's /32 picks the DESTINATION's own address as the
- * source. Measured, not inferred: the B215 P1d cells recorded a confined process
+ * source. Measured, not inferred: direct observation recorded a confined process
  * holding K3SM_POD_IP=100.64.99.8 dialling 100.64.99.7 and the ACCEPTING side
  * seeing peer=100.64.99.7 — the callee's own IP. Neither loopback (P1d.5 is a
  * separate case) nor the caller's alias (P1d.4) wins; the destination does, and
@@ -1670,7 +1672,7 @@ int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len) {
  *
  * TCP AND UDP ALIKE. Nothing here inspects SO_TYPE: a connected SOCK_DGRAM
  * socket has exactly the same source-selection problem and the same fix, and
- * B215 proved the sibling bind-rung claim is not TCP-scoped either.
+ * Direct measurement proved the sibling bind-rung claim is not TCP-scoped either.
  *
  * NO SO_REUSEADDR HERE, deliberately — unlike the bind rung. That option exists
  * there because a rewritten LISTENER takes a fixed port that a standing wildcard

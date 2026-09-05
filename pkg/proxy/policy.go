@@ -50,7 +50,7 @@ type PolicyRule struct {
 	Ports map[uint16]struct{}
 }
 
-// PolicyTable is the pure-logic core of the M10.4 NetworkPolicy L4 subset: it maps
+// PolicyTable is the pure-logic core of the NetworkPolicy L4 subset: it maps
 // a policy-selected backend pod IP to its resolved union-of-allows ingress rules
 // and answers one question — Allow(src, backend, port) — per accepted connection
 // (TCP) or admitted flow (UDP), after the routing table has picked the backend.
@@ -73,7 +73,7 @@ type PolicyRule struct {
 //     source. This is the hint contract: the subset restricts attributable pod
 //     traffic and fails open on anything it cannot attribute.
 //   - Except on a vm-hosting node, for an unknown source inside the configured
-//     vmnet prefix: that one case fails closed (M11.3-d3a). See vmnet below and
+//     vmnet prefix: that one case fails closed. See vmnet below and
 //     the branch in Allow — it is scoped to exactly that source class, so every
 //     other transient-unknown source keeps the fail-open above.
 //   - An empty table (pre-informer-sync, or no policies) allows everything, and a
@@ -96,7 +96,8 @@ type PolicyTable struct {
 	// read-only thereafter, exactly like alwaysAllow. The zero/invalid Prefix means
 	// "this node hosts no vm pods", which is every node NewPolicyTable builds a table
 	// for, and it is inert: the unknown-source path then behaves exactly as it did
-	// before M11.3-d3a. Its only use is scoping that fail-closed branch in Allow.
+	// before this fail-closed branch existed. Its only use is scoping that fail-closed
+	// branch in Allow.
 	vmnet netip.Prefix
 
 	mu sync.RWMutex
@@ -121,8 +122,8 @@ type PolicyTable struct {
 	lastVMUnknownLog time.Time
 	lastDenyLog      time.Time
 
-	// evalCount counts Allow evaluations (atomically). It exists for the M10.4
-	// gate's asserted-bypass subtest: a direct pod-IP→pod-IP connection never
+	// evalCount counts Allow evaluations (atomically). It exists for the
+	// NetworkPolicy gate's asserted-bypass subtest: a direct pod-IP→pod-IP connection never
 	// transits a VIP accept path, so it must never bump this counter.
 	evalCount atomic.Uint64
 }
@@ -139,7 +140,7 @@ func NewPolicyTable(alwaysAllow ...netip.Addr) *PolicyTable {
 // NewPolicyTableVMNet is NewPolicyTable for a node that hosts vm-RuntimeClass pods:
 // vmnet is the NAT segment those guests are attached to (the vmnet subnet, e.g.
 // 192.168.64.0/24). It seeds the one extra thing that distinguishes such a node —
-// the fail-closed unknown-vm-source branch in Allow (M11.3-d3a) — and changes
+// the fail-closed unknown-vm-source branch in Allow — and changes
 // nothing else. Passing the zero Prefix is exactly NewPolicyTable, so a node that
 // runs no guests keeps the unconditional unknown-source fail-open.
 //
@@ -239,7 +240,7 @@ func (t *PolicyTable) Allow(src, backend netip.Addr, port uint16) bool {
 		// Fail closed for a source inside this node's vmnet segment. A vm guest's
 		// live transport address is its macOS-assigned vmnet DHCP lease, and nothing
 		// maps that lease back to a pod today: the lease->pod registry (the deferred
-		// half of the M11.3-d3a/d3b split) is not built. So a vm pod's traffic
+		// half of source attribution) is not built. So a vm pod's traffic
 		// arrives here as an unknown source, and under the fail-open below it would
 		// be allowed past a policy that selects the destination — a NetworkPolicy
 		// bypass for exactly the pod class NetworkPolicy is most needed for. It is
