@@ -74,7 +74,7 @@ type Watcher struct {
 	// The worker applies both in arrival order, so the table ends on the empty set
 	// and — the informers run a 0 resync period — nothing ever recomputes it. The
 	// Service blackholes until its next real event. The proxy's per-VIP worker
-	// serializes DELIVERY, which is not the same guarantee (B207).
+	// serializes DELIVERY, which is not the same guarantee.
 	//
 	// Striping bounds the contention: only Services that hash together wait on each
 	// other. The lock is held across ReconcilePolicy, whose sole blocking point is a

@@ -123,7 +123,7 @@ type RoutingTable struct {
 	affinity map[PortKey]map[netip.Addr]*affinityBinding
 	// affinityCount is the live-binding total across all PortKeys — the sum of
 	// len(binds) over the affinity map — guarded by mu. It is a plain int under the
-	// single table lock, not an atomic: unlike B48's cross-lock udpBudget it never
+	// single table lock, not an atomic: unlike the cross-lock udpBudget it never
 	// leaves mu. It backs the relay-global aggregate ceiling (maxAffinityTotal) and
 	// must stay an exact function of the affinity map's cardinality — +1 at the one
 	// create in PickSticky, -1 at each single-key delete (routed through
@@ -363,7 +363,7 @@ func (t *RoutingTable) Delete(key PortKey) {
 }
 
 // SetTransportOverrides atomically replaces the published-to-live transport
-// address map, the seam the two-address vm-pod identity model needs (M11.3-d2).
+// address map, the seam the two-address vm-pod identity model needs.
 //
 // # The two addresses
 //

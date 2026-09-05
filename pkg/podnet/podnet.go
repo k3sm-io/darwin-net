@@ -31,7 +31,7 @@ import (
 // processes to, and Teardown reclaims it. It is defined here, at the consumer of
 // the allocator and alias manager, and is the only surface the runtime depends on.
 //
-// runtimed (M2) is the caller: it invokes Setup before launching the pod's
+// runtimed is the caller: it invokes Setup before launching the pod's
 // processes, binds them to the returned IP via IP_BOUND_IF, and records the IP in
 // runtime/v1 PodBox.pod_ip; it invokes Teardown when the pod is removed.
 //

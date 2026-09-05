@@ -40,7 +40,7 @@ const MaxSearchDomains = 8
 // pod-spec fields and calls it); it takes DISCRETE searches/ndots rather than a
 // full netv1.DNSConfig "extra" so it can only ever augment the search list and
 // ndots and can NEVER override the cluster server VIP (ClusterDNSIP) or domain.
-// That type-enforces B18's infra-wins invariant — a ClusterFirst pod always
+// That type-enforces the infra-wins invariant — a ClusterFirst pod always
 // points at the cluster resolver; dnsConfig may add to its search/ndots, never
 // preempt the cluster server.
 //
@@ -61,8 +61,8 @@ const MaxSearchDomains = 8
 //     shim's skip-empty behavior), and the tail beyond MaxSearchDomains is truncated.
 //   - NDots: ndots > 0 overrides base.NDots (the pod's ndots wins); ndots <= 0
 //     keeps base.NDots. An explicit `ndots: 0` is INDISTINGUISHABLE from unset in
-//     the int32 field, so it is treated as unset (→ cluster default); honoring an
-//     explicit 0 is deferred to B20b.
+//     the int32 field, so it is treated as unset (→ cluster default); an explicit
+//     0 is not honored.
 //   - ClusterDNSIP and ClusterDomain are carried from base UNCHANGED.
 //
 // Sanitize+cap go through the same sanitizeSearch/capSearch helpers ConfigToEnv,
@@ -71,8 +71,7 @@ const MaxSearchDomains = 8
 //
 // base is not mutated: out starts as a copy of base and is given a FRESH
 // SearchDomains slice that never aliases the caller's. dnsConfig.nameservers and
-// non-ndots dnsConfig.options are NOT honored here (the single-server shim ABI;
-// deferred to B20b).
+// non-ndots dnsConfig.options are NOT honored here (the single-server shim ABI).
 func MergeDNSConfig(base netv1.DNSConfig, searches []string, ndots int32) (netv1.DNSConfig, int) {
 	out := base
 
@@ -92,7 +91,7 @@ func MergeDNSConfig(base netv1.DNSConfig, searches []string, ndots int32) (netv1
 
 	// A positive pod ndots overrides the cluster default. ndots <= 0 — which an
 	// explicit `ndots: 0` is indistinguishable from in the int32 field — keeps
-	// base.NDots; honoring an explicit 0 is deferred to B20b.
+	// base.NDots; an explicit 0 is not honored today.
 	if ndots > 0 {
 		out.NDots = ndots
 	}

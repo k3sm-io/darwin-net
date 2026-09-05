@@ -41,7 +41,7 @@ import (
 const policyRecomputeDebounce = 100 * time.Millisecond
 
 // PolicyWatcher resolves NetworkPolicies into the PolicyTable's concrete verdict
-// state. It is the selector-aware half of the M10.4 L4 subset: it watches
+// state. It is the selector-aware half of the NetworkPolicy L4 subset: it watches
 // NetworkPolicies, Pods, AND Namespaces (namespaceSelector peers match on
 // namespace LABELS, so namespace objects are load-bearing), and on any event
 // debounce-recomputes the FULL resolved state — every policy's selected backend

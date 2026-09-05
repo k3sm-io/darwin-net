@@ -32,9 +32,10 @@ import (
 
 // PFAnchor is the pf anchor the mesh loads its MSS-clamp rule into. Wiring the
 // anchor into the main ruleset (anchor "io.k3sm.mesh") is the root netd boundary's
-// job — the full pf sub-anchor is M4; M3 pulls only this minimal clamp forward. It
-// is exported so the netd daemon (k3sm.io/darwin-net/pkg/netd) loads the standalone
-// MSS-clamp verb into the same anchor.
+// job — the full pf sub-anchor is not built; this minimal clamp is pulled
+// forward on its own here. It is exported so the netd daemon
+// (k3sm.io/darwin-net/pkg/netd) loads the standalone MSS-clamp verb into the
+// same anchor.
 const PFAnchor = "io.k3sm.mesh"
 
 // wgLink is the immutable configuration of the real wireguard device.

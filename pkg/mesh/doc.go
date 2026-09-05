@@ -58,7 +58,7 @@ limitations under the License.
 //   - An MSS clamp scoped to the utun egress. A pod socket bound to an lo0 alias
 //     sees the loopback MTU (16384) and can advertise an MSS too large for the 1380
 //     utun, blackholing large-payload cross-node TCP; a minimal pf scrub anchor
-//     (pulled forward from M4) clamps max-mss on the utun only, never lo0.
+//     (built ahead of the full pf sub-anchor) clamps max-mss on the utun only, never lo0.
 //
 // # The endpoint-roaming contract
 //
@@ -71,11 +71,11 @@ limitations under the License.
 // otherwise leaves it alone (Plan.UAPIUpdate), because re-stamping a stale CR
 // endpoint over a roamed one blackholes every reply until the peer re-handshakes.
 //
-// # Scope (M3.1)
+// # Scope
 //
 // No relay: endpoints must be mutually routable / same-L2 (the MeshPeer carries a
 // reachable host:port). Cross-node source identity is per-NODE, not per-pod (the
-// egress source is the node's mesh IP). NodePort (M3.2) and the infra-VIP mesh
-// exemption (M3.3) are separate sub-phases. Private keys never leave the node and
+// egress source is the node's mesh IP). NodePort and the infra-VIP mesh
+// exemption are handled separately. Private keys never leave the node and
 // never appear on a MeshPeer (DESIGN §5b).
 package mesh

@@ -32,7 +32,7 @@ const affinityDefaultTimeout = 3 * time.Hour
 // so a peer churning source IPs cannot grow it without limit. Same-node pods share
 // one trust domain with no per-pod uid isolation, so this is a hard safety bound on
 // top of the TTL sweep. It is generous, and an evicted binding pins no live resource
-// (unlike B23's per-flow UDP socket), so over-cap eviction only degrades that client
+// (unlike the ClusterIP UDP datagram relay's per-flow socket), so over-cap eviction only degrades that client
 // to a fresh round-robin pick; on saturation one existing binding is evicted in O(1)
 // — a pseudo-random victim (Go map iteration is randomized), since a best-effort
 // affinity overlay needs no true-LRU victim and this avoids an O(cap) scan under the
@@ -144,7 +144,7 @@ func (t *RoutingTable) PickStickyCluster(key PortKey, client netip.Addr, now tim
 // (ClusterIP) surface, stickiness integrity inherits the same substrate anti-spoofing
 // the TCP splice and iTP:Local locality already assume — a pod that could forge
 // another's lo0 source IP could share, or (by churning IPs to the cap) evict, that
-// client's binding. On the external (*:NodePort) surface B55 adds, there is no such
+// client's binding. On the external (*:NodePort) surface, there is no such
 // substrate: an off-cluster client presents an arbitrary, unauthenticated source IP
 // (it is not a mesh pod and is not confined to the pod CIDR), so it can collide with
 // an internal client's key (share a binding) or churn source IPs to consume the
@@ -231,7 +231,7 @@ func (t *RoutingTable) pickStickyScoped(key PortKey, client netip.Addr, now time
 	if len(binds) >= perPortCap {
 		// O(1) pseudo-random eviction: Go map iteration is randomized and a best-effort
 		// affinity overlay needs no true-LRU victim, so evict the first entry range
-		// visits. This replaces B22's O(cap) least-recently-seen scan under the lock.
+		// visits. This replaces the affinity table's earlier O(cap) least-recently-seen scan under the lock.
 		for k := range binds {
 			t.dropBinding(binds, k)
 			break

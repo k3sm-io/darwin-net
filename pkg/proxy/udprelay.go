@@ -38,7 +38,7 @@ const maxUDPFlows = 8192
 // every other pod's access to that Service (the caps mirror flows membership, so a
 // dropped flow never counted and a reaped flow un-counts). Fairness here is per VIP;
 // the per-source-global fair share — one source IP's flows across all VIPs — is the
-// shared udpBudget's maxPerSource (B52), so a pod fanning flows across N distinct VIPs
+// shared udpBudget's maxPerSource, so a pod fanning flows across N distinct VIPs
 // cannot consume the whole relay-global budget and starve every VIP either.
 const maxUDPFlowsPerSource = maxUDPFlows / 4
 
@@ -69,10 +69,10 @@ const (
 // udpBudget is the relay-global admission gate shared by every per-VIP UDP relay. It
 // enforces two caps under one mutex so the two counters can never diverge:
 //
-//   - maxTotal bounds live upstream sockets across all relays (B48's fd ceiling), so
+//   - maxTotal bounds live upstream sockets across all relays (the shared fd ceiling), so
 //     the datagram relays cannot jointly exhaust the process fd table the co-resident
 //     control plane spends from.
-//   - maxPerSource bounds any one source IP's live flows across all VIPs (B52's
+//   - maxPerSource bounds any one source IP's live flows across all VIPs (the
 //     per-source-global fair share). The per-VIP maxUDPFlowsPerSource bounds a source
 //     per VIP, but a pod fanning flows across N distinct UDP VIPs could still consume
 //     the whole global budget and starve every other pod on every VIP; this cap is
@@ -105,9 +105,9 @@ const (
 type udpBudget struct {
 	mu           sync.Mutex
 	total        int64              // live upstream flows across all VIPs, guarded by mu
-	maxTotal     int64              // the relay-global fd ceiling (B48), read-only after construction
+	maxTotal     int64              // the relay-global fd ceiling, read-only after construction
 	bySource     map[netip.Addr]int // live flows per source IP across all VIPs, guarded by mu
-	maxPerSource int                // one source IP's share of maxTotal (B52), read-only after construction
+	maxPerSource int                // one source IP's share of maxTotal, read-only after construction
 }
 
 // newUDPBudget builds the relay-global UDP admission budget: maxTotal is the fd
@@ -236,13 +236,13 @@ type udpFlow struct {
 // cannot open raw sockets to forge an L3 source, and wireguard's symmetric AllowedIPs
 // constrain every cross-node source to the sending node's pod CIDR.
 //
-// Fair-share + budget (B48/B52): the per-VIP cap (maxUDPFlows) bounds total flows but
+// Fair-share + budget: the per-VIP cap (maxUDPFlows) bounds total flows but
 // is not a per-source quota, so admission adds more gates. perSourceCap
 // (maxUDPFlowsPerSource) bounds any single source IP's flows per VIP so one pod
 // cycling ephemeral ports cannot monopolize a VIP's table; the shared budget (a
 // udpBudget) bounds both concurrent upstream sockets across all relays (so the relay
 // subsystem cannot exhaust the co-resident control plane's fds) and any one source
-// IP's flows across all VIPs (B52's per-source-global fair share, so a pod fanning
+// IP's flows across all VIPs (the per-source-global fair share, so a pod fanning
 // flows across N VIPs cannot consume the whole global budget and starve every other
 // pod on every VIP). perSource and the budget's counters are an exact function of
 // flows membership: incremented only at the authoritative insert and decremented only
@@ -273,7 +273,7 @@ type udpRelay struct {
 	budget       *udpBudget
 	log          *slog.Logger
 
-	// policy is the optional NetworkPolicy L4-subset verdict table (M10.4), shared
+	// policy is the optional NetworkPolicy L4-subset verdict table, shared
 	// with the owning Proxy and consulted once per flow at admission (upstreamFor,
 	// after the once-per-flow Pick, before the dial) — a denied flow is never
 	// created. Nil allows everything (Allow is nil-receiver-safe). Set before
@@ -309,8 +309,8 @@ type udpRelay struct {
 // budget is the shared relay-global admission budget
 // (global fd total + per-source-global share) — a nil budget is defensively replaced
 // via newUDPBudget with a private one sized to the per-VIP cap, so reserve/release
-// never nil-panic and bySource is never nil (no cross-VIP coupling, the pre-B48
-// bound). Call start to run it and Close to tear it down.
+// never nil-panic and bySource is never nil (no cross-VIP coupling). Call
+// start to run it and Close to tear it down.
 func newUDPRelay(conn net.PacketConn, key PortKey, table *RoutingTable, egress egressScope, idleTimeout time.Duration, perSourceCap int, budget *udpBudget, log *slog.Logger) *udpRelay {
 	if budget == nil {
 		budget = newUDPBudget(maxUDPFlows, udpPerSourceGlobalCap(maxUDPFlows))
@@ -447,7 +447,7 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 		r.log.Debug("udp relay no backend", "vip", r.key.String(), "err", err)
 		return nil
 	}
-	// NetworkPolicy L4-subset verdict (M10.4) at flow admission, after the
+	// NetworkPolicy L4-subset verdict at flow admission, after the
 	// once-per-flow pick (the verdict is per picked backend, never per VIP) and
 	// before the dial: a denied flow is never created — no upstream socket, no
 	// reader, no flow-table entry, and the datagram is dropped.
@@ -455,13 +455,13 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 		r.policy.logDenied("udp", r.key, srcIP, be.Addr())
 		return nil
 	}
-	// Same published-to-live transport resolution the TCP dial does (M11.3-d2): the
+	// Same published-to-live transport resolution the TCP dial does: the
 	// datagram path must not diverge, or a vm-pod backend would be reachable over a
 	// TCP Service and silently blackholed over a UDP one. A backend with no override
 	// resolves to itself, so this is unchanged for every host-process pod.
 	dst := r.table.transportAddr(be.Addr())
 	raddr := net.UDPAddrFromAddrPort(dst)
-	// Destination-scoped mesh-egress source (M14.2-d1), the identical decision the
+	// Destination-scoped mesh-egress source, the identical decision the
 	// TCP path applies: re-originate from the node's mesh-egress /32 only for a
 	// cross-node pod backend, so a utun reply falls inside this node's wireguard
 	// AllowedIPs and is not blackholed — while a same-node, node-LAN, loopback or

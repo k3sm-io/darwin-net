@@ -138,7 +138,7 @@ func internalPolicy(p *corev1.ServiceInternalTrafficPolicy) trafficPolicy {
 // table-testable.
 //
 // addressType filters which slices count (IPv4 here); FQDN/IPv6 slices are
-// ignored for the M1 single-node path.
+// ignored — only IPv4 addresses are supported.
 func endpointsForPort(slices []*discoveryv1.EndpointSlice, portName string) []netv1.Endpoint {
 	var out []netv1.Endpoint
 	for _, sl := range slices {
