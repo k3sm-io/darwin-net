@@ -53,13 +53,13 @@ func clientIPAffinity(timeout time.Duration) affinityConfig {
 }
 
 // affinityBindings reports the live ClientIP binding total across ALL ports
-// (RoutingTable.affinityCount). It is a mu-guarded test accessor (kept in _test.go so
-// it is not compiled into the proxy binary), mirroring udpRelay.flowCount: the
+// (RoutingTable.affinityCount). It is an affMu-guarded test accessor (kept in _test.go
+// so it is not compiled into the proxy binary), mirroring udpRelay.flowCount: the
 // count-conservation invariant is that it equals the summed cardinality of the affinity
 // map at all times, so an unpaired increment or decrement breaks it.
 func (t *RoutingTable) affinityBindings() int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	t.affMu.Lock()
+	defer t.affMu.Unlock()
 	return t.affinityCount
 }
 
