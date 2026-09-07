@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -202,19 +203,24 @@ func (b *udpBudget) release(srcIP netip.Addr) {
 // backend picked once for this client 5-tuple, plus the client address responses
 // are written back to. lastActivity drives idle GC.
 //
-// Locking discipline: lastActivity is guarded by udpRelay.mu — it is written by
-// the dispatcher on a client→upstream datagram and by the reader on an
-// upstream→client datagram, and read by the sweeper. upstream, clientAddr, and
-// srcIP are set once before the reader goroutine is started and never mutated, so
-// the reader reads them without the lock (the goroutine-start happens-before covers
-// it); srcIP is read again under mu by the sweeper/Close to un-count the flow. srcIP
-// is the parsed source IP of clientAddr — the per-source fair-share bucket key —
-// stored on the flow so a removal path un-counts the exact bucket the insert counted.
+// Locking discipline: lastActivity is an atomic, NOT guarded by udpRelay.mu. It is
+// stamped on every datagram in either direction — by the dispatcher on a
+// client→upstream datagram and by the reader on an upstream→client datagram — and
+// a stamp that took mu would make every flow's reader contend with the single
+// dispatcher goroutine that every flow on the VIP shares. The sweeper Loads it
+// under mu. The value is nanoseconds since udpRelay.epoch on the monotonic clock
+// (time.Since), so a wall-clock step never mass-expires or immortalizes flows.
+// upstream, clientAddr, and srcIP are set once before the reader goroutine is
+// started and never mutated, so the reader reads them without the lock (the
+// goroutine-start happens-before covers it); srcIP is read again under mu by the
+// sweeper/Close to un-count the flow. srcIP is the parsed source IP of clientAddr
+// — the per-source fair-share bucket key — stored on the flow so a removal path
+// un-counts the exact bucket the insert counted.
 type udpFlow struct {
 	upstream     *net.UDPConn
 	clientAddr   net.Addr
 	srcIP        netip.Addr
-	lastActivity time.Time
+	lastActivity atomic.Int64 // monotonic nanoseconds since udpRelay.epoch
 }
 
 // udpRelay is the connectionless ClusterIP UDP data path — the macOS-native analog
@@ -250,9 +256,10 @@ type udpFlow struct {
 // ever touches them, so the counts never drift and the caps can never silently stop
 // firing.
 //
-// Locking discipline: mu guards flows, perSource, closed, and each flow's
-// lastActivity. The dispatcher is the sole inserter; the sweeper and Close are the
-// only removers; readers only update lastActivity. Pick and all socket I/O run
+// Locking discipline: mu guards flows, perSource, and closed. Each flow's
+// lastActivity is an atomic stamped outside mu (see udpFlow). The dispatcher is the
+// sole inserter; the sweeper and Close are the only removers; readers never take
+// mu at all. Pick and all socket I/O run
 // outside mu (Pick has its own lock; a blocking Read/Write must never hold mu). The
 // budget is a strict leaf, mutex-guarded (not lock-free): reserve/release take
 // budget.mu and nothing else, are reached under mu (relay.mu → budget.mu, never
@@ -269,6 +276,7 @@ type udpRelay struct {
 	// egressScope.sourceFor verdict rather than carrying a second predicate.
 	egress       egressScope
 	idleTimeout  time.Duration
+	epoch        time.Time // zero point of every flow's lastActivity (monotonic)
 	perSourceCap int
 	budget       *udpBudget
 	log          *slog.Logger
@@ -321,6 +329,7 @@ func newUDPRelay(conn net.PacketConn, key PortKey, table *RoutingTable, egress e
 		table:        table,
 		egress:       egress,
 		idleTimeout:  idleTimeout,
+		epoch:        time.Now(),
 		perSourceCap: perSourceCap,
 		budget:       budget,
 		log:          log,
@@ -395,9 +404,9 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 
 	r.mu.Lock()
 	if fl := r.flows[clientKey]; fl != nil {
-		fl.lastActivity = time.Now()
 		up := fl.upstream
 		r.mu.Unlock()
+		r.touch(fl)
 		return up
 	}
 	if r.closed {
@@ -514,7 +523,8 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 		}
 		return nil
 	}
-	fl := &udpFlow{upstream: up, clientAddr: clientAddr, srcIP: srcIP, lastActivity: time.Now()}
+	fl := &udpFlow{upstream: up, clientAddr: clientAddr, srcIP: srcIP}
+	r.touch(fl)
 	r.flows[clientKey] = fl
 	r.perSource[srcIP]++ // counted at insert only — mirrors the flows insert exactly
 	r.wg.Add(1)
@@ -558,12 +568,11 @@ func (r *udpRelay) readUpstream(fl *udpFlow) {
 	}
 }
 
-// touch stamps fl as active now. It is the reader's per-datagram write to
-// lastActivity, taken under mu per the udpFlow locking discipline.
+// touch stamps fl as active now: one atomic store of the monotonic offset from
+// epoch, no lock, so the per-datagram path never contends with the dispatcher or
+// the sweeper (see the udpFlow locking discipline).
 func (r *udpRelay) touch(fl *udpFlow) {
-	r.mu.Lock()
-	fl.lastActivity = time.Now()
-	r.mu.Unlock()
+	fl.lastActivity.Store(int64(time.Since(r.epoch)))
 }
 
 // sweep idle-GCs flows: every idleTimeout/2 it closes and removes flows silent for
@@ -596,8 +605,9 @@ func (r *udpRelay) sweep() {
 func (r *udpRelay) sweepExpired(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	elapsed := now.Sub(r.epoch)
 	for k, fl := range r.flows {
-		if now.Sub(fl.lastActivity) >= r.idleTimeout {
+		if elapsed-time.Duration(fl.lastActivity.Load()) >= r.idleTimeout {
 			_ = fl.upstream.Close()
 			delete(r.flows, k)
 			r.releaseFlowLocked(fl)
