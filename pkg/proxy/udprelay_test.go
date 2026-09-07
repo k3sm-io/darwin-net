@@ -238,7 +238,7 @@ func TestUDPRelayIdleFlowGC(t *testing.T) {
 
 	newRelay := func(t *testing.T, idle time.Duration) *udpRelay {
 		t.Helper()
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			t.Fatalf("listen vip udp: %v", err)
 		}
@@ -283,7 +283,7 @@ func TestUDPRelayIdleFlowGC(t *testing.T) {
 		relay := newRelay(t, idle)
 
 		var lastWarn time.Time
-		if up := relay.upstreamFor(&net.UDPAddr{IP: net.IPv4(10, 0, 5, 1), Port: 45000}, &lastWarn); up == nil {
+		if up := relay.upstreamFor(netip.MustParseAddrPort("10.0.5.1:45000"), &lastWarn); up == nil {
 			t.Fatal("upstreamFor admitted no flow, so this test would assert nothing")
 		}
 		deadline := time.Now().Add(30 * time.Second)
@@ -319,7 +319,7 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 	// dispatcher/sweeper goroutine runs) with the shared echo backend registered and
 	// the injected caps. A long idle timeout means only an explicit sweepExpired reaps.
 	newRelay := func(budget *udpBudget, perSourceCap int) *udpRelay {
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			t.Fatalf("listen vip udp: %v", err)
 		}
@@ -331,8 +331,8 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 	}
 	// client fabricates a distinct client address; the per-source counter keys on the
 	// parsed IP, decoupled from any real loopback bind.
-	client := func(a, b, c, d byte, port int) net.Addr {
-		return &net.UDPAddr{IP: net.IPv4(a, b, c, d), Port: port}
+	client := func(a, b, c, d byte, port int) netip.AddrPort {
+		return netip.AddrPortFrom(netip.AddrFrom4([4]byte{a, b, c, d}), uint16(port))
 	}
 
 	t.Run("PerSourceFairShare", func(t *testing.T) {
@@ -496,7 +496,7 @@ func TestUDPRelayPerSourceGlobalCap(t *testing.T) {
 	// not the per-VIP one — is the binding constraint. A long idle timeout means only
 	// an explicit Close reaps.
 	newRelay := func(budget *udpBudget) *udpRelay {
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			t.Fatalf("listen vip udp: %v", err)
 		}
@@ -506,8 +506,8 @@ func TestUDPRelayPerSourceGlobalCap(t *testing.T) {
 		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
 		return newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, 100, budget, slog.Default())
 	}
-	client := func(a, b, c, d byte, port int) net.Addr {
-		return &net.UDPAddr{IP: net.IPv4(a, b, c, d), Port: port}
+	client := func(a, b, c, d byte, port int) netip.AddrPort {
+		return netip.AddrPortFrom(netip.AddrFrom4([4]byte{a, b, c, d}), uint16(port))
 	}
 
 	// One budget shared by BOTH VIPs: total 8 sockets across all relays, and any ONE
@@ -639,8 +639,8 @@ func TestUDPRelayFirstLockPerSourceGlobalReject(t *testing.T) {
 	defer be.close()
 	beIP, bePort := be.addrPort()
 
-	client := func(a, b, c, d byte, port int) net.Addr {
-		return &net.UDPAddr{IP: net.IPv4(a, b, c, d), Port: port}
+	client := func(a, b, c, d byte, port int) netip.AddrPort {
+		return netip.AddrPortFrom(netip.AddrFrom4([4]byte{a, b, c, d}), uint16(port))
 	}
 
 	// newRelay builds an UNSTARTED relay (upstreamFor is driven directly) on its own VIP
@@ -649,7 +649,7 @@ func TestUDPRelayFirstLockPerSourceGlobalReject(t *testing.T) {
 	// wraps net.DialUDP to a real loopback echo backend, so a not-capped flow dials once
 	// and a capped flow never dials. A long idle timeout means only explicit Close reaps.
 	newRelay := func(budget *udpBudget) (*udpRelay, *countingDialer) {
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			t.Fatalf("listen vip udp: %v", err)
 		}
@@ -669,9 +669,9 @@ func TestUDPRelayFirstLockPerSourceGlobalReject(t *testing.T) {
 		// (via budget.reserve) to pre-load bySource/total to the capped state under test.
 		budget     func() *udpBudget
 		preReserve []netip.Addr
-		src        net.Addr   // the NEW-flow client the subtest drives upstreamFor with
-		srcIP      netip.Addr // its parsed source IP (for the peek-reason assertion)
-		wantAdmit  bool       // true → reaches r.dial (count 1, non-nil); false → early reject (count 0, nil)
+		src        netip.AddrPort // the NEW-flow client the subtest drives upstreamFor with
+		srcIP      netip.Addr     // its parsed source IP (for the peek-reason assertion)
+		wantAdmit  bool           // true → reaches r.dial (count 1, non-nil); false → early reject (count 0, nil)
 		wantReason udpRejectReason
 	}{
 		{

@@ -73,7 +73,7 @@ func benchEcho(b *testing.B, readers int) (net.PacketConn, func()) {
 // long idle timeout so the sweeper never reaps a benchmark flow mid-run.
 func benchRelay(b *testing.B, backend net.Addr) (*udpRelay, *net.UDPAddr) {
 	b.Helper()
-	vip, err := net.ListenPacket("udp", "127.0.0.1:0")
+	vip, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		b.Fatalf("listen vip: %v", err)
 	}
@@ -129,14 +129,14 @@ func BenchmarkUDPRelayDatagram(b *testing.B) {
 // flows keyed the way the dispatcher keys them, plus the client addresses that
 // hit those keys. The flows' upstream is nil: the fast path returns it without
 // dereferencing, and nothing here forwards a datagram.
-func benchFlows(n int) (*udpRelay, []net.Addr, []*udpFlow) {
+func benchFlows(n int) (*udpRelay, []netip.AddrPort, []*udpFlow) {
 	r := newUDPRelay(nil, PortKey{}, nil, egressScope{}, time.Hour, n, nil, quietLogger())
-	addrs := make([]net.Addr, n)
+	addrs := make([]netip.AddrPort, n)
 	flows := make([]*udpFlow, n)
 	for i := range addrs {
-		a := &net.UDPAddr{IP: net.IPv4(10, 0, byte(i>>8), byte(i)), Port: 40000 + i}
-		fl := &udpFlow{clientAddr: a, srcIP: srcIPOf(a)}
-		r.flows[a.String()] = fl
+		a := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)}), uint16(40000+i))
+		fl := &udpFlow{client: a, srcIP: a.Addr()}
+		r.flows[a] = fl
 		addrs[i], flows[i] = a, fl
 	}
 	return r, addrs, flows

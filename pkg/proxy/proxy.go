@@ -663,13 +663,13 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 		// reads the VIP socket, picks a backend once per client flow, opens a
 		// connected upstream socket, relays both ways, and idle-GCs the flow (see
 		// udprelay.go); the socket stays pinned to that backend, no conntrack-style
-		// flush. Binds directly via net.ListenPacket, not through p.binder (that seam
+		// flush. Binds directly via net.ListenUDP, not through p.binder (that seam
 		// is stream-only), so a privileged (<1024) VIP without root gets an honest
 		// EACCES; the netd datagram path is deferred. NodePort UDP is deferred too: a
 		// wildcard reply re-selects its source on a multi-homed node (wrong src IP,
 		// client drops it), needing IP_RECVDSTADDR/IP_SENDSRCADDR (out of scope).
 		clusterAP := netip.AddrPortFrom(ip, uint16(port.Port))
-		pc, err := net.ListenPacket("udp", clusterAP.String())
+		pc, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(clusterAP))
 		if err != nil {
 			_ = p.alias.Remove(ctx, ip)
 			return nil, fmt.Errorf("listen udp clusterIP %s: %w", clusterAP, err)
