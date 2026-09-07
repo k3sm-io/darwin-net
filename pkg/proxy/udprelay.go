@@ -554,10 +554,16 @@ func (r *udpRelay) readUpstream(fl *udpFlow) {
 		if _, err := r.conn.WriteTo(buf[:n], fl.clientAddr); err != nil {
 			return // VIP socket closed → shutting down
 		}
-		r.mu.Lock()
-		fl.lastActivity = time.Now()
-		r.mu.Unlock()
+		r.touch(fl)
 	}
+}
+
+// touch stamps fl as active now. It is the reader's per-datagram write to
+// lastActivity, taken under mu per the udpFlow locking discipline.
+func (r *udpRelay) touch(fl *udpFlow) {
+	r.mu.Lock()
+	fl.lastActivity = time.Now()
+	r.mu.Unlock()
 }
 
 // sweep idle-GCs flows: every idleTimeout/2 it closes and removes flows silent for
