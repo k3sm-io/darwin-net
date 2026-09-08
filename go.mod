@@ -3,7 +3,7 @@ module k3sm.io/darwin-net
 go 1.25.8
 
 require (
-	golang.org/x/net v0.54.0
+	golang.org/x/net v0.55.0
 	// golang.zx2c4.com/wireguard is userspace WireGuard — the node-mesh datapath over
 	// a root-created utun (pkg/mesh). It publishes no semver tags, so it is pinned to
 	// a commit pseudo-version (never @latest); it transitively pulls the pure-Go
