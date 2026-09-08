@@ -3,7 +3,7 @@ module k3sm.io/darwin-net
 go 1.25.8
 
 require (
-	golang.org/x/net v0.51.0
+	golang.org/x/net v0.54.0
 	// golang.zx2c4.com/wireguard is userspace WireGuard — the node-mesh datapath over
 	// a root-created utun (pkg/mesh). It publishes no semver tags, so it is pinned to
 	// a commit pseudo-version (never @latest); it transitively pulls the pure-Go
@@ -15,7 +15,7 @@ require (
 	k8s.io/client-go v0.35.0
 )
 
-require golang.org/x/sys v0.42.0
+require golang.org/x/sys v0.45.0
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
@@ -38,10 +38,10 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/crypto v0.48.0 // indirect
+	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
-	golang.org/x/term v0.40.0 // indirect
-	golang.org/x/text v0.34.0 // indirect
+	golang.org/x/term v0.43.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
