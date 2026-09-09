@@ -108,3 +108,25 @@ func spliceBench(b *testing.B, payload int) {
 }
 
 func BenchmarkSplice(b *testing.B) { spliceBench(b, 4<<10) }
+
+// TestSpliceAllocs is the acceptance bar for #87: the splice's copy path must not
+// allocate its buffers. With io.Copy on two *net.TCPConn values each direction
+// falls through ReadFrom/WriteTo to a private 32 KiB buffer, 64 KiB per
+// connection; the pooled, method-hidden copy leaves a few small objects (the
+// WaitGroup, the closure, the two goroutine frames). The bytes bound is the one
+// that bites; the count bound keeps a stray boxing from creeping in.
+func TestSpliceAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("allocation accounting is not meaningful under -race")
+	}
+	r := testing.Benchmark(func(b *testing.B) { spliceBench(b, 256<<10) }) // a large payload keeps the iteration count, and the wall time, small
+	if r.N == 0 {
+		t.Fatal("the benchmark did not run, so it asserts nothing")
+	}
+	if got := r.AllocedBytesPerOp(); got > 1<<10 {
+		t.Fatalf("splice allocates %d B/op (%d allocs/op), want ≤ 1 KiB: the copy fell back to io.Copy's private buffers", got, r.AllocsPerOp())
+	}
+	if got := r.AllocsPerOp(); got > 8 {
+		t.Fatalf("splice allocates %d objects/op, want ≤ 8", got)
+	}
+}
