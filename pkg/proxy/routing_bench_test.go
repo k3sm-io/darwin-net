@@ -19,6 +19,7 @@ package proxy
 import (
 	"fmt"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -161,4 +162,66 @@ func BenchmarkRoutingTablePickUnderReconcile(b *testing.B) {
 	b.StopTimer()
 	close(stop)
 	<-done
+}
+
+// BenchmarkSyncPrimitives is the number behind "why a snapshot and not an
+// RWMutex": the bare cost of each primitive when every core hits it at once. What
+// it shows is host-dependent — one contended atomic is a cache-line hand-off, cheap
+// on a single die and about a mutex across two (#92) — which is why it is committed
+// rather than quoted.
+func BenchmarkSyncPrimitives(b *testing.B) {
+	b.Run("RWMutex.RLock", func(b *testing.B) {
+		var mu sync.RWMutex
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				mu.RLock()
+				mu.RUnlock()
+			}
+		})
+	})
+	b.Run("Mutex.Lock", func(b *testing.B) {
+		var mu sync.Mutex
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				mu.Lock()
+				mu.Unlock()
+			}
+		})
+	})
+	b.Run("atomic.Uint64.Add", func(b *testing.B) {
+		var n atomic.Uint64
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				n.Add(1)
+			}
+		})
+	})
+	b.Run("atomic.Pointer.Load", func(b *testing.B) {
+		var p atomic.Pointer[routingSnapshot]
+		p.Store(&routingSnapshot{})
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				if p.Load() == nil {
+					b.Fatal("nil snapshot")
+				}
+			}
+		})
+	})
+}
+
+// BenchmarkRoutingTableReconcile is the writer side: one SetEndpointsPolicy on a
+// table of n ports, which is the maps.Clone in withState plus the state build. It
+// runs under the writer lock, off the accept path, once per reconcile.
+func BenchmarkRoutingTableReconcile(b *testing.B) {
+	for _, n := range []int{50, 1000} {
+		b.Run(fmt.Sprintf("ports=%d", n), func(b *testing.B) {
+			tbl, keys := benchTable(n, 8, affinityConfig{})
+			eps := benchEndpoints(0, 8)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				tbl.SetEndpointsPolicy(keys[i%n], eps, trafficCluster, affinityConfig{})
+			}
+		})
+	}
 }
