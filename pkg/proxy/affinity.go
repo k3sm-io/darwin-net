@@ -35,8 +35,8 @@ const affinityDefaultTimeout = 3 * time.Hour
 // (unlike the ClusterIP UDP datagram relay's per-flow socket), so over-cap eviction only degrades that client
 // to a fresh round-robin pick; on saturation one existing binding is evicted in O(1)
 // — a pseudo-random victim (Go map iteration is randomized), since a best-effort
-// affinity overlay needs no true-LRU victim and this avoids an O(cap) scan under the
-// table write lock. The relay-global aggregate ceiling (maxAffinityBindingsTotal)
+// affinity overlay needs no true-LRU victim and this avoids an O(cap) scan under
+// affMu. The relay-global aggregate ceiling (maxAffinityBindingsTotal)
 // bounds the sum across all ports on top of this per-port cap.
 const maxAffinityBindingsPerPort = 8192
 

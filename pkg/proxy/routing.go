@@ -113,6 +113,11 @@ func (b backend) Locality() Locality { return b.locality }
 // Why a snapshot and not an RWMutex: under 16-way contention RLock/RUnlock cost
 // more than a plain Mutex (the reader count is one cache line every core writes),
 // while an atomic pointer load is a plain MOV. The accept path is the hot side.
+// The win is across keys and under reconcile: each key's cursor is its own line
+// and a writer never stalls a reader. On one hot key every core still shares that
+// key's cursor, and what that costs is the host's cache-line hand-off — cheap on a
+// single die, about what the mutex cost across two (BenchmarkRoutingTablePick
+// against BenchmarkRoutingTablePickManyKeys; #92 has the numbers and the options).
 //
 // The table is independent of socket ownership — per-VIP reconcile serialization
 // (one worker per ClusterIP:port) lives in the proxy server, not here.
