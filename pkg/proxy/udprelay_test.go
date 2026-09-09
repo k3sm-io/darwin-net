@@ -811,6 +811,82 @@ func udpRoundTripRetry(t *testing.T, c *net.UDPConn, payload string, overall tim
 	return ""
 }
 
+// TestUDPRelayFlowKey pins the canonical flow key: a 4-in-6 and a plain v4 form of
+// one client map to one key, so they share one flow and one fair-share bucket. The
+// table covers the pure function; the subtest drives upstreamFor with both forms of
+// one client through flowKey (the precondition dispatch establishes) and counts.
+//
+// Non-vacuity: the last subtest feeds upstreamFor the raw pair and gets two flows in
+// two buckets — that split is exactly what flowKey exists to prevent.
+func TestUDPRelayFlowKey(t *testing.T) {
+	t.Parallel()
+
+	v4 := netip.MustParseAddrPort("10.0.7.1:40000")
+	mapped := netip.AddrPortFrom(netip.AddrFrom16(v4.Addr().As16()), v4.Port()) // ::ffff:10.0.7.1
+	v6 := netip.MustParseAddrPort("[fd00::7]:40000")
+	if !mapped.Addr().Is4In6() {
+		t.Fatalf("fixture is not 4-in-6: %v", mapped)
+	}
+	for _, tc := range []struct {
+		name string
+		in   netip.AddrPort
+		want netip.AddrPort
+	}{
+		{"plain v4 is already canonical", v4, v4},
+		{"4-in-6 unmaps to its v4", mapped, v4},
+		{"native v6 is untouched", v6, v6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := flowKey(tc.in); got != tc.want {
+				t.Fatalf("flowKey(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	be := newUDPEchoBackend(t)
+	defer be.close()
+	beIP, bePort := be.addrPort()
+	newRelay := func(t *testing.T) *udpRelay {
+		t.Helper()
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatalf("listen vip udp: %v", err)
+		}
+		vipAddr := pc.LocalAddr().(*net.UDPAddr)
+		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
+		tbl := NewRoutingTable(netip.Prefix{})
+		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
+		r := newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), slog.Default())
+		t.Cleanup(func() { _ = r.Close() })
+		return r
+	}
+
+	t.Run("both forms of one client share one flow and one bucket", func(t *testing.T) {
+		relay := newRelay(t)
+		var lastWarn time.Time
+		for _, c := range []netip.AddrPort{v4, mapped} {
+			if up := relay.upstreamFor(flowKey(c), &lastWarn); up == nil {
+				t.Fatalf("upstreamFor(%v) dropped, want admitted", c)
+			}
+		}
+		if fc, ps := relay.flowCount(), relay.perSourceTotal(); fc != 1 || ps != 1 {
+			t.Fatalf("flows=%d perSource=%d after both forms of one client, want 1/1", fc, ps)
+		}
+	})
+	t.Run("the raw pair splits, so the precondition is load-bearing", func(t *testing.T) {
+		relay := newRelay(t)
+		var lastWarn time.Time
+		for _, c := range []netip.AddrPort{v4, mapped} {
+			if up := relay.upstreamFor(c, &lastWarn); up == nil {
+				t.Fatalf("upstreamFor(%v) dropped, want admitted", c)
+			}
+		}
+		if fc, ps := relay.flowCount(), relay.perSourceTotal(); fc != 2 || ps != 2 {
+			t.Fatalf("flows=%d perSource=%d for the uncanonicalized pair, want 2/2", fc, ps)
+		}
+	})
+}
+
 // TestUDPRelayFoundFlowStampedUnderLock pins the found-flow ordering in
 // upstreamFor: the activity stamp lands inside the mu critical section, so the
 // sweeper — which decides under the same mu — can never reap a flow between the

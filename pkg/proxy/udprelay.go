@@ -362,9 +362,7 @@ func (r *udpRelay) dispatch() {
 		if err != nil {
 			return // VIP socket closed → shutting down
 		}
-		// Unmap once so a 4-in-6 and a plain v4 form of the same client share one
-		// flow and one fair-share bucket; the reply path re-maps as the socket needs.
-		client = netip.AddrPortFrom(client.Addr().Unmap(), client.Port())
+		client = flowKey(client)
 		up := r.upstreamFor(client, &lastWarn)
 		if up == nil {
 			continue // no backend, saturated, dial failed, or shutting down: drop
@@ -402,6 +400,9 @@ func (r *udpRelay) dispatch() {
 // decremented only at a flow delete, so they are an exact function of flows
 // membership. Every second-lock rejection Close()s the dialed socket so a rejected
 // upstream fd never leaks.
+//
+// Precondition: client is already canonical (flowKey has unmapped it — see dispatch).
+// upstreamFor keys and counts on it as given.
 func (r *udpRelay) upstreamFor(client netip.AddrPort, lastWarn *time.Time) *net.UDPConn {
 	srcIP := client.Addr()
 
@@ -538,6 +539,14 @@ func (r *udpRelay) upstreamFor(client netip.AddrPort, lastWarn *time.Time) *net.
 	go r.readUpstream(fl)
 	r.mu.Unlock()
 	return up
+}
+
+// flowKey canonicalizes a datagram's source for the flow table and the per-source
+// bucket: a 4-in-6 and a plain v4 form of one client must land on one key, or that
+// client would hold two flows and be counted in two fair-share buckets. The reply
+// path re-maps as the socket needs.
+func flowKey(client netip.AddrPort) netip.AddrPort {
+	return netip.AddrPortFrom(client.Addr().Unmap(), client.Port())
 }
 
 // readUpstream relays one flow's backend responses to the client until the
