@@ -853,7 +853,7 @@ func splice(a, b net.Conn) {
 	wg.Add(2)
 	cp := func(dst, src net.Conn) {
 		defer wg.Done()
-		_, _ = io.Copy(dst, src)
+		copyConn(dst, src)
 		if c, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = c.CloseWrite()
 		}
@@ -862,6 +862,40 @@ func splice(a, b net.Conn) {
 	go cp(b, a)
 	wg.Wait()
 }
+
+// spliceBuffers pools the copy buffers: one per direction per live connection,
+// io.Copy's own 32 KiB so bytes per read are unchanged.
+var spliceBuffers = sync.Pool{New: func() any { b := make([]byte, 32<<10); return &b }}
+
+// copyConn copies src to dst until EOF through a pooled buffer.
+//
+// io.Copy and io.CopyBuffer hand off to src.WriteTo or dst.ReadFrom when either
+// exists and ignore the caller's buffer when they do. *net.TCPConn has both, and on
+// darwin neither has a socket-to-socket kernel path (splice is linux-only; sendfile
+// takes an *os.File source), so each falls back to a private io.Copy with a fresh
+// 32 KiB buffer: 64 KiB of garbage per proxied connection (#87). readOnly and
+// writeOnly hide the two methods so the copy stays on the pooled buffer; both are
+// pointer-shaped, so boxing them allocates nothing. A conn that is not a
+// *net.TCPConn (none reaches here from handle) keeps the plain io.Copy.
+func copyConn(dst, src net.Conn) {
+	d, dok := dst.(*net.TCPConn)
+	s, sok := src.(*net.TCPConn)
+	if !dok || !sok {
+		_, _ = io.Copy(dst, src)
+		return
+	}
+	buf := spliceBuffers.Get().(*[]byte)
+	_, _ = io.CopyBuffer(writeOnly{d}, readOnly{s}, *buf)
+	spliceBuffers.Put(buf)
+}
+
+type readOnly struct{ c *net.TCPConn }
+
+func (r readOnly) Read(p []byte) (int, error) { return r.c.Read(p) }
+
+type writeOnly struct{ c *net.TCPConn }
+
+func (w writeOnly) Write(p []byte) (int, error) { return w.c.Write(p) }
 
 // listener bundles the sockets and lo0 alias owned by one Service port so the
 // worker can tear them down atomically.
