@@ -139,17 +139,21 @@ func (t *RoutingTable) PickStickyCluster(key PortKey, client netip.Addr, now tim
 // sticky client does not perturb the fan-out of new clients.
 //
 // Locking: with affinity off this is Pick — one snapshot load, no lock. With ClientIP
-// on it takes affMu (a leaf) for the binding lookup, refresh, evict and record. The
-// snapshot it decided on was loaded before affMu, so a writer may have published a
-// newer generation in between — one that turned affinity off for this port, drained
-// it, or deleted it — and then purged the port's bindings under affMu. Recording a
-// binding now would resurrect exactly what that purge removed. So before recording,
-// the pick re-loads the snapshot under affMu and records only if key still maps to
-// the very portState it picked from; otherwise it returns the round-robin backend
-// with nothing recorded (one connection loses stickiness, never reachability).
-// Writers make this sufficient by storing the snapshot BEFORE purging (see
-// SetEndpointsPolicy and Delete): any pick that acquires affMu after the purge sees
-// the new generation and records nothing; any that recorded before it is purged.
+// on it takes affMu (a leaf) and re-loads the snapshot under it before touching a
+// binding; the lock-free load only decided whether to lock. That re-load is what
+// keeps a hit honest: a reconcile that shrank the port's Ready set with affinity
+// still on purges nothing, and a hit validated against the older set would hand out
+// a backend the current generation dropped. A writer can still publish a newer
+// generation during the critical section — one that turned affinity off for this
+// port, drained it, or deleted it — and it purges the port's bindings under affMu
+// right after its store; a binding recorded against the older generation would
+// resurrect exactly what that purge removed. So before recording, the pick loads
+// once more and records only if key still maps to the very portState it picked
+// from; otherwise it returns the round-robin backend with nothing recorded (one
+// connection loses stickiness, never reachability). Writers make this sufficient by
+// storing the snapshot BEFORE purging (see SetEndpointsPolicy and Delete): any pick
+// that acquires affMu after the purge sees the new generation and records nothing;
+// any that recorded before it is purged.
 //
 // Trust model: the binding key is the client's source IP alone. On the internal
 // (ClusterIP) surface, stickiness integrity inherits the same substrate anti-spoofing
@@ -193,23 +197,9 @@ func (t *RoutingTable) PickStickyCluster(key PortKey, client netip.Addr, now tim
 //     binding is still re-validated against the live Cluster pool on every hit, so it
 //     always resolves to a Ready backend — coarse, never wrong-routing.
 func (t *RoutingTable) pickStickyScoped(key PortKey, client netip.Addr, now time.Time, external bool) (backend, error) {
-	st := t.load().states[key]
-	if st == nil || len(st.all) == 0 {
-		return backend{}, ErrNoBackends
-	}
-	pool, set, err := t.activePool(key, st, external)
+	st, pool, _, err := t.scoped(key, external)
 	if err != nil {
-		// e.g. internal-scope iTP:Local with no node-local backend: propagate the drop;
-		// never fall back to a stale binding (that would spill node-local traffic to a
-		// remote). The external scope is error-free today, but propagate rather than
-		// discard so a future eTP:Local drop surfaces as an error, not a silent spill.
 		return backend{}, err
-	}
-	// Defensive empty-pool guard (folded in from the old PickCluster): activePool's
-	// non-error return is non-empty today, but a future subset scope could empty the
-	// pool — guard roundRobin's cursor%len from a divide-by-zero.
-	if len(pool) == 0 {
-		return backend{}, ErrNoBackends
 	}
 	if st.affinityMode != affinityClientIP {
 		return t.roundRobin(st, pool), nil // the accept path's common case: no lock
@@ -217,6 +207,20 @@ func (t *RoutingTable) pickStickyScoped(key PortKey, client netip.Addr, now time
 
 	t.affMu.Lock()
 	defer t.affMu.Unlock()
+	// Re-load under affMu. The lock-free load above only decided whether to take
+	// the lock; a reconcile landing between the two may have shrunk this port's Ready
+	// set with affinity still on — the one change that purges nothing — and a hit
+	// validated against that older set would hand out a backend the current
+	// generation dropped. SweepExpired re-loads under affMu for the same reason.
+	st, pool, set, err := t.scoped(key, external)
+	if err != nil {
+		return backend{}, err
+	}
+	if st.affinityMode != affinityClientIP {
+		// Affinity went off between the loads. The writer's purge follows its store
+		// and takes affMu after this pick, so record nothing.
+		return t.roundRobin(st, pool), nil
+	}
 	binds := t.affinity[key]
 	if b := binds[client]; b != nil {
 		// A hit is reused only if the bound backend is STILL eligible (O(1) membership

@@ -105,9 +105,10 @@ func (b backend) Locality() Locality { return b.locality }
 // round-robin cursor and the fail-open warn-once — are atomics on the portState,
 // which is shared by pointer across snapshots until a reconcile replaces it. Only
 // ClientIP session affinity keeps a lock, affMu, a leaf: a sticky pick with
-// affinity off is exactly a Pick (lock-free); with affinity on it takes affMu for
-// the binding lookup and re-validates the snapshot before recording. Writers take
-// mu, then affMu, never the reverse, and a pick takes affMu alone.
+// affinity off is exactly a Pick (lock-free); with affinity on it takes affMu,
+// re-loads the snapshot under it, and re-validates the generation once more before
+// recording. Writers take mu, then affMu, never the reverse, and a pick takes affMu
+// alone.
 //
 // Why a snapshot and not an RWMutex: under 16-way contention RLock/RUnlock cost
 // more than a plain Mutex (the reader count is one cache line every core writes),
@@ -650,15 +651,34 @@ func (t *RoutingTable) roundRobin(st *portState, pool []backend) backend {
 //
 // Pick returns ErrNoBackends when the key has no Ready backends at all.
 func (t *RoutingTable) Pick(key PortKey) (backend, error) {
-	st := t.load().states[key]
-	if st == nil || len(st.all) == 0 {
-		return backend{}, ErrNoBackends
-	}
-	pool, _, err := t.activePool(key, st, false)
+	st, pool, _, err := t.scoped(key, false)
 	if err != nil {
 		return backend{}, err
 	}
 	return t.roundRobin(st, pool), nil
+}
+
+// scoped resolves key in the current generation to its portState, the pool the
+// scope selects, and the membership set the sticky path re-validates against. It is
+// the shared prologue of Pick and pickStickyScoped: ErrNoBackends for an absent or
+// empty key, and activePool's own error otherwise — an internal-scope iTP:Local port
+// with no node-local backend is a drop that propagates, never a fallback to a stale
+// binding (that would spill node-local traffic to a remote). An empty pool is also
+// ErrNoBackends: activePool's non-error return is non-empty today, but a future
+// subset scope could empty it, and roundRobin's cursor%len must never divide by zero.
+func (t *RoutingTable) scoped(key PortKey, external bool) (*portState, []backend, map[netip.AddrPort]struct{}, error) {
+	st := t.load().states[key]
+	if st == nil || len(st.all) == 0 {
+		return nil, nil, nil, ErrNoBackends
+	}
+	pool, set, err := t.activePool(key, st, external)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(pool) == 0 {
+		return nil, nil, nil, ErrNoBackends
+	}
+	return st, pool, set, nil
 }
 
 // PickAt selects the backend at index i modulo the Ready-set size, without

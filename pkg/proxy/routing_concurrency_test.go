@@ -33,7 +33,12 @@ import (
 // things the lock split must keep true:
 //
 //  1. Every pick returns a member of that key's Ready set (or ErrNoBackends while
-//     the deleted key is absent): a reader never sees a torn generation.
+//     the deleted key is absent): a reader never sees a torn generation. For the
+//     port whose membership shrinks and grows with affinity on, the set is the
+//     union: from outside a pick, a hit validated against a stale generation is
+//     indistinguishable from a reconcile that landed after the validation, so the
+//     hit-path re-load is pinned by TestPickStickyHitRevalidatesUnderAffMu and this
+//     writer's job is to run that path, and count conservation, under -race.
 //  2. Once the writers stop, affinityCount equals the summed cardinality of the
 //     affinity map, and no port whose final state is affinity-off or absent holds a
 //     binding: the store-then-purge order plus the pick's re-validation closes the
@@ -42,7 +47,7 @@ func TestRoutingTableConcurrentPicksAndWriters(t *testing.T) {
 	t.Parallel()
 	tbl := NewRoutingTable(netip.MustParsePrefix("100.64.0.0/24"))
 	mk := func(ip string) PortKey { return PortKey{ClusterIP: ip, Port: 80, Protocol: netv1.ProtocolTCP} }
-	toggled, churned, sticky, plain := mk("10.43.0.1"), mk("10.43.0.2"), mk("10.43.0.3"), mk("10.43.0.4")
+	toggled, churned, sticky, plain, shrinking := mk("10.43.0.1"), mk("10.43.0.2"), mk("10.43.0.3"), mk("10.43.0.4"), mk("10.43.0.5")
 	eps := func(base int) []netv1.Endpoint {
 		out := make([]netv1.Endpoint, 4)
 		for i := range out {
@@ -51,11 +56,11 @@ func TestRoutingTableConcurrentPicksAndWriters(t *testing.T) {
 		return out
 	}
 	allowed := map[PortKey]map[string]bool{}
-	for key, base := range map[PortKey]int{toggled: 10, churned: 20, sticky: 30, plain: 40} {
+	for key, base := range map[PortKey]int{toggled: 10, churned: 20, sticky: 30, plain: 40, shrinking: 50} {
 		e := eps(base)
 		allowed[key] = endpointIPSet(e)
 		aff := affinityConfig{}
-		if key == sticky || key == toggled {
+		if key == sticky || key == toggled || key == shrinking {
 			aff = clientIPAffinity(time.Hour)
 		}
 		tbl.SetEndpointsPolicy(key, e, trafficCluster, aff)
@@ -104,6 +109,7 @@ func TestRoutingTableConcurrentPicksAndWriters(t *testing.T) {
 	spawn(4, func(i int) { be, err := tbl.Pick(plain); check(plain, be, err) })
 	spawn(4, func(i int) { be, err := tbl.PickSticky(sticky, clientOf(i), time.Now()); check(sticky, be, err) })
 	spawn(4, func(i int) { be, err := tbl.PickSticky(toggled, clientOf(i), time.Now()); check(toggled, be, err) })
+	spawn(4, func(i int) { be, err := tbl.PickSticky(shrinking, clientOf(i), time.Now()); check(shrinking, be, err) })
 	spawn(2, func(i int) {
 		be, err := tbl.PickStickyCluster(churned, clientOf(i), time.Now())
 		check(churned, be, err)
@@ -119,6 +125,15 @@ func TestRoutingTableConcurrentPicksAndWriters(t *testing.T) {
 			aff = clientIPAffinity(time.Hour)
 		}
 		tbl.SetEndpointsPolicy(toggled, eps(10), trafficCluster, aff)
+	})
+	var shrinks int
+	spawn(1, func(int) {
+		shrinks++
+		e := eps(50)
+		if shrinks%2 == 0 {
+			e = e[1:3] // membership changes, affinity stays on: the one reconcile that purges nothing
+		}
+		tbl.SetEndpointsPolicy(shrinking, e, trafficCluster, clientIPAffinity(time.Hour))
 	})
 	spawn(1, func(int) {
 		tbl.Delete(churned)

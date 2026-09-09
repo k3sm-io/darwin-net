@@ -732,3 +732,90 @@ func TestAffinityAggregateBoundAndEviction(t *testing.T) {
 		}
 	})
 }
+
+// TestPickStickyHitRevalidatesUnderAffMu pins the re-load under affMu: a hit is
+// validated against the generation current when the lock is taken, not the one
+// loaded before it. Ready shrinks from {A,B} to {B} with ClientIP affinity on — the
+// one reconcile that purges nothing — while a pick for the client bound to A is
+// parked on affMu. Re-loaded, the pick hands out B and re-binds; validated against
+// the pre-lock snapshot it hands out A, a backend the current generation dropped.
+//
+// The park is the test holding affMu; the pause lets the pick reach the lock after
+// its lock-free load. A slower scheduler only weakens the demonstration (the pick
+// would load the new generation anyway), it cannot make this fail.
+func TestPickStickyHitRevalidatesUnderAffMu(t *testing.T) {
+	t.Parallel()
+	tbl := NewRoutingTable(netip.Prefix{})
+	key := PortKey{ClusterIP: "10.43.0.9", Port: 80, Protocol: netv1.ProtocolTCP}
+	a := netv1.Endpoint{IP: "100.64.0.1", Port: 8080, Ready: true}
+	b := netv1.Endpoint{IP: "100.64.0.2", Port: 8080, Ready: true}
+	client := netip.MustParseAddr("100.64.9.1")
+	now := time.Now()
+
+	tbl.SetEndpointsPolicy(key, []netv1.Endpoint{a, b}, trafficCluster, clientIPAffinity(time.Hour))
+	be, err := tbl.PickSticky(key, client, now)
+	if err != nil || be.Addr().Addr().String() != a.IP {
+		t.Fatalf("first pick = %v, %v; want %s bound (round-robin from a fresh state starts at the sorted head)", be, err, a.IP)
+	}
+
+	tbl.affMu.Lock()
+	picked := make(chan backend, 1)
+	go func() {
+		be, err := tbl.PickSticky(key, client, now)
+		if err != nil {
+			be = backend{}
+		}
+		picked <- be
+	}()
+	time.Sleep(50 * time.Millisecond)
+	tbl.SetEndpointsPolicy(key, []netv1.Endpoint{b}, trafficCluster, clientIPAffinity(time.Hour)) // shrink, affinity on: no purge, affMu untouched
+	tbl.affMu.Unlock()
+
+	if got := <-picked; got.Addr().Addr().String() != b.IP {
+		t.Fatalf("pick parked across the shrink returned %v, want %s: the hit was validated against the pre-lock generation", got.Addr(), b.IP)
+	}
+	tbl.affMu.Lock()
+	bound := tbl.affinity[key][client]
+	tbl.affMu.Unlock()
+	if bound == nil || bound.backend.Addr().Addr().String() != b.IP {
+		t.Fatalf("binding after the pick = %v, want re-bound to %s", bound, b.IP)
+	}
+}
+
+// TestPickStickyRecordsNothingWhenAffinityGoesOff pins the documented fail-open
+// outcome of a sticky pick racing a reconcile of its own key: a new client's pick is
+// parked on affMu while the port's affinity is switched off. The writer stores the
+// new generation and then waits on affMu for its purge. Whichever takes the lock
+// first, the pick returns a live backend and the port ends with no binding — the
+// pick either saw affinity off on its re-load and recorded nothing, or recorded
+// against the old generation and the purge that follows the store removed it.
+func TestPickStickyRecordsNothingWhenAffinityGoesOff(t *testing.T) {
+	t.Parallel()
+	tbl := NewRoutingTable(netip.Prefix{})
+	key := PortKey{ClusterIP: "10.43.0.10", Port: 80, Protocol: netv1.ProtocolTCP}
+	eps := []netv1.Endpoint{{IP: "100.64.0.1", Port: 8080, Ready: true}, {IP: "100.64.0.2", Port: 8080, Ready: true}}
+	client := netip.MustParseAddr("100.64.9.2")
+	tbl.SetEndpointsPolicy(key, eps, trafficCluster, clientIPAffinity(time.Hour))
+
+	tbl.affMu.Lock()
+	picked := make(chan backend, 1)
+	go func() {
+		be, _ := tbl.PickSticky(key, client, time.Now())
+		picked <- be
+	}()
+	stored := make(chan struct{})
+	go func() {
+		defer close(stored)
+		tbl.SetEndpointsPolicy(key, eps, trafficCluster, affinityConfig{}) // store, then block on affMu for the purge
+	}()
+	time.Sleep(50 * time.Millisecond)
+	tbl.affMu.Unlock()
+	<-stored
+
+	if got := <-picked; !endpointIPSet(eps)[got.Addr().Addr().String()] {
+		t.Fatalf("pick across the affinity-off reconcile returned %v, want a member of the Ready set", got.Addr())
+	}
+	if n := tbl.affinityBindings(); n != 0 || len(tbl.affinity[key]) != 0 {
+		t.Fatalf("affinityCount=%d, bindings for %s=%d after affinity went off, want 0/0", n, key, len(tbl.affinity[key]))
+	}
+}
