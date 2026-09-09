@@ -810,3 +810,71 @@ func udpRoundTripRetry(t *testing.T, c *net.UDPConn, payload string, overall tim
 	}
 	return ""
 }
+
+// TestUDPRelayFoundFlowStampedUnderLock pins the found-flow ordering in
+// upstreamFor: the activity stamp lands inside the mu critical section, so the
+// sweeper — which decides under the same mu — can never reap a flow between the
+// dispatcher's lookup and its stamp. With the stamp moved after Unlock, a sweep in
+// that gap closes the upstream and the dispatcher writes to a dead socket.
+//
+// The loop provokes exactly that interleave: a sweeper spinning on mu with a clock
+// that expires only a stale stamp, against a dispatcher that re-stales one flow and
+// re-finds it. Every socket upstreamFor hands back must still accept a write; a
+// flow the sweeper legitimately reaped while stale is simply re-dialed, so the only
+// way a write fails is the gap.
+func TestUDPRelayFoundFlowStampedUnderLock(t *testing.T) {
+	t.Parallel()
+
+	be := newUDPEchoBackend(t)
+	defer be.close()
+	beIP, bePort := be.addrPort()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen vip udp: %v", err)
+	}
+	vipAddr := pc.LocalAddr().(*net.UDPAddr)
+	key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
+	tbl := NewRoutingTable(netip.Prefix{})
+	tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
+	const idle = time.Hour
+	relay := newUDPRelay(pc, key, tbl, egressScope{}, idle, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), slog.Default())
+	defer relay.Close()
+
+	client := netip.MustParseAddrPort("10.0.8.1:40000")
+	// A clock at which a stale stamp (0: the epoch) has idled past the timeout and a
+	// fresh one (time.Since(epoch), microseconds at least) has not.
+	expired := relay.epoch.Add(idle + 1)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				relay.sweepExpired(expired)
+			}
+		}
+	}()
+	defer wg.Wait()
+	defer close(stop)
+
+	var lastWarn time.Time
+	for i := 0; i < 20000; i++ {
+		relay.mu.Lock()
+		if fl := relay.flows[client]; fl != nil {
+			fl.lastActivity.Store(0) // stale: reapable until the dispatcher re-stamps it
+		}
+		relay.mu.Unlock()
+		up := relay.upstreamFor(client, &lastWarn)
+		if up == nil {
+			t.Fatalf("iteration %d: upstreamFor dropped the datagram", i)
+		}
+		if _, err := up.Write([]byte("x")); err != nil {
+			t.Fatalf("iteration %d: upstreamFor returned a socket the sweeper had closed: %v", i, err)
+		}
+	}
+}

@@ -407,9 +407,13 @@ func (r *udpRelay) upstreamFor(client netip.AddrPort, lastWarn *time.Time) *net.
 
 	r.mu.Lock()
 	if fl := r.flows[client]; fl != nil {
+		// Stamp before Unlock. The sweeper reaps under this same mu, so a flow the
+		// dispatcher has just found cannot be closed between the lookup and its stamp;
+		// stamped after Unlock, a sweep landing in that gap hands the dispatcher a dead
+		// socket (one datagram lost at every idle boundary).
+		r.touch(fl)
 		up := fl.upstream
 		r.mu.Unlock()
-		r.touch(fl)
 		return up
 	}
 	if r.closed {
