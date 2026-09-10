@@ -335,32 +335,34 @@ phases:
 
   - id: M14
     title: Destination-scoped mesh-egress source binding (the server-mesh enabler)
-    status: todo
+    status: done  # 2026-09-09 — darwin-net's whole M14 slice is M14.0 (see note); M14.0 landed on main (c79b70f, #75) and is fully verified below. The rest of the M14 program (k3sm-side server-mesh wiring + the two-Mac K3SM_LAB=1 lab) is out of this repo's scope and is tracked in k3sm's own ledger.
+    completed: 2026-09-09
     strategy: hard cut
     depends_on: []
     note: "darwin-net's single slice of the workspace M14 program (authoritative input: docs/m14-plan.md, sub-phase M14.2-d1; the rest of M14 is k3sm-side and lab work). It exists because k3sm CANNOT bring the server onto the mesh until this lands: the server's proxy would otherwise source-bind EVERY backend dial to a mesh-egress address, which is the documented 'breaks ALL backend dials' hazard and the reason k3sm leaves netserve.Config.MeshEgressIP deliberately empty today. Scoping the bind at the DIALER is what keeps the whole program hard cut — it is a unilateral per-node decision no peer observes, so no MeshPeer/AllowedIPs protocol change (and no named exception) is triggered."
     subphases:
       - id: M14.0
         title: bind the mesh-egress source only for foreign pod-CIDR destinations
-        status: todo
+        status: done  # 2026-09-09 — landed by c79b70f "fix(proxy): scope the mesh-egress source bind to cross-node pod dials" (#75), already merged to main; all four deliverables + the acceptance are cited below
+        completed: 2026-09-09
         strategy: hard cut
         depends_on: []
         deliverables:
           - id: M14.0-d1
-            done: false
+            done: true  # 2026-09-09 — pkg/proxy/meshegress.go:90 egressScope.sourceFor (the predicate: loc != LocalityRemote at :97 fails to the kernel default incl. LocalityUnknown; !clusterCIDR.Contains(dst) at :102 excludes node-LAN/upstream/loopback) + pkg/proxy/meshegress.go:118 Proxy.dialerFor selects between two dialers built once; pkg/proxy/proxy.go:187 WithMeshEgressSource builds the immutable p.meshDialer (proxy.go:194) alongside the never-mutated default p.dialer — per-connection selection, no shared-LocalAddr mutation
             desc: "Select the dial source PER CONNECTION from the already-precomputed backend.Locality(): bind the mesh-egress source only when the destination is inside podnet.ClusterPodCIDR AND outside this node's own /24. Every other destination — loopback, a ClusterIP VIP splicing to a local backend, a node LAN address, upstream — keeps kernel default source selection. LocalityUnknown NEVER binds (the zero/invalid-podCIDR state that classify() fails open for in the ROUTING decision must fail to the kernel default here, not to a bind; the two decisions have opposite safe directions). IMPLEMENTATION IS CONSTRAINED, not free: use two IMMUTABLE dialers chosen per dial, or a connection-local dialer value — NEVER mutate the shared p.dialer.LocalAddr, which is a data race across the per-connection handle() goroutines and would reintroduce the wrong-source blackhole non-deterministically instead of uniformly. The UDP relay already does this correctly with a per-flow local; mirror that shape."
           - id: M14.0-d2
-            done: false
+            done: true  # 2026-09-09 — pkg/proxy/udprelay.go:270 carries its own egress egressScope field (wired at construction, udprelay.go:314 newUDPRelay); udprelay.go:472 calls the SAME r.egress.sourceFor(be.Locality(), dst.Addr()) predicate as the TCP path, so both protocols read one shared table
             desc: "BOTH protocols get identical scoping. The TCP dial path and the UDP relay's per-flow source must apply the same predicate — the UDP half is exactly the half a TCP-only functional test cannot see, so an asymmetry here ships as UDP Services silently failing against hostNetwork/LAN backends."
           - id: M14.0-d3
-            done: false
+            done: true  # 2026-09-09 — the node-LAN blackhole is the defect c79b70f's own commit message names explicitly ("a node LAN destination... the reply routes back over the peer's utun where wireguard drops it"); the fix is the same destination-scoped predicate as d1/d2 (a node-LAN dst fails egressScope.sourceFor's clusterCIDR.Contains check, meshegress.go:102), and pkg/mesh's AllowedIPs==podCIDR equality invariant is untouched — no MeshPeer/AllowedIPs change shipped with this fix
             desc: "This also closes a LATENT WORKER-SIDE defect, not just the server enabler: today's unconditional bind blackholes any dial whose destination is a node LAN address (a hostprocess pod reports podIP == nodeIP), because the reply routes back over the peer's utun and wireguard drops it as outside the sender's AllowedIPs. Rejected alternative, recorded: widening AllowedIPs to include node LAN /32s would break the AllowedIPs == podCIDR equality invariant pkg/mesh/doc.go asserts AND trip the phased MeshPeer-protocol named exception."
           - id: M14.0-d4
-            done: false
+            done: true  # 2026-09-09 — TestWithMeshEgressSourceBindsDialer no longer exists in pkg/proxy/meshegress_test.go (grep-confirmed); it was replaced by TestWithMeshEgressSourceBuildsSeparateBoundDialer (meshegress_test.go:337), which pins the two-immutable-dialers shape and that the option alone binds no dial
             desc: "Retire or rewrite pkg/proxy/meshegress_test.go's TestWithMeshEgressSourceBindsDialer, which asserts the construction-time 'bind once, unconditionally' contract this deliberately replaces. Left in place it either goes red for the right reason or — worse — stays green while asserting nothing about production behaviour, because WithMeshEgressSource would keep setting a field the new dial path no longer reads."
         acceptance:
           - id: M14.0-a1
-            met: false
+            met: true  # 2026-09-09 — ran CGO_ENABLED=0 go test -race ./pkg/proxy/... -run 'TestEgressScope|TestProxyDialerFor|TestUDPRelayAppliesEgressScope|TestWithMeshEgressSourceBuildsSeparateBoundDialer|TestProxyConcurrentScopedDialsShareNoDialerState' here: all pass, incl. TestProxyConcurrentScopedDialsShareNoDialerState (concurrent local+remote-destination dials under -race, meshegress_test.go:411) and the full scopeCases() table (foreign /24 bound; own /24, loopback, node LAN, ClusterIP VIP, upstream, LocalityUnknown all unbound) for both TestProxyDialerForAppliesEgressScope (TCP) and TestUDPRelayAppliesEgressScope (UDP). This closes the method:unit gate this acceptance names. The check text's own cross-node datapath leg (hack/lab/m3.sh, K3SM_LAB=1) is explicitly carved out of this acceptance ("never auto-greened here") and stays unrun — no K3SM_LAB=1 two-Mac session has occurred, so that leg is not claimed here.
             check: "unit tables over the scoping decision for BOTH TCP and UDP (foreign /24 => bound; own /24, loopback, node LAN, ClusterIP VIP, and LocalityUnknown => unbound), run under -race with concurrent local- and remote-destination dials so the per-connection shared-state property is actually exercised rather than assumed; the construction-time bind test is rewritten. The cross-node datapath proof rides the k3sm two-Mac lab (hack/lab/m3.sh, K3SM_LAB=1), never auto-greened here"
             method: unit
 ---
