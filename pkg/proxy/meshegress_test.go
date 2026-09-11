@@ -259,7 +259,7 @@ func TestUDPRelayAppliesEgressScope(t *testing.T) {
 			if !tc.dst.IsValid() {
 				t.Skip("an invalid address is not a routable endpoint; covered by the predicate table")
 			}
-			pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+			pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 			if err != nil {
 				t.Fatalf("listen vip udp: %v", err)
 			}
@@ -301,7 +301,7 @@ func TestUDPRelayAppliesEgressScope(t *testing.T) {
 				return nil, errors.New("test seam: no upstream socket")
 			}
 			var lastWarn time.Time
-			_ = r.upstreamFor(&net.UDPAddr{IP: net.IPv4(10, 1, 0, 1), Port: 40000}, &lastWarn)
+			_ = r.upstreamFor(netip.MustParseAddrPort("10.1.0.1:40000"), &lastWarn)
 
 			mu.Lock()
 			defer mu.Unlock()

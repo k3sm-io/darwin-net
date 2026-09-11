@@ -238,7 +238,7 @@ func TestUDPRelayIdleFlowGC(t *testing.T) {
 
 	newRelay := func(t *testing.T, idle time.Duration) *udpRelay {
 		t.Helper()
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			t.Fatalf("listen vip udp: %v", err)
 		}
@@ -283,7 +283,7 @@ func TestUDPRelayIdleFlowGC(t *testing.T) {
 		relay := newRelay(t, idle)
 
 		var lastWarn time.Time
-		if up := relay.upstreamFor(&net.UDPAddr{IP: net.IPv4(10, 0, 5, 1), Port: 45000}, &lastWarn); up == nil {
+		if up := relay.upstreamFor(netip.MustParseAddrPort("10.0.5.1:45000"), &lastWarn); up == nil {
 			t.Fatal("upstreamFor admitted no flow, so this test would assert nothing")
 		}
 		deadline := time.Now().Add(30 * time.Second)
@@ -319,7 +319,7 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 	// dispatcher/sweeper goroutine runs) with the shared echo backend registered and
 	// the injected caps. A long idle timeout means only an explicit sweepExpired reaps.
 	newRelay := func(budget *udpBudget, perSourceCap int) *udpRelay {
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			t.Fatalf("listen vip udp: %v", err)
 		}
@@ -331,8 +331,8 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 	}
 	// client fabricates a distinct client address; the per-source counter keys on the
 	// parsed IP, decoupled from any real loopback bind.
-	client := func(a, b, c, d byte, port int) net.Addr {
-		return &net.UDPAddr{IP: net.IPv4(a, b, c, d), Port: port}
+	client := func(a, b, c, d byte, port int) netip.AddrPort {
+		return netip.AddrPortFrom(netip.AddrFrom4([4]byte{a, b, c, d}), uint16(port))
 	}
 
 	t.Run("PerSourceFairShare", func(t *testing.T) {
@@ -496,7 +496,7 @@ func TestUDPRelayPerSourceGlobalCap(t *testing.T) {
 	// not the per-VIP one — is the binding constraint. A long idle timeout means only
 	// an explicit Close reaps.
 	newRelay := func(budget *udpBudget) *udpRelay {
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			t.Fatalf("listen vip udp: %v", err)
 		}
@@ -506,8 +506,8 @@ func TestUDPRelayPerSourceGlobalCap(t *testing.T) {
 		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
 		return newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, 100, budget, slog.Default())
 	}
-	client := func(a, b, c, d byte, port int) net.Addr {
-		return &net.UDPAddr{IP: net.IPv4(a, b, c, d), Port: port}
+	client := func(a, b, c, d byte, port int) netip.AddrPort {
+		return netip.AddrPortFrom(netip.AddrFrom4([4]byte{a, b, c, d}), uint16(port))
 	}
 
 	// One budget shared by BOTH VIPs: total 8 sockets across all relays, and any ONE
@@ -639,8 +639,8 @@ func TestUDPRelayFirstLockPerSourceGlobalReject(t *testing.T) {
 	defer be.close()
 	beIP, bePort := be.addrPort()
 
-	client := func(a, b, c, d byte, port int) net.Addr {
-		return &net.UDPAddr{IP: net.IPv4(a, b, c, d), Port: port}
+	client := func(a, b, c, d byte, port int) netip.AddrPort {
+		return netip.AddrPortFrom(netip.AddrFrom4([4]byte{a, b, c, d}), uint16(port))
 	}
 
 	// newRelay builds an UNSTARTED relay (upstreamFor is driven directly) on its own VIP
@@ -649,7 +649,7 @@ func TestUDPRelayFirstLockPerSourceGlobalReject(t *testing.T) {
 	// wraps net.DialUDP to a real loopback echo backend, so a not-capped flow dials once
 	// and a capped flow never dials. A long idle timeout means only explicit Close reaps.
 	newRelay := func(budget *udpBudget) (*udpRelay, *countingDialer) {
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			t.Fatalf("listen vip udp: %v", err)
 		}
@@ -669,9 +669,9 @@ func TestUDPRelayFirstLockPerSourceGlobalReject(t *testing.T) {
 		// (via budget.reserve) to pre-load bySource/total to the capped state under test.
 		budget     func() *udpBudget
 		preReserve []netip.Addr
-		src        net.Addr   // the NEW-flow client the subtest drives upstreamFor with
-		srcIP      netip.Addr // its parsed source IP (for the peek-reason assertion)
-		wantAdmit  bool       // true → reaches r.dial (count 1, non-nil); false → early reject (count 0, nil)
+		src        netip.AddrPort // the NEW-flow client the subtest drives upstreamFor with
+		srcIP      netip.Addr     // its parsed source IP (for the peek-reason assertion)
+		wantAdmit  bool           // true → reaches r.dial (count 1, non-nil); false → early reject (count 0, nil)
 		wantReason udpRejectReason
 	}{
 		{
@@ -809,4 +809,148 @@ func udpRoundTripRetry(t *testing.T, c *net.UDPConn, payload string, overall tim
 		return string(buf[:n])
 	}
 	return ""
+}
+
+// TestUDPRelayFlowKey pins the canonical flow key: a 4-in-6 and a plain v4 form of
+// one client map to one key, so they share one flow and one fair-share bucket. The
+// table covers the pure function; the subtest drives upstreamFor with both forms of
+// one client through flowKey (the precondition dispatch establishes) and counts.
+//
+// Non-vacuity: the last subtest feeds upstreamFor the raw pair and gets two flows in
+// two buckets — that split is exactly what flowKey exists to prevent.
+func TestUDPRelayFlowKey(t *testing.T) {
+	t.Parallel()
+
+	v4 := netip.MustParseAddrPort("10.0.7.1:40000")
+	mapped := netip.AddrPortFrom(netip.AddrFrom16(v4.Addr().As16()), v4.Port()) // ::ffff:10.0.7.1
+	v6 := netip.MustParseAddrPort("[fd00::7]:40000")
+	if !mapped.Addr().Is4In6() {
+		t.Fatalf("fixture is not 4-in-6: %v", mapped)
+	}
+	for _, tc := range []struct {
+		name string
+		in   netip.AddrPort
+		want netip.AddrPort
+	}{
+		{"plain v4 is already canonical", v4, v4},
+		{"4-in-6 unmaps to its v4", mapped, v4},
+		{"native v6 is untouched", v6, v6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := flowKey(tc.in); got != tc.want {
+				t.Fatalf("flowKey(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	be := newUDPEchoBackend(t)
+	defer be.close()
+	beIP, bePort := be.addrPort()
+	newRelay := func(t *testing.T) *udpRelay {
+		t.Helper()
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatalf("listen vip udp: %v", err)
+		}
+		vipAddr := pc.LocalAddr().(*net.UDPAddr)
+		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
+		tbl := NewRoutingTable(netip.Prefix{})
+		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
+		r := newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), slog.Default())
+		t.Cleanup(func() { _ = r.Close() })
+		return r
+	}
+
+	t.Run("both forms of one client share one flow and one bucket", func(t *testing.T) {
+		relay := newRelay(t)
+		var lastWarn time.Time
+		for _, c := range []netip.AddrPort{v4, mapped} {
+			if up := relay.upstreamFor(flowKey(c), &lastWarn); up == nil {
+				t.Fatalf("upstreamFor(%v) dropped, want admitted", c)
+			}
+		}
+		if fc, ps := relay.flowCount(), relay.perSourceTotal(); fc != 1 || ps != 1 {
+			t.Fatalf("flows=%d perSource=%d after both forms of one client, want 1/1", fc, ps)
+		}
+	})
+	t.Run("the raw pair splits, so the precondition is load-bearing", func(t *testing.T) {
+		relay := newRelay(t)
+		var lastWarn time.Time
+		for _, c := range []netip.AddrPort{v4, mapped} {
+			if up := relay.upstreamFor(c, &lastWarn); up == nil {
+				t.Fatalf("upstreamFor(%v) dropped, want admitted", c)
+			}
+		}
+		if fc, ps := relay.flowCount(), relay.perSourceTotal(); fc != 2 || ps != 2 {
+			t.Fatalf("flows=%d perSource=%d for the uncanonicalized pair, want 2/2", fc, ps)
+		}
+	})
+}
+
+// TestUDPRelayFoundFlowStampedUnderLock pins the found-flow ordering in
+// upstreamFor: the activity stamp lands inside the mu critical section, so the
+// sweeper — which decides under the same mu — can never reap a flow between the
+// dispatcher's lookup and its stamp. With the stamp moved after Unlock, a sweep in
+// that gap closes the upstream and the dispatcher writes to a dead socket.
+//
+// The loop provokes exactly that interleave: a sweeper spinning on mu with a clock
+// that expires only a stale stamp, against a dispatcher that re-stales one flow and
+// re-finds it. Every socket upstreamFor hands back must still accept a write; a
+// flow the sweeper legitimately reaped while stale is simply re-dialed, so the only
+// way a write fails is the gap.
+func TestUDPRelayFoundFlowStampedUnderLock(t *testing.T) {
+	t.Parallel()
+
+	be := newUDPEchoBackend(t)
+	defer be.close()
+	beIP, bePort := be.addrPort()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen vip udp: %v", err)
+	}
+	vipAddr := pc.LocalAddr().(*net.UDPAddr)
+	key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
+	tbl := NewRoutingTable(netip.Prefix{})
+	tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
+	const idle = time.Hour
+	relay := newUDPRelay(pc, key, tbl, egressScope{}, idle, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), slog.Default())
+	defer relay.Close()
+
+	client := netip.MustParseAddrPort("10.0.8.1:40000")
+	// A clock at which a stale stamp (0: the epoch) has idled past the timeout and a
+	// fresh one (time.Since(epoch), microseconds at least) has not.
+	expired := relay.epoch.Add(idle + 1)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				relay.sweepExpired(expired)
+			}
+		}
+	}()
+	defer wg.Wait()
+	defer close(stop)
+
+	var lastWarn time.Time
+	for i := 0; i < 20000; i++ {
+		relay.mu.Lock()
+		if fl := relay.flows[client]; fl != nil {
+			fl.lastActivity.Store(0) // stale: reapable until the dispatcher re-stamps it
+		}
+		relay.mu.Unlock()
+		up := relay.upstreamFor(client, &lastWarn)
+		if up == nil {
+			t.Fatalf("iteration %d: upstreamFor dropped the datagram", i)
+		}
+		if _, err := up.Write([]byte("x")); err != nil {
+			t.Fatalf("iteration %d: upstreamFor returned a socket the sweeper had closed: %v", i, err)
+		}
+	}
 }

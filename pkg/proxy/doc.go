@@ -161,7 +161,7 @@ limitations under the License.
 //
 // A ClusterIP UDP Service is served by a connectionless datagram relay
 // (udprelay.go); there is no Accept/CloseWrite. One dispatcher goroutine reads
-// datagrams on the VIP PacketConn (bound on the specific lo0 alias, mirroring the
+// datagrams on the VIP UDP socket (bound on the specific lo0 alias, mirroring the
 // TCP specific-bind) and, per client 5-tuple: (a) selects a backend once via the
 // routing table (Pick — the relay never re-picks per datagram), (b) opens a
 // connected per-flow upstream UDP socket, (c) forwards the datagram, and (d) spawns
@@ -224,7 +224,7 @@ limitations under the License.
 // it; honoring it needs IP_RECVDSTADDR/IP_SENDSRCADDR) and privileged (<1024) UDP
 // via the netd helper (the binder seam returns net.Listener/FileListener — stream
 // only — and cannot adopt a datagram fd, so a <1024 UDP ClusterIP without root
-// surfaces an honest net.ListenPacket EACCES rather than a helper-bound socket).
+// surfaces an honest net.ListenUDP EACCES rather than a helper-bound socket).
 // The cluster-DNS VIP (10.43.0.10:53) never reaches the relay: the address-keyed
 // infra-VIP exemption (WithInfraVIPExemptions) steps the proxy aside before any
 // worker is created, so a legitimate user UDP Service on a non-exempt VIP is relayed

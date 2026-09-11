@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -199,27 +200,33 @@ func (b *udpBudget) release(srcIP netip.Addr) {
 }
 
 // udpFlow is one client→backend datagram flow: a connected upstream socket to the
-// backend picked once for this client 5-tuple, plus the client address responses
-// are written back to. lastActivity drives idle GC.
+// backend picked once for this client 5-tuple, plus the client address (a value,
+// netip.AddrPort, so keying and replying allocate nothing) responses are written
+// back to. lastActivity drives idle GC.
 //
-// Locking discipline: lastActivity is guarded by udpRelay.mu — it is written by
-// the dispatcher on a client→upstream datagram and by the reader on an
-// upstream→client datagram, and read by the sweeper. upstream, clientAddr, and
-// srcIP are set once before the reader goroutine is started and never mutated, so
-// the reader reads them without the lock (the goroutine-start happens-before covers
-// it); srcIP is read again under mu by the sweeper/Close to un-count the flow. srcIP
-// is the parsed source IP of clientAddr — the per-source fair-share bucket key —
-// stored on the flow so a removal path un-counts the exact bucket the insert counted.
+// Locking discipline: lastActivity is an atomic, NOT guarded by udpRelay.mu. It is
+// stamped on every datagram in either direction — by the dispatcher on a
+// client→upstream datagram and by the reader on an upstream→client datagram — and
+// a stamp that took mu would make every flow's reader contend with the single
+// dispatcher goroutine that every flow on the VIP shares. The sweeper Loads it
+// under mu. The value is nanoseconds since udpRelay.epoch on the monotonic clock
+// (time.Since), so a wall-clock step never mass-expires or immortalizes flows.
+// upstream, client, and srcIP are set once before the reader goroutine is
+// started and never mutated, so the reader reads them without the lock (the
+// goroutine-start happens-before covers it); srcIP is read again under mu by the
+// sweeper/Close to un-count the flow. srcIP is client's IP (unmapped) — the
+// per-source fair-share bucket key — stored on the flow so a removal path
+// un-counts the exact bucket the insert counted.
 type udpFlow struct {
 	upstream     *net.UDPConn
-	clientAddr   net.Addr
+	client       netip.AddrPort
 	srcIP        netip.Addr
-	lastActivity time.Time
+	lastActivity atomic.Int64 // monotonic nanoseconds since udpRelay.epoch
 }
 
 // udpRelay is the connectionless ClusterIP UDP data path — the macOS-native analog
 // of kube-proxy's userspace UDP proxy. One dispatcher goroutine reads datagrams on
-// the VIP PacketConn and, per client 5-tuple, selects a backend once (via
+// the VIP socket and, per client 5-tuple, selects a backend once (via
 // RoutingTable.Pick — the single iTP/round-robin/fail-open selector; the relay
 // never re-picks per datagram), opens a connected per-flow upstream socket,
 // forwards the datagram, and spawns one reader goroutine that writes each backend
@@ -230,7 +237,7 @@ type udpFlow struct {
 // wireguard return path is not blackholed.
 //
 // Non-reflection invariant: a backend response is written back only to the client
-// address the inbound datagram carried (conn.WriteTo to fl.clientAddr). The relay
+// address the inbound datagram carried (WriteToUDPAddrPort to fl.client). The relay
 // does not self-enforce non-reflection — that safety rests on the same anti-spoofing
 // the TCP splice and upstream kube-proxy userspace already assume: unprivileged pods
 // cannot open raw sockets to forge an L3 source, and wireguard's symmetric AllowedIPs
@@ -250,16 +257,17 @@ type udpFlow struct {
 // ever touches them, so the counts never drift and the caps can never silently stop
 // firing.
 //
-// Locking discipline: mu guards flows, perSource, closed, and each flow's
-// lastActivity. The dispatcher is the sole inserter; the sweeper and Close are the
-// only removers; readers only update lastActivity. Pick and all socket I/O run
+// Locking discipline: mu guards flows, perSource, and closed. Each flow's
+// lastActivity is an atomic stamped outside mu (see udpFlow). The dispatcher is the
+// sole inserter; the sweeper and Close are the only removers; readers never take
+// mu at all. Pick and all socket I/O run
 // outside mu (Pick has its own lock; a blocking Read/Write must never hold mu). The
 // budget is a strict leaf, mutex-guarded (not lock-free): reserve/release take
 // budget.mu and nothing else, are reached under mu (relay.mu → budget.mu, never
 // inverted), and never re-enter the relay. Close joins the dispatcher, the sweeper,
 // and every reader through wg before returning, so teardown strands no goroutine.
 type udpRelay struct {
-	conn  net.PacketConn
+	conn  *net.UDPConn // the VIP socket; the concrete type so reads and writes carry netip.AddrPort, not a heap net.Addr
 	key   PortKey
 	table *RoutingTable
 	// egress is the destination-scoped mesh-egress source decision, shared
@@ -269,6 +277,7 @@ type udpRelay struct {
 	// egressScope.sourceFor verdict rather than carrying a second predicate.
 	egress       egressScope
 	idleTimeout  time.Duration
+	epoch        time.Time // zero point of every flow's lastActivity (monotonic)
 	perSourceCap int
 	budget       *udpBudget
 	log          *slog.Logger
@@ -288,7 +297,7 @@ type udpRelay struct {
 
 	mu     sync.Mutex
 	closed bool
-	flows  map[string]*udpFlow
+	flows  map[netip.AddrPort]*udpFlow
 	// perSource counts live flows per source IP on this VIP, guarded by mu (distinct
 	// from the shared budget's bySource, which counts a source across all VIPs). It
 	// mirrors flows exactly (summed, it equals len(flows)); an entry is pruned at zero
@@ -311,7 +320,7 @@ type udpRelay struct {
 // via newUDPBudget with a private one sized to the per-VIP cap, so reserve/release
 // never nil-panic and bySource is never nil (no cross-VIP coupling). Call
 // start to run it and Close to tear it down.
-func newUDPRelay(conn net.PacketConn, key PortKey, table *RoutingTable, egress egressScope, idleTimeout time.Duration, perSourceCap int, budget *udpBudget, log *slog.Logger) *udpRelay {
+func newUDPRelay(conn *net.UDPConn, key PortKey, table *RoutingTable, egress egressScope, idleTimeout time.Duration, perSourceCap int, budget *udpBudget, log *slog.Logger) *udpRelay {
 	if budget == nil {
 		budget = newUDPBudget(maxUDPFlows, udpPerSourceGlobalCap(maxUDPFlows))
 	}
@@ -321,11 +330,12 @@ func newUDPRelay(conn net.PacketConn, key PortKey, table *RoutingTable, egress e
 		table:        table,
 		egress:       egress,
 		idleTimeout:  idleTimeout,
+		epoch:        time.Now(),
 		perSourceCap: perSourceCap,
 		budget:       budget,
 		log:          log,
 		dial:         func(laddr, raddr *net.UDPAddr) (*net.UDPConn, error) { return net.DialUDP("udp", laddr, raddr) },
-		flows:        make(map[string]*udpFlow),
+		flows:        make(map[netip.AddrPort]*udpFlow),
 		perSource:    make(map[netip.Addr]int),
 		done:         make(chan struct{}),
 	}
@@ -348,11 +358,12 @@ func (r *udpRelay) dispatch() {
 	buf := make([]byte, maxUDPDatagram)
 	var lastWarn time.Time
 	for {
-		n, clientAddr, err := r.conn.ReadFrom(buf)
+		n, client, err := r.conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			return // VIP socket closed → shutting down
 		}
-		up := r.upstreamFor(clientAddr, &lastWarn)
+		client = flowKey(client)
+		up := r.upstreamFor(client, &lastWarn)
 		if up == nil {
 			continue // no backend, saturated, dial failed, or shutting down: drop
 		}
@@ -362,7 +373,7 @@ func (r *udpRelay) dispatch() {
 	}
 }
 
-// upstreamFor returns the connected upstream socket for clientAddr's flow,
+// upstreamFor returns the connected upstream socket for client's flow,
 // creating the flow on first sight: it picks a backend once (RoutingTable.Pick),
 // dials a connected upstream socket source-bound to the mesh-egress address when
 // set, records the flow, and starts its reader goroutine. It returns nil — the
@@ -389,13 +400,19 @@ func (r *udpRelay) dispatch() {
 // decremented only at a flow delete, so they are an exact function of flows
 // membership. Every second-lock rejection Close()s the dialed socket so a rejected
 // upstream fd never leaks.
-func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UDPConn {
-	clientKey := clientAddr.String()
-	srcIP := srcIPOf(clientAddr)
+//
+// Precondition: client is already canonical (flowKey has unmapped it — see dispatch).
+// upstreamFor keys and counts on it as given.
+func (r *udpRelay) upstreamFor(client netip.AddrPort, lastWarn *time.Time) *net.UDPConn {
+	srcIP := client.Addr()
 
 	r.mu.Lock()
-	if fl := r.flows[clientKey]; fl != nil {
-		fl.lastActivity = time.Now()
+	if fl := r.flows[client]; fl != nil {
+		// Stamp before Unlock. The sweeper reaps under this same mu, so a flow the
+		// dispatcher has just found cannot be closed between the lookup and its stamp;
+		// stamped after Unlock, a sweep landing in that gap hands the dispatcher a dead
+		// socket (one datagram lost at every idle boundary).
+		r.touch(fl)
 		up := fl.upstream
 		r.mu.Unlock()
 		return up
@@ -514,8 +531,9 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 		}
 		return nil
 	}
-	fl := &udpFlow{upstream: up, clientAddr: clientAddr, srcIP: srcIP, lastActivity: time.Now()}
-	r.flows[clientKey] = fl
+	fl := &udpFlow{upstream: up, client: client, srcIP: srcIP}
+	r.touch(fl)
+	r.flows[client] = fl
 	r.perSource[srcIP]++ // counted at insert only — mirrors the flows insert exactly
 	r.wg.Add(1)
 	go r.readUpstream(fl)
@@ -523,20 +541,12 @@ func (r *udpRelay) upstreamFor(clientAddr net.Addr, lastWarn *time.Time) *net.UD
 	return up
 }
 
-// srcIPOf extracts the source IP that keys clientAddr's per-source fair-share
-// bucket. On a UDP PacketConn the address is always a *net.UDPAddr; the string-parse
-// fallback covers any other net.Addr defensively. The address is Unmap'd so a
-// 4-in-6 and a bare v4 form of the same source collapse to one bucket. A zero Addr
-// (an unparseable address) is a single shared bucket — acceptable, since a UDP
-// datagram always carries a concrete source.
-func srcIPOf(clientAddr net.Addr) netip.Addr {
-	if ua, ok := clientAddr.(*net.UDPAddr); ok {
-		return ua.AddrPort().Addr().Unmap()
-	}
-	if ap, err := netip.ParseAddrPort(clientAddr.String()); err == nil {
-		return ap.Addr().Unmap()
-	}
-	return netip.Addr{}
+// flowKey canonicalizes a datagram's source for the flow table and the per-source
+// bucket: a 4-in-6 and a plain v4 form of one client must land on one key, or that
+// client would hold two flows and be counted in two fair-share buckets. The reply
+// path re-maps as the socket needs.
+func flowKey(client netip.AddrPort) netip.AddrPort {
+	return netip.AddrPortFrom(client.Addr().Unmap(), client.Port())
 }
 
 // readUpstream relays one flow's backend responses to the client until the
@@ -551,13 +561,18 @@ func (r *udpRelay) readUpstream(fl *udpFlow) {
 		if err != nil {
 			return // upstream closed → flow ended
 		}
-		if _, err := r.conn.WriteTo(buf[:n], fl.clientAddr); err != nil {
+		if _, err := r.conn.WriteToUDPAddrPort(buf[:n], fl.client); err != nil {
 			return // VIP socket closed → shutting down
 		}
-		r.mu.Lock()
-		fl.lastActivity = time.Now()
-		r.mu.Unlock()
+		r.touch(fl)
 	}
+}
+
+// touch stamps fl as active now: one atomic store of the monotonic offset from
+// epoch, no lock, so the per-datagram path never contends with the dispatcher or
+// the sweeper (see the udpFlow locking discipline).
+func (r *udpRelay) touch(fl *udpFlow) {
+	fl.lastActivity.Store(int64(time.Since(r.epoch)))
 }
 
 // sweep idle-GCs flows: every idleTimeout/2 it closes and removes flows silent for
@@ -590,8 +605,9 @@ func (r *udpRelay) sweep() {
 func (r *udpRelay) sweepExpired(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	elapsed := now.Sub(r.epoch)
 	for k, fl := range r.flows {
-		if now.Sub(fl.lastActivity) >= r.idleTimeout {
+		if elapsed-time.Duration(fl.lastActivity.Load()) >= r.idleTimeout {
 			_ = fl.upstream.Close()
 			delete(r.flows, k)
 			r.releaseFlowLocked(fl)
@@ -615,7 +631,7 @@ func (r *udpRelay) releaseFlowLocked(fl *udpFlow) {
 }
 
 // Close tears the relay down leak-free: it closes the VIP socket (unblocking the
-// dispatcher's ReadFrom), stops the sweeper, closes every flow's upstream socket
+// dispatcher's read), stops the sweeper, closes every flow's upstream socket
 // (unblocking each reader's Read), and joins the dispatcher, the sweeper, and all
 // readers through wg before returning. It is idempotent. Setting closed under mu
 // before the dispatcher can insert again guarantees no reader is spawned after the
@@ -635,11 +651,11 @@ func (r *udpRelay) Close() error {
 	for _, fl := range flows {
 		r.releaseFlowLocked(fl)
 	}
-	r.flows = make(map[string]*udpFlow)
+	r.flows = make(map[netip.AddrPort]*udpFlow)
 	r.mu.Unlock()
 
 	close(r.done)         // stop the sweeper
-	err := r.conn.Close() // unblock the dispatcher's ReadFrom
+	err := r.conn.Close() // unblock the dispatcher's read
 
 	for _, fl := range flows {
 		_ = fl.upstream.Close() // unblock each reader's Read

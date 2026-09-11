@@ -340,7 +340,7 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 		key := PortKey{ClusterIP: "10.43.1.7", Port: 53, Protocol: netv1.ProtocolUDP}
 		table.SetEndpoints(key, []netv1.Endpoint{{IP: beAP.Addr().String(), Port: int32(beAP.Port()), Ready: true}})
 
-		vip, err := net.ListenPacket("udp", "127.0.0.1:0")
+		vip, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			t.Fatalf("listen vip socket: %v", err)
 		}
@@ -350,14 +350,14 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 
 		var lastWarn time.Time
 		// Denied source at flow admission: no upstream socket, no flow entry.
-		if up := r.upstreamFor(&net.UDPAddr{IP: srcB.AsSlice(), Port: 5001}, &lastWarn); up != nil {
+		if up := r.upstreamFor(netip.AddrPortFrom(srcB, 5001), &lastWarn); up != nil {
 			t.Fatalf("denied source must not be admitted a flow")
 		}
 		if got := r.flowCount(); got != 0 {
 			t.Fatalf("denied flow was created: flowCount = %d, want 0", got)
 		}
 		// Allowed source: flow created and relays to the backend.
-		up := r.upstreamFor(&net.UDPAddr{IP: srcA.AsSlice(), Port: 5002}, &lastWarn)
+		up := r.upstreamFor(netip.AddrPortFrom(srcA, 5002), &lastWarn)
 		if up == nil {
 			t.Fatalf("allowed source must be admitted a flow")
 		}

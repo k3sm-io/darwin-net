@@ -254,7 +254,7 @@ func TestTransportOverrideDialTarget(t *testing.T) {
 		key := PortKey{ClusterIP: "10.43.2.3", Port: 53, Protocol: netv1.ProtocolUDP}
 		table.SetEndpoints(key, []netv1.Endpoint{{IP: vmPublished.String(), Port: int32(beAP.Port()), Ready: true}})
 
-		vip, err := net.ListenPacket("udp", "127.0.0.1:0")
+		vip, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			t.Fatalf("listen vip socket: %v", err)
 		}
@@ -262,7 +262,7 @@ func TestTransportOverrideDialTarget(t *testing.T) {
 		defer func() { _ = r.Close() }()
 
 		var lastWarn time.Time
-		up := r.upstreamFor(&net.UDPAddr{IP: src.AsSlice(), Port: 5001}, &lastWarn)
+		up := r.upstreamFor(netip.AddrPortFrom(src, 5001), &lastWarn)
 		if up == nil {
 			t.Fatalf("flow admission failed")
 		}
