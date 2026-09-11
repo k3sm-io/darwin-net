@@ -35,8 +35,8 @@ const affinityDefaultTimeout = 3 * time.Hour
 // (unlike the ClusterIP UDP datagram relay's per-flow socket), so over-cap eviction only degrades that client
 // to a fresh round-robin pick; on saturation one existing binding is evicted in O(1)
 // — a pseudo-random victim (Go map iteration is randomized), since a best-effort
-// affinity overlay needs no true-LRU victim and this avoids an O(cap) scan under the
-// table write lock. The relay-global aggregate ceiling (maxAffinityBindingsTotal)
+// affinity overlay needs no true-LRU victim and this avoids an O(cap) scan under
+// affMu. The relay-global aggregate ceiling (maxAffinityBindingsTotal)
 // bounds the sum across all ports on top of this per-port cap.
 const maxAffinityBindingsPerPort = 8192
 
@@ -136,9 +136,24 @@ func (t *RoutingTable) PickStickyCluster(key PortKey, client netip.Addr, now tim
 // never a stale/remote fallback; the external scope never returns it.
 //
 // The round-robin cursor is advanced only on a miss/expiry/invalidation, so a steady
-// sticky client does not perturb the fan-out of new clients. pickStickyScoped takes
-// the table write lock (it may create or refresh a binding, and shares Pick's
-// locking).
+// sticky client does not perturb the fan-out of new clients.
+//
+// Locking: with affinity off this is Pick — one snapshot load, no lock. With ClientIP
+// on it takes affMu (a leaf) and re-loads the snapshot under it before touching a
+// binding; the lock-free load only decided whether to lock. That re-load is what
+// keeps a hit honest: a reconcile that shrank the port's Ready set with affinity
+// still on purges nothing, and a hit validated against the older set would hand out
+// a backend the current generation dropped. A writer can still publish a newer
+// generation during the critical section — one that turned affinity off for this
+// port, drained it, or deleted it — and it purges the port's bindings under affMu
+// right after its store; a binding recorded against the older generation would
+// resurrect exactly what that purge removed. So before recording, the pick loads
+// once more and records only if key still maps to the very portState it picked
+// from; otherwise it returns the round-robin backend with nothing recorded (one
+// connection loses stickiness, never reachability). Writers make this sufficient by
+// storing the snapshot BEFORE purging (see SetEndpointsPolicy and Delete): any pick
+// that acquires affMu after the purge sees the new generation and records nothing;
+// any that recorded before it is purged.
 //
 // Trust model: the binding key is the client's source IP alone. On the internal
 // (ClusterIP) surface, stickiness integrity inherits the same substrate anti-spoofing
@@ -182,30 +197,30 @@ func (t *RoutingTable) PickStickyCluster(key PortKey, client netip.Addr, now tim
 //     binding is still re-validated against the live Cluster pool on every hit, so it
 //     always resolves to a Ready backend — coarse, never wrong-routing.
 func (t *RoutingTable) pickStickyScoped(key PortKey, client netip.Addr, now time.Time, external bool) (backend, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	st := t.states[key]
-	if st == nil || len(st.all) == 0 {
-		return backend{}, ErrNoBackends
-	}
-	pool, set, err := t.activePool(key, st, external)
+	st, pool, _, err := t.scoped(key, external)
 	if err != nil {
-		// e.g. internal-scope iTP:Local with no node-local backend: propagate the drop;
-		// never fall back to a stale binding (that would spill node-local traffic to a
-		// remote). The external scope is error-free today, but propagate rather than
-		// discard so a future eTP:Local drop surfaces as an error, not a silent spill.
 		return backend{}, err
 	}
-	// Defensive empty-pool guard (folded in from the old PickCluster): activePool's
-	// non-error return is non-empty today, but a future subset scope could empty the
-	// pool — guard roundRobin's cursor%len from a divide-by-zero.
-	if len(pool) == 0 {
-		return backend{}, ErrNoBackends
-	}
 	if st.affinityMode != affinityClientIP {
-		return t.roundRobin(st, pool), nil
+		return t.roundRobin(st, pool), nil // the accept path's common case: no lock
 	}
 
+	t.affMu.Lock()
+	defer t.affMu.Unlock()
+	// Re-load under affMu. The lock-free load above only decided whether to take
+	// the lock; a reconcile landing between the two may have shrunk this port's Ready
+	// set with affinity still on — the one change that purges nothing — and a hit
+	// validated against that older set would hand out a backend the current
+	// generation dropped. SweepExpired re-loads under affMu for the same reason.
+	st, pool, set, err := t.scoped(key, external)
+	if err != nil {
+		return backend{}, err
+	}
+	if st.affinityMode != affinityClientIP {
+		// Affinity went off between the loads. The writer's purge follows its store
+		// and takes affMu after this pick, so record nothing.
+		return t.roundRobin(st, pool), nil
+	}
 	binds := t.affinity[key]
 	if b := binds[client]; b != nil {
 		// A hit is reused only if the bound backend is STILL eligible (O(1) membership
@@ -246,7 +261,7 @@ func (t *RoutingTable) pickStickyScoped(key PortKey, client netip.Addr, now time
 	if t.affinityCount >= totalCap {
 		if !t.affinityWarned {
 			t.affinityWarned = true
-			t.log.Warn("ClientIP session affinity degraded to round-robin: relay-global binding ceiling reached; new clients stay reachable but lose stickiness",
+			t.logger().Warn("ClientIP session affinity degraded to round-robin: relay-global binding ceiling reached; new clients stay reachable but lose stickiness",
 				"bindings", t.affinityCount, "max", totalCap)
 		}
 		return be, nil
@@ -254,6 +269,13 @@ func (t *RoutingTable) pickStickyScoped(key PortKey, client netip.Addr, now time
 	// Below the ceiling: clear the throttle so a later re-saturation warns again.
 	t.affinityWarned = false
 
+	// Re-validate the generation before recording (see the locking note above): if
+	// key no longer maps to the portState this pick came from, a writer has moved
+	// on and may have purged this port's bindings; degrade this one connection to
+	// the round-robin pick and record nothing.
+	if t.load().states[key] != st {
+		return be, nil
+	}
 	if binds == nil {
 		binds = make(map[netip.Addr]*affinityBinding)
 		t.affinity[key] = binds
@@ -272,10 +294,11 @@ func (t *RoutingTable) pickStickyScoped(key PortKey, client netip.Addr, now time
 // on its next connection. Bindings whose port has vanished (no portState) are dropped
 // wholesale.
 func (t *RoutingTable) SweepExpired(now time.Time) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.affMu.Lock()
+	defer t.affMu.Unlock()
+	snap := t.load()
 	for key, binds := range t.affinity {
-		st := t.states[key]
+		st := snap.states[key]
 		if st == nil {
 			// Orphaned port (its state vanished): drop wholesale, decrementing
 			// affinityCount by the sub-map's cardinality so the total stays exact.
@@ -300,7 +323,7 @@ func (t *RoutingTable) SweepExpired(now time.Time) {
 // is the single counter-aware single-key removal site: the stale-binding refresh drop,
 // the per-port O(1) eviction, and the idle sweep all route through it, so a single-key
 // delete can never leak the count (the wholesale sibling is dropAffinity). The caller
-// holds t.mu and guarantees client is present in binds.
+// holds affMu and guarantees client is present in binds.
 func (t *RoutingTable) dropBinding(binds map[netip.Addr]*affinityBinding, client netip.Addr) {
 	delete(binds, client)
 	t.affinityCount--
@@ -314,8 +337,18 @@ func (t *RoutingTable) dropBinding(binds map[netip.Addr]*affinityBinding, client
 // through it, so a wholesale delete can never leak the count (a per-call decrement would
 // under-count by len(binds)-1 and drift the total up to the ceiling). A missing or
 // already-empty sub-map decrements 0 (len(nil) == 0), so there is no special case. The
-// caller holds t.mu.
+// caller holds affMu.
 func (t *RoutingTable) dropAffinity(key PortKey) {
 	t.affinityCount -= len(t.affinity[key])
 	delete(t.affinity, key)
+}
+
+// purgeAffinity is dropAffinity for writers that hold mu but not affMu: it takes
+// the leaf lock, drops key's bindings, and releases. Writers call it only AFTER
+// storing the snapshot that made those bindings stale, which is what lets
+// pickStickyScoped's re-validation close the store/purge window.
+func (t *RoutingTable) purgeAffinity(key PortKey) {
+	t.affMu.Lock()
+	t.dropAffinity(key)
+	t.affMu.Unlock()
 }

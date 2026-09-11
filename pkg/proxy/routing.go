@@ -19,9 +19,11 @@ package proxy
 import (
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
@@ -95,13 +97,30 @@ func (b backend) Locality() Locality { return b.locality }
 // connection. It carries no sockets, no informers, and no I/O, so its load-
 // balancing behavior is fully table-testable.
 //
-// Locking discipline: all state is guarded by mu. The table is written by the
-// reconcile path (SetEndpointsPolicy, one call per Service port key) and read by
-// the accept path (Pick). Pick takes the write lock because it advances a per-key
-// round-robin cursor; the read-only inspectors (Backends, Len, PickAt) take the
-// read lock. The table is independent of socket ownership — per-VIP reconcile
-// serialization (one worker per ClusterIP:port) lives in the proxy server, not
-// here.
+// Locking discipline: the routing state (per-key backends, the transport
+// overrides) is an immutable snapshot behind an atomic pointer. A pick Loads the
+// pointer and never locks; a reconcile builds the next snapshot under mu and
+// Stores it, so readers see either the old generation or the new one, whole, and
+// are never stalled by a writer. The two per-key values a pick mutates — the
+// round-robin cursor and the fail-open warn-once — are atomics on the portState,
+// which is shared by pointer across snapshots until a reconcile replaces it. Only
+// ClientIP session affinity keeps a lock, affMu, a leaf: a sticky pick with
+// affinity off is exactly a Pick (lock-free); with affinity on it takes affMu,
+// re-loads the snapshot under it, and re-validates the generation once more before
+// recording. Writers take mu, then affMu, never the reverse, and a pick takes affMu
+// alone.
+//
+// Why a snapshot and not an RWMutex: under 16-way contention RLock/RUnlock cost
+// more than a plain Mutex (the reader count is one cache line every core writes),
+// while an atomic pointer load is a plain MOV. The accept path is the hot side.
+// The win is across keys and under reconcile: each key's cursor is its own line
+// and a writer never stalls a reader. On one hot key every core still shares that
+// key's cursor, and what that costs is the host's cache-line hand-off — cheap on a
+// single die, about what the mutex cost across two (BenchmarkRoutingTablePick
+// against BenchmarkRoutingTablePickManyKeys; #92 has the numbers and the options).
+//
+// The table is independent of socket ownership — per-VIP reconcile serialization
+// (one worker per ClusterIP:port) lives in the proxy server, not here.
 type RoutingTable struct {
 	// podCIDR, when valid, classifies backend locality. The zero Prefix means
 	// locality is unknown (every backend is LocalityUnknown). It is load-bearing
@@ -110,21 +129,33 @@ type RoutingTable struct {
 	// steering is by the mesh's per-peer kernel routes, not this classifier.
 	podCIDR netip.Prefix
 
-	mu     sync.RWMutex
-	states map[PortKey]*portState
+	// snap is the current routing generation. Readers Load it (see load, which
+	// substitutes an empty snapshot for a never-written table so the zero value
+	// reads fine); writers Store the next one under mu. A snapshot's maps are never
+	// mutated after they are published — withState and withTransport copy.
+	snap atomic.Pointer[routingSnapshot]
+	// mu serializes writers only (SetEndpointsPolicy, Delete, SetTransportOverrides):
+	// each loads the current snapshot, derives the next, and stores it, and two
+	// writers racing would otherwise lose one's update. No reader takes it.
+	mu sync.Mutex
+
+	// affMu guards affinity, affinityCount and affinityWarned. It is a leaf lock:
+	// nothing is acquired while it is held, and writers acquire it after mu (via
+	// purgeAffinity), never before, so there is one ordering and no inversion.
+	affMu sync.Mutex
 	// affinity holds ClientIP session-affinity bindings: PortKey -> client IP -> the
-	// backend that client is stuck to. It is table-level (guarded by the same mu, so
-	// the affinity and routing locks are folded into one — no two-lock ordering
-	// hazard) and not a portState field, so a binding survives endpoint churn:
-	// SetEndpointsPolicy replaces the portState on every reconcile, which would wipe
-	// a per-portState map. Bindings are re-validated against the live pool on every
-	// PickSticky hit and idle-swept by the owning Proxy (SweepExpired); only
-	// ClientIP ports have entries here (a None or deleted port is purged).
+	// backend that client is stuck to. It is table-level and not a portState field,
+	// so a binding survives endpoint churn: SetEndpointsPolicy replaces the portState
+	// on every reconcile, which would wipe a per-portState map. Bindings are
+	// re-validated against the live pool on every PickSticky hit and idle-swept by
+	// the owning Proxy (SweepExpired); only ClientIP ports have entries here (a None
+	// or deleted port is purged, always after the snapshot that made the port None
+	// or absent is stored — see pickStickyScoped for why that order matters).
 	affinity map[PortKey]map[netip.Addr]*affinityBinding
 	// affinityCount is the live-binding total across all PortKeys — the sum of
-	// len(binds) over the affinity map — guarded by mu. It is a plain int under the
-	// single table lock, not an atomic: unlike the cross-lock udpBudget it never
-	// leaves mu. It backs the relay-global aggregate ceiling (maxAffinityTotal) and
+	// len(binds) over the affinity map — guarded by affMu. It is a plain int under
+	// that lock, not an atomic: it never leaves affMu.
+	// It backs the relay-global aggregate ceiling (maxAffinityTotal) and
 	// must stay an exact function of the affinity map's cardinality — +1 at the one
 	// create in PickSticky, -1 at each single-key delete (routed through
 	// dropBinding: the stale-binding refresh, the per-port evict, and the idle
@@ -145,15 +176,8 @@ type RoutingTable struct {
 	// saturation episode (mirroring portState.warned for the iTP:Local fail-open): it is
 	// set when the global ceiling first engages and cleared by PickSticky once the count
 	// falls back below the cap, so a later re-saturation is logged again, not silent.
+	// Guarded by affMu.
 	affinityWarned bool
-	// transport maps a backend's published address (the identity in the routing
-	// table, the EndpointSlice, DNS and status.podIP) to the live transport address
-	// the dial must actually use. It is empty on every node that hosts no vm pod, so
-	// the resolution is a single map miss on the ordinary path. Guarded by mu and
-	// replaced wholesale by SetTransportOverrides (the same atomic-swap lifecycle
-	// SetEndpointsPolicy and PolicyTable.Update use), so a generation of overrides can
-	// never leak into the next one. See SetTransportOverrides for the full contract.
-	transport map[netip.Addr]netip.Addr
 
 	// log records the fail-open degradation when internalTrafficPolicy: Local meets
 	// an unknown podCIDR (a loud, throttled Warn so the misconfig is observable). It
@@ -163,12 +187,69 @@ type RoutingTable struct {
 	log *slog.Logger
 }
 
+// routingSnapshot is one immutable generation of the routing state: the per-key
+// backend sets and the published-to-live transport overrides. Readers hold a
+// pointer to it for the duration of one pick and see a consistent world; writers
+// derive the next generation with withState / withTransport and never touch a
+// published one. The maps may be nil (a never-written table); reads of a nil map
+// are well-defined.
+type routingSnapshot struct {
+	states map[PortKey]*portState
+	// transport maps a backend's published address (the identity in the routing
+	// table, the EndpointSlice, DNS and status.podIP) to the live transport address
+	// the dial must actually use. It is empty on every node that hosts no vm pod, so
+	// the resolution is a single map miss on the ordinary path. Replaced wholesale by
+	// SetTransportOverrides (the same swap lifecycle SetEndpointsPolicy and
+	// PolicyTable.Update use), so a generation of overrides can never leak into the
+	// next one. See SetTransportOverrides for the full contract.
+	transport map[netip.Addr]netip.Addr
+}
+
+// emptySnapshot is what a never-written table reads: nil maps, every lookup a
+// miss. It is shared and never mutated.
+var emptySnapshot = &routingSnapshot{}
+
+// load returns the current snapshot, or emptySnapshot before the first write, so
+// every read path is one atomic load and no nil check at the call site.
+func (t *RoutingTable) load() *routingSnapshot {
+	if s := t.snap.Load(); s != nil {
+		return s
+	}
+	return emptySnapshot
+}
+
+// withState returns the next generation with key's state replaced by st, or
+// removed when st is nil. The states map is copied (a reconcile is O(#ports),
+// which is small and off the accept path); the transport map is shared, since it
+// is immutable once published.
+func (s *routingSnapshot) withState(key PortKey, st *portState) *routingSnapshot {
+	next := maps.Clone(s.states)
+	if next == nil {
+		next = make(map[PortKey]*portState, 1)
+	}
+	if st == nil {
+		delete(next, key)
+	} else {
+		next[key] = st
+	}
+	return &routingSnapshot{states: next, transport: s.transport}
+}
+
+// withTransport returns the next generation with the transport overrides replaced
+// wholesale by m (already normalized and owned by the snapshot). The states map is
+// shared, so every portState — and its live cursor — carries over untouched.
+func (s *routingSnapshot) withTransport(m map[netip.Addr]netip.Addr) *routingSnapshot {
+	return &routingSnapshot{states: s.states, transport: m}
+}
+
 // portState is the per-PortKey routing state for one bound Service port. Every
-// field is written together under the table write lock in SetEndpointsPolicy, so
-// Pick always observes a consistent (policy, all, locals) snapshot: a connection
-// can never see a freshly installed backend set paired with a stale policy, and
-// the node-local subset is precomputed once per reconcile rather than rescanned
-// per connection.
+// field but the two atomics is written once, before the state is published into a
+// snapshot, and never again, so Pick always observes a consistent (policy, all,
+// locals) view: a connection can never see a freshly installed backend set paired
+// with a stale policy, and the node-local subset is precomputed once per reconcile
+// rather than rescanned per connection. The cursor and the warn-once are atomics
+// because picks advance them lock-free; a portState is shared by pointer across
+// snapshots (a SetTransportOverrides keeps it) until a reconcile replaces it.
 type portState struct {
 	// all is every Ready backend for the key, sorted by IP then port. It is the
 	// trafficCluster pool and the fail-open pool.
@@ -179,14 +260,15 @@ type portState struct {
 	// policy is the internalTrafficPolicy of the owning Service, applied to this
 	// port. It selects the pool Pick round-robins over.
 	policy trafficPolicy
-	// cursor is the round-robin cursor over the active pool. SetEndpointsPolicy
-	// installs a fresh state (cursor 0) on any change so distribution restarts
-	// deterministically.
-	cursor uint64
+	// cursor is the round-robin cursor over the active pool, advanced atomically
+	// by every pick. SetEndpointsPolicy installs a fresh state (cursor 0) on any
+	// change so distribution restarts deterministically.
+	cursor atomic.Uint64
 	// warned records that the fail-open Warn has already fired for this state, so
 	// an unknown-podCIDR iTP: Local port logs once per backend set, not per
-	// connection. A new state (a reconcile) clears it.
-	warned bool
+	// connection: the first pick to win the compare-and-swap logs, every other pick
+	// sees true and stays quiet. A new state (a reconcile) clears it.
+	warned atomic.Bool
 	// affinityMode is the port's session-affinity mode (affinityClientIP or
 	// affinityNone), installed from the Service's SessionAffinity each reconcile. It
 	// is config, not bindings — the bindings live table-level in RoutingTable.affinity
@@ -231,8 +313,6 @@ func (k PortKey) String() string {
 func NewRoutingTable(podCIDR netip.Prefix) *RoutingTable {
 	return &RoutingTable{
 		podCIDR:            podCIDR,
-		states:             make(map[PortKey]*portState),
-		transport:          make(map[netip.Addr]netip.Addr),
 		affinity:           make(map[PortKey]map[netip.Addr]*affinityBinding),
 		maxAffinityPerPort: maxAffinityBindingsPerPort,
 		maxAffinityTotal:   maxAffinityBindingsTotal,
@@ -249,8 +329,8 @@ func (t *RoutingTable) SetEndpoints(key PortKey, eps []netv1.Endpoint) int {
 }
 
 // SetEndpointsPolicy replaces the backend set and the traffic policy for key in a
-// single locked write, so (policy, backends, node-local subset) is always a
-// consistent snapshot for Pick. Unready endpoints are dropped here, at the single
+// single snapshot swap, so (policy, backends, node-local subset) is always a
+// consistent view for Pick. Unready endpoints are dropped here, at the single
 // admission point, so the accept path can never select one: there is no readiness
 // check in Pick because an unready endpoint is never in the table. Endpoints are
 // sorted by IP then port for deterministic ordering, and the LocalityLocal subset
@@ -331,16 +411,15 @@ func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, pol
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if len(ready) == 0 {
-		delete(t.states, key)
-		t.dropAffinity(key) // no backends: any bindings are meaningless
+		// Store first, purge second: a sticky pick that loaded the old generation
+		// re-validates against the current one under affMu before it records, so
+		// once the new generation is visible no pick can add a binding for key, and
+		// the purge that follows is final (see pickStickyScoped).
+		t.snap.Store(t.load().withState(key, nil))
+		t.purgeAffinity(key) // no backends: any bindings are meaningless
 		return 0
 	}
-	if aff.mode != affinityClientIP {
-		// Affinity off for this port: purge bindings so a Service toggled
-		// ClientIP->None (or never sticky) leaves nothing to resurrect on re-enable.
-		t.dropAffinity(key)
-	}
-	t.states[key] = &portState{
+	t.snap.Store(t.load().withState(key, &portState{
 		all:             ready,
 		locals:          locals,
 		policy:          policy,
@@ -348,6 +427,12 @@ func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, pol
 		affinityTimeout: aff.timeout,
 		allSet:          allSet,
 		localSet:        localSet,
+	}))
+	if aff.mode != affinityClientIP {
+		// Affinity off for this port: purge bindings so a Service toggled
+		// ClientIP->None (or never sticky) leaves nothing to resurrect on re-enable.
+		// Same store-then-purge order as above, for the same reason.
+		t.purgeAffinity(key)
 	}
 	return len(ready)
 }
@@ -358,8 +443,8 @@ func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, pol
 func (t *RoutingTable) Delete(key PortKey) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.states, key)
-	t.dropAffinity(key)
+	t.snap.Store(t.load().withState(key, nil))
+	t.purgeAffinity(key) // after the store, as in SetEndpointsPolicy
 }
 
 // SetTransportOverrides atomically replaces the published-to-live transport
@@ -421,7 +506,7 @@ func (t *RoutingTable) SetTransportOverrides(overrides map[netip.Addr]netip.Addr
 		next[published.Unmap()] = live.Unmap()
 	}
 	t.mu.Lock()
-	t.transport = next
+	t.snap.Store(t.load().withTransport(next))
 	t.mu.Unlock()
 }
 
@@ -436,9 +521,7 @@ func (t *RoutingTable) SetTransportOverrides(overrides map[netip.Addr]netip.Addr
 // policies and Services name and the one that survives a lease change. Only the
 // packet needs the lease.
 func (t *RoutingTable) transportAddr(published netip.AddrPort) netip.AddrPort {
-	t.mu.RLock()
-	live, ok := t.transport[published.Addr().Unmap()]
-	t.mu.RUnlock()
+	live, ok := t.load().transport[published.Addr().Unmap()]
 	if !ok {
 		return published
 	}
@@ -508,7 +591,8 @@ var ErrNoLocalBackends = fmt.Errorf("proxy: no node-local backends for internalT
 //     wrong prefix still drops, since podCIDR drives lo0 alias allocation.
 //
 // The set is returned so PickSticky can re-validate a cached binding against the live
-// pool in O(1). The caller must hold t.mu (activePool may flip st.warned and log).
+// pool in O(1). activePool takes no lock: st is immutable but for its atomics, and
+// the warn-once is a compare-and-swap, so exactly one caller logs per backend set.
 func (t *RoutingTable) activePool(key PortKey, st *portState, external bool) ([]backend, map[netip.AddrPort]struct{}, error) {
 	pool, set := st.all, st.allSet
 	if external {
@@ -526,11 +610,11 @@ func (t *RoutingTable) activePool(key PortKey, st *portState, external bool) ([]
 				return nil, nil, ErrNoLocalBackends
 			}
 			pool, set = st.locals, st.localSet
-		} else if !st.warned {
+		} else if st.warned.CompareAndSwap(false, true) {
 			// Locality is unknowable (zero/invalid podCIDR): fail open to all backends
 			// and warn once per backend set, so an unset/malformed podCIDR degrades
-			// iTP: Local to Cluster loudly instead of blackholing it.
-			st.warned = true
+			// iTP: Local to Cluster loudly instead of blackholing it. The CAS makes the
+			// once exact under concurrent picks with no lock.
 			t.logger().Warn("internalTrafficPolicy:Local routing degraded to Cluster: node podCIDR is unset/invalid so backend locality is unknown; routing to ALL backends instead of dropping",
 				"key", key.String(), "backends", len(st.all))
 		}
@@ -540,11 +624,10 @@ func (t *RoutingTable) activePool(key PortKey, st *portState, external bool) ([]
 
 // roundRobin returns the next backend in pool and advances st's per-key cursor so
 // successive calls fan out. pool must be non-empty (activePool guarantees it for a
-// non-error return). The caller holds t.mu.
+// non-error return). Lock-free: one atomic add claims a slot, so concurrent picks
+// each get a distinct cursor value and the fan-out stays exact.
 func (t *RoutingTable) roundRobin(st *portState, pool []backend) backend {
-	i := st.cursor % uint64(len(pool))
-	st.cursor++
-	return pool[i]
+	return pool[(st.cursor.Add(1)-1)%uint64(len(pool))]
 }
 
 // Pick selects the next backend for key using round-robin, advancing a per-key
@@ -573,17 +656,34 @@ func (t *RoutingTable) roundRobin(st *portState, pool []backend) backend {
 //
 // Pick returns ErrNoBackends when the key has no Ready backends at all.
 func (t *RoutingTable) Pick(key PortKey) (backend, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	st := t.states[key]
-	if st == nil || len(st.all) == 0 {
-		return backend{}, ErrNoBackends
-	}
-	pool, _, err := t.activePool(key, st, false)
+	st, pool, _, err := t.scoped(key, false)
 	if err != nil {
 		return backend{}, err
 	}
 	return t.roundRobin(st, pool), nil
+}
+
+// scoped resolves key in the current generation to its portState, the pool the
+// scope selects, and the membership set the sticky path re-validates against. It is
+// the shared prologue of Pick and pickStickyScoped: ErrNoBackends for an absent or
+// empty key, and activePool's own error otherwise — an internal-scope iTP:Local port
+// with no node-local backend is a drop that propagates, never a fallback to a stale
+// binding (that would spill node-local traffic to a remote). An empty pool is also
+// ErrNoBackends: activePool's non-error return is non-empty today, but a future
+// subset scope could empty it, and roundRobin's cursor%len must never divide by zero.
+func (t *RoutingTable) scoped(key PortKey, external bool) (*portState, []backend, map[netip.AddrPort]struct{}, error) {
+	st := t.load().states[key]
+	if st == nil || len(st.all) == 0 {
+		return nil, nil, nil, ErrNoBackends
+	}
+	pool, set, err := t.activePool(key, st, external)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(pool) == 0 {
+		return nil, nil, nil, ErrNoBackends
+	}
+	return st, pool, set, nil
 }
 
 // PickAt selects the backend at index i modulo the Ready-set size, without
@@ -592,9 +692,7 @@ func (t *RoutingTable) Pick(key PortKey) (backend, error) {
 // index over the full set, decoupling distribution assertions from call ordering.
 // It returns ErrNoBackends when the key has no Ready backends.
 func (t *RoutingTable) PickAt(key PortKey, i uint64) (backend, error) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	st := t.states[key]
+	st := t.load().states[key]
 	if st == nil || len(st.all) == 0 {
 		return backend{}, ErrNoBackends
 	}
@@ -605,10 +703,8 @@ func (t *RoutingTable) PickAt(key PortKey, i uint64) (backend, error) {
 // (sorted) order. It is used by tests and diagnostics; the returned slice is
 // owned by the caller.
 func (t *RoutingTable) Backends(key PortKey) []backend {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
 	var bes []backend
-	if st := t.states[key]; st != nil {
+	if st := t.load().states[key]; st != nil {
 		bes = st.all
 	}
 	out := make([]backend, len(bes))
@@ -618,9 +714,7 @@ func (t *RoutingTable) Backends(key PortKey) []backend {
 
 // Len reports the number of Ready backends for key.
 func (t *RoutingTable) Len(key PortKey) int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if st := t.states[key]; st != nil {
+	if st := t.load().states[key]; st != nil {
 		return len(st.all)
 	}
 	return 0
