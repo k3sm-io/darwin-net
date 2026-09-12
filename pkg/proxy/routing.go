@@ -114,7 +114,10 @@ func (b backend) Locality() Locality { return b.locality }
 // more than a plain Mutex (the reader count is one cache line every core writes),
 // while an atomic pointer load is a plain MOV. The accept path is the hot side.
 // The win is across keys and under reconcile: each key's cursor is its own line
-// and a writer never stalls a reader. On one hot key every core still shares that
+// and a writer never stalls a reader. That is now literal rather than approximate
+// — portState pads its two written atomics onto their own 128-byte line and
+// rounds itself to two, so the cursor shares a line neither with the fields a pick
+// reads nor with the next key's state. On one hot key every core still shares that
 // key's cursor, and what that costs is the host's cache-line hand-off — cheap on a
 // single die, about what the mutex cost across two (BenchmarkRoutingTablePick
 // against BenchmarkRoutingTablePickManyKeys; #92 has the numbers and the options).
@@ -242,6 +245,13 @@ func (s *routingSnapshot) withTransport(m map[netip.Addr]netip.Addr) *routingSna
 	return &routingSnapshot{states: s.states, transport: m}
 }
 
+// cacheLineSize is the Apple Silicon cache-line size in bytes: `sysctl
+// hw.cachelinesize` reports 128 on every M-series die, twice the x86 convention.
+// Padding to 64 here would leave the per-pick writes sharing a line with the
+// per-pick reads on the target hardware, which is precisely the sharing the
+// padding exists to remove.
+const cacheLineSize = 128
+
 // portState is the per-PortKey routing state for one bound Service port. Every
 // field but the two atomics is written once, before the state is published into a
 // snapshot, and never again, so Pick always observes a consistent (policy, all,
@@ -250,6 +260,11 @@ func (s *routingSnapshot) withTransport(m map[netip.Addr]netip.Addr) *routingSna
 // rather than rescanned per connection. The cursor and the warn-once are atomics
 // because picks advance them lock-free; a portState is shared by pointer across
 // snapshots (a SetTransportOverrides keeps it) until a reconcile replaces it.
+//
+// Layout is load-bearing, not incidental: the two atomics are padded onto a cache
+// line of their own, after every read-only field, so a pick's fetch-add does not
+// invalidate the line the same pick (and every other core's pick) reads all,
+// locals and policy from. See the pads below for the arithmetic.
 type portState struct {
 	// all is every Ready backend for the key, sorted by IP then port. It is the
 	// trafficCluster pool and the fail-open pool.
@@ -260,15 +275,6 @@ type portState struct {
 	// policy is the internalTrafficPolicy of the owning Service, applied to this
 	// port. It selects the pool Pick round-robins over.
 	policy trafficPolicy
-	// cursor is the round-robin cursor over the active pool, advanced atomically
-	// by every pick. SetEndpointsPolicy installs a fresh state (cursor 0) on any
-	// change so distribution restarts deterministically.
-	cursor atomic.Uint64
-	// warned records that the fail-open Warn has already fired for this state, so
-	// an unknown-podCIDR iTP: Local port logs once per backend set, not per
-	// connection: the first pick to win the compare-and-swap logs, every other pick
-	// sees true and stays quiet. A new state (a reconcile) clears it.
-	warned atomic.Bool
 	// affinityMode is the port's session-affinity mode (affinityClientIP or
 	// affinityNone), installed from the Service's SessionAffinity each reconcile. It
 	// is config, not bindings — the bindings live table-level in RoutingTable.affinity
@@ -284,6 +290,34 @@ type portState struct {
 	// nil when there are no node-local backends.
 	allSet   map[netip.AddrPort]struct{}
 	localSet map[netip.AddrPort]struct{}
+
+	// The two atomics below are the only fields a pick writes, and they are
+	// deliberately the last fields, pushed onto a cache line of their own.
+	//
+	// The leading pad's 80 is the end of the read-only block above (all 0+24,
+	// locals 24+24, policy 48+1, affinityMode 49+1, six bytes of alignment so the
+	// 8-byte time.Duration starts at 56, affinityTimeout 56+8, allSet 64+8,
+	// localSet 72+8), so cursor lands at exactly cacheLineSize. The trailing
+	// pad's 12 is sizeof(cursor)+sizeof(warned), which rounds the struct to
+	// 2*cacheLineSize: heap objects of that size class are 256-byte aligned, so
+	// back-to-back portStates never put one key's atomics on the line holding the
+	// next key's read-only header.
+	//
+	// Reordering, adding, or resizing ANY read-only field above invalidates the 80
+	// and silently re-shares the line. TestPortStateCursorIsolatedCacheLine is the
+	// alarm on that: when it goes red, recompute the pads, do not relax the test.
+	// The cost is 256 B per Service port — 256 KiB at 1,000 ports.
+	_ [cacheLineSize - 80]byte
+	// cursor is the round-robin cursor over the active pool, advanced atomically
+	// by every pick. SetEndpointsPolicy installs a fresh state (cursor 0) on any
+	// change so distribution restarts deterministically.
+	cursor atomic.Uint64
+	// warned records that the fail-open Warn has already fired for this state, so
+	// an unknown-podCIDR iTP: Local port logs once per backend set, not per
+	// connection: the first pick to win the compare-and-swap logs, every other pick
+	// sees true and stays quiet. A new state (a reconcile) clears it.
+	warned atomic.Bool
+	_      [cacheLineSize - 12]byte
 }
 
 // PortKey identifies one bound Service port: the ClusterIP plus the Service Port
