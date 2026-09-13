@@ -35,31 +35,36 @@ import (
 // meshPeerResource is the MeshPeer CRD resource name within net.k3sm.io/v1.
 const meshPeerResource = "meshpeers"
 
-// meshResyncPeriod is how often the MeshPeer informer re-delivers its full cache
-// through the event handler even when no MeshPeer changed, so the watcher
-// periodically re-applies the desired mesh state. It is the mesh's reconvergence
-// floor after the root netd helper restarts (launchctl kickstart -k io.k3sm.netd):
-// the utun/wireguard device and its up/route state live IN the netd process and are
-// lost on a restart, while this watcher is a long-lived unprivileged client that
-// tracks no device generation — so without a periodic resync nothing re-issues
-// ConfigureMesh until the next unrelated MeshPeer change, and the cross-node mesh
-// would stay DOWN indefinitely. 30s bounds reconvergence to <=30s after a helper
-// restart; the cost is negligible because the MeshPeer set is small (one per
-// cluster node, cluster-scoped) and Device.Apply is an idempotent full-resync UAPI
-// write, so a resync with no change is a cheap re-assertion, not new state.
+// meshResyncPeriod is how often the watcher re-applies the desired mesh state even
+// when no MeshPeer changed. It is the mesh's reconvergence floor after the root netd
+// helper restarts (launchctl kickstart -k io.k3sm.netd): the utun/wireguard device
+// and its up/route state live IN the netd process and are lost on a restart, while
+// this watcher is a long-lived unprivileged client that tracks no device generation —
+// so without a periodic resync nothing re-issues ConfigureMesh until the next
+// unrelated MeshPeer change, and the cross-node mesh would stay DOWN indefinitely.
+// 30s bounds reconvergence to <=30s after a helper restart; the cost is negligible
+// because Device.Apply is an idempotent full-resync UAPI write, so a resync with no
+// change is a cheap re-assertion, not new state.
+//
+// The period drives the WATCHER'S OWN ticker (Watcher.resyncLoop), not the informer's
+// resync. An informer resync re-delivers the whole cache through UpdateFunc, which
+// would fire one full Reconcile per cached MeshPeer — N ConfigureMesh RPCs to netd
+// per tick on an N-node cluster — for a single re-assertion of one full snapshot. The
+// informer is therefore built with resync 0 and the ticker calls resync exactly once
+// per period regardless of node count.
 const meshResyncPeriod = 30 * time.Second
 
-// Watcher drives a Mesh from a MeshPeer informer. On every MeshPeer add, update,
+// Watcher drives a Mesh from a MeshPeer informer. On every MeshPeer add, real update,
 // or delete it recomputes the FULL peer snapshot from the informer cache and calls
 // Mesh.Reconcile — a continuous reconcile, never a one-shot startup read — so a
 // peer that roams onto a new endpoint or rotates its key reconverges automatically.
 // It mirrors the Service proxy's Watcher: correctness comes from the full-snapshot
 // reconcile, not from per-event ordering.
 //
-// The informer is built with a bounded resync period (meshResyncPeriod) so the same
-// full-snapshot reconcile also fires periodically with no MeshPeer change; that is
-// what reconverges the utun/wireguard after the root netd helper restarts and drops
-// the in-process device, without waiting for an unrelated MeshPeer event to arrive.
+// The same full-snapshot reconcile also fires periodically with no MeshPeer change,
+// driven by the watcher's own ticker at resyncPeriod; that is what reconverges the
+// utun/wireguard after the root netd helper restarts and drops the in-process device,
+// without waiting for an unrelated MeshPeer event to arrive.
 type Watcher struct {
 	mesh         *Mesh
 	informer     cache.SharedIndexInformer
@@ -70,9 +75,11 @@ type Watcher struct {
 // NewWatcher builds a Watcher over the cluster REST config for the given Mesh. It
 // registers the net.k3sm.io/v1 types (netv1.AddToScheme) into a private scheme,
 // builds a typed REST client for the MeshPeer GVK, and wires a shared informer
-// that yields typed *netv1.MeshPeer objects with a bounded resync (meshResyncPeriod)
-// so the reconcile re-fires periodically. It does not start the informer — call Run.
-// The MeshPeer is cluster-scoped, so the informer watches all namespaces.
+// that yields typed *netv1.MeshPeer objects. The informer takes resync period 0 —
+// the periodic re-assertion is the watcher's own ticker (meshResyncPeriod), which
+// reconciles once per tick instead of once per cached peer. It does not start the
+// informer — call Run. The MeshPeer is cluster-scoped, so the informer watches all
+// namespaces.
 func NewWatcher(cfg *rest.Config, mesh *Mesh, log *slog.Logger) (*Watcher, error) {
 	if log == nil {
 		log = slog.Default()
@@ -93,39 +100,85 @@ func NewWatcher(cfg *rest.Config, mesh *Mesh, log *slog.Logger) (*Watcher, error
 	}
 
 	lw := cache.NewListWatchFromClient(client, meshPeerResource, metav1.NamespaceAll, fields.Everything())
-	informer := cache.NewSharedIndexInformer(lw, &netv1.MeshPeer{}, meshResyncPeriod, cache.Indexers{})
+	informer := cache.NewSharedIndexInformer(lw, &netv1.MeshPeer{}, 0, cache.Indexers{})
 	return &Watcher{mesh: mesh, informer: informer, resyncPeriod: meshResyncPeriod, log: log}, nil
 }
 
 // Run starts the informer and blocks until ctx is cancelled. It registers an event
-// handler that reconciles the full mesh on any MeshPeer change AND on the informer's
-// periodic resync (every meshResyncPeriod the cache is re-delivered through
-// UpdateFunc with no change), then waits for the cache to sync before returning
-// control to the blocking wait. The periodic resync is what reconverges the mesh
-// after a netd restart without a MeshPeer event.
+// handler that reconciles the full mesh on any real MeshPeer change, waits for the
+// cache to sync, then drives one full resync per meshResyncPeriod tick — the path
+// that reconverges the mesh after a netd restart without a MeshPeer event.
 func (w *Watcher) Run(ctx context.Context) error {
-	handler := cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(any) { w.resync(ctx) },
-		UpdateFunc: func(_, _ any) { w.resync(ctx) },
-		DeleteFunc: func(any) { w.resync(ctx) },
-	}
-	if _, err := w.informer.AddEventHandler(handler); err != nil {
+	if _, err := w.informer.AddEventHandler(w.handler(ctx)); err != nil {
 		return fmt.Errorf("add meshpeer handler: %w", err)
 	}
 	go w.informer.Run(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), w.informer.HasSynced) {
 		return fmt.Errorf("meshpeer informer cache sync failed")
 	}
-	<-ctx.Done()
-	return ctx.Err()
+	ticker := time.NewTicker(w.resyncPeriod)
+	defer ticker.Stop()
+	return w.resyncLoop(ctx, ticker.C)
+}
+
+// handler is the informer event handler: an add or a delete always reconciles the
+// full snapshot, and an update reconciles only when the MeshPeer actually changed
+// (meshPeerChanged). The update guard keeps a re-delivery of an unchanged object —
+// from a relist, or from an informer resync should one ever be configured — from
+// multiplying into one Reconcile (one netd ConfigureMesh RPC) per cached peer.
+func (w *Watcher) handler(ctx context.Context) cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(any) { w.resync(ctx) },
+		UpdateFunc: func(oldObj, newObj any) {
+			if !meshPeerChanged(oldObj, newObj) {
+				return
+			}
+			w.resync(ctx)
+		},
+		DeleteFunc: func(any) { w.resync(ctx) },
+	}
+}
+
+// meshPeerChanged reports whether an informer update carries a real MeshPeer change,
+// by comparing ResourceVersion — the apiserver's own change token, which advances on
+// every write and is identical on a re-delivery of the same object. Anything that is
+// not a typed *netv1.MeshPeer pair (a tombstone, an unexpected type) counts as
+// changed, so the guard fails toward reconciling: a redundant full-snapshot reconcile
+// is idempotent, a missed one leaves the mesh stale.
+func meshPeerChanged(oldObj, newObj any) bool {
+	oldPeer, ok := oldObj.(*netv1.MeshPeer)
+	if !ok {
+		return true
+	}
+	newPeer, ok := newObj.(*netv1.MeshPeer)
+	if !ok {
+		return true
+	}
+	return oldPeer.ResourceVersion != newPeer.ResourceVersion
+}
+
+// resyncLoop calls resync once per tick until ctx is cancelled, returning ctx.Err().
+// One tick is one full-snapshot reconcile no matter how many MeshPeers are cached —
+// the coalescing that an informer-driven resync cannot give, because that re-delivers
+// the cache object by object. ticks is a parameter so the loop is drivable in a test
+// without waiting a real period.
+func (w *Watcher) resyncLoop(ctx context.Context, ticks <-chan time.Time) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticks:
+			w.resync(ctx)
+		}
+	}
 }
 
 // resync recomputes the full peer snapshot from the informer cache and reconciles
-// the mesh. It is driven both by MeshPeer events and by the informer's periodic
-// resync (meshResyncPeriod), so it re-asserts the desired state even when nothing
-// changed — that is the post-netd-restart reconvergence path. A reconcile error is
-// logged here, at the boundary that handles it (the next event or resync re-drives
-// it); it does not stop the watch.
+// the mesh. It is driven both by MeshPeer events and by the periodic ticker
+// (meshResyncPeriod), so it re-asserts the desired state even when nothing changed —
+// that is the post-netd-restart reconvergence path. A reconcile error is logged here,
+// at the boundary that handles it (the next event or tick re-drives it); it does not
+// stop the watch.
 func (w *Watcher) resync(ctx context.Context) {
 	store := w.informer.GetStore().List()
 	specs := make([]netv1.MeshPeerSpec, 0, len(store))
