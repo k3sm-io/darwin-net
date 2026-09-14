@@ -108,14 +108,25 @@ type WGDevice struct {
 
 	mu    sync.Mutex
 	iface string // resolved interface name after CreateTUN (e.g. "utun4")
-	dev   *device.Device
+	dev   wgControl
 	tun   tun.Device
 	// routes is the set of prefixes this device has VERIFIED in the kernel table,
 	// re-derived from a read-back on every apply — never a record of the route
 	// commands that were issued (route(8) reports success it did not achieve).
 	routes    map[netip.Prefix]struct{}
 	applied   AppliedEndpoints // endpoints this device last programmed, per peer key
+	lastUAPI  string           // the peer update IpcSet last accepted; "" once the device is gone
 	pfApplied bool
+}
+
+// wgControl is the slice of *device.Device the applier drives: the UAPI write,
+// the bring-up, and the close. It exists so the Apply path — in particular the
+// decision to write or skip a peer update — is testable against a recorder with no
+// utun and no wireguard in play; Up always installs the real device.
+type wgControl interface {
+	IpcSet(uapi string) error
+	Up() error
+	Close()
 }
 
 // NewDevice constructs the production wireguard Device from cfg. It performs no
@@ -245,6 +256,7 @@ func (d *WGDevice) Up(ctx context.Context) error {
 	// endpoint memory starts empty: the next Apply is a full resync that
 	// programs every peer's CR endpoint.
 	d.applied = nil
+	d.lastUAPI = ""
 	d.pfApplied = true
 	d.log.Info("mesh device up", "iface", name, "meshIP", d.cfg.meshIP.String(), "linkIP", d.cfg.linkIP.String(), "mtu", d.cfg.mtu, "mss", d.cfg.mss, "listenPort", d.cfg.listenPort)
 	return nil
@@ -262,6 +274,18 @@ func (d *WGDevice) Up(ctx context.Context) error {
 // still reconciling AllowedIPs, keepalives, additions, and removals. A failed
 // IpcSet leaves the device in an unknown state, so the memory is dropped and the
 // next apply is a full resync again.
+//
+// An update whose UAPI text is byte-identical to the one this device last wrote
+// is not written again. UAPIUpdate never renders an empty update — an incremental
+// update re-states every peer's AllowedIPs and keepalive — so "unchanged" is the
+// only empty there is: identical text means the same peer set, the same
+// AllowedIPs and keepalives, and no endpoint the roaming contract would re-stamp,
+// which is exactly the periodic resync on a quiet cluster. The skip is a pure
+// no-op elimination: IpcSet with that text would program what wireguard already
+// holds. The route reconcile below is NOT skipped — the kernel table is outside
+// this process and is re-verified on every apply regardless. The memory is
+// cleared with the endpoint memory (Up, a failed IpcSet, Down), so a re-created
+// device is always written in full.
 func (d *WGDevice) Apply(ctx context.Context, plan Plan) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -269,9 +293,14 @@ func (d *WGDevice) Apply(ctx context.Context, plan Plan) error {
 		return fmt.Errorf("%w: mesh device not up", ErrPeerConfig)
 	}
 	uapi, next := plan.UAPIUpdate(d.applied)
-	if err := d.dev.IpcSet(uapi); err != nil {
-		d.applied = nil
-		return fmt.Errorf("apply wireguard peers: %w", err)
+	written := uapi != d.lastUAPI
+	if written {
+		if err := d.dev.IpcSet(uapi); err != nil {
+			d.applied = nil
+			d.lastUAPI = ""
+			return fmt.Errorf("apply wireguard peers: %w", err)
+		}
+		d.lastUAPI = uapi
 	}
 	d.applied = next
 
@@ -279,7 +308,7 @@ func (d *WGDevice) Apply(ctx context.Context, plan Plan) error {
 	if err != nil {
 		return err
 	}
-	d.log.Info("mesh peers applied", "peers", len(plan.Peers), "routes", installed, "skipped", len(plan.Skipped))
+	d.log.Info("mesh peers applied", "peers", len(plan.Peers), "written", written, "routes", installed, "skipped", len(plan.Skipped))
 	return nil
 }
 
@@ -392,6 +421,7 @@ func (d *WGDevice) Down(ctx context.Context) error {
 	// The peers died with the device; forget what was programmed so a later Up +
 	// Apply re-programs every endpoint rather than suppressing them all.
 	d.applied = nil
+	d.lastUAPI = ""
 	d.log.Info("mesh device down", "iface", d.iface)
 	return nil
 }
