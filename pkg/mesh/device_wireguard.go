@@ -108,7 +108,7 @@ type WGDevice struct {
 
 	mu    sync.Mutex
 	iface string // resolved interface name after CreateTUN (e.g. "utun4")
-	dev   *device.Device
+	dev   wgControl
 	tun   tun.Device
 	// routes is the set of prefixes this device has VERIFIED in the kernel table,
 	// re-derived from a read-back on every apply — never a record of the route
@@ -116,6 +116,16 @@ type WGDevice struct {
 	routes    map[netip.Prefix]struct{}
 	applied   AppliedEndpoints // endpoints this device last programmed, per peer key
 	pfApplied bool
+}
+
+// wgControl is the slice of *device.Device the applier drives: the UAPI write,
+// the bring-up, and the close. It exists so the Apply path — in particular the
+// decision to write or skip a peer update — is testable against a recorder with no
+// utun and no wireguard in play; Up always installs the real device.
+type wgControl interface {
+	IpcSet(uapi string) error
+	Up() error
+	Close()
 }
 
 // NewDevice constructs the production wireguard Device from cfg. It performs no
