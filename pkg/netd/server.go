@@ -22,10 +22,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,6 +98,16 @@ type Config struct {
 	// live — replacing this value for every later policy decision (see
 	// handleConfigureMesh). Read it through Server.nodeCIDR, never from cfg.
 	NodePodCIDR netip.Prefix
+	// IdentityPath, when non-empty, is the file the daemon persists an ADOPTED node
+	// pod CIDR to (temp-and-rename, 0600) and re-reads at start, so an identity the
+	// join handed over survives a helper restart the agent did not drive — a crash
+	// plus launchd KeepAlive, say, which would otherwise revert the daemon to
+	// NodePodCIDR while the kernel still holds the node's pod aliases and make it
+	// reject every one of them until the mesh's next resync. The caller chooses the
+	// path and owns its directory, which must be root-only (k3sm passes a path under
+	// its mesh key dir). Optional: empty disables persistence, and an unreadable or
+	// malformed file is logged and ignored (the daemon falls back to NodePodCIDR).
+	IdentityPath string
 	// ServiceCIDR, when valid, additionally admits an EnsureAlias for a Service VIP
 	// (the proxy's ClusterIPs live here, outside the pod aggregate). Optional.
 	ServiceCIDR netip.Prefix
@@ -140,8 +153,9 @@ type Config struct {
 // held only around those reads/writes and never across a Privileged call that
 // touches the datapath (ifconfig/pfctl/wireguard can block), so one wedged
 // operation cannot stall every other connection's policy checks. The single
-// exception is the in-memory SetNodePodCIDR inside adoptNodePodCIDR, which does no
-// I/O and must not interleave with the adoption decision it implements.
+// exception is adoptNodePodCIDR, which must not let its decision interleave with
+// the executor re-point and the identity write it authorizes; see its comment for
+// why that call is bounded.
 type Server struct {
 	cfg  Config
 	log  *slog.Logger
@@ -186,14 +200,101 @@ func NewServer(cfg Config) *Server {
 	if priv == nil {
 		priv = newDarwinApplier(cfg.NodePodCIDR, cfg.Logger)
 	}
+	node := cfg.NodePodCIDR.Masked()
+	if restored, ok := restoreIdentity(cfg.IdentityPath, cfg.ClusterAggregate, cfg.Logger); ok {
+		cfg.Logger.Info("netd: restored adopted node pod CIDR", "path", cfg.IdentityPath,
+			"nodePodCIDR", restored.String(), "configured", node.String())
+		node = restored
+	}
 	return &Server{
 		cfg:         cfg,
 		log:         cfg.Logger,
 		peer:        peer,
 		priv:        priv,
-		nodePodCIDR: cfg.NodePodCIDR.Masked(),
+		nodePodCIDR: node,
 		aliases:     make(map[netip.Addr]struct{}),
 	}
+}
+
+// restoreIdentity reads a previously adopted node pod CIDR from path. It is
+// deliberately FAIL-OPEN: an empty path, an absent file (the normal first boot), an
+// unreadable one, a malformed prefix, or one outside the pinned cluster aggregate
+// all yield false, and the daemon starts on its configured Config.NodePodCIDR. The
+// file is an optimization for the restart case, never an authority — the agent
+// re-asserts the identity on its next ConfigureMesh either way, and honouring a
+// corrupt file would move the policy boundary on the strength of a bad byte.
+func restoreIdentity(path string, aggregate netip.Prefix, log *slog.Logger) (netip.Prefix, bool) {
+	if path == "" {
+		return netip.Prefix{}, false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			log.Warn("netd: reading the persisted node pod CIDR failed (falling back to the configured one)", "path", path, "err", err)
+		}
+		return netip.Prefix{}, false
+	}
+	cidr, err := netip.ParsePrefix(strings.TrimSpace(string(raw)))
+	if err != nil {
+		log.Warn("netd: the persisted node pod CIDR is malformed (ignoring)", "path", path, "err", err)
+		return netip.Prefix{}, false
+	}
+	cidr = cidr.Masked()
+	if !withinAggregate(cidr, aggregate) {
+		log.Warn("netd: the persisted node pod CIDR is outside the cluster aggregate (ignoring)",
+			"path", path, "nodePodCIDR", cidr.String(), "aggregate", aggregate.String())
+		return netip.Prefix{}, false
+	}
+	return cidr, true
+}
+
+// withinAggregate reports whether cidr is wholly inside aggregate: its base address
+// is contained AND it is no wider, so a supernet sharing the aggregate's base
+// address cannot pass as "inside" it.
+func withinAggregate(cidr, aggregate netip.Prefix) bool {
+	return aggregate.Contains(cidr.Addr()) && cidr.Bits() >= aggregate.Bits()
+}
+
+// persistIdentity records cidr as the adopted identity when a path is configured.
+// A write failure is logged, never fatal: the running daemon has already adopted
+// the identity correctly, and failing the adoption over an unwritable file would
+// wedge the join for a benefit that only matters after a restart.
+func (s *Server) persistIdentity(cidr netip.Prefix) {
+	if s.cfg.IdentityPath == "" {
+		return
+	}
+	if err := writeIdentityFile(s.cfg.IdentityPath, cidr); err != nil {
+		s.log.Error("netd: persisting the adopted node pod CIDR failed (a helper restart will fall back to the configured one)",
+			"path", s.cfg.IdentityPath, "nodePodCIDR", cidr.String(), "err", err)
+	}
+}
+
+// writeIdentityFile writes cidr to path atomically: a 0600 temp file in the same
+// directory (os.CreateTemp creates it 0600 and root owns the directory), then a
+// rename. A torn write would be read back as a malformed prefix on the next boot
+// and ignored, which is safe but silently loses the identity — the rename makes the
+// file either the old content or the new one.
+func writeIdentityFile(path string, cidr netip.Prefix) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".nodepodcidr-*")
+	if err != nil {
+		return fmt.Errorf("create temp beside %s: %w", path, err)
+	}
+	tmp := f.Name()
+	defer func() {
+		// A no-op once the rename succeeded (the name is gone by then).
+		_ = os.Remove(tmp)
+	}()
+	if _, err := f.WriteString(cidr.String() + "\n"); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", tmp, path, err)
+	}
+	return nil
 }
 
 // nodeCIDR returns the node identity in force: the configured pre-adoption /24
@@ -450,7 +551,7 @@ func (s *Server) handleConfigureMesh(ctx context.Context, st *connState, args *w
 	if s.cfg.MeshKeyResolver == nil {
 		return s.errResp("configureMesh: no mesh key resolver configured (refusing — there is no embedded key)")
 	}
-	if err := s.adoptNodePodCIDR(args.NodePodCIDR); err != nil {
+	if err := s.adoptNodePodCIDR(ctx, args.NodePodCIDR); err != nil {
 		s.log.Warn("netd: node pod CIDR adoption rejected", "err", err)
 		return s.errResp(err.Error())
 	}
@@ -502,16 +603,19 @@ func (s *Server) handleConfigureMesh(ctx context.Context, st *connState, args *w
 // The rules, in order: an omitted CIDR changes nothing (an older client); a
 // malformed one, or one outside the pinned cluster aggregate, is refused; the
 // identity already in force is a no-op; and a DIFFERENT identity is refused
-// outright once anything is live — an alias, a mesh route, or a mesh device that is
-// up — because moving the policy boundary under running pods would orphan the
-// aliases already plumbed under the old /24. Otherwise the daemon adopts it and
-// re-points the executor, whose mesh-egress and utun link addresses derive from it.
+// outright once anything is live — a POD alias under the current identity, a mesh
+// route, or a mesh device that is up — because moving the policy boundary under
+// running pods would orphan the aliases already plumbed under the old /24.
+// Otherwise the daemon adopts it, re-points the executor (whose mesh-egress and
+// utun link addresses derive from it), and persists it for a restart.
 //
 // It is called with s.mu unheld and takes it for the whole decision, including the
-// executor's SetNodePodCIDR — the one Privileged call made under the lock, and an
-// in-memory re-derivation that performs no I/O — so the decision and the
-// re-pointing cannot interleave with a concurrent adoption.
-func (s *Server) adoptNodePodCIDR(arg string) error {
+// executor's SetNodePodCIDR and the identity write — so the decision and the
+// re-pointing cannot interleave with a concurrent adoption. That is the one place
+// mu is held across a Privileged call; it is bounded (the mesh is by definition not
+// up, so the executor only re-derives two addresses and closes a never-upped
+// device) and happens at most once per daemon lifetime.
+func (s *Server) adoptNodePodCIDR(ctx context.Context, arg string) error {
 	if arg == "" {
 		return nil
 	}
@@ -520,7 +624,7 @@ func (s *Server) adoptNodePodCIDR(arg string) error {
 		return fmt.Errorf("%w: configureMesh: parse nodePodCIDR %q: %v", ErrPolicy, arg, err)
 	}
 	want = want.Masked()
-	if !s.cfg.ClusterAggregate.Contains(want.Addr()) || want.Bits() < s.cfg.ClusterAggregate.Bits() {
+	if !withinAggregate(want, s.cfg.ClusterAggregate) {
 		return fmt.Errorf("%w: configureMesh: node pod CIDR %s is outside the cluster aggregate %s",
 			ErrPolicy, want, s.cfg.ClusterAggregate)
 	}
@@ -531,23 +635,34 @@ func (s *Server) adoptNodePodCIDR(arg string) error {
 		s.log.Debug("netd: configureMesh node pod CIDR unchanged", "nodePodCIDR", want.String())
 		return nil
 	}
-	if s.hasLiveStateLocked() {
-		return fmt.Errorf("%w: configureMesh: node identity already pinned to %s; refusing %s (live: %d alias(es), %d mesh route(s), mesh up=%t)",
-			ErrPolicy, s.nodePodCIDR, want, len(s.aliases), s.meshRoutes, s.meshUp)
+	if pods := s.livePodAliasesLocked(); pods > 0 || s.meshRoutes > 0 || s.meshUp {
+		return fmt.Errorf("%w: configureMesh: node identity already pinned to %s; refusing %s (live: %d pod alias(es), %d mesh route(s), mesh up=%t)",
+			ErrPolicy, s.nodePodCIDR, want, pods, s.meshRoutes, s.meshUp)
 	}
-	if err := s.priv.SetNodePodCIDR(want); err != nil {
+	if err := s.priv.SetNodePodCIDR(ctx, want); err != nil {
 		return fmt.Errorf("%w: configureMesh: adopt node pod CIDR %s: %v", ErrPolicy, want, err)
 	}
 	old := s.nodePodCIDR
 	s.nodePodCIDR = want
+	s.persistIdentity(want)
 	s.log.Info("netd: adopted node pod CIDR from ConfigureMesh", "old", old.String(), "new", want.String())
 	return nil
 }
 
-// hasLiveStateLocked reports whether the daemon currently holds any object whose
-// validity depends on the node identity. s.mu must be held.
-func (s *Server) hasLiveStateLocked() bool {
-	return len(s.aliases) > 0 || s.meshRoutes > 0 || s.meshUp
+// livePodAliasesLocked counts the live aliases that are POD addresses under the
+// identity in force — the only aliases an adoption would orphan. A Service VIP
+// alias (admitted by Config.ServiceCIDR) is deliberately not counted: it lives
+// outside the pod aggregate, nothing about it is derived from the node /24, and the
+// proxy plumbs VIPs as soon as it syncs, so counting them would let ordinary
+// Service traffic block a worker's one legitimate adoption. s.mu must be held.
+func (s *Server) livePodAliasesLocked() int {
+	n := 0
+	for ip := range s.aliases {
+		if s.nodePodCIDR.Contains(ip) {
+			n++
+		}
+	}
+	return n
 }
 
 // trackAlias records a plumbed alias daemon-wide (connState's accounting is

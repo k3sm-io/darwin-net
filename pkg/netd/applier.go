@@ -50,10 +50,11 @@ type Privileged interface {
 	RemoveMesh(ctx context.Context) error
 	// SetNodePodCIDR re-points the executor at cidr, re-deriving everything it
 	// derives from the node's pod /24 (the mesh-egress source and the utun link
-	// address). The server calls it only when it adopts a new node identity, which
-	// it does only while nothing is live; an executor that cannot serve the new
-	// CIDR returns an error and the adoption is refused. It performs no I/O.
-	SetNodePodCIDR(cidr netip.Prefix) error
+	// address) and retiring anything built from the old one. The server calls it
+	// only when it adopts a new node identity, which it does only while nothing is
+	// live; an executor that cannot serve the new CIDR returns an error and the
+	// adoption is refused.
+	SetNodePodCIDR(ctx context.Context, cidr netip.Prefix) error
 	// LoadPFAnchor loads the utun-scoped MSS-clamp rule (mssClamp already validated).
 	LoadPFAnchor(ctx context.Context, mssClamp int) error
 	// BindPort binds a listening socket on the specific addr and returns it; the
@@ -123,10 +124,16 @@ func (a *darwinApplier) RemoveAlias(ctx context.Context, ip netip.Addr) error {
 // mesh needs from it. It refuses while the mesh is UP — those addresses are already
 // programmed on a live utun, so changing them behind it would leave the device
 // carrying an identity the daemon no longer believes in (the server refuses such an
-// adoption too; this is the executor-side backstop). With the mesh down, any device
-// built from the old CIDR is dropped so the next ConfigureMesh rebuilds it from the
-// re-derived pair.
-func (a *darwinApplier) SetNodePodCIDR(cidr netip.Prefix) error {
+// adoption too; this is the executor-side backstop).
+//
+// With the mesh down, a device built from the OLD CIDR is torn down before it is
+// dropped. Dropping the reference alone would leak: a device whose Up failed partway
+// holds an open utun and possibly a lo0 mesh-egress alias, and nothing else in the
+// daemon still has a handle on it. Down is idempotent and leak-free, so calling it
+// on a never-upped or already-downed device is safe; its error is only logged,
+// because a stale device's teardown must not fail an adoption that is otherwise
+// admissible.
+func (a *darwinApplier) SetNodePodCIDR(ctx context.Context, cidr netip.Prefix) error {
 	meshIP, err := podnet.MeshEgressIP(cidr)
 	if err != nil {
 		return fmt.Errorf("derive mesh-egress source for %s: %w", cidr, err)
@@ -140,7 +147,13 @@ func (a *darwinApplier) SetNodePodCIDR(cidr netip.Prefix) error {
 	if a.meshUp {
 		return fmt.Errorf("mesh is up on node podCIDR %s: refusing to re-derive its addresses", a.nodePodCIDR)
 	}
-	a.nodePodCIDR, a.meshIP, a.linkIP, a.dev = cidr, meshIP, linkIP, nil
+	if a.dev != nil {
+		if err := a.dev.Down(ctx); err != nil {
+			a.log.Debug("tearing down the device built from the previous node podCIDR", "nodePodCIDR", a.nodePodCIDR.String(), "err", err)
+		}
+		a.dev = nil
+	}
+	a.nodePodCIDR, a.meshIP, a.linkIP = cidr, meshIP, linkIP
 	return nil
 }
 

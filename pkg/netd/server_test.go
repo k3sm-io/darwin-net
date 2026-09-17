@@ -80,7 +80,7 @@ func (f *fakePriv) ConfigureMesh(_ context.Context, privKeyB64 string, _ int, pl
 
 // SetNodePodCIDR records an adoption; the real executor re-derives its mesh
 // addresses from the new /24 here.
-func (f *fakePriv) SetNodePodCIDR(cidr netip.Prefix) error {
+func (f *fakePriv) SetNodePodCIDR(_ context.Context, cidr netip.Prefix) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.adopted = append(f.adopted, cidr)
