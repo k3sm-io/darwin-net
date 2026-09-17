@@ -193,15 +193,24 @@ func (c *Client) RemoveAlias(ctx context.Context, ip netip.Addr) error {
 
 // ConfigureMesh asks the daemon to bring the wireguard mesh up (resolving
 // privKeyRef to the private key root-side) and program the typed peers.
-func (c *Client) ConfigureMesh(ctx context.Context, privKeyRef string, listenPort int, peers []MeshPeerArg) error {
+//
+// nodePodCIDR is the node's own pod /24; the daemon adopts it as its node identity
+// when it still holds the pre-join default and nothing is live (see
+// ConfigureMeshArgs.NodePodCIDR). The zero Prefix omits the field, which is exactly
+// what an older client sends and leaves the daemon's configured identity alone.
+func (c *Client) ConfigureMesh(ctx context.Context, privKeyRef string, listenPort int, nodePodCIDR netip.Prefix, peers []MeshPeerArg) error {
+	args := &ConfigureMeshArgs{
+		LocalPrivKeyRef: privKeyRef,
+		ListenPort:      listenPort,
+		Peers:           peers,
+	}
+	if nodePodCIDR.IsValid() {
+		args.NodePodCIDR = nodePodCIDR.String()
+	}
 	_, err := c.roundTrip(ctx, Request{
-		Version: CurrentVersion(),
-		Verb:    VerbConfigureMesh,
-		ConfigureMesh: &ConfigureMeshArgs{
-			LocalPrivKeyRef: privKeyRef,
-			ListenPort:      listenPort,
-			Peers:           peers,
-		},
+		Version:       CurrentVersion(),
+		Verb:          VerbConfigureMesh,
+		ConfigureMesh: args,
 	})
 	return err
 }

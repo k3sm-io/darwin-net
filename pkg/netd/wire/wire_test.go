@@ -18,6 +18,7 @@ package wire
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"testing"
@@ -83,4 +84,44 @@ func TestVersionCompatibility(t *testing.T) {
 	if (Version{Major: ProtocolVersionMajor + 1, Minor: 0}).Compatible() {
 		t.Fatal("different major should be incompatible")
 	}
+}
+
+// TestConfigureMeshArgsNodePodCIDRIsAdditive pins the compatibility contract of the
+// nodePodCIDR field: it is omitted when unset (so the frame an older client sends
+// is byte-identical to today's), and a frame that lacks it decodes to the empty
+// string — which the daemon reads as "keep the configured identity" — rather than
+// failing the decode. The protocol Version is deliberately NOT bumped for it.
+func TestConfigureMeshArgsNodePodCIDRIsAdditive(t *testing.T) {
+	t.Run("unset is omitted from the encoding", func(t *testing.T) {
+		b, err := json.Marshal(ConfigureMeshArgs{LocalPrivKeyRef: "ref", ListenPort: 51820})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if bytes.Contains(b, []byte("nodePodCIDR")) {
+			t.Fatalf("encoding %s carries nodePodCIDR when unset", b)
+		}
+	})
+
+	t.Run("set is carried verbatim", func(t *testing.T) {
+		b, err := json.Marshal(ConfigureMeshArgs{LocalPrivKeyRef: "ref", NodePodCIDR: "100.64.7.0/24"})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if !bytes.Contains(b, []byte(`"nodePodCIDR":"100.64.7.0/24"`)) {
+			t.Fatalf("encoding %s does not carry the node pod CIDR", b)
+		}
+	})
+
+	t.Run("an old client's frame still decodes", func(t *testing.T) {
+		var req Request
+		if err := json.Unmarshal([]byte(`{"version":{"major":1,"minor":0},"verb":"ConfigureMesh","configureMesh":{"localPrivKeyRef":"ref","peers":[]}}`), &req); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if req.ConfigureMesh == nil {
+			t.Fatal("configureMesh args did not decode")
+		}
+		if req.ConfigureMesh.NodePodCIDR != "" {
+			t.Fatalf("nodePodCIDR = %q, want empty for a frame that omits it", req.ConfigureMesh.NodePodCIDR)
+		}
+	})
 }

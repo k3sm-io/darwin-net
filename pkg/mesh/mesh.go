@@ -150,7 +150,7 @@ func New(self netip.Prefix, opts ...Option) (*Mesh, error) {
 	}
 	if m.dev == nil {
 		if m.netdSocket != "" {
-			m.dev = newNetdDevice(m.netdSocket, m.netdPrivKeyRef, m.listenPort, m.log)
+			m.dev = newNetdDevice(m.netdSocket, m.netdPrivKeyRef, m.listenPort, s, m.log)
 		} else {
 			m.dev = NewDevice(DeviceConfig{
 				UTUNName:      m.utunName,

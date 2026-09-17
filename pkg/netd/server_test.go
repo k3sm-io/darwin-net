@@ -53,6 +53,7 @@ type fakePriv struct {
 	meshRemoved int
 	pfClamps    []int
 	bound       []netip.AddrPort
+	adopted     []netip.Prefix
 }
 
 func (f *fakePriv) EnsureAlias(_ context.Context, ip netip.Addr) error {
@@ -74,6 +75,15 @@ func (f *fakePriv) ConfigureMesh(_ context.Context, privKeyB64 string, _ int, pl
 	defer f.mu.Unlock()
 	f.meshKeys = append(f.meshKeys, privKeyB64)
 	f.meshPlans = append(f.meshPlans, plan)
+	return nil
+}
+
+// SetNodePodCIDR records an adoption; the real executor re-derives its mesh
+// addresses from the new /24 here.
+func (f *fakePriv) SetNodePodCIDR(cidr netip.Prefix) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.adopted = append(f.adopted, cidr)
 	return nil
 }
 
@@ -126,6 +136,12 @@ func (f *fakePriv) plans() []mesh.Plan {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]mesh.Plan(nil), f.meshPlans...)
+}
+
+func (f *fakePriv) adoptions() []netip.Prefix {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]netip.Prefix(nil), f.adopted...)
 }
 
 func (f *fakePriv) boundPorts() []netip.AddrPort {
@@ -307,7 +323,7 @@ func TestServerConfigureMeshRouteOutsideRouteSetRejected(t *testing.T) {
 		Endpoint:   "192.0.2.10:51820",
 		AllowedIPs: []string{"100.64.0.0/16"},
 	}}
-	if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, peers); err == nil {
+	if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers); err == nil {
 		t.Fatal("ConfigureMesh with non-/24 AllowedIPs succeeded, want rejection")
 	}
 	if got := fp.plans(); len(got) != 0 {
@@ -328,7 +344,7 @@ func TestServerConfigureMeshRouteOutsideAggregateRejected(t *testing.T) {
 		Endpoint:   "192.0.2.10:51820",
 		AllowedIPs: []string{"10.9.9.0/24"}, // valid /24 but outside 100.64.0.0/10
 	}}
-	if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, peers); err == nil {
+	if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers); err == nil {
 		t.Fatal("ConfigureMesh with out-of-aggregate /24 succeeded, want rejection")
 	}
 	if got := fp.plans(); len(got) != 0 {
@@ -342,7 +358,7 @@ func TestServerConfigureMeshNoResolverFailsFast(t *testing.T) {
 	sock, _ := startServer(t, netd.Config{}) // no MeshKeyResolver
 	ctx := context.Background()
 	peers := []wire.MeshPeerArg{{PubKey: genKeyB64(t), Endpoint: "192.0.2.10:51820", AllowedIPs: []string{"100.64.1.0/24"}}}
-	if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, peers); err == nil {
+	if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers); err == nil {
 		t.Fatal("ConfigureMesh without a key resolver succeeded, want fail-fast rejection")
 	}
 }
@@ -552,7 +568,7 @@ func TestServerHappyPathVerbs(t *testing.T) {
 		t.Fatalf("RemoveAlias: %v", err)
 	}
 	peers := []wire.MeshPeerArg{{PubKey: genKeyB64(t), Endpoint: "192.0.2.10:51820", AllowedIPs: []string{"100.64.1.0/24"}}}
-	if err := c.ConfigureMesh(ctx, "ref", 51820, peers); err != nil {
+	if err := c.ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers); err != nil {
 		t.Fatalf("ConfigureMesh: %v", err)
 	}
 	if err := c.LoadPFAnchor(ctx, mesh.MSSClamp); err != nil {

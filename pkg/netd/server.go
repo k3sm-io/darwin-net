@@ -87,7 +87,13 @@ type Config struct {
 	// ClusterAggregate is the pinned pod aggregate a pod alias must fall within
 	// (default podnet.ClusterPodCIDR, 100.64.0.0/10).
 	ClusterAggregate netip.Prefix
-	// NodePodCIDR is this node's pod /24; a pod alias must fall within it.
+	// NodePodCIDR is the PRE-ADOPTION node pod /24: the identity the daemon starts
+	// with, which on a worker is only the --node-pod-cidr default (the server's own
+	// /24) because netd is installed and started before the node joins and the join
+	// assigns the real /24 afterwards. A pod alias must fall within the identity in
+	// force, and ConfigureMesh may ADOPT the node's real /24 once — while nothing is
+	// live — replacing this value for every later policy decision (see
+	// handleConfigureMesh). Read it through Server.nodeCIDR, never from cfg.
 	NodePodCIDR netip.Prefix
 	// ServiceCIDR, when valid, additionally admits an EnsureAlias for a Service VIP
 	// (the proxy's ClusterIPs live here, outside the pod aggregate). Optional.
@@ -126,13 +132,27 @@ type Config struct {
 // Server is the k3sm-netd daemon logic: it accepts unix-socket connections,
 // authenticates each peer, decodes the framed RPC, re-validates every parameter,
 // renders the privileged artifacts, and applies them via the Privileged executor.
-// It holds no per-request mutable state of its own (config is read-only after
-// NewServer); per-connection accounting lives in connState.
+// Per-connection accounting lives in connState; the daemon-wide state below is the
+// node identity and just enough live-object accounting to decide whether that
+// identity may still be adopted.
+//
+// Locking discipline: mu guards nodePodCIDR, aliases, meshRoutes and meshUp. It is
+// held only around those reads/writes and never across a Privileged call that
+// touches the datapath (ifconfig/pfctl/wireguard can block), so one wedged
+// operation cannot stall every other connection's policy checks. The single
+// exception is the in-memory SetNodePodCIDR inside adoptNodePodCIDR, which does no
+// I/O and must not interleave with the adoption decision it implements.
 type Server struct {
 	cfg  Config
 	log  *slog.Logger
 	peer PeerVerifier
 	priv Privileged
+
+	mu          sync.RWMutex
+	nodePodCIDR netip.Prefix
+	aliases     map[netip.Addr]struct{}
+	meshRoutes  int
+	meshUp      bool
 }
 
 // NewServer constructs a Server from cfg, filling defaults: the cluster aggregate
@@ -166,7 +186,23 @@ func NewServer(cfg Config) *Server {
 	if priv == nil {
 		priv = newDarwinApplier(cfg.NodePodCIDR, cfg.Logger)
 	}
-	return &Server{cfg: cfg, log: cfg.Logger, peer: peer, priv: priv}
+	return &Server{
+		cfg:         cfg,
+		log:         cfg.Logger,
+		peer:        peer,
+		priv:        priv,
+		nodePodCIDR: cfg.NodePodCIDR.Masked(),
+		aliases:     make(map[netip.Addr]struct{}),
+	}
+}
+
+// nodeCIDR returns the node identity in force: the configured pre-adoption /24
+// until a ConfigureMesh adopts the node's real one. Every policy decision reads it
+// through here so an adoption is seen by all of them at once.
+func (s *Server) nodeCIDR() netip.Prefix {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.nodePodCIDR
 }
 
 // Serve accepts connections on l until ctx is cancelled, handling each in its own
@@ -373,6 +409,7 @@ func (s *Server) handleEnsureAlias(ctx context.Context, st *connState, args *wir
 		st.removeAlias(ip)
 		return s.errResp(fmt.Sprintf("ensureAlias: %v", err))
 	}
+	s.trackAlias(ip)
 	s.log.Info("netd: alias ensured", "ip", ip.String())
 	return s.okResp()
 }
@@ -395,13 +432,17 @@ func (s *Server) handleRemoveAlias(ctx context.Context, st *connState, args *wir
 		return s.errResp(fmt.Sprintf("removeAlias: %v", err))
 	}
 	st.removeAlias(ip)
+	s.untrackAlias(ip)
 	s.log.Info("netd: alias removed", "ip", ip.String())
 	return s.okResp()
 }
 
-// handleConfigureMesh re-validates the typed peers with the existing mesh logic
-// (RouteSet/ValidatePlan), enforces aggregate containment on the routes, resolves
-// the private key root-side, and applies the rendered plan.
+// handleConfigureMesh adopts the node pod CIDR the client carries (see
+// adoptNodePodCIDR), re-validates the typed peers with the existing mesh logic
+// (RouteSet/ValidatePlan) against the identity then in force, enforces aggregate
+// containment on the routes, resolves the private key root-side, and applies the
+// rendered plan. Adoption runs FIRST so the plan is validated against the node's
+// real self, not the pre-join default.
 func (s *Server) handleConfigureMesh(ctx context.Context, st *connState, args *wire.ConfigureMeshArgs) wire.Response {
 	if args == nil {
 		return s.errResp("configureMesh: missing args")
@@ -409,12 +450,16 @@ func (s *Server) handleConfigureMesh(ctx context.Context, st *connState, args *w
 	if s.cfg.MeshKeyResolver == nil {
 		return s.errResp("configureMesh: no mesh key resolver configured (refusing — there is no embedded key)")
 	}
+	if err := s.adoptNodePodCIDR(args.NodePodCIDR); err != nil {
+		s.log.Warn("netd: node pod CIDR adoption rejected", "err", err)
+		return s.errResp(err.Error())
+	}
 	specs, err := meshSpecs(args.Peers)
 	if err != nil {
 		s.log.Warn("netd: mesh peers rejected", "err", err)
 		return s.errResp(err.Error())
 	}
-	plan, err := mesh.ValidatePlan(s.cfg.NodePodCIDR, specs)
+	plan, err := mesh.ValidatePlan(s.nodeCIDR(), specs)
 	if err != nil {
 		s.log.Warn("netd: mesh plan rejected", "err", err)
 		return s.errResp(fmt.Sprintf("configureMesh: %v", err))
@@ -438,15 +483,114 @@ func (s *Server) handleConfigureMesh(ctx context.Context, st *connState, args *w
 	if err := s.priv.ConfigureMesh(ctx, key, listenPort, plan); err != nil {
 		return s.errResp(fmt.Sprintf("configureMesh: %v", err))
 	}
+	s.trackMesh(len(plan.Routes))
 	s.log.Info("netd: mesh configured", "peers", len(plan.Peers), "routes", len(plan.Routes))
 	return s.okResp()
 }
 
-// handleRemoveMesh tears the mesh down.
+// adoptNodePodCIDR applies the node pod CIDR a ConfigureMesh carried, if any.
+//
+// netd is installed and started as root long before a node joins a cluster, so on
+// a worker it boots with only the --node-pod-cidr default — the server's own /24 —
+// as its node identity, while the join assigns the node's real /24 afterwards.
+// Nothing else can hand that /24 over: restarting the daemon to re-read the flag
+// would drop every lo0 alias and mesh route on the node. Live, that mismatch
+// brought the worker's mesh up under the server's identity and rejected every pod
+// alias as "not in node podCIDR". So the identity is adopted over the channel the
+// join already drives.
+//
+// The rules, in order: an omitted CIDR changes nothing (an older client); a
+// malformed one, or one outside the pinned cluster aggregate, is refused; the
+// identity already in force is a no-op; and a DIFFERENT identity is refused
+// outright once anything is live — an alias, a mesh route, or a mesh device that is
+// up — because moving the policy boundary under running pods would orphan the
+// aliases already plumbed under the old /24. Otherwise the daemon adopts it and
+// re-points the executor, whose mesh-egress and utun link addresses derive from it.
+//
+// It is called with s.mu unheld and takes it for the whole decision, including the
+// executor's SetNodePodCIDR — the one Privileged call made under the lock, and an
+// in-memory re-derivation that performs no I/O — so the decision and the
+// re-pointing cannot interleave with a concurrent adoption.
+func (s *Server) adoptNodePodCIDR(arg string) error {
+	if arg == "" {
+		return nil
+	}
+	want, err := netip.ParsePrefix(arg)
+	if err != nil {
+		return fmt.Errorf("%w: configureMesh: parse nodePodCIDR %q: %v", ErrPolicy, arg, err)
+	}
+	want = want.Masked()
+	if !s.cfg.ClusterAggregate.Contains(want.Addr()) || want.Bits() < s.cfg.ClusterAggregate.Bits() {
+		return fmt.Errorf("%w: configureMesh: node pod CIDR %s is outside the cluster aggregate %s",
+			ErrPolicy, want, s.cfg.ClusterAggregate)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.nodePodCIDR == want {
+		s.log.Debug("netd: configureMesh node pod CIDR unchanged", "nodePodCIDR", want.String())
+		return nil
+	}
+	if s.hasLiveStateLocked() {
+		return fmt.Errorf("%w: configureMesh: node identity already pinned to %s; refusing %s (live: %d alias(es), %d mesh route(s), mesh up=%t)",
+			ErrPolicy, s.nodePodCIDR, want, len(s.aliases), s.meshRoutes, s.meshUp)
+	}
+	if err := s.priv.SetNodePodCIDR(want); err != nil {
+		return fmt.Errorf("%w: configureMesh: adopt node pod CIDR %s: %v", ErrPolicy, want, err)
+	}
+	old := s.nodePodCIDR
+	s.nodePodCIDR = want
+	s.log.Info("netd: adopted node pod CIDR from ConfigureMesh", "old", old.String(), "new", want.String())
+	return nil
+}
+
+// hasLiveStateLocked reports whether the daemon currently holds any object whose
+// validity depends on the node identity. s.mu must be held.
+func (s *Server) hasLiveStateLocked() bool {
+	return len(s.aliases) > 0 || s.meshRoutes > 0 || s.meshUp
+}
+
+// trackAlias records a plumbed alias daemon-wide (connState's accounting is
+// per-connection, and an alias outlives the connection that asked for it).
+func (s *Server) trackAlias(ip netip.Addr) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.aliases[ip] = struct{}{}
+}
+
+// untrackAlias drops an alias the daemon has torn down.
+func (s *Server) untrackAlias(ip netip.Addr) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.aliases, ip)
+}
+
+// trackMesh records that the mesh is up carrying routes routes.
+func (s *Server) trackMesh(routes int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.meshUp = true
+	s.meshRoutes = routes
+}
+
+// untrackMesh records that the mesh is down and carries no routes.
+func (s *Server) untrackMesh() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.meshUp = false
+	s.meshRoutes = 0
+}
+
+// handleRemoveMesh tears the mesh down. It drops the mesh from the live-state
+// accounting but deliberately does NOT un-pin the node identity: a rejoin with the
+// same /24 is the norm, and a different /24 is admitted anyway once nothing is
+// live, so un-pinning would buy nothing and would widen the window in which the
+// identity can move.
 func (s *Server) handleRemoveMesh(ctx context.Context) wire.Response {
 	if err := s.priv.RemoveMesh(ctx); err != nil {
 		return s.errResp(fmt.Sprintf("removeMesh: %v", err))
 	}
+	s.untrackMesh()
 	s.log.Info("netd: mesh removed")
 	return s.okResp()
 }
@@ -525,14 +669,15 @@ func (s *Server) validateAliasIP(ip netip.Addr) error {
 	if ip.IsMulticast() || ip.IsUnspecified() {
 		return fmt.Errorf("%w: alias %s is not a unicast host", ErrPolicy, ip)
 	}
-	if s.cfg.ClusterAggregate.Contains(ip) && s.cfg.NodePodCIDR.Contains(ip) {
+	node := s.nodeCIDR()
+	if s.cfg.ClusterAggregate.Contains(ip) && node.Contains(ip) {
 		return nil
 	}
 	if s.cfg.ServiceCIDR.IsValid() && s.cfg.ServiceCIDR.Contains(ip) {
 		return nil
 	}
 	return fmt.Errorf("%w: alias %s not in node podCIDR %s (aggregate %s) or service CIDR",
-		ErrPolicy, ip, s.cfg.NodePodCIDR, s.cfg.ClusterAggregate)
+		ErrPolicy, ip, node, s.cfg.ClusterAggregate)
 }
 
 // authorizePort applies the BindPort policy to a specific-address bind (handleBindPort

@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/netip"
 
 	"k3sm.io/darwin-net/pkg/netd/wire"
 )
@@ -41,12 +42,15 @@ type netdDevice struct {
 	client     *wire.Client
 	privKeyRef string
 	listenPort int
+	self       netip.Prefix
 	log        *slog.Logger
 }
 
 // newNetdDevice constructs a helper-backed Device dialing socketPath. privKeyRef
-// is the opaque reference the daemon resolves to the node's private key root-side.
-func newNetdDevice(socketPath, privKeyRef string, listenPort int, log *slog.Logger) *netdDevice {
+// is the opaque reference the daemon resolves to the node's private key root-side;
+// self is the node's own pod /24, which every ConfigureMesh carries so a daemon
+// still holding its pre-join default can adopt the node's real identity.
+func newNetdDevice(socketPath, privKeyRef string, listenPort int, self netip.Prefix, log *slog.Logger) *netdDevice {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -54,6 +58,7 @@ func newNetdDevice(socketPath, privKeyRef string, listenPort int, log *slog.Logg
 		client:     wire.NewClient(socketPath),
 		privKeyRef: privKeyRef,
 		listenPort: listenPort,
+		self:       self,
 		log:        log,
 	}
 }
@@ -62,7 +67,7 @@ func newNetdDevice(socketPath, privKeyRef string, listenPort int, log *slog.Logg
 // creates the utun, sets the resolved private key + listen port, and loads the
 // MSS-clamp anchor). It is idempotent: the daemon's ConfigureMesh is.
 func (d *netdDevice) Up(ctx context.Context) error {
-	return d.client.ConfigureMesh(ctx, d.privKeyRef, d.listenPort, nil)
+	return d.client.ConfigureMesh(ctx, d.privKeyRef, d.listenPort, d.self, nil)
 }
 
 // Apply sends the plan's peer set to the daemon as typed scalars; the daemon
@@ -82,7 +87,7 @@ func (d *netdDevice) Apply(ctx context.Context, plan Plan) error {
 		}
 		peers = append(peers, wire.MeshPeerArg{PubKey: pub, Endpoint: pc.Endpoint, AllowedIPs: allowed})
 	}
-	return d.client.ConfigureMesh(ctx, d.privKeyRef, d.listenPort, peers)
+	return d.client.ConfigureMesh(ctx, d.privKeyRef, d.listenPort, d.self, peers)
 }
 
 // Down tears the mesh down via the daemon.

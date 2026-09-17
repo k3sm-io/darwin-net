@@ -48,6 +48,12 @@ type Privileged interface {
 	ConfigureMesh(ctx context.Context, privKeyB64 string, listenPort int, plan mesh.Plan) error
 	// RemoveMesh tears the wireguard mesh down (leak-free, idempotent).
 	RemoveMesh(ctx context.Context) error
+	// SetNodePodCIDR re-points the executor at cidr, re-deriving everything it
+	// derives from the node's pod /24 (the mesh-egress source and the utun link
+	// address). The server calls it only when it adopts a new node identity, which
+	// it does only while nothing is live; an executor that cannot serve the new
+	// CIDR returns an error and the adoption is refused. It performs no I/O.
+	SetNodePodCIDR(cidr netip.Prefix) error
 	// LoadPFAnchor loads the utun-scoped MSS-clamp rule (mssClamp already validated).
 	LoadPFAnchor(ctx context.Context, mssClamp int) error
 	// BindPort binds a listening socket on the specific addr and returns it; the
@@ -60,20 +66,21 @@ type Privileged interface {
 // It runs as root inside the daemon; unit tests inject a fake Privileged instead,
 // so this code path is exercised only in the root-gated integration tier.
 //
-// Locking discipline: the lazily-built mesh device and its up/iface state are
-// guarded by mu so concurrent ConfigureMesh/RemoveMesh/LoadPFAnchor calls (from
-// different connections) serialize. Alias and port operations are independent
-// (the kernel serializes them) and take no lock here.
+// Locking discipline: the lazily-built mesh device, its up/iface state, and the
+// node CIDR the mesh addresses derive from are guarded by mu, so concurrent
+// ConfigureMesh/RemoveMesh/LoadPFAnchor/SetNodePodCIDR calls (from different
+// connections) serialize. Alias and port operations are independent (the kernel
+// serializes them) and take no lock here.
 type darwinApplier struct {
+	utunName string
+	log      *slog.Logger
+
+	mu          sync.Mutex
 	nodePodCIDR netip.Prefix
 	meshIP      netip.Addr // derived from nodePodCIDR; invalid if the CIDR is bad
 	linkIP      netip.Addr // the mesh utun's own p2p address; same derivation contract
-	utunName    string
-	log         *slog.Logger
-
-	mu     sync.Mutex
-	dev    *mesh.WGDevice
-	meshUp bool
+	dev         *mesh.WGDevice
+	meshUp      bool
 }
 
 // newDarwinApplier builds the production executor for a node whose pod /24 is
@@ -109,6 +116,31 @@ func (a *darwinApplier) RemoveAlias(ctx context.Context, ip netip.Addr) error {
 	if err := run(ctx, "ifconfig", "lo0", "-alias", ip.String()); err != nil {
 		a.log.Debug("ifconfig lo0 -alias tolerated (address may be absent)", "ip", ip.String(), "err", err)
 	}
+	return nil
+}
+
+// SetNodePodCIDR re-points the applier at cidr and re-derives the two addresses the
+// mesh needs from it. It refuses while the mesh is UP — those addresses are already
+// programmed on a live utun, so changing them behind it would leave the device
+// carrying an identity the daemon no longer believes in (the server refuses such an
+// adoption too; this is the executor-side backstop). With the mesh down, any device
+// built from the old CIDR is dropped so the next ConfigureMesh rebuilds it from the
+// re-derived pair.
+func (a *darwinApplier) SetNodePodCIDR(cidr netip.Prefix) error {
+	meshIP, err := podnet.MeshEgressIP(cidr)
+	if err != nil {
+		return fmt.Errorf("derive mesh-egress source for %s: %w", cidr, err)
+	}
+	linkIP, err := podnet.MeshLinkIP(cidr)
+	if err != nil {
+		return fmt.Errorf("derive mesh link address for %s: %w", cidr, err)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.meshUp {
+		return fmt.Errorf("mesh is up on node podCIDR %s: refusing to re-derive its addresses", a.nodePodCIDR)
+	}
+	a.nodePodCIDR, a.meshIP, a.linkIP, a.dev = cidr, meshIP, linkIP, nil
 	return nil
 }
 
