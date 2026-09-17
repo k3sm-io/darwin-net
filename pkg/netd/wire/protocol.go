@@ -120,11 +120,19 @@ type MeshPeerArg struct {
 
 // ConfigureMeshArgs programs the mesh: a reference the daemon resolves to the
 // node's PRIVATE key root-side (never the key itself), the wireguard listen port,
-// and the typed peer set.
+// the node's own pod /24, and the typed peer set.
 type ConfigureMeshArgs struct {
-	LocalPrivKeyRef string        `json:"localPrivKeyRef"`
-	ListenPort      int           `json:"listenPort,omitempty"`
-	Peers           []MeshPeerArg `json:"peers,omitempty"`
+	LocalPrivKeyRef string `json:"localPrivKeyRef"`
+	ListenPort      int    `json:"listenPort,omitempty"`
+	// NodePodCIDR, when present, is the node's OWN pod /24 as the client knows it.
+	// It exists because netd is started by the installer before the node joins, so
+	// on a worker it boots with the server's /24 as its node identity and cannot be
+	// restarted to learn the real one (a restart drops every alias and route on the
+	// node). The daemon adopts it once, before anything is live, and refuses a later
+	// change; see netd.Server's ConfigureMesh handling. The field is additive: an
+	// older client omits it and the daemon keeps its configured identity.
+	NodePodCIDR string        `json:"nodePodCIDR,omitempty"`
+	Peers       []MeshPeerArg `json:"peers,omitempty"`
 }
 
 // LoadPFAnchorArgs carries the TCP MSS the daemon clamps to on the mesh utun.
