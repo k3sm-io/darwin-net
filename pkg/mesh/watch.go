@@ -216,6 +216,13 @@ func (w *Watcher) reconcileLoop(ctx context.Context, ticks <-chan time.Time) err
 // post-netd-restart reconvergence path. A reconcile error is logged here, at the
 // boundary that handles it (the next event or tick re-drives it); it does not stop
 // the watch.
+//
+// The coalescing above also coalesces retries: a failed Reconcile does not
+// re-arm the trigger on its own, so a burst of N events that lands during a
+// failing pass is still one further attempt, where before coalescing it would
+// have been N. The periodic tick is the floor either way, so the worst-case
+// time to reconverge after a failure is unchanged; re-arming on failure without
+// a backoff would instead turn a persistent error into a hot loop.
 func (w *Watcher) resync(ctx context.Context) {
 	store := w.informer.GetStore().List()
 	specs := make([]netv1.MeshPeerSpec, 0, len(store))

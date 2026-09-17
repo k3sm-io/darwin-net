@@ -309,7 +309,20 @@ func TestMeshWatcherCoalescesEvents(t *testing.T) {
 		w, fake := newTestWatcher(t)
 		fake.gate = make(chan struct{})
 		h := w.handler()
-		h.AddFunc(seedPeer(t, w, "nodeB", "100.64.1.0/24", "192.0.2.10:51820", 0x42, "1"))
+		// The gate is armed before the loop is running to drain anything, so
+		// if a handler ever reconciled inline this seed would block forever on
+		// the fake's gate with nobody to release it. Guard it exactly like the
+		// in-flight add below: run it off the test goroutine and bound the wait.
+		seeded := make(chan struct{})
+		go func() {
+			h.AddFunc(seedPeer(t, w, "nodeB", "100.64.1.0/24", "192.0.2.10:51820", 0x42, "1"))
+			close(seeded)
+		}()
+		select {
+		case <-seeded:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("AddFunc blocked before the loop started; a handler must never wait on the device")
+		}
 		_, stop := startLoop(t, w)
 
 		// The loop drains the slot and starts the first pass, which parks inside

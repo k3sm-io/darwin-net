@@ -123,6 +123,13 @@ type WGDevice struct {
 // the bring-up, and the close. It exists so the Apply path — in particular the
 // decision to write or skip a peer update — is testable against a recorder with no
 // utun and no wireguard in play; Up always installs the real device.
+//
+// Apply's IpcSet-skip rests on an invariant this interface does not enforce:
+// nothing else in this process, and no other UAPI listener on the host (there is
+// none in this tree), writes this device's peer table. lastUAPI is the applier's
+// own memory of what it last wrote, not a read-back, so a second writer would
+// make that memory wrong; introducing one would have to clear it on every write
+// that isn't the applier's own.
 type wgControl interface {
 	IpcSet(uapi string) error
 	Up() error
@@ -286,6 +293,13 @@ func (d *WGDevice) Up(ctx context.Context) error {
 // this process and is re-verified on every apply regardless. The memory is
 // cleared with the endpoint memory (Up, a failed IpcSet, Down), so a re-created
 // device is always written in full.
+//
+// The settle after an endpoint transition costs two writes, not one: the
+// transition's own render carries the endpoint= line, and the next incremental
+// render — the roaming contract has now recorded the new endpoint, so it does
+// not re-stamp it — differs textually and is written once more before the two
+// converge. This recurs on every endpoint transition a peer makes over the
+// device's life, not once per device lifetime.
 func (d *WGDevice) Apply(ctx context.Context, plan Plan) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()

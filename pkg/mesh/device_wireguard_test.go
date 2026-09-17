@@ -141,32 +141,79 @@ func TestApplySkipsTheUAPIWriteWhenNothingChanged(t *testing.T) {
 }
 
 // TestApplyForgetsTheLastWriteWhenItFails: a rejected IpcSet leaves wireguard in
-// an unknown state, so the next apply must be a full replace and must be
-// written even if it happens to render the same text as the rejected one.
+// an unknown state, so the next apply must be a full replace and must be written
+// even if it happens to render the same text as an update this device already
+// holds — the memo that ordinarily skips an unchanged write must not survive a
+// failed one. The two subtests pin two different rejected shapes: the first is
+// the original endpoint-move sequence, which cannot by itself tell a correct
+// lastUAPI reset apart from a deleted one (its post-failure full replace differs
+// from the memoized incremental text either way, so it is written regardless);
+// the second closes that gap by making the post-failure apply render the exact
+// text the memo already held before the failure.
 func TestApplyForgetsTheLastWriteWhenItFails(t *testing.T) {
-	ctx := context.Background()
-	d, wg, _ := applierDevice(t)
-	plan := peerPlan(t, "192.0.2.10:51820")
-	if err := d.Apply(ctx, plan); err != nil {
-		t.Fatalf("first Apply: %v", err)
-	}
-	if err := d.Apply(ctx, plan); err != nil {
-		t.Fatalf("second Apply: %v", err)
-	}
-	wg.setErr = errors.New("ipc: boom")
-	moved := peerPlan(t, "192.0.2.99:51820")
-	if err := d.Apply(ctx, moved); err == nil {
-		t.Fatalf("Apply with IpcSet failing returned nil, want an error")
-	}
-	wg.setErr = nil
-	if err := d.Apply(ctx, moved); err != nil {
-		t.Fatalf("Apply after the failure: %v", err)
-	}
-	last := wg.sets[len(wg.sets)-1]
-	if !strings.Contains(last, "replace_peers=true\n") || !strings.Contains(last, "endpoint=192.0.2.99:51820\n") {
-		t.Fatalf("the apply after a failed write wrote %q, want a full replace carrying the endpoint", last)
-	}
-	if got := len(wg.sets); got != 4 {
-		t.Fatalf("IpcSet called %d times, want 4 (full, incremental, rejected, full again)", got)
-	}
+	t.Run("a rejected incremental write is followed by a full replace", func(t *testing.T) {
+		ctx := context.Background()
+		d, wg, _ := applierDevice(t)
+		plan := peerPlan(t, "192.0.2.10:51820")
+		if err := d.Apply(ctx, plan); err != nil {
+			t.Fatalf("first Apply: %v", err)
+		}
+		if err := d.Apply(ctx, plan); err != nil {
+			t.Fatalf("second Apply: %v", err)
+		}
+		wg.setErr = errors.New("ipc: boom")
+		moved := peerPlan(t, "192.0.2.99:51820")
+		if err := d.Apply(ctx, moved); err == nil {
+			t.Fatalf("Apply with IpcSet failing returned nil, want an error")
+		}
+		wg.setErr = nil
+		if err := d.Apply(ctx, moved); err != nil {
+			t.Fatalf("Apply after the failure: %v", err)
+		}
+		last := wg.sets[len(wg.sets)-1]
+		if !strings.Contains(last, "replace_peers=true\n") || !strings.Contains(last, "endpoint=192.0.2.99:51820\n") {
+			t.Fatalf("the apply after a failed write wrote %q, want a full replace carrying the endpoint", last)
+		}
+		if got := len(wg.sets); got != 4 {
+			t.Fatalf("IpcSet called %d times, want 4 (full, incremental, rejected, full again)", got)
+		}
+	})
+
+	// Fails-before: without d.lastUAPI = "" in Apply's error branch, the memo
+	// still holds the full replace F from the one successful apply before the
+	// failure. The apply that follows the failure renders that same F again
+	// (d.applied was reset to nil, and the plan is unchanged), the
+	// byte-identical-text skip fires, IpcSet is never called a third time, and
+	// the total is 2 (the full replace plus the rejected incremental attempt,
+	// which fakeWG still records) instead of 3 — an apply is skipped against a
+	// device whose state Apply itself just declared unknown.
+	t.Run("a full replace that the memo already holds is re-written after a rejected write", func(t *testing.T) {
+		ctx := context.Background()
+		d, wg, _ := applierDevice(t)
+		plan := peerPlan(t, "192.0.2.10:51820")
+		if err := d.Apply(ctx, plan); err != nil {
+			t.Fatalf("first Apply: %v", err)
+		}
+		full := wg.sets[0]
+		if !strings.Contains(full, "replace_peers=true\n") || !strings.Contains(full, "endpoint=192.0.2.10:51820\n") {
+			t.Fatalf("first Apply wrote %q, want a full replace carrying the endpoint", full)
+		}
+
+		wg.setErr = errors.New("ipc: boom")
+		moved := peerPlan(t, "192.0.2.99:51820")
+		if err := d.Apply(ctx, moved); err == nil {
+			t.Fatalf("Apply with IpcSet failing returned nil, want an error")
+		}
+
+		wg.setErr = nil
+		if err := d.Apply(ctx, plan); err != nil {
+			t.Fatalf("Apply after the failure: %v", err)
+		}
+		if got := len(wg.sets); got != 3 {
+			t.Fatalf("IpcSet called %d times, want 3 (full, rejected incremental, full again — the post-failure apply must re-write text the memo already held)", got)
+		}
+		if got := wg.sets[2]; got != full {
+			t.Fatalf("the post-failure apply wrote %q, want the same full replace rendered again:\n%s", got, full)
+		}
+	})
 }
