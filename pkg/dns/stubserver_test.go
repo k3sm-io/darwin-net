@@ -65,14 +65,7 @@ type stubDNS struct {
 // stop.
 func newStubDNS(t *testing.T, zone map[string]netip.Addr) *stubDNS {
 	t.Helper()
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		t.Fatalf("stub dns listen: %v", err)
-	}
-	tcpLn, err := net.Listen("tcp", conn.LocalAddr().String())
-	if err != nil {
-		t.Fatalf("stub dns tcp listen: %v", err)
-	}
+	conn, tcpLn := bindSamePortPair(t, bindPairAttempts)
 	s := &stubDNS{
 		conn:        conn,
 		tcpLn:       tcpLn,
