@@ -18,6 +18,7 @@ package mesh
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 	"testing"
 	"time"
@@ -76,6 +77,42 @@ func waitForApplies(t *testing.T, fake *fakeDevice, want int) {
 	t.Fatalf("Apply called %d times, want at least %d", fake.applyCount(), want)
 }
 
+// waitUntil polls cond for up to two seconds and fails the test if it never holds.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// armed reports whether the watcher's one-slot trigger currently holds a pass,
+// without consuming it. It is the deterministic way to assert that a handler did
+// or did not arm a reconcile: there is no goroutine to wait on and no timeout to
+// pick.
+func armed(w *Watcher) bool { return len(w.kick) == 1 }
+
+// startLoop runs the watcher's reconcile loop on its own goroutine, driven by the
+// returned tick channel, and returns a stop func that cancels it and waits for it
+// to exit — after stop the fake's counts are final.
+func startLoop(t *testing.T, w *Watcher) (ticks chan time.Time, stop func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks = make(chan time.Time)
+	done := make(chan error, 1)
+	go func() { done <- w.reconcileLoop(ctx, ticks) }()
+	return ticks, func() {
+		cancel()
+		if err := <-done; err != context.Canceled {
+			t.Fatalf("reconcileLoop returned %v, want context.Canceled", err)
+		}
+	}
+}
+
 // TestMeshWatcherResyncReconverges is the M3 reconvergence guard: the watcher drives
 // a bounded periodic resync, and a resync that fires with NO MeshPeer change still
 // re-drives Device.Apply on the unchanged snapshot. That periodic re-assertion is
@@ -119,7 +156,7 @@ func TestMeshWatcherResyncReconverges(t *testing.T) {
 	// driven by the test so no real period elapses.
 	ticks := make(chan time.Time)
 	done := make(chan error, 1)
-	go func() { done <- w.resyncLoop(ctx, ticks) }()
+	go func() { done <- w.reconcileLoop(ctx, ticks) }()
 	ticks <- time.Now()
 	waitForApplies(t, fake, 2)
 	cancel()
@@ -151,15 +188,10 @@ func TestMeshWatcherCoalescesResync(t *testing.T) {
 		seedPeer(t, w, "nodeB", "100.64.1.0/24", "192.0.2.10:51820", 0x42, "1")
 		seedPeer(t, w, "nodeC", "100.64.2.0/24", "192.0.2.11:51820", 0x43, "1")
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		ticks := make(chan time.Time)
-		done := make(chan error, 1)
-		go func() { done <- w.resyncLoop(ctx, ticks) }()
+		ticks, stop := startLoop(t, w)
 		ticks <- time.Now()
 		waitForApplies(t, fake, 1)
-		cancel()
-		<-done
+		stop()
 
 		// The loop has exited, so the count is final: one tick, one Reconcile —
 		// not one per cached peer.
@@ -176,8 +208,11 @@ func TestMeshWatcherCoalescesResync(t *testing.T) {
 		w, fake := newTestWatcher(t)
 		peer := seedPeer(t, w, "nodeB", "100.64.1.0/24", "192.0.2.10:51820", 0x42, "7")
 
-		h := w.handler(context.Background())
+		h := w.handler()
 		h.UpdateFunc(peer, peer.DeepCopy())
+		if armed(w) {
+			t.Fatalf("a re-delivery of an unchanged MeshPeer armed a reconcile, want none")
+		}
 		if got := fake.applyCount(); got != 0 {
 			t.Fatalf("a re-delivery of an unchanged MeshPeer drove Apply %d times, want 0", got)
 		}
@@ -193,8 +228,14 @@ func TestMeshWatcherCoalescesResync(t *testing.T) {
 			t.Fatalf("update informer store: %v", err)
 		}
 
-		h := w.handler(context.Background())
+		h := w.handler()
 		h.UpdateFunc(peer, updated)
+		if !armed(w) {
+			t.Fatalf("a real MeshPeer change did not arm a reconcile")
+		}
+		_, stop := startLoop(t, w)
+		waitForApplies(t, fake, 1)
+		stop()
 		if got := fake.applyCount(); got != 1 {
 			t.Fatalf("a real MeshPeer change drove Apply %d times, want 1", got)
 		}
@@ -207,20 +248,115 @@ func TestMeshWatcherCoalescesResync(t *testing.T) {
 		w, fake := newTestWatcher(t)
 		peer := seedPeer(t, w, "nodeB", "100.64.1.0/24", "192.0.2.10:51820", 0x42, "1")
 
-		h := w.handler(context.Background())
+		h := w.handler()
+		_, stop := startLoop(t, w)
 		h.AddFunc(peer)
-		if got := fake.applyCount(); got != 1 {
-			t.Fatalf("AddFunc drove Apply %d times, want 1", got)
-		}
+		waitForApplies(t, fake, 1)
 		if err := w.informer.GetStore().Delete(peer); err != nil {
 			t.Fatalf("delete from informer store: %v", err)
 		}
 		h.DeleteFunc(peer)
+		waitForApplies(t, fake, 2)
+		stop()
 		if got := fake.applyCount(); got != 2 {
-			t.Fatalf("DeleteFunc drove Apply %d times, want 2", got)
+			t.Fatalf("add then delete drove Apply %d times, want 2", got)
 		}
 		if len(fake.last().Peers) != 0 {
 			t.Fatalf("after the delete the snapshot carried %d peers, want 0", len(fake.last().Peers))
+		}
+	})
+}
+
+// TestMeshWatcherCoalescesEvents pins the EVENT side of the fan-out: informer
+// events do not reconcile inline, they arm a one-slot trigger that a single loop
+// drains, so a burst of events is one pass, and an event that lands while a pass
+// is running neither blocks the informer nor gets lost.
+//
+// Fails-before: with the handlers calling resync inline, N adds were N full
+// passes — N ConfigureMesh RPCs to netd during the initial list of an N-node
+// cluster — and an add delivered during a pass blocked the informer's delivery
+// goroutine on Mesh.mu until the device write finished. The per-peer routes and
+// the endpoint-roaming contract in plan.go are unchanged; only when and how many
+// times the snapshot is applied is.
+func TestMeshWatcherCoalescesEvents(t *testing.T) {
+	t.Run("a burst of adds is one pass with the full snapshot", func(t *testing.T) {
+		w, fake := newTestWatcher(t)
+		h := w.handler()
+		const n = 8
+		for i := 0; i < n; i++ {
+			name := fmt.Sprintf("node%d", i)
+			h.AddFunc(seedPeer(t, w, name, fmt.Sprintf("100.64.%d.0/24", i+1), fmt.Sprintf("192.0.2.%d:51820", 10+i), byte(0x42+i), "1"))
+		}
+		if !armed(w) {
+			t.Fatalf("%d adds did not arm a reconcile", n)
+		}
+		if got := fake.applyCount(); got != 0 {
+			t.Fatalf("the handlers drove Apply %d times themselves, want 0 (a handler must not reconcile inline)", got)
+		}
+
+		_, stop := startLoop(t, w)
+		waitForApplies(t, fake, 1)
+		stop()
+		if got := fake.applyCount(); got != 1 {
+			t.Fatalf("%d adds drove Apply %d times, want 1", n, got)
+		}
+		if got := len(fake.last().Peers); got != n {
+			t.Fatalf("the single pass applied %d peers, want %d (the pass must carry the FULL snapshot)", got, n)
+		}
+	})
+
+	t.Run("an event during a pass does not block the informer and is not lost", func(t *testing.T) {
+		w, fake := newTestWatcher(t)
+		fake.gate = make(chan struct{})
+		h := w.handler()
+		// The gate is armed before the loop is running to drain anything, so
+		// if a handler ever reconciled inline this seed would block forever on
+		// the fake's gate with nobody to release it. Guard it exactly like the
+		// in-flight add below: run it off the test goroutine and bound the wait.
+		seeded := make(chan struct{})
+		go func() {
+			h.AddFunc(seedPeer(t, w, "nodeB", "100.64.1.0/24", "192.0.2.10:51820", 0x42, "1"))
+			close(seeded)
+		}()
+		select {
+		case <-seeded:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("AddFunc blocked before the loop started; a handler must never wait on the device")
+		}
+		_, stop := startLoop(t, w)
+
+		// The loop drains the slot and starts the first pass, which parks inside
+		// Device.Apply on the fake's gate (with Mesh.mu held, as in production).
+		// Once the slot is empty the pass is committed, so a second add delivered
+		// now — from the informer's point of view — lands in the slot and owes
+		// exactly one further pass. The handler must return at once: it arms the
+		// trigger and does not wait for the device.
+		waitUntil(t, "the loop to drain the trigger", func() bool { return !armed(w) })
+		returned := make(chan struct{})
+		go func() {
+			h.AddFunc(seedPeer(t, w, "nodeC", "100.64.2.0/24", "192.0.2.11:51820", 0x43, "1"))
+			close(returned)
+		}()
+		select {
+		case <-returned:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("AddFunc blocked behind a running reconcile pass; a handler must never wait on the device")
+		}
+
+		if !armed(w) {
+			t.Fatalf("an add during a running pass did not arm the next pass (the add would be lost)")
+		}
+		// The first pass is still parked, so nothing is recorded yet. Release it,
+		// then the one pass the in-flight add owes.
+		fake.gate <- struct{}{}
+		fake.gate <- struct{}{}
+		waitForApplies(t, fake, 2)
+		stop()
+		if got := fake.applyCount(); got != 2 {
+			t.Fatalf("an add during a pass drove Apply %d times in total, want 2 (one pass owed, none lost)", got)
+		}
+		if got := len(fake.last().Peers); got != 2 {
+			t.Fatalf("the pass after the in-flight add applied %d peers, want 2 (the add must not be lost)", got)
 		}
 	})
 }

@@ -39,6 +39,10 @@ type fakeDevice struct {
 	ups     int
 	downs   int
 	applied []Plan
+	// gate, when set before use, makes every Apply wait for a receive on it
+	// before recording the plan — a device that is slow to program, so a test can
+	// hold a reconcile pass open and observe what the watcher does meanwhile.
+	gate chan struct{}
 }
 
 func (f *fakeDevice) Up(context.Context) error {
@@ -49,6 +53,9 @@ func (f *fakeDevice) Up(context.Context) error {
 }
 
 func (f *fakeDevice) Apply(_ context.Context, p Plan) error {
+	if f.gate != nil {
+		<-f.gate
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.applied = append(f.applied, p)
