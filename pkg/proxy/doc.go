@@ -289,9 +289,21 @@ limitations under the License.
 // must not disturb. A backend with no override is dialed exactly as before, which is
 // what leaves every host-process pod untouched; for a vm pod an absent override
 // means undialable, and the dial fails as any unreachable backend's does — the table
-// never substitutes an address to paper over a missing lease. The feeder is the k3sm
-// assembler (from the guest agent's Health lease report) and it does not exist yet,
-// so no override is installed today.
+// never substitutes an address to paper over a missing lease. The feeder exists,
+// and is scoped to vm-RuntimeClass pods only: k3sm's provider runs
+// transportFeed.observe (pkg/provider/transportoverride.go), which is called
+// from observeTransport on every runtime status observation and republishes
+// SetTransportOverrides with the whole published-to-live map whenever a pod's
+// pair changes. observeTransport itself is fed by runtimed's guest lease
+// (pkg/runtime/podstatus.go, GuestTransportAddress), which the runtime polls
+// from the guest agent's Health report every 5 seconds (defaultGuestLeasePoll),
+// backing off to at most a minute while the guest agent is unreachable
+// (guestLeasePollMaxBackoff). So a reader should expect a vm backend to become
+// dialable up to one poll interval after the Pod reports Ready, and later than
+// that only while the poll is backing off; an absent lease still means
+// undialable, never a substitute address. The gate is the pod's RESOLVED
+// backend, not the RuntimeClass it asked for. A host-process pod carries no
+// override and no such lag: its dial is exactly as before.
 //
 // # NetworkPolicy L4 subset — VIP-mediated ingress hint, NOT isolation
 //
