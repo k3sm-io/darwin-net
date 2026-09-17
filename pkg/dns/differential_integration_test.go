@@ -232,15 +232,7 @@ type templateDNS struct {
 // port for UDP and TCP).
 func newTemplateDNS(t *testing.T, byHost map[string]wireFixture) *templateDNS {
 	t.Helper()
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		t.Fatalf("template stub udp listen: %v", err)
-	}
-	tcpLn, err := net.Listen("tcp", udp.LocalAddr().String())
-	if err != nil {
-		_ = udp.Close()
-		t.Fatalf("template stub tcp listen: %v", err)
-	}
+	udp, tcpLn := bindSamePortPair(t, bindPairAttempts)
 	s := &templateDNS{udp: udp, tcpLn: tcpLn, byHost: byHost, done: make(chan struct{})}
 	s.wg.Add(2)
 	go s.serveUDP()
