@@ -171,8 +171,26 @@ type Server struct {
 
 // NewServer constructs a Server from cfg, filling defaults: the cluster aggregate
 // (podnet.ClusterPodCIDR), the request cap and per-connection cap, the uid
-// PeerVerifier (ServiceUID), and the production darwin Privileged executor. It
-// performs no I/O; call Serve to start accepting.
+// PeerVerifier (ServiceUID), and the production darwin Privileged executor. Its
+// only I/O is the identity restore (Config.IdentityPath) and, when a caller
+// supplied its own executor and the restore moved the identity, the one call that
+// re-points that executor; call Serve to start accepting.
+//
+// The CONSTRUCTION ORDER is the production fix, and it is load-bearing. The
+// executor derives the mesh-egress lo0 alias and the utun's own link address from
+// the node pod /24, so it must be built from the identity that will actually
+// govern — the restored one — not from the pre-adoption flag default. Building it
+// first and restoring afterwards moved only the Server's policy view: live, a
+// restarted worker logged the restored 100.64.1.0/24, admitted pod aliases in it,
+// and still carried a utun addressed out of the SERVER's /24 plus a lo0 alias
+// holding the control plane's own mesh address, so every dial of the apiserver's
+// mesh address was refused locally. Every shipped call site takes this path:
+// nothing in k3sm sets Config.Privileged, so the daemon always builds its own.
+//
+// The Config.Privileged branch below is therefore reachable only from tests, which
+// inject a double. It is kept correct rather than dropped so a test double never
+// silently observes a different identity than the daemon does — but it is not what
+// fixes the node, and a reader should not look for the production behavior there.
 func NewServer(cfg Config) *Server {
 	if !cfg.ClusterAggregate.IsValid() {
 		cfg.ClusterAggregate = podnet.ClusterPodCIDR
@@ -196,15 +214,39 @@ func NewServer(cfg Config) *Server {
 	if peer == nil {
 		peer = newUIDVerifier(cfg.ServiceUID)
 	}
-	priv := cfg.Privileged
-	if priv == nil {
-		priv = newDarwinApplier(cfg.NodePodCIDR, cfg.Logger)
-	}
-	node := cfg.NodePodCIDR.Masked()
+	configured := cfg.NodePodCIDR.Masked()
+	node := configured
 	if restored, ok := restoreIdentity(cfg.IdentityPath, cfg.ClusterAggregate, cfg.Logger); ok {
 		cfg.Logger.Info("netd: restored adopted node pod CIDR", "path", cfg.IdentityPath,
-			"nodePodCIDR", restored.String(), "configured", node.String())
+			"nodePodCIDR", restored.String(), "configured", configured.String())
 		node = restored
+	}
+	priv := cfg.Privileged
+	if priv == nil {
+		priv = newDarwinApplier(node, cfg.Logger)
+	} else if node != configured {
+		// A caller-supplied executor (tests only; see above) was built for the
+		// configured prefix, so it is the one thing the restore cannot fix by
+		// construction: re-point it. Nothing is live yet — no listener, no
+		// connection, no mesh — so a background context is the whole truth about
+		// the deadline here, and the executor only re-derives two addresses.
+		//
+		// A refusal does NOT revert the identity. The restored /24 is the one the
+		// node is already on: its pod aliases are plumbed in the kernel and, for a
+		// supplied executor, whatever it holds is live before this call. Falling
+		// back to the configured prefix would re-open the pre-adoption policy
+		// window — admitting aliases in the server's own /24 and rejecting the
+		// node's real ones — which is the very failure the restore exists to
+		// prevent. So the policy keeps the restored identity, the disagreement is
+		// logged at Error, and the next ConfigureMesh re-asserts the identity
+		// through adoptNodePodCIDR, which re-points the executor again. netd must
+		// not fail to start over this either: the persisted file is an
+		// optimization, never an authority (the same fail-open posture
+		// restoreIdentity itself has).
+		if err := priv.SetNodePodCIDR(context.Background(), node); err != nil {
+			cfg.Logger.Error("netd: the executor refused the restored node pod CIDR; policy uses it anyway and the two disagree until the next configureMesh",
+				"nodePodCIDR", node.String(), "configured", configured.String(), "err", err)
+		}
 	}
 	return &Server{
 		cfg:         cfg,
