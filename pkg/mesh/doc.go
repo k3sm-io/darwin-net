@@ -43,9 +43,10 @@ limitations under the License.
 //     rather than a formality, and dropping either one blackholes every peer while
 //     the logs report success: the kernel refuses an interface-bound route on an
 //     ADDRESSLESS utun (hence the mesh-link address, podnet.MeshLinkIP, on the
-//     tunnel itself), and route(8) exits 0 even when that refusal happened (hence
-//     the read-back: every apply verifies its routes against the kernel routing
-//     table and fails loudly on divergence, routeTable/reconcileRoutes).
+//     tunnel itself), and the kernel's verdict on a routing-socket write is on the
+//     request, not on what the table holds afterwards (hence the read-back: every
+//     apply verifies its routes against the kernel routing table and fails loudly
+//     on divergence, routeTable/reconcileRoutes).
 //   - A reserved mesh-egress source (podnet.MeshEgressIP, the .1 of the node /24),
 //     which stays an lo0 alias and is never moved onto the utun.
 //     The Service proxy binds its backend dialer to it (proxy.WithMeshEgressSource)

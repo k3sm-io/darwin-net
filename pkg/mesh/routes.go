@@ -17,13 +17,12 @@ limitations under the License.
 package mesh
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
-	"os/exec"
+	"os"
 	"sort"
 	"strings"
 
@@ -50,21 +49,22 @@ type Route struct {
 
 // routeTable is the kernel routing-table seam the mesh applier drives. It is
 // defined here, at the consumer, per the standards: the production implementation
-// mutates through route(8) and reads back through the kernel's own PF_ROUTE table
-// dump, while unit tests substitute a fake so the apply/verify/fail-loudly cycle is
-// exercised without privilege.
+// mutates by writing RTM_ADD / RTM_DELETE messages to a PF_ROUTE socket and reads
+// back through the kernel's own PF_ROUTE table dump, while unit tests substitute a
+// fake so the apply/verify/fail-loudly cycle is exercised without privilege.
 //
-// The seam is (mutate, read-back) rather than (mutate) alone because the mutation
-// cannot be trusted on macOS: route(8) exits 0 even when its routing-socket write
-// was rejected by the kernel — an addressless utun makes every RTM_ADD fail with
-// ENETUNREACH, route(8) prints "writing to routing socket: Network is unreachable"
-// and still exits 0. An applier that believed the exit status reported peer routes
-// that were never in the table. Only List is authoritative.
+// The seam is (mutate, read-back) rather than (mutate) alone because a mutation's
+// verdict is not the same claim as the table's state. The routing-socket write
+// returns the kernel's errno for the REQUEST (EEXIST, ESRCH, ENETUNREACH on an
+// addressless utun), which is cheap and immediate; it does not prove what the
+// table holds afterwards, and the applier once shipped believing a mutation's
+// success report (route(8)'s exit status, which was 0 on a rejected write) while
+// the table held nothing. Only List is authoritative.
 type routeTable interface {
-	// Add installs a route for prefix bound to iface. It returns the tool's own
-	// report of what it did, which is DIAGNOSTIC ONLY (it is quoted back in the
-	// divergence error, never parsed for a verdict), plus an error if the tool
-	// itself failed.
+	// Add installs a route for prefix bound to iface. It returns a report of the
+	// request and its verdict, which is DIAGNOSTIC ONLY (it is quoted back in the
+	// divergence error, never parsed for a verdict), plus an error if the kernel
+	// refused the request or the request could not be made.
 	Add(ctx context.Context, prefix netip.Prefix, iface string) (string, error)
 	// Delete removes the route for prefix bound to iface, with the same diagnostic
 	// report contract as Add. Deleting an absent route is not an error.
@@ -74,26 +74,36 @@ type routeTable interface {
 	List(ctx context.Context) ([]Route, error)
 }
 
-// kernelRouteTable is the production routeTable on darwin: route(8) for the
-// mutation, the kernel's PF_ROUTE table dump (sysctl NET_RT_DUMP, decoded by
+// kernelRouteTable is the production routeTable on darwin: RTM_ADD / RTM_DELETE
+// written to a PF_ROUTE socket for the mutation (the message route(8) would build
+// for `-net <prefix> -interface <iface>`, with the write's errno as the kernel's
+// verdict), the kernel's PF_ROUTE table dump (sysctl NET_RT_DUMP, decoded by
 // golang.org/x/net/route) for the read-back. It performs no work at construction
 // and holds no state; the routing table itself is the state.
-type kernelRouteTable struct{}
-
-// Add runs `route -n add -net <prefix> -interface <iface>`.
-func (kernelRouteTable) Add(ctx context.Context, prefix netip.Prefix, iface string) (string, error) {
-	return runRoute(ctx, "add", prefix, iface)
+type kernelRouteTable struct {
+	// write delivers one marshalled routing message to the kernel and returns the
+	// write's error. nil means a fresh PF_ROUTE socket per message (production);
+	// tests substitute a recorder so the request and the errno mapping are pinned
+	// without privilege.
+	write func([]byte) error
 }
 
-// Delete runs `route -n delete -net <prefix> -interface <iface>`. A route that is
-// already gone reports "not in table" and is not an error — teardown is idempotent
-// and the caller verifies absence by reading the table back.
-func (kernelRouteTable) Delete(ctx context.Context, prefix netip.Prefix, iface string) (string, error) {
-	out, err := runRoute(ctx, "delete", prefix, iface)
-	if err != nil && strings.Contains(out, "not in table") {
-		return out, nil
+// Add writes RTM_ADD for prefix bound to iface. EEXIST is returned as an error
+// like any other refusal: the route may be bound to another interface, and the
+// caller's read-back is what decides whether the one in the table is ours.
+func (t kernelRouteTable) Add(ctx context.Context, prefix netip.Prefix, iface string) (string, error) {
+	return t.request(ctx, unix.RTM_ADD, prefix, iface)
+}
+
+// Delete writes RTM_DELETE for prefix bound to iface. A route that is already
+// gone answers ESRCH and is not an error — teardown is idempotent and the caller
+// verifies absence by reading the table back.
+func (t kernelRouteTable) Delete(ctx context.Context, prefix netip.Prefix, iface string) (string, error) {
+	report, err := t.request(ctx, unix.RTM_DELETE, prefix, iface)
+	if errors.Is(err, unix.ESRCH) {
+		return report, nil
 	}
-	return out, err
+	return report, err
 }
 
 // List decodes the kernel's IPv4 routing table into Route values. Messages the
@@ -170,16 +180,79 @@ func interfaceNames() (map[int]string, error) {
 	return names, nil
 }
 
-// runRoute invokes route(8) for one prefix. Its exit status is reported but is NOT
-// authoritative (see routeTable); the combined output is returned for diagnostics.
-func runRoute(ctx context.Context, verb string, prefix netip.Prefix, iface string) (string, error) {
-	args := []string{"-n", verb, "-net", prefix.String(), "-interface", iface}
-	out, err := exec.CommandContext(ctx, "route", args...).CombinedOutput()
-	report := string(bytes.TrimSpace(out))
-	if err != nil {
-		return report, fmt.Errorf("route %v: %w: %s", args, err, report)
+// request builds the routing message for one prefix, writes it to the kernel, and
+// returns a report of the request. The errno from the write IS the verdict on the
+// request (see routeTable); it is returned wrapped so callers can match it with
+// errors.Is, and the report names the request it answers.
+func (t kernelRouteTable) request(ctx context.Context, typ int, prefix netip.Prefix, iface string) (string, error) {
+	report := fmt.Sprintf("%s %s -interface %s", routeTypeName(typ), prefix, iface)
+	if err := ctx.Err(); err != nil {
+		return report, err
 	}
-	return report, nil
+	ifi, err := net.InterfaceByName(iface)
+	if err != nil {
+		return report, fmt.Errorf("resolve interface: %w", err)
+	}
+	b, err := routeMessage(typ, prefix, iface, ifi.Index).Marshal()
+	if err != nil {
+		return report, fmt.Errorf("marshal: %w", err)
+	}
+	write := t.write
+	if write == nil {
+		write = writeRoutingSocket
+	}
+	if err := write(b); err != nil {
+		return report, fmt.Errorf("routing socket write: %w", err)
+	}
+	return report + ": accepted", nil
+}
+
+// routeMessage is the RTM_ADD or RTM_DELETE request for prefix bound to iface —
+// the message route(8) builds for `-net <prefix> -interface <iface>`: RTF_UP and
+// RTF_STATIC, no RTF_GATEWAY (the next hop is the link itself, so the gateway is
+// the interface's own AF_LINK address, carrying its index), no RTF_HOST (the
+// netmask says how wide the route is). It is a pure function of its arguments so
+// the encoding is table-tested without a socket.
+func routeMessage(typ int, prefix netip.Prefix, iface string, ifindex int) *xroute.RouteMessage {
+	prefix = prefix.Masked()
+	addrs := make([]xroute.Addr, unix.RTAX_NETMASK+1)
+	addrs[unix.RTAX_DST] = &xroute.Inet4Addr{IP: prefix.Addr().As4()}
+	addrs[unix.RTAX_GATEWAY] = &xroute.LinkAddr{Index: ifindex, Name: iface}
+	var mask [4]byte
+	copy(mask[:], net.CIDRMask(prefix.Bits(), 32))
+	addrs[unix.RTAX_NETMASK] = &xroute.Inet4Addr{IP: mask}
+	return &xroute.RouteMessage{
+		Type:  typ,
+		Flags: unix.RTF_UP | unix.RTF_STATIC,
+		ID:    uintptr(os.Getpid()),
+		Addrs: addrs,
+	}
+}
+
+// writeRoutingSocket delivers one routing message to the kernel over a fresh
+// PF_ROUTE socket. The write is synchronous: its error is the kernel's verdict on
+// the request, so nothing is read back from the socket.
+func writeRoutingSocket(b []byte) error {
+	fd, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	unix.CloseOnExec(fd)
+	defer unix.Close(fd)
+	_, err = unix.Write(fd, b)
+	return err
+}
+
+// routeTypeName renders a routing message type for reports.
+func routeTypeName(typ int) string {
+	switch typ {
+	case unix.RTM_ADD:
+		return "RTM_ADD"
+	case unix.RTM_DELETE:
+		return "RTM_DELETE"
+	default:
+		return fmt.Sprintf("RTM_%d", typ)
+	}
 }
 
 // prefixesOn returns the set of prefixes in have that are bound to iface.
@@ -210,15 +283,15 @@ func sortedPrefixes(set map[netip.Prefix]struct{}) []netip.Prefix {
 	return out
 }
 
-// routeReport renders route(8)'s own account of an add for the divergence error.
-// The empty report is its own diagnosis: nothing was added this time round, so the
-// route was verified by an earlier apply and has since left the table (the utun
-// went away, or something outside the mesh removed it).
+// routeReport renders the routing socket's account of an add for the divergence
+// error. The empty report is its own diagnosis: nothing was added this time round,
+// so the route was verified by an earlier apply and has since left the table (the
+// utun went away, or something outside the mesh removed it).
 func routeReport(report string) string {
 	if report == "" {
 		return " (no add was issued: the route was verified by an earlier apply and has since disappeared)"
 	}
-	return fmt.Sprintf(" (route(8) reported %q — it exits 0 even when the kernel rejects the write)", report)
+	return fmt.Sprintf(" (the routing socket reported %q)", report)
 }
 
 // formatPrefixes renders a prefix list for an error message.
