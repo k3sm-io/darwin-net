@@ -285,6 +285,13 @@ func TestConfigureMeshAdoptsTheNodePodCIDR(t *testing.T) {
 		// aliases still plumbed in the kernel and nothing to re-assert the identity
 		// until the mesh's next resync.
 		restarted, fp2 := startServer(t, cfg)
+		// The restore re-points the executor at construction, before a byte is
+		// served: the mesh addresses it derives from the node /24 must come from
+		// the restored identity, not from the flag default (see
+		// TestRestoredIdentityReachesTheApplier).
+		if got := fp2.adoptions(); len(got) != 1 || got[0].String() != workerCIDR {
+			t.Fatalf("restarted executor re-pointed at %v, want exactly [%s] at construction", got, workerCIDR)
+		}
 		c2 := wire.NewClient(restarted)
 		if err := c2.EnsureAlias(ctx, netip.MustParseAddr("100.64.7.5")); err != nil {
 			t.Fatalf("the restarted daemon rejected a pod alias in the adopted /24: %v", err)
@@ -312,8 +319,8 @@ func TestConfigureMeshAdoptsTheNodePodCIDR(t *testing.T) {
 		if !resp.OK {
 			t.Fatalf("raw ConfigureMesh without a nodePodCIDR rejected: %s", resp.Error)
 		}
-		if got := fp2.adoptions(); len(got) != 0 {
-			t.Fatalf("the restarted daemon re-adopted: %v", got)
+		if got := fp2.adoptions(); len(got) != 1 {
+			t.Fatalf("the restarted daemon re-adopted: %v, want only the construction-time re-point", got)
 		}
 		// Still the restored identity: the peer on bootCIDR is a real peer, routed.
 		plans := fp2.plans()
