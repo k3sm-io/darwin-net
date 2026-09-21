@@ -42,6 +42,7 @@ var (
 	routeTestSelf    = netip.MustParsePrefix("100.66.0.0/24")
 	routeTestPeer    = netip.MustParsePrefix("100.66.9.0/24")
 	routeTestPeerSrc = netip.MustParseAddr("100.66.9.5")
+	routeTestHost    = netip.MustParsePrefix("100.66.9.7/32")
 )
 
 // TestKernelRoutesLandOnlyWithAUTUNAddress is the hardware-level root-cause pin for
@@ -198,6 +199,72 @@ func TestInboundTunnelTrafficToTheMeshIPIsAnswered(t *testing.T) {
 			t.Fatalf("no ICMP echo reply left %s within 5s: an echo request that arrived on the tunnel for this node's mesh IP %s was not answered", iface, meshIP)
 		}
 	}
+}
+
+// TestKernelRouteTableAnswersPresentAndAbsent pins, against the real kernel, the
+// two errnos the routing-socket path maps and the host-route shape, which the
+// unit tests pin only against a fake writer. Each case starts from an empty
+// table on the utun and leaves it empty. Root-gated, like its siblings.
+func TestKernelRouteTableAnswersPresentAndAbsent(t *testing.T) {
+	requireRoot(t)
+	ctx := context.Background()
+	rt := kernelRouteTable{}
+
+	_, iface := newTestUTUN(t)
+	linkIP, err := podnet.MeshLinkIP(routeTestSelf)
+	if err != nil {
+		t.Fatalf("MeshLinkIP: %v", err)
+	}
+	mustRun(t, "ifconfig", iface, "inet", linkIP.String(), linkIP.String(), "netmask", "255.255.255.255", "up")
+
+	// mustAdd installs prefix and removes it when the case ends, so a failing
+	// assertion in one case cannot leak a route into the next.
+	mustAdd := func(t *testing.T, prefix netip.Prefix) {
+		t.Helper()
+		if report, err := rt.Add(ctx, prefix, iface); err != nil {
+			t.Fatalf("add %s: %v (%s)", prefix, err, report)
+		}
+		t.Cleanup(func() { _, _ = rt.Delete(context.Background(), prefix, iface) })
+		if !routeIsOn(t, rt, prefix, iface) {
+			t.Fatalf("route %s is absent from the table on %s after its add", prefix, iface)
+		}
+	}
+
+	t.Run("a second add of a present route is refused with EEXIST and the route stays", func(t *testing.T) {
+		mustAdd(t, routeTestPeer)
+		report, err := rt.Add(ctx, routeTestPeer, iface)
+		if !errors.Is(err, unix.EEXIST) {
+			t.Fatalf("second add err = %v (report %q), want EEXIST", err, report)
+		}
+		if !routeIsOn(t, rt, routeTestPeer, iface) {
+			t.Fatalf("route %s left %s after the refused second add", routeTestPeer, iface)
+		}
+	})
+
+	t.Run("a delete of an absent route is not an error and the route stays absent", func(t *testing.T) {
+		if routeIsOn(t, rt, routeTestPeer, iface) {
+			t.Fatalf("route %s is on %s before the case starts", routeTestPeer, iface)
+		}
+		if report, err := rt.Delete(ctx, routeTestPeer, iface); err != nil {
+			t.Fatalf("delete of an absent route err = %v (report %q), want nil: ESRCH is the idempotent case", err, report)
+		}
+		if routeIsOn(t, rt, routeTestPeer, iface) {
+			t.Fatalf("route %s appeared after a delete", routeTestPeer)
+		}
+	})
+
+	t.Run("a host route lands as a /32 and deletes", func(t *testing.T) {
+		mustAdd(t, routeTestHost)
+		if routeIsOn(t, rt, routeTestPeer, iface) {
+			t.Fatalf("the /32 add reads back as its /24 %s; the read-back lost the prefix length", routeTestPeer)
+		}
+		if _, err := rt.Delete(ctx, routeTestHost, iface); err != nil {
+			t.Fatalf("delete %s: %v", routeTestHost, err)
+		}
+		if routeIsOn(t, rt, routeTestHost, iface) {
+			t.Fatalf("host route %s survived its delete", routeTestHost)
+		}
+	})
 }
 
 // requireRoot skips a test that cannot run unprivileged.
