@@ -26,6 +26,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -122,6 +123,7 @@ func TestInboundTunnelTrafficToTheMeshIPIsAnswered(t *testing.T) {
 	requireRoot(t)
 	ctx := context.Background()
 	rt := kernelRouteTable{}
+	requireNoLiveMesh(t, rt)
 
 	dev, iface := newTestUTUN(t)
 
@@ -265,6 +267,24 @@ func TestKernelRouteTableAnswersPresentAndAbsent(t *testing.T) {
 			t.Fatalf("host route %s survived its delete", routeTestHost)
 		}
 	})
+}
+
+// requireNoLiveMesh skips a datapath test on a host whose own mesh is up: a live
+// node holds the mesh-egress alias on lo0 and steers the peer range over its own
+// utun, so an echo injected on this test's bare utun is answered by that node's
+// stack, not by the path under test. The test needs a Mac with nothing up; saying
+// so is better than a timeout that reads as a datapath failure.
+func requireNoLiveMesh(t *testing.T, rt kernelRouteTable) {
+	t.Helper()
+	have, err := rt.List(context.Background())
+	if err != nil {
+		t.Fatalf("list kernel routes: %v", err)
+	}
+	for _, r := range have {
+		if podnet.ClusterPodCIDR.Contains(r.Prefix.Addr()) && strings.HasPrefix(r.Interface, "utun") {
+			t.Skipf("a live mesh owns %s on %s; this test needs a Mac with no k3sm node up", r.Prefix, r.Interface)
+		}
+	}
 }
 
 // requireRoot skips a test that cannot run unprivileged.
