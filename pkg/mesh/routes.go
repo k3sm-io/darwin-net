@@ -25,6 +25,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 
 	xroute "golang.org/x/net/route"
 	"golang.org/x/sys/unix"
@@ -233,14 +234,34 @@ func routeMessage(typ int, prefix netip.Prefix, iface string, ifindex int) *xrou
 // PF_ROUTE socket. The write is synchronous: its error is the kernel's verdict on
 // the request, so nothing is read back from the socket.
 func writeRoutingSocket(b []byte) error {
+	// Darwin has no SOCK_CLOEXEC, so the socket is created and marked
+	// close-on-exec in two syscalls. The daemon forks (ifconfig, pfctl) from
+	// other goroutines, and a child spawned in that window would inherit a root
+	// routing-socket fd; the runtime's ForkLock is what closes the window, as it
+	// does for every fd os and net create.
+	syscall.ForkLock.RLock()
 	fd, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
+	if err == nil {
+		unix.CloseOnExec(fd)
+	}
+	syscall.ForkLock.RUnlock()
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
-	unix.CloseOnExec(fd)
 	defer unix.Close(fd)
-	_, err = unix.Write(fd, b)
-	return err
+	for {
+		n, err := unix.Write(fd, b)
+		if errors.Is(err, unix.EINTR) {
+			continue // a signal, not a verdict on the request
+		}
+		if err != nil {
+			return err
+		}
+		if n != len(b) {
+			return fmt.Errorf("short write: %d of %d bytes", n, len(b))
+		}
+		return nil
+	}
 }
 
 // routeTypeName renders a routing message type for reports.
