@@ -112,7 +112,7 @@ type WGDevice struct {
 	tun   tun.Device
 	// routes is the set of prefixes this device has VERIFIED in the kernel table,
 	// re-derived from a read-back on every apply — never a record of the route
-	// commands that were issued (route(8) reports success it did not achieve).
+	// requests that were made (an accepted write is not a route in the table).
 	routes    map[netip.Prefix]struct{}
 	applied   AppliedEndpoints // endpoints this device last programmed, per peer key
 	lastUAPI  string           // the peer update IpcSet last accepted; "" once the device is gone
@@ -236,10 +236,9 @@ func (d *WGDevice) Up(ctx context.Context) error {
 	// The utun's own point-to-point address. It is what makes the per-peer routes
 	// installable: macOS resolves an interface-bound route's source address from an
 	// address on that interface, so RTM_ADD against an ADDRESSLESS utun is rejected
-	// with ENETUNREACH — and route(8) prints "writing to routing socket: Network is
-	// unreachable" while still exiting 0, so the failure is invisible to a caller
-	// that trusts the exit status. Every peer route silently failed to land before
-	// this address existed.
+	// with ENETUNREACH. Every peer route silently failed to land before this
+	// address existed (the applier then drove route(8), which prints that refusal
+	// and still exits 0, so a caller that trusted the exit status never saw it).
 	if err := d.run(ctx, "ifconfig", name, "inet", d.cfg.linkIP.String(), d.cfg.linkIP.String(), "netmask", "255.255.255.255", "up"); err != nil {
 		dev.Close()
 		return fmt.Errorf("assign mesh link address %s to %s: %w", d.cfg.linkIP, name, err)
@@ -330,14 +329,14 @@ func (d *WGDevice) Apply(ctx context.Context, plan Plan) error {
 // per peer podCIDR, each bound to the mesh utun — and then VERIFIES the result by
 // reading the kernel table back, returning the number of routes proven present.
 //
-// The read-back is the whole point. route(8) exits 0 even when the kernel rejected
-// its routing-socket write, so "the command succeeded" and "the route exists" are
+// The read-back is the whole point. The routing-socket write's verdict is on the
+// REQUEST, so "the kernel accepted the add" and "the route exists on our utun" are
 // different claims and only the second one matters: a peer route that is missing
 // sends that peer's pod traffic to the host default gateway, which fails as a
 // silent cross-node blackhole rather than as an error anybody sees. So the device's
 // own route set is re-derived from the table on every apply, and a route that is
 // wanted but absent (or bound to another interface) fails the apply loudly with
-// ErrRouteNotInstalled, quoting route(8)'s own report of what it thought it did.
+// ErrRouteNotInstalled, quoting the routing socket's own report of the request.
 //
 // A stale route the delete did not remove is a warning, not a failure: the desired
 // routes are all present, the lingering one stays owned so the next apply retries
@@ -356,9 +355,9 @@ func (d *WGDevice) reconcileRoutes(ctx context.Context, want []netip.Prefix) (in
 		reports[r] = out
 		if err != nil {
 			// Deliberately not fatal here: the kernel table below is the verdict.
-			// route(8) reports failures that did not happen (adding a route that is
-			// already present) as readily as successes that did not, so an apply that
-			// stopped on this error would refuse to converge a mesh that is fine.
+			// EEXIST for a route the table already holds on our utun is a mesh that
+			// is fine, so an apply that stopped on this error would refuse to
+			// converge it; the read-back tells that case from a route bound elsewhere.
 			reports[r] = fmt.Sprintf("%s (error: %v)", out, err)
 		}
 	}

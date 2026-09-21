@@ -19,16 +19,20 @@ package mesh
 import (
 	"context"
 	"errors"
+	"net"
 	"net/netip"
 	"strings"
 	"testing"
+
+	xroute "golang.org/x/net/route"
+	"golang.org/x/sys/unix"
 )
 
 // fakeRouteTable is the kernel routing table as a test double. It separates what a
 // caller ASKED for (adds/deletes, recorded) from what the table actually HOLDS
 // (table), which is the whole distinction the read-back exists to make: dropAdds
-// reproduces the live macOS failure where route(8) reports a successful add,
-// exits 0, and the kernel installs nothing.
+// reproduces the live macOS failure where the add is refused (or reported done)
+// and the kernel installs nothing.
 type fakeRouteTable struct {
 	table    []Route
 	adds     []Route
@@ -97,17 +101,19 @@ func mustPrefixes(t *testing.T, ss ...string) []netip.Prefix {
 }
 
 // TestReconcileRoutesFailsLoudlyWhenTheKernelDropsTheAdd is the regression test for
-// the defect this file exists for: on macOS, `route -n add -net <cidr> -interface
-// <utun>` against an ADDRESSLESS utun is rejected by the kernel with ENETUNREACH,
-// route(8) prints "writing to routing socket: Network is unreachable" — and exits
-// 0. The old applier trusted that exit status, recorded the route as installed and
-// logged "routes=1" while the kernel table held nothing, so every packet for the
-// peer's pods went to the host's default gateway. The apply must instead fail, and
-// must not claim ownership of a route that is not there.
+// the defect this file exists for: on macOS an RTM_ADD for a route bound to an
+// ADDRESSLESS utun is rejected by the kernel with ENETUNREACH and nothing lands.
+// The applier once drove route(8), which prints that refusal and exits 0; it
+// trusted the exit status, recorded the route as installed and logged "routes=1"
+// while the kernel table held nothing, so every packet for the peer's pods went to
+// the host's default gateway. The apply must instead fail on what the table holds,
+// whatever the mutation reported, and must not claim ownership of a route that is
+// not there.
 func TestReconcileRoutesFailsLoudlyWhenTheKernelDropsTheAdd(t *testing.T) {
 	fake := &fakeRouteTable{
 		dropAdds: true,
-		addOut:   "route: writing to routing socket: Network is unreachable\nadd net 100.64.1.0: gateway utun9: Network is unreachable",
+		addOut:   "RTM_ADD 100.64.1.0/24 -interface utun9: network is unreachable",
+		addErr:   unix.ENETUNREACH,
 	}
 	d := routeDevice(fake)
 
@@ -121,8 +127,8 @@ func TestReconcileRoutesFailsLoudlyWhenTheKernelDropsTheAdd(t *testing.T) {
 	if !strings.Contains(err.Error(), "100.64.1.0/24") {
 		t.Errorf("error %q does not name the missing prefix", err)
 	}
-	if !strings.Contains(err.Error(), "Network is unreachable") {
-		t.Errorf("error %q does not quote route(8)'s own report, so an operator cannot see WHY it failed", err)
+	if !strings.Contains(err.Error(), "network is unreachable") {
+		t.Errorf("error %q does not quote the routing socket's own report, so an operator cannot see WHY it failed", err)
 	}
 	if len(d.routes) != 0 {
 		t.Errorf("device claims %v as installed routes after a failed apply", d.routes)
@@ -277,5 +283,163 @@ func TestSortedPrefixes(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("sortedPrefixes = %v, want %v", got, want)
 		}
+	}
+}
+
+// TestRouteMessageEncodesAnInterfaceRoute pins the routing message the production
+// table writes, decoded back through the same parser the read-back uses: an
+// RTM_ADD / RTM_DELETE that is RTF_UP|RTF_STATIC and nothing else (no RTF_GATEWAY:
+// the next hop is the link; no RTF_HOST: the netmask is the width), whose
+// destination is the masked prefix, whose netmask is the prefix length, and whose
+// gateway is the interface's own AF_LINK address carrying its index. This is the
+// message route(8) builds for `-net <prefix> -interface <iface>`, so the kernel
+// sees the same request it did before the exec was removed.
+func TestRouteMessageEncodesAnInterfaceRoute(t *testing.T) {
+	cases := []struct {
+		name   string
+		typ    int
+		prefix string
+		bits   int
+		mask   [4]byte
+	}{
+		{"add /24", unix.RTM_ADD, "100.64.1.7/24", 24, [4]byte{255, 255, 255, 0}},
+		{"delete /24", unix.RTM_DELETE, "100.64.2.0/24", 24, [4]byte{255, 255, 255, 0}},
+		{"add /32", unix.RTM_ADD, "100.64.3.9/32", 32, [4]byte{255, 255, 255, 255}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prefix := netip.MustParsePrefix(tc.prefix)
+			b, err := routeMessage(tc.typ, prefix, "utun9", 21).Marshal()
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			msgs, err := xroute.ParseRIB(xroute.RIBTypeRoute, b)
+			if err != nil {
+				t.Fatalf("parse the marshalled message back: %v", err)
+			}
+			if len(msgs) != 1 {
+				t.Fatalf("parsed %d messages, want 1", len(msgs))
+			}
+			rm, ok := msgs[0].(*xroute.RouteMessage)
+			if !ok {
+				t.Fatalf("parsed %T, want *route.RouteMessage", msgs[0])
+			}
+			if rm.Type != tc.typ {
+				t.Errorf("type = %d, want %d", rm.Type, tc.typ)
+			}
+			if rm.Flags != unix.RTF_UP|unix.RTF_STATIC {
+				t.Errorf("flags = %#x, want RTF_UP|RTF_STATIC (%#x) and nothing else", rm.Flags, unix.RTF_UP|unix.RTF_STATIC)
+			}
+			if len(rm.Addrs) <= unix.RTAX_NETMASK {
+				t.Fatalf("addrs = %v, want dst, gateway and netmask", rm.Addrs)
+			}
+			dst, ok := rm.Addrs[unix.RTAX_DST].(*xroute.Inet4Addr)
+			if !ok || dst.IP != prefix.Masked().Addr().As4() {
+				t.Errorf("dst = %+v, want the masked prefix address %s", rm.Addrs[unix.RTAX_DST], prefix.Masked().Addr())
+			}
+			gw, ok := rm.Addrs[unix.RTAX_GATEWAY].(*xroute.LinkAddr)
+			if !ok || gw.Index != 21 {
+				t.Errorf("gateway = %+v, want the AF_LINK address of interface index 21", rm.Addrs[unix.RTAX_GATEWAY])
+			}
+			mask, ok := rm.Addrs[unix.RTAX_NETMASK].(*xroute.Inet4Addr)
+			if !ok || mask.IP != tc.mask {
+				t.Errorf("netmask = %+v, want %v", rm.Addrs[unix.RTAX_NETMASK], tc.mask)
+			}
+			// The read-back decodes this message to exactly the Route the applier
+			// will look for, so the write and the verification agree on the key.
+			if p, ok := routeMessagePrefix(rm); !ok || p != netip.PrefixFrom(prefix.Masked().Addr(), tc.bits) {
+				t.Errorf("read-back decodes the message as %v (%v), want %s", p, ok, prefix.Masked())
+			}
+		})
+	}
+}
+
+// TestKernelRouteTableReportsTheKernelsVerdict pins the errno mapping of the
+// production table with the socket write recorded: an accepted write is reported
+// as such; a refused add surfaces the kernel's errno (ENETUNREACH on an addressless
+// utun, EEXIST for a route the table already holds) rather than swallowing it,
+// since the read-back needs to tell an add that landed elsewhere from one that
+// landed here; a delete of a route that is already gone (ESRCH) is not an error,
+// so teardown stays idempotent; any other refusal of a delete is. In every case
+// the report names the request and the bytes written are the message routeMessage
+// builds, addressed to the interface's real index.
+func TestKernelRouteTableReportsTheKernelsVerdict(t *testing.T) {
+	lo, err := net.InterfaceByName("lo0")
+	if err != nil {
+		t.Skipf("no lo0 to resolve an interface index against: %v", err)
+	}
+	prefix := netip.MustParsePrefix("100.64.1.0/24")
+	cases := []struct {
+		name    string
+		del     bool
+		errno   error
+		wantErr error // nil: the call must succeed
+		typ     int
+	}{
+		{"add accepted", false, nil, nil, unix.RTM_ADD},
+		{"add refused on an addressless link", false, unix.ENETUNREACH, unix.ENETUNREACH, unix.RTM_ADD},
+		{"add of a route the table already holds", false, unix.EEXIST, unix.EEXIST, unix.RTM_ADD},
+		{"delete accepted", true, nil, nil, unix.RTM_DELETE},
+		{"delete of a route already gone", true, unix.ESRCH, nil, unix.RTM_DELETE},
+		{"delete refused", true, unix.EPERM, unix.EPERM, unix.RTM_DELETE},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var written [][]byte
+			rt := kernelRouteTable{write: func(b []byte) error {
+				written = append(written, b)
+				return tc.errno
+			}}
+			var (
+				report string
+				err    error
+			)
+			if tc.del {
+				report, err = rt.Delete(context.Background(), prefix, lo.Name)
+			} else {
+				report, err = rt.Add(context.Background(), prefix, lo.Name)
+			}
+			if tc.wantErr == nil && err != nil {
+				t.Fatalf("err = %v, want nil (report %q)", err, report)
+			}
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want one wrapping %v (report %q)", err, tc.wantErr, report)
+			}
+			if tc.errno == nil && !strings.HasSuffix(report, ": accepted") {
+				t.Errorf("report %q does not say the kernel accepted the request", report)
+			}
+			if !strings.Contains(report, prefix.String()) || !strings.Contains(report, lo.Name) {
+				t.Errorf("report %q does not name the prefix and interface of the request", report)
+			}
+			if len(written) != 1 {
+				t.Fatalf("wrote %d messages, want exactly 1", len(written))
+			}
+			msgs, err := xroute.ParseRIB(xroute.RIBTypeRoute, written[0])
+			if err != nil || len(msgs) != 1 {
+				t.Fatalf("parse the written message: %v (%d messages)", err, len(msgs))
+			}
+			rm := msgs[0].(*xroute.RouteMessage)
+			if rm.Type != tc.typ {
+				t.Errorf("wrote type %d, want %d", rm.Type, tc.typ)
+			}
+			gw, ok := rm.Addrs[unix.RTAX_GATEWAY].(*xroute.LinkAddr)
+			if !ok || gw.Index != lo.Index {
+				t.Errorf("wrote gateway %+v, want the AF_LINK address of %s (index %d)", rm.Addrs[unix.RTAX_GATEWAY], lo.Name, lo.Index)
+			}
+		})
+	}
+}
+
+// TestKernelRouteTableRefusesAnUnknownInterface pins that a request for an
+// interface the host does not have fails before anything is written: there is no
+// index to bind the route to, and a message with index 0 would ask the kernel to
+// pick a link.
+func TestKernelRouteTableRefusesAnUnknownInterface(t *testing.T) {
+	rt := kernelRouteTable{write: func([]byte) error {
+		t.Fatal("a routing message was written for an interface that does not exist")
+		return nil
+	}}
+	if _, err := rt.Add(context.Background(), netip.MustParsePrefix("100.64.1.0/24"), "utun999"); err == nil {
+		t.Fatal("Add on a nonexistent interface returned no error")
 	}
 }

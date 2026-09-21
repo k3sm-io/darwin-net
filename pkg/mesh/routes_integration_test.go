@@ -21,6 +21,7 @@ package mesh
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"net/netip"
 	"os"
@@ -28,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/tun"
 
 	"k3sm.io/darwin-net/pkg/podnet"
@@ -44,15 +46,16 @@ var (
 
 // TestKernelRoutesLandOnlyWithAUTUNAddress is the hardware-level root-cause pin for
 // the defect the mesh shipped with: a per-peer route bound to an ADDRESSLESS utun
-// is rejected by the kernel with ENETUNREACH, while route(8) prints its complaint
-// and STILL EXITS 0 — so an applier that trusted the exit status logged
-// "routes=1" with an empty kernel table and sent every cross-node packet to the
-// host's default gateway.
+// is rejected by the kernel with ENETUNREACH. The applier then drove route(8),
+// which prints that complaint and STILL EXITS 0 — so an applier that trusted the
+// exit status logged "routes=1" with an empty kernel table and sent every
+// cross-node packet to the host's default gateway.
 //
-// It asserts both halves against the real kernel: addressless -> the route is
-// absent from the table read-back; with the utun carrying podnet.MeshLinkIP -> the
-// same command lands and the read-back proves it. It is root-gated (t.Skip without
-// root) and does NOT run in the unit pass.
+// It asserts both halves against the real kernel: addressless -> the routing
+// socket refuses the write with ENETUNREACH and the route is absent from the table
+// read-back; with the utun carrying podnet.MeshLinkIP -> the same request lands and
+// the read-back proves it. It is root-gated (t.Skip without root) and does NOT run
+// in the unit pass.
 func TestKernelRoutesLandOnlyWithAUTUNAddress(t *testing.T) {
 	requireRoot(t)
 	ctx := context.Background()
@@ -60,10 +63,13 @@ func TestKernelRoutesLandOnlyWithAUTUNAddress(t *testing.T) {
 
 	_, iface := newTestUTUN(t)
 
-	// (1) Addressless: route(8) may or may not complain, but the kernel table is
-	// the verdict, and it must NOT hold the route.
-	report, _ := rt.Add(ctx, routeTestPeer, iface)
+	// (1) Addressless: the routing socket reports the refusal synchronously, and
+	// the kernel table is the verdict regardless: it must NOT hold the route.
+	report, err := rt.Add(ctx, routeTestPeer, iface)
 	t.Logf("addressless add reported: %q", report)
+	if !errors.Is(err, unix.ENETUNREACH) {
+		t.Errorf("addressless add err = %v, want the kernel's ENETUNREACH from the routing-socket write", err)
+	}
 	if routeIsOn(t, rt, routeTestPeer, iface) {
 		t.Fatalf("a route landed on the addressless %s; this test's premise (and the fix it guards) no longer holds", iface)
 	}
