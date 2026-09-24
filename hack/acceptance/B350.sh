@@ -85,7 +85,7 @@
 #
 # Usage:
 #   bash hack/acceptance/B350.sh                                  # CI tier
-#   sudo K3SM_LAB=1 PATH="$PATH" bash hack/acceptance/B350.sh     # + lab tier
+#   sudo K3SM_LAB=1 GO="$(command -v go)" bash hack/acceptance/B350.sh     # + lab tier
 #   (K3SM_MESH_UTUN=utunN pins the mesh interface; default: the `on` token of
 #   the live anchor rule.)
 set -euo pipefail
@@ -220,6 +220,10 @@ echo "----------------------------------------"
 EVID="$HERE/.b350-evidence/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$EVID"
 [ -f "$HERE/.b350-evidence/.gitignore" ] || printf '*\n' >"$HERE/.b350-evidence/.gitignore"
+git -C "$HERE/../.." check-ignore -q "hack/acceptance/.b350-evidence/probe" || {
+  echo "FAIL  the evidence dir is not git-ignored — refusing to write into a public tree" >&2
+  exit 1
+}
 echo "==> evidence: $EVID"
 
 # Never trust pfctl's exit status alone: the routing side of this mesh shipped a
@@ -241,6 +245,10 @@ pfctl -s Anchors >"$EVID/pf-anchors.txt" 2>&1 || true
 ls -lt /Library/Logs/DiagnosticReports/*.panic >"$EVID/panic-reports.txt" 2>&1 || true
 
 utun="${K3SM_MESH_UTUN:-}"
+if [ -n "$utun" ] && ! printf '%s' "$utun" | grep -qE '^utun[0-9]+$'; then
+  echo "FAIL  K3SM_MESH_UTUN must match utun<N> (got: $utun)" >&2
+  exit 1
+fi
 if [ -z "$utun" ]; then
 	utun="$(printf '%s\n' "$live" | sed -nE 's/.* on (utun[0-9]+) .*/\1/p' | head -n1)"
 fi
