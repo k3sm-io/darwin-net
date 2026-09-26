@@ -531,7 +531,7 @@ func servePort(t *testing.T, p *Proxy, key PortKey) string {
 // on another node remote and mesh-sourced).
 func TestNodeAddressEndpointsDialWithoutTheMeshSource(t *testing.T) {
 	t.Parallel()
-	nodeAddr := netip.MustParseAddr("192.168.0.50")
+	nodeAddr := netip.MustParseAddr("192.168.1.50")
 	cases := []struct {
 		name      string
 		ip        string
@@ -539,8 +539,8 @@ func TestNodeAddressEndpointsDialWithoutTheMeshSource(t *testing.T) {
 		wantMesh  bool
 		nodeLocal bool
 	}{
-		{name: "this node's address dials the default dialer", ip: "192.168.0.50", wantLoc: LocalityNode, nodeLocal: true},
-		{name: "another node's LAN address dials a plain dialer", ip: "192.168.0.60", wantLoc: LocalityNodeRouted},
+		{name: "this node's address dials the default dialer", ip: "192.168.1.50", wantLoc: LocalityNode, nodeLocal: true},
+		{name: "another node's LAN address dials a plain dialer", ip: "192.168.1.60", wantLoc: LocalityNodeRouted},
 		{name: "same-node pod keeps its locality", ip: "100.64.3.9", wantLoc: LocalityLocal, nodeLocal: true},
 		{name: "pod on another node keeps its locality", ip: "100.64.7.5", wantLoc: LocalityRemote, wantMesh: true},
 	}
