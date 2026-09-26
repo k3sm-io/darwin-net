@@ -49,6 +49,12 @@ limitations under the License.
 //     PodDNSConfig hands each pod the DNSConfig the shim consumes (live), built
 //     around the same VIP/domain defaults the per-node resolver (the in-process
 //     k3sm/pkg/netserve resolver) binds. See the per-node DNS section below.
+//   - partial.go — CompletePartialName / IsReservedSuffix: the pure
+//     classifier the per-node resolver applies before its zone switch to
+//     complete partial cluster names server-side, and the reserved-suffix set
+//     (a dated IANA TLD snapshot in the generated tlds_iana.go plus special-use
+//     names) a namespace may not claim as a host match domain. See the
+//     layering section below.
 //   - merge.go — MergeDNSConfig / MaxSearchDomains: the pure ClusterFirst additive
 //     dnsConfig merge — a pod's search domains append to the cluster search list
 //     (cluster-first, deduped, capped) and its ndots overrides the cluster
@@ -67,7 +73,8 @@ limitations under the License.
 // # Test tiers (and the cross-repo caveat)
 //
 // The shim only takes effect when the pod is spawned by runtimed's non-platform
-// exec-shim: Apple's sandbox-exec strips DYLD_* from the environment, so the true
+// exec-shim, and only while no restricted binary sits in its exec chain (see the
+// layering section below): Apple's sandbox-exec strips DYLD_* from the environment, so the true
 // end-to-end test (a pod under Seatbelt resolving a Service) is an integration-
 // tier test that depends on runtimed and lives in that slice. For this repo the
 // shim is proven by:
@@ -94,15 +101,42 @@ limitations under the License.
 // resolution_test.go (TestInPodKubernetesAndCrossNamespaceResolution,
 // TestCandidateNamesCrossNamespaceContract).
 //
-// Decision: because resolution rides the getaddrinfo shim and Apple's
-// sandbox-exec strips DYLD_* from the child environment, the in-pod-API path
-// requires runtimed's non-platform exec-shim backend — the one backend under
-// which DYLD_INSERT_LIBRARIES survives into the pod. The runtime pins that
-// backend for pods that need in-pod API access (coordinated with runtimed);
-// there is no new darwin-net component. The documented alternative, for a future
-// platform/confined backend where DYLD_* cannot survive, is a machine-wide DNS
-// proxy (an mDNSResponder resolver scoped to the cluster domain) injected via
-// /etc/resolver — out of scope here, since this decision pins the exec-shim backend.
+// # Layering: the node resolver is the floor, the shim refines it
+//
+// Correction of record (B243): an earlier decision here pinned the in-pod-API
+// path to runtimed's non-platform exec-shim as "the one backend under which
+// DYLD_INSERT_LIBRARIES survives". That is false, measured on the live rig on
+// 2026-09-01 and again on 2026-09-26: dyld strips DYLD_* when it execs a
+// restricted binary (platform, hardened, setuid or __RESTRICT), so a pod whose
+// command wraps in /bin/sh, /usr/bin/env or any other Apple binary loses the
+// shim in that process and every descendant, whatever backend spawned it.
+//
+// Pod DNS is therefore layered, as on Linux, where the kubelet's resolv.conf
+// is inherited at the kernel level and no wrapper can drop it:
+//
+//   - The floor, for EVERY process: the node resolver configuration k3sm's
+//     netd publishes (a supplemental resolver for the cluster match domains,
+//     pointed at the cluster DNS VIP, contributing nothing to the host search
+//     list). Every process resolves fully qualified cluster names and
+//     <name>.<ns>.svc; <name>.<ns> resolves only for a namespace an admin
+//     opted in, and only if its name is not a real suffix (IsReservedSuffix).
+//     macOS applies no ndots to a supplemental domain, so partial names reach
+//     the per-node resolver as-is and are completed server-side
+//     (CompletePartialName, partial.go; the CoreDNS autopath precedent).
+//     Single-label names are deliberately NOT on the floor: a node-wide search
+//     list could never put the asking pod's namespace first.
+//   - The shim, where it survives: per-namespace precedence (the pod's own
+//     search list, bare Service names, ndots) and the bind()/connect() source
+//     discipline (pod identity, per-IP port space), which no resolver can
+//     restore. That second half is why the shim stays load-bearing.
+//   - The host-fallback route that keeps the shim alive: runtimed rewrites exec
+//     of the platform shells and env onto ad-hoc re-signed copies made at
+//     install time, which are not restricted and so keep DYLD_INSERT_LIBRARIES.
+//     Those copies are arm64e, which is why the shim ships an arm64e slice
+//     (proven by TestShimLoadsIntoArm64eHost, a live load, not a header read).
+//
+// A process that still ends up restricted (a platform binary as the main
+// process) keeps only the floor; runtimed reports that on the pod.
 //
 // # Per-node DNS and the infra-VIP exemption
 //
