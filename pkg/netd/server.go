@@ -69,6 +69,11 @@ var ErrPolicy = errors.New("netd: request denied by policy")
 // informer, supplies it). A nil authorizer denies every <1024 bind (fail safe).
 type PortAuthorizer interface {
 	// Authorize returns a non-nil error to reject binding port on nodeAddr.
+	// nodeAddr is the textual address the client requested. An unspecified
+	// nodeAddr ("0.0.0.0" or "::") means a WILDCARD bind was requested: the
+	// authorizer must admit it only for a port it knows to be served on every
+	// node interface (the canonical ingress ports, the ServiceLB shape), and
+	// deny it otherwise. The daemon never forwards a wildcard on a >=1024 port.
 	Authorize(ctx context.Context, port int, nodeAddr string) error
 }
 
@@ -769,11 +774,15 @@ func (s *Server) handleLoadPFAnchor(ctx context.Context, args *wire.LoadPFAnchor
 	return s.okResp()
 }
 
-// handleBindPort validates the address (specific, never wildcard — a wildcard
-// NodePort is bound in-process by the proxy, never here) and authorizes the port
-// (the PortAuthorizer gates a privileged <1024 infra-VIP port; a specific-address
-// >=1024 VIP port is allowed), then binds and returns the listening socket fd for
-// the server to pass over SCM_RIGHTS.
+// handleBindPort validates the address and authorizes the port, then binds and
+// returns the listening socket fd for the server to pass over SCM_RIGHTS. A
+// specific address is authorized as before (the PortAuthorizer gates a privileged
+// <1024 infra-VIP port; a specific-address >=1024 VIP port is allowed). A wildcard
+// is admitted only on a privileged (<1024) port the PortAuthorizer confirms (the
+// canonical ingress ports, bound on every interface as k3s ServiceLB does); a
+// wildcard on a >=1024 port is refused before the authorizer is consulted, since
+// the service uid can bind it itself and a root-owned wildcard would outlive the
+// requester (a wildcard NodePort is bound in-process by the proxy, never here).
 func (s *Server) handleBindPort(ctx context.Context, st *connState, args *wire.BindPortArgs) (wire.Response, *os.File) {
 	if args == nil {
 		return s.errResp("bindPort: missing args"), nil
@@ -785,8 +794,12 @@ func (s *Server) handleBindPort(ctx context.Context, st *connState, args *wire.B
 	if err != nil {
 		return s.errResp(fmt.Sprintf("bindPort: parse nodeAddr %q: %v", args.NodeAddr, err)), nil
 	}
-	if addr.IsUnspecified() || addr.IsMulticast() {
-		return s.errResp(fmt.Sprintf("%v: bindPort requires a specific non-wildcard address, got %s", ErrPolicy, addr)), nil
+	if addr.IsMulticast() {
+		return s.errResp(fmt.Sprintf("%v: bindPort requires a unicast or wildcard address, got %s", ErrPolicy, addr)), nil
+	}
+	wildcard := addr.IsUnspecified()
+	if wildcard && args.Port >= 1024 {
+		return s.errResp(fmt.Sprintf("%v: bindPort refuses a wildcard on non-privileged port %d, got %s", ErrPolicy, args.Port, addr)), nil
 	}
 	network := args.Protocol
 	if network == "" {
@@ -808,7 +821,11 @@ func (s *Server) handleBindPort(ctx context.Context, st *connState, args *wire.B
 		st.removeBoundPort()
 		return s.errResp(fmt.Sprintf("bindPort: %v", err)), nil
 	}
-	s.log.Info("netd: port bound", "network", network, "addr", ap.String())
+	scope := "specific"
+	if wildcard {
+		scope = "wildcard"
+	}
+	s.log.Info("netd: port bound", "network", network, "addr", ap.String(), "scope", scope)
 	resp := s.okResp()
 	resp.FDPassed = true
 	resp.BoundAddr = ap.String()
@@ -837,8 +854,9 @@ func (s *Server) validateAliasIP(ip netip.Addr) error {
 		ErrPolicy, ip, node, s.cfg.ClusterAggregate)
 }
 
-// authorizePort applies the BindPort policy to a specific-address bind (handleBindPort
-// has already rejected the wildcard). The contract is self-consistent with the real
+// authorizePort applies the BindPort policy (handleBindPort has already rejected a
+// wildcard on a >=1024 port, so a wildcard reaching here is privileged and is
+// always put to the PortAuthorizer). The contract is self-consistent with the real
 // consumers: a privileged (<1024) port — the infra VIPs 10.43.0.1:443 / 10.43.0.10:53,
 // which are the proxy's only helper-bound ports (pkg/proxy netdBinder routes only
 // <1024 here, binding >=1024 itself) — is the escalation-sensitive case and must be
@@ -847,7 +865,8 @@ func (s *Server) validateAliasIP(ip netip.Addr) error {
 // port grants no more than the unprivileged service uid could bind itself, so it is
 // allowed. There is no NodePort-range branch: a NodePort is reached on
 // the wildcard *:nodePort, which the proxy binds in-process (it needs no privilege)
-// and which this daemon rejects as a wildcard — the helper has no NodePort path.
+// and which this daemon rejects as a high-port wildcard — the helper has no NodePort
+// path.
 func (s *Server) authorizePort(ctx context.Context, port int, nodeAddr string) error {
 	if port < 1024 {
 		if s.cfg.PortAuthorizer == nil {

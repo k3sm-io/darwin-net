@@ -19,10 +19,10 @@ limitations under the License.
 // the L7 ingress in pkg/ingress).
 //
 // A Binder opens a listening socket on the address the CALLER chooses. An
-// implementation may refuse an address it is not authorized to bind — Netd
-// refuses the wildcard, which the root netd daemon rejects as a cross-tenant
-// footgun on the shared node — so callers handle the error rather than assume a
-// legal address by construction. Two implementations exist:
+// implementation may refuse an address it is not authorized to bind — the root
+// netd daemon behind Netd refuses a wildcard on a >=1024 port and admits a <1024
+// wildcard only for a port its authorizer confirms — so callers handle the error
+// rather than assume a legal address by construction. Two implementations exist:
 //
 //   - Direct binds with net.Listen in-process: the explicit run-as-root mode and
 //     the rootless-test mode.
