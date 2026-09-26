@@ -31,9 +31,10 @@ import (
 // over SCM_RIGHTS.
 type Binder interface {
 	// Listen returns a listening socket on addr. An implementation MAY refuse
-	// an address it is not authorized to bind — Netd refuses the wildcard,
-	// which the root daemon rejects as a cross-tenant footgun on the shared
-	// node — so every caller must handle the error. Legality is a property of
+	// an address it is not authorized to bind — Netd's root daemon refuses a
+	// wildcard on a non-privileged (>=1024) port, and admits a privileged
+	// wildcard only for a port its authorizer confirms (the canonical ingress
+	// ports) — so every caller must handle the error. Legality is a property of
 	// the binder in hand, NOT a precondition callers can discharge by knowing
 	// the concrete type: a seam whose contract depends on which implementation
 	// is behind it is a hidden type dependency, not a seam.
@@ -50,8 +51,11 @@ func (Direct) Listen(_ context.Context, network string, addr netip.AddrPort) (ne
 }
 
 // Netd binds every requested port through the root netd daemon: the daemon
-// authorizes the SPECIFIC-address bind (it rejects a wildcard) and returns the
-// listening socket over SCM_RIGHTS, which Listen adopts. This is the ONE
+// authorizes the bind and returns the listening socket over SCM_RIGHTS, which
+// Listen adopts. Netd forwards every address unchanged and does not pre-refuse
+// the wildcard client-side: the daemon is the one authority, and it refuses a
+// wildcard on a >=1024 port (the caller can bind that itself) while admitting a
+// <1024 wildcard its authorizer confirms. This is the ONE
 // SCM_RIGHTS fd-adoption path in the module — consumers wanting a local-bind
 // fast path for unprivileged ports wrap it (see pkg/proxy) rather than copying it.
 type Netd struct {

@@ -29,9 +29,11 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 )
 
-// Locality classifies a backend as local to this node or remote (reachable only
-// over the wireguard mesh). It is computed proxy-side from the node podCIDR with
-// a cheap CIDR Contains, avoiding a getifaddrs scan per connection.
+// Locality classifies a backend as local to this node, a pod on another node
+// (reachable only over the wireguard mesh), or a node address (this node's own, or
+// another node's, reached by plain routing and never over the mesh). It is
+// computed proxy-side from the node podCIDR, this node's address and the cluster
+// pod aggregate with cheap comparisons, avoiding a getifaddrs scan per connection.
 type Locality uint8
 
 const (
@@ -42,8 +44,22 @@ const (
 	// same-node lo0 pod IP reachable over loopback with no mesh hop.
 	LocalityLocal
 	// LocalityRemote means the backend IP is outside the node podCIDR, so it is a
-	// pod on another node reachable over the wireguard mesh.
+	// pod on another node reachable over the wireguard mesh. It is also the
+	// classification of any address the node-address rules below do not claim
+	// (loopback, or every non-pod address when the table has no cluster aggregate).
 	LocalityRemote
+	// LocalityNode means the backend IP is this node's own address (its
+	// InternalIP; a hostNetwork endpoint such as the ServiceLB-shaped ingress
+	// reports podIP == nodeIP). It is dialed with the default-source dialer over
+	// the loopback path, and it counts as node-local for internalTrafficPolicy:
+	// Local, matching upstream's endpoint-on-this-node rule.
+	LocalityNode
+	// LocalityNodeRouted means the backend IP is outside the cluster pod
+	// aggregate, outside 127.0.0.0/8 and not this node's address: another node's
+	// address (a hostNetwork endpoint there). It is dialed with the plain
+	// default-source dialer and never with the mesh-egress source, because a node
+	// address falls inside no peer's AllowedIPs.
+	LocalityNodeRouted
 )
 
 // String renders the locality for logs.
@@ -53,6 +69,10 @@ func (l Locality) String() string {
 		return "local"
 	case LocalityRemote:
 		return "remote"
+	case LocalityNode:
+		return "node"
+	case LocalityNodeRouted:
+		return "node-routed"
 	default:
 		return "unknown"
 	}
@@ -131,6 +151,15 @@ type RoutingTable struct {
 	// Pick). For every other path locality stays a hint/metric — cross-node
 	// steering is by the mesh's per-peer kernel routes, not this classifier.
 	podCIDR netip.Prefix
+	// nodeAddr is this node's own address (its InternalIP), classifying a backend
+	// at it as LocalityNode. clusterCIDR is the cluster pod aggregate; a backend
+	// outside it (and outside 127.0.0.0/8) is LocalityNodeRouted. Both are the zero
+	// value on a bare table, which keeps the podCIDR-only classification; Proxy.New
+	// copies them from its options (WithNodeAddress, WithClusterPodCIDR) before any
+	// worker starts, so reconcile's reads of them are ordered by the goroutine-start
+	// happens-before, the same discipline as log. They are never written afterwards.
+	nodeAddr    netip.Addr
+	clusterCIDR netip.Prefix
 
 	// snap is the current routing generation. Readers Load it (see load, which
 	// substitutes an empty snapshot for a never-written table so the zero value
@@ -269,8 +298,8 @@ type portState struct {
 	// all is every Ready backend for the key, sorted by IP then port. It is the
 	// trafficCluster pool and the fail-open pool.
 	all []backend
-	// locals is the LocalityLocal subset of all (same sorted order), precomputed at
-	// reconcile time. It is the trafficLocal pool under a valid podCIDR.
+	// locals is the node-local subset of all (LocalityLocal and LocalityNode, same
+	// sorted order), precomputed at reconcile time. It is the trafficLocal pool under a valid podCIDR.
 	locals []backend
 	// policy is the internalTrafficPolicy of the owning Service, applied to this
 	// port. It selects the pool Pick round-robins over.
@@ -367,7 +396,7 @@ func (t *RoutingTable) SetEndpoints(key PortKey, eps []netv1.Endpoint) int {
 // consistent view for Pick. Unready endpoints are dropped here, at the single
 // admission point, so the accept path can never select one: there is no readiness
 // check in Pick because an unready endpoint is never in the table. Endpoints are
-// sorted by IP then port for deterministic ordering, and the LocalityLocal subset
+// sorted by IP then port for deterministic ordering, and the node-local subset
 // is precomputed once (not rescanned per connection) for trafficLocal selection.
 // The per-key pick cursor and fail-open warn-throttle are reset so distribution
 // and observability restart predictably whenever the set changes.
@@ -415,7 +444,7 @@ func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, pol
 	// connection.
 	var locals []backend
 	for _, b := range ready {
-		if b.locality == LocalityLocal {
+		if b.locality.nodeLocal() {
 			locals = append(locals, b)
 		}
 	}
@@ -562,17 +591,35 @@ func (t *RoutingTable) transportAddr(published netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(live, published.Port())
 }
 
-// classify computes a backend's locality from the node podCIDR. A zero podCIDR
-// yields LocalityUnknown. It does not lock; callers hold no lock requirement
-// because podCIDR is immutable after construction.
+// classify computes a backend's locality. A zero podCIDR yields LocalityUnknown
+// (the fail-open state, whatever the address). Otherwise an address inside the
+// node podCIDR is LocalityLocal; this node's own address is LocalityNode; an
+// address outside the cluster pod aggregate and outside 127.0.0.0/8 is
+// LocalityNodeRouted (another node's address); anything else is LocalityRemote.
+// With no nodeAddr / clusterCIDR configured the last two rules are inert. It does
+// not lock: every field it reads is fixed before any reconcile runs.
 func (t *RoutingTable) classify(addr netip.Addr) Locality {
 	if !t.podCIDR.IsValid() {
 		return LocalityUnknown
 	}
-	if t.podCIDR.Contains(addr) {
+	a := addr.Unmap()
+	if t.podCIDR.Contains(a) {
 		return LocalityLocal
 	}
+	if t.nodeAddr.IsValid() && a == t.nodeAddr.Unmap() {
+		return LocalityNode
+	}
+	if t.clusterCIDR.IsValid() && a.IsValid() && !t.clusterCIDR.Contains(a) && !a.IsLoopback() {
+		return LocalityNodeRouted
+	}
 	return LocalityRemote
+}
+
+// nodeLocal reports whether a backend of locality l runs on this node — the
+// internalTrafficPolicy: Local pool: a same-node pod (LocalityLocal) or an
+// endpoint at this node's own address (LocalityNode).
+func (l Locality) nodeLocal() bool {
+	return l == LocalityLocal || l == LocalityNode
 }
 
 // logger returns the table's structured logger, defaulting to slog.Default() when

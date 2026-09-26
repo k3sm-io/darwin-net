@@ -17,16 +17,19 @@ limitations under the License.
 package netd_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -398,16 +401,147 @@ func TestServerBindPortHighVIPPortAllowed(t *testing.T) {
 	}
 }
 
-// TestServerBindPortWildcardRejected proves the daemon refuses to bind a wildcard
-// address: it binds only a specific NodeAddr, never *. A NodePort is reached on the
-// wildcard *:nodePort, which the proxy binds in-process (a >=1024 wildcard needs no
-// privilege) — the helper has no NodePort path, so a wildcard bind is always rejected
-// here regardless of port.
+// TestServerBindPortWildcardRejected proves the daemon refuses a wildcard on a
+// non-privileged port. A NodePort is reached on the wildcard *:nodePort, which the
+// proxy binds in-process (a >=1024 wildcard needs no privilege) — the helper has no
+// NodePort path. (A <1024 wildcard is a separate, authorizer-gated case: see
+// TestBindPortAllowsTheWildcardForDeclaredIngressPorts.)
 func TestServerBindPortWildcardRejected(t *testing.T) {
 	sock, _ := startServer(t, netd.Config{})
 	ctx := context.Background()
 	if _, err := wire.NewClient(sock).BindPort(ctx, "tcp", netip.MustParseAddrPort("0.0.0.0:30080")); err == nil {
 		t.Fatal("BindPort(0.0.0.0) succeeded, want wildcard rejection")
+	}
+}
+
+// recordingAuthorizer records every (port, nodeAddr) it is asked about and admits
+// only the ports in allow.
+type recordingAuthorizer struct {
+	allow map[int]bool
+	mu    sync.Mutex
+	asked []string
+}
+
+func (a *recordingAuthorizer) Authorize(_ context.Context, port int, nodeAddr string) error {
+	a.mu.Lock()
+	a.asked = append(a.asked, net.JoinHostPort(nodeAddr, fmt.Sprint(port)))
+	a.mu.Unlock()
+	if a.allow[port] {
+		return nil
+	}
+	return fmt.Errorf("port %d not declared by the canonical ingress service", port)
+}
+
+func (a *recordingAuthorizer) calls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.asked...)
+}
+
+// lockedBuffer is a goroutine-safe log sink (the server logs from its conn goroutines).
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestBindPortAllowsTheWildcardForDeclaredIngressPorts pins the ServiceLB-shaped
+// wildcard grant: a privileged wildcard bind from the service uid is put to the
+// PortAuthorizer (which sees the unspecified address, i.e. "wildcard requested")
+// and bound when it admits the port, logged with scope=wildcard; a wildcard the
+// authorizer denies is refused; a wildcard on a >=1024 port is refused before the
+// authorizer is consulted; and a non-service peer is refused by the peer verifier
+// before anything else.
+func TestBindPortAllowsTheWildcardForDeclaredIngressPorts(t *testing.T) {
+	cases := []struct {
+		name       string
+		addr       string
+		allow      map[int]bool
+		wrongPeer  bool
+		wantBound  bool
+		wantAsked  []string
+		wantLogHas string
+	}{
+		{
+			name:       "authorized wildcard on 80 is bound",
+			addr:       "0.0.0.0:80",
+			allow:      map[int]bool{80: true, 443: true},
+			wantBound:  true,
+			wantAsked:  []string{"0.0.0.0:80"},
+			wantLogHas: "scope=wildcard",
+		},
+		{
+			name:      "denied wildcard on 80 is refused",
+			addr:      "0.0.0.0:80",
+			allow:     map[int]bool{443: true},
+			wantAsked: []string{"0.0.0.0:80"},
+		},
+		{
+			name:  "wildcard on 8080 is refused before the authorizer",
+			addr:  "0.0.0.0:8080",
+			allow: map[int]bool{8080: true},
+		},
+		{
+			name:      "wildcard on 80 from a non-service peer is refused",
+			addr:      "0.0.0.0:80",
+			allow:     map[int]bool{80: true},
+			wrongPeer: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := &recordingAuthorizer{allow: tc.allow}
+			logs := &lockedBuffer{}
+			cfg := netd.Config{
+				PortAuthorizer: auth,
+				Logger:         slog.New(slog.NewTextHandler(logs, nil)),
+			}
+			if tc.wrongPeer {
+				cfg.ServiceUID = uint32(os.Getuid()) + 1
+			}
+			sock, fp := startServer(t, cfg)
+			ap := netip.MustParseAddrPort(tc.addr)
+			file, err := wire.NewClient(sock).BindPort(context.Background(), "tcp", ap)
+			if file != nil {
+				_ = file.Close()
+			}
+			bound := fp.boundPorts()
+			if tc.wantBound {
+				if err != nil {
+					t.Fatalf("BindPort(%s) = %v, want bound", ap, err)
+				}
+				if len(bound) != 1 || bound[0] != ap {
+					t.Fatalf("executor bound %v, want [%s]", bound, ap)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("BindPort(%s) succeeded, want refusal", ap)
+				}
+				if len(bound) != 0 {
+					t.Fatalf("refused wildcard reached the executor: %v", bound)
+				}
+			}
+			if got := auth.calls(); fmt.Sprint(got) != fmt.Sprint(tc.wantAsked) {
+				t.Fatalf("authorizer asked %v, want %v", got, tc.wantAsked)
+			}
+			if tc.wantLogHas != "" {
+				out := logs.String()
+				if !strings.Contains(out, "netd: port bound") || !strings.Contains(out, tc.wantLogHas) {
+					t.Fatalf("log lacks the bound line with %q:\n%s", tc.wantLogHas, out)
+				}
+			}
+		})
 	}
 }
 

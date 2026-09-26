@@ -520,3 +520,80 @@ func servePort(t *testing.T, p *Proxy, key PortKey) string {
 	go p.serve(ln, key, internalListener)
 	return ln.Addr().String()
 }
+
+// TestNodeAddressEndpointsDialWithoutTheMeshSource pins the node-address
+// localities on a mesh node (mesh-egress source configured): an endpoint at this
+// node's own address (a hostNetwork endpoint, podIP == nodeIP) is LocalityNode,
+// dialed through the default dialer and counted node-local for
+// internalTrafficPolicy: Local; an endpoint at another node's LAN address is
+// LocalityNodeRouted and dialed through the plain default dialer with no
+// LocalAddr; a pod-CIDR endpoint keeps today's locality (same-node pod local, pod
+// on another node remote and mesh-sourced).
+func TestNodeAddressEndpointsDialWithoutTheMeshSource(t *testing.T) {
+	t.Parallel()
+	nodeAddr := netip.MustParseAddr("192.168.1.50")
+	cases := []struct {
+		name      string
+		ip        string
+		wantLoc   Locality
+		wantMesh  bool
+		nodeLocal bool
+	}{
+		{name: "this node's address dials the default dialer", ip: "192.168.1.50", wantLoc: LocalityNode, nodeLocal: true},
+		{name: "another node's LAN address dials a plain dialer", ip: "192.168.1.60", wantLoc: LocalityNodeRouted},
+		{name: "same-node pod keeps its locality", ip: "100.64.3.9", wantLoc: LocalityLocal, nodeLocal: true},
+		{name: "pod on another node keeps its locality", ip: "100.64.7.5", wantLoc: LocalityRemote, wantMesh: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tbl := NewRoutingTable(nodePodCIDR)
+			p := New(tbl,
+				withAliasManager(newNoopAliasManager()),
+				WithLogger(slog.New(slog.DiscardHandler)),
+				WithMeshEgressSource(meshSource),
+				WithNodeAddress(nodeAddr),
+			)
+			key := PortKey{ClusterIP: "10.43.0.80", Port: 80, Protocol: netv1.ProtocolTCP}
+			eps := []netv1.Endpoint{{IP: tc.ip, Port: 8080, Ready: true}}
+			if n := tbl.SetEndpoints(key, eps); n != 1 {
+				t.Fatalf("installed %d backends, want 1", n)
+			}
+			be, err := tbl.Pick(key)
+			if err != nil {
+				t.Fatalf("pick: %v", err)
+			}
+			if be.Locality() != tc.wantLoc {
+				t.Fatalf("locality of %s = %v, want %v", tc.ip, be.Locality(), tc.wantLoc)
+			}
+
+			dst := be.Addr().Addr()
+			d := p.dialerFor(be.Locality(), dst)
+			if tc.wantMesh {
+				if d != p.meshDialer {
+					t.Fatalf("dialerFor(%v, %s) = default dialer, want the mesh-bound dialer", be.Locality(), dst)
+				}
+			} else {
+				if d != p.dialer {
+					t.Fatalf("dialerFor(%v, %s) = mesh-bound dialer, want the default dialer", be.Locality(), dst)
+				}
+				if d.LocalAddr != nil {
+					t.Fatalf("dialer LocalAddr = %#v, want nil (no mesh source)", d.LocalAddr)
+				}
+				if src := p.egress.sourceFor(be.Locality(), dst); src.IsValid() {
+					t.Fatalf("sourceFor(%v, %s) = %s, want no source (the UDP relay path)", be.Locality(), dst, src)
+				}
+			}
+
+			// internalTrafficPolicy: Local steers only to endpoints on this node.
+			tbl.SetEndpointsPolicy(key, eps, trafficLocal, affinityConfig{})
+			_, err = tbl.Pick(key)
+			switch {
+			case tc.nodeLocal && err != nil:
+				t.Fatalf("iTP:Local pick of node-local %s = %v, want it selected", tc.ip, err)
+			case !tc.nodeLocal && !errors.Is(err, ErrNoLocalBackends):
+				t.Fatalf("iTP:Local pick of off-node %s = %v, want ErrNoLocalBackends", tc.ip, err)
+			}
+		})
+	}
+}

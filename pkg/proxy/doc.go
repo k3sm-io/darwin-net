@@ -108,32 +108,35 @@ limitations under the License.
 //
 // # Locality (load-bearing only for internalTrafficPolicy: Local)
 //
-// Backend locality (local lo0 pod IP vs remote pod over the wireguard mesh) is
-// computed proxy-side from the node podCIDR with a cheap netip.Prefix.Contains —
-// no getifaddrs scan per connection. For cluster-default Services it is a
-// hint/metric only: cross-node steering is done by the per-peer kernel routes the
-// mesh installs on the utun (pkg/mesh), not by this classifier, and Pick
-// round-robins over every Ready backend regardless of locality. classify mislabels
-// any address outside the node podCIDR — including loopback and node-local infra
-// VIPs — as remote, so cluster-default routing never gates on it; infra VIPs stay
-// node-local for free because the mesh routes only peer pod /24s to the utun, so
-// 10.43.0.10 / 10.43.0.1 are never steered over it.
+// Backend locality (local lo0 pod IP, remote pod over the wireguard mesh, this
+// node's own address, or another node's address) is computed proxy-side from the
+// node podCIDR, this node's address (WithNodeAddress) and the cluster pod
+// aggregate with cheap comparisons — no getifaddrs scan per connection. For
+// cluster-default Services it does not steer: cross-node steering is done by the
+// per-peer kernel routes the mesh installs on the utun (pkg/mesh), and Pick
+// round-robins over every Ready backend regardless of locality. Loopback is
+// classified remote, which is harmless because the dial scoping binds the mesh
+// source only inside the pod aggregate; infra VIPs stay node-local for free
+// because the mesh routes only peer pod /24s to the utun, so 10.43.0.10 /
+// 10.43.0.1 are never steered over it. A node-address endpoint (a hostNetwork
+// pod, podIP == nodeIP) is LocalityNode on this node and LocalityNodeRouted on
+// another, and is always dialed without the mesh-egress source (see egressScope).
 //
-// Locality is load-bearing for exactly one decision: internalTrafficPolicy:
-// Local backend selection under a valid node podCIDR (routing.go Pick). There the
-// table filters to the LocalityLocal subset, dropping (ErrNoLocalBackends → the
+// Locality is load-bearing for two decisions: the per-dial mesh-egress source
+// (only LocalityRemote binds it), and internalTrafficPolicy: Local backend
+// selection under a valid node podCIDR (routing.go Pick). There the table filters
+// to the node-local subset (LocalityLocal and LocalityNode), dropping (ErrNoLocalBackends → the
 // listener closes the accepted conn) when no backend is node-local — the faithful
 // upstream no-fallback. Under a zero/invalid podCIDR (locality is unknowable) Pick
 // fails open to all backends with a loud Warn rather than blackhole the Service.
 // Two divergences from upstream kube-proxy are documented:
 //
-//   - k3sm derives locality from podCIDR.Contains(endpointIP), not upstream's
-//     endpoint.nodeName == thisNode. This is faithful for k3sm's pod-backed
-//     Services — every pod is an lo0 alias IP inside the node podCIDR by
-//     construction, so "IP in podCIDR" is equivalent to "on this node" — but it
-//     would misclassify a host-network or otherwise non-pod endpoint, which the
-//     Darwin-process pod path never produces. If such endpoints are ever modeled,
-//     locality must move to a nodeName-equivalent signal.
+//   - k3sm derives locality from the endpoint address (podCIDR.Contains, or
+//     equality with this node's address), not upstream's endpoint.nodeName ==
+//     thisNode. This is faithful for pod-backed Services — every pod is an lo0
+//     alias IP inside the node podCIDR by construction — and for a hostNetwork
+//     endpoint at this node's address; it would still misclassify a host-network
+//     endpoint at a secondary node address that WithNodeAddress does not name.
 //   - On a no-local-backend drop the userspace listener has already accepted the
 //     TCP connection, so the client sees connect-then-RST rather than upstream's
 //     iptables SYN-drop. This is immaterial to conformance: reachability fails
