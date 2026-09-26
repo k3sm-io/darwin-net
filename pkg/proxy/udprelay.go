@@ -25,28 +25,31 @@ import (
 	"time"
 )
 
-// maxUDPFlows bounds the relay's per-VIP flow table. Same-node pods share one
+// MaxUDPFlows bounds the relay's per-VIP flow table. Same-node pods share one
 // trust domain with no per-pod uid isolation, so a single pod cycling ephemeral
 // source ports must not exhaust file descriptors and goroutines for every Service
 // the proxy owns. On saturation a new flow is dropped (a live flow is never
-// evicted); the cap is generous so legitimate fan-in is unaffected.
-const maxUDPFlows = 8192
+// evicted); the cap is generous so legitimate fan-in is unaffected. k3sm's
+// installer pins its daemons' RLIMIT_NOFILE against this floor and the
+// UDPFlowBudgetFor rule, so it is exported for that test, and a change here must
+// keep that relationship true.
+const MaxUDPFlows = 8192
 
 // maxUDPFlowsPerSource is the per-VIP fair-share sub-cap: no single source IP may
 // hold more than this many concurrent flows per VIP. It is strictly less than the
-// per-VIP maxUDPFlows so the fair share is not vacuous — one same-node pod cycling
+// per-VIP MaxUDPFlows so the fair share is not vacuous — one same-node pod cycling
 // ephemeral source ports cannot monopolize a VIP's whole flow table and starve
 // every other pod's access to that Service (the caps mirror flows membership, so a
 // dropped flow never counted and a reaped flow un-counts). Fairness here is per VIP;
 // the per-source-global fair share — one source IP's flows across all VIPs — is the
 // shared udpBudget's maxPerSource, so a pod fanning flows across N distinct VIPs
 // cannot consume the whole relay-global budget and starve every VIP either.
-const maxUDPFlowsPerSource = maxUDPFlows / 4
+const maxUDPFlowsPerSource = MaxUDPFlows / 4
 
 // maxUDPDatagram is the read buffer size for one datagram. A datagram socket
 // discards any bytes beyond the supplied buffer, so it is sized to the maximum
 // IPv4 UDP payload to avoid truncating a large datagram. One buffer is held per
-// live flow reader, so worst-case buffer memory is bounded by maxUDPFlows.
+// live flow reader, so worst-case buffer memory is bounded by MaxUDPFlows.
 const maxUDPDatagram = 65535
 
 // udpSaturationWarnInterval throttles the flow-table-saturation Warn so a pod
@@ -130,9 +133,9 @@ func newUDPBudget(maxTotal int64, maxPerSource int) *udpBudget {
 }
 
 // udpPerSourceGlobalCap derives one source IP's share of the relay-global budget as
-// maxTotal/4 (floored at 1). It is /4 — not /8 — so at the floor budget (maxUDPFlows)
-// the per-source-global cap (maxUDPFlows/4) coincides with the per-VIP
-// maxUDPFlowsPerSource (also maxUDPFlows/4) rather than dropping below it, which would
+// maxTotal/4 (floored at 1). It is /4 — not /8 — so at the floor budget (MaxUDPFlows)
+// the per-source-global cap (MaxUDPFlows/4) coincides with the per-VIP
+// maxUDPFlowsPerSource (also MaxUDPFlows/4) rather than dropping below it, which would
 // make the per-VIP sub-cap vacuous; it scales up with a larger RLIMIT-derived budget.
 func udpPerSourceGlobalCap(maxTotal int64) int {
 	c := int(maxTotal / 4)
@@ -243,7 +246,7 @@ type udpFlow struct {
 // cannot open raw sockets to forge an L3 source, and wireguard's symmetric AllowedIPs
 // constrain every cross-node source to the sending node's pod CIDR.
 //
-// Fair-share + budget: the per-VIP cap (maxUDPFlows) bounds total flows but
+// Fair-share + budget: the per-VIP cap (MaxUDPFlows) bounds total flows but
 // is not a per-source quota, so admission adds more gates. perSourceCap
 // (maxUDPFlowsPerSource) bounds any single source IP's flows per VIP so one pod
 // cycling ephemeral ports cannot monopolize a VIP's table; the shared budget (a
@@ -322,7 +325,7 @@ type udpRelay struct {
 // start to run it and Close to tear it down.
 func newUDPRelay(conn *net.UDPConn, key PortKey, table *RoutingTable, egress egressScope, idleTimeout time.Duration, perSourceCap int, budget *udpBudget, log *slog.Logger) *udpRelay {
 	if budget == nil {
-		budget = newUDPBudget(maxUDPFlows, udpPerSourceGlobalCap(maxUDPFlows))
+		budget = newUDPBudget(MaxUDPFlows, udpPerSourceGlobalCap(MaxUDPFlows))
 	}
 	return &udpRelay{
 		conn:         conn,
@@ -425,14 +428,14 @@ func (r *udpRelay) upstreamFor(client netip.AddrPort, lastWarn *time.Time) *net.
 	// source is already at its per-VIP fair-share cap. Read-only — no reservation, no
 	// increment — the second lock is authoritative, so a race here costs at worst a
 	// wasted dial+close, never an over-admit.
-	perVIPFull := len(r.flows) >= maxUDPFlows
+	perVIPFull := len(r.flows) >= MaxUDPFlows
 	perSourceFull := r.perSource[srcIP] >= r.perSourceCap
 	if perVIPFull || perSourceFull {
 		r.mu.Unlock()
 		if time.Since(*lastWarn) >= udpSaturationWarnInterval {
 			*lastWarn = time.Now()
 			if perVIPFull {
-				r.log.Warn("udp relay flow table saturated; dropping new flow", "vip", r.key.String(), "maxFlows", maxUDPFlows)
+				r.log.Warn("udp relay flow table saturated; dropping new flow", "vip", r.key.String(), "maxFlows", MaxUDPFlows)
 			} else {
 				r.log.Warn("udp relay per-source flow cap reached; dropping new flow", "vip", r.key.String(), "src", srcIP.String(), "perSourceCap", r.perSourceCap)
 			}
@@ -506,7 +509,7 @@ func (r *udpRelay) upstreamFor(client netip.AddrPort, lastWarn *time.Time) *net.
 	}
 	// Authoritative admit. Re-check per-VIP then per-source (the first-lock read raced
 	// the dial); on either rejection close the dialed socket so its fd does not leak.
-	if len(r.flows) >= maxUDPFlows || r.perSource[srcIP] >= r.perSourceCap {
+	if len(r.flows) >= MaxUDPFlows || r.perSource[srcIP] >= r.perSourceCap {
 		r.mu.Unlock()
 		_ = up.Close()
 		return nil

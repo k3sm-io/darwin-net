@@ -82,7 +82,7 @@ func benchRelay(b *testing.B, backend net.Addr) (*udpRelay, *net.UDPAddr) {
 	key := PortKey{ClusterIP: vipAddr.IP.String(), Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
 	tbl := NewRoutingTable(netip.Prefix{})
 	tbl.SetEndpoints(key, []netv1.Endpoint{{IP: be.IP.String(), Port: int32(be.Port), Ready: true}})
-	r := newUDPRelay(vip, key, tbl, egressScope{}, time.Hour, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), quietLogger())
+	r := newUDPRelay(vip, key, tbl, egressScope{}, time.Hour, maxUDPFlowsPerSource, newUDPBudget(MaxUDPFlows, MaxUDPFlows), quietLogger())
 	r.start()
 	return r, vipAddr
 }
