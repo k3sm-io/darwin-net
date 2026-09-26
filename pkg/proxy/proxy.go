@@ -100,6 +100,9 @@ type Proxy struct {
 	// *net.UDPAddr from the same decision). Its zero value binds nothing, which is
 	// the single-node posture. Set once at construction; see egressScope.
 	egress egressScope
+	// nodeAddr is this node's own address (WithNodeAddress), copied into the
+	// routing table by New for locality classification. Read-only after New.
+	nodeAddr netip.Addr
 	// exemptVIPs are infra VIPs owned by a node-local binder (per-node resolver on
 	// the kube-dns VIP) rather than by the proxy: the proxy never aliases, binds,
 	// or routes them. It is set once by WithInfraVIPExemptions and read-only
@@ -214,6 +217,18 @@ func WithClusterPodCIDR(cidr netip.Prefix) Option {
 	}
 }
 
+// WithNodeAddress sets this node's own address (its InternalIP). A backend at it
+// is classified LocalityNode: dialed with the default-source dialer over the
+// loopback path, and counted as node-local for internalTrafficPolicy: Local. It is
+// what lets a hostNetwork endpoint (podIP == nodeIP, e.g. the ServiceLB-shaped
+// ingress bound on every interface) be classified as on this node. Another node's
+// address needs no option: any endpoint outside the cluster pod aggregate
+// (WithClusterPodCIDR) and outside 127.0.0.0/8 is LocalityNodeRouted. An invalid
+// Addr (the default) leaves this node's address unclassified.
+func WithNodeAddress(addr netip.Addr) Option {
+	return func(p *Proxy) { p.nodeAddr = addr.Unmap() }
+}
+
 // WithInfraVIPExemptions marks one or more infra VIPs as owned by a node-local
 // binder rather than the Service proxy, so the proxy never takes ownership of
 // them: no lo0 alias, no listening socket, no routing-table entry.
@@ -312,6 +327,10 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 	// table.log is safe under the goroutine-start happens-before.
 	if p.table != nil {
 		p.table.log = p.log
+		// The node-address classification inputs ride the same pre-Run
+		// happens-before: this node's address and the cluster pod aggregate.
+		p.table.nodeAddr = p.nodeAddr
+		p.table.clusterCIDR = p.egress.clusterCIDR
 	}
 	// Same propagation for the policy table's two throttled data-path signals (the
 	// unknown-source fail-open Warn and the deny Info); its logger() accessor

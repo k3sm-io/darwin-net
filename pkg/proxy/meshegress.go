@@ -91,9 +91,12 @@ func (s egressScope) sourceFor(loc Locality, dst netip.Addr) netip.Addr {
 	if !s.src.IsValid() || !s.clusterCIDR.IsValid() {
 		return netip.Addr{}
 	}
-	// LocalityUnknown and LocalityLocal both fail to the kernel default: an
-	// unclassifiable node must not assert a source, and a same-node backend is
-	// reached over loopback with no mesh hop.
+	// Only a pod on another node binds. LocalityUnknown, LocalityLocal,
+	// LocalityNode and LocalityNodeRouted all fail to the kernel default: an
+	// unclassifiable node must not assert a source, a same-node backend (pod or
+	// this node's address) is reached over loopback with no mesh hop, and another
+	// node's address is inside no peer's AllowedIPs, so its reply never returns
+	// over the utun.
 	if loc != LocalityRemote {
 		return netip.Addr{}
 	}
@@ -107,7 +110,11 @@ func (s egressScope) sourceFor(loc Locality, dst netip.Addr) netip.Addr {
 
 // dialerFor returns the *net.Dialer a TCP backend dial must use for a backend with
 // locality loc at transport address dst: the mesh-source-bound dialer when
-// egressScope.sourceFor elects a bind, otherwise the default-source dialer.
+// egressScope.sourceFor elects a bind (a LocalityRemote pod inside the cluster
+// aggregate), otherwise the default-source dialer, which carries no LocalAddr.
+// A node-address backend (LocalityNode on this node, LocalityNodeRouted on
+// another) always takes the default dialer: the loopback path for this node, a
+// plainly routed dial for another.
 //
 // Both dialers are built once in New and are never mutated afterwards, so the
 // per-connection handle goroutines only ever read them. Selecting between two
