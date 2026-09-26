@@ -172,7 +172,7 @@ limitations under the License.
 // source. A sweeper goroutine expires a flow after udpFlowIdleTimeout of two-way
 // silence (Linux conntrack-UDP / kube-proxy's userspace udpIdleTimeout) so cached
 // sockets and the backend selection do not pin to a dead client. The flow table is
-// bounded (maxUDPFlows): same-node pods share one trust domain with no per-pod
+// bounded (MaxUDPFlows): same-node pods share one trust domain with no per-pod
 // isolation, so ephemeral-source-port churn from one pod must not exhaust fds and
 // goroutines for every Service the proxy owns — on saturation a new flow is dropped
 // (a throttled Warn), never a live one evicted.
@@ -181,7 +181,7 @@ limitations under the License.
 //
 // Further admission gates harden the relay against one same-node pod monopolizing a
 // VIP or exhausting the co-resident control plane's fds. A per-source sub-cap
-// (maxUDPFlowsPerSource = maxUDPFlows/4) bounds any single source IP's concurrent
+// (maxUDPFlowsPerSource = MaxUDPFlows/4) bounds any single source IP's concurrent
 // flows per VIP, so a pod cycling ephemeral source ports cannot fill a VIP's whole
 // table and starve every other pod's access to that Service. A relay-global budget (a
 // mutex-guarded udpBudget shared by every per-VIP relay via New) then enforces two
@@ -199,8 +199,8 @@ limitations under the License.
 //
 // The budget is a static reservation of the relay's fd slice, not a live whole-daemon
 // governor: TCP proxy handles and the kine/apiserver clients spend from the same
-// process fd table, uncounted here. Its default is half the enforced soft
-// RLIMIT_NOFILE, floored at maxUDPFlows so a low launchd soft limit never regresses a
+// process fd table, uncounted here. Its default is half the smaller of the enforced
+// soft RLIMIT_NOFILE and kern.maxfilesperproc, floored at MaxUDPFlows so a low launchd soft limit never regresses a
 // single VIP below its per-VIP capacity; the k3sm assembler — which alone sees
 // the whole process fd table — sizes it via WithUDPFlowBudget, because a leaf
 // subsystem must not unilaterally partition a process-global resource. The

@@ -246,7 +246,7 @@ func TestUDPRelayIdleFlowGC(t *testing.T) {
 		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
 		tbl := NewRoutingTable(netip.Prefix{})
 		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
-		r := newUDPRelay(pc, key, tbl, egressScope{}, idle, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), slog.Default())
+		r := newUDPRelay(pc, key, tbl, egressScope{}, idle, maxUDPFlowsPerSource, newUDPBudget(MaxUDPFlows, MaxUDPFlows), slog.Default())
 		r.start()
 		t.Cleanup(func() { _ = r.Close() })
 		return r
@@ -414,13 +414,13 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 			}
 		}
 		// The three counters move in lockstep at the second-lock insert, so none can
-		// diverge and none exceeds the per-VIP maxUDPFlows.
+		// diverge and none exceeds the per-VIP MaxUDPFlows.
 		fc, ps, b := relay.flowCount(), relay.perSourceTotal(), budget.liveTotal()
 		if fc != 5 || ps != 5 || b != 5 {
 			t.Fatalf("counter divergence: flowCount=%d perSourceTotal=%d budget=%d, want 5/5/5", fc, ps, b)
 		}
-		if fc > maxUDPFlows {
-			t.Fatalf("per-VIP flow count %d exceeds maxUDPFlows %d", fc, maxUDPFlows)
+		if fc > MaxUDPFlows {
+			t.Fatalf("per-VIP flow count %d exceeds MaxUDPFlows %d", fc, MaxUDPFlows)
 		}
 	})
 
@@ -856,7 +856,7 @@ func TestUDPRelayFlowKey(t *testing.T) {
 		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
 		tbl := NewRoutingTable(netip.Prefix{})
 		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
-		r := newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), slog.Default())
+		r := newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, maxUDPFlowsPerSource, newUDPBudget(MaxUDPFlows, MaxUDPFlows), slog.Default())
 		t.Cleanup(func() { _ = r.Close() })
 		return r
 	}
@@ -913,7 +913,7 @@ func TestUDPRelayFoundFlowStampedUnderLock(t *testing.T) {
 	tbl := NewRoutingTable(netip.Prefix{})
 	tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
 	const idle = time.Hour
-	relay := newUDPRelay(pc, key, tbl, egressScope{}, idle, maxUDPFlowsPerSource, newUDPBudget(maxUDPFlows, maxUDPFlows), slog.Default())
+	relay := newUDPRelay(pc, key, tbl, egressScope{}, idle, maxUDPFlowsPerSource, newUDPBudget(MaxUDPFlows, MaxUDPFlows), slog.Default())
 	defer relay.Close()
 
 	client := netip.MustParseAddrPort("10.0.8.1:40000")
@@ -952,5 +952,30 @@ func TestUDPRelayFoundFlowStampedUnderLock(t *testing.T) {
 		if _, err := up.Write([]byte("x")); err != nil {
 			t.Fatalf("iteration %d: upstreamFor returned a socket the sweeper had closed: %v", i, err)
 		}
+	}
+}
+
+// TestUDPFlowBudgetFor pins the exported budget rule: half of
+// min(soft RLIMIT_NOFILE, kern.maxfilesperproc), floored at MaxUDPFlows, with a
+// zero maxfilesperproc treated as unknown.
+func TestUDPFlowBudgetFor(t *testing.T) {
+	cases := []struct {
+		name            string
+		cur, maxPerProc uint64
+		want            int64
+	}{
+		{name: "64 GB host, rlimit binds", cur: 131072, maxPerProc: 245760, want: 65536},
+		{name: "8 GB host, kernel cap binds below the floor", cur: 131072, maxPerProc: 10240, want: 8192},
+		{name: "kernel cap binds above the floor", cur: 131072, maxPerProc: 32768, want: 16384},
+		{name: "unknown kernel cap, rlimit alone", cur: 131072, maxPerProc: 0, want: 65536},
+		{name: "floor wins at the boundary", cur: 16384, maxPerProc: 0, want: 8192},
+		{name: "zero limits take the floor", cur: 0, maxPerProc: 0, want: 8192},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := UDPFlowBudgetFor(tc.cur, tc.maxPerProc); got != tc.want {
+				t.Fatalf("UDPFlowBudgetFor(%d, %d) = %d, want %d", tc.cur, tc.maxPerProc, got, tc.want)
+			}
+		})
 	}
 }

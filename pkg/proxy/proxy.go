@@ -118,7 +118,7 @@ type Proxy struct {
 	// jointly exhaust the process fd table the co-resident control plane spends
 	// from) and caps any one source IP's flows across all VIPs (the
 	// per-source-global fair share). Constructed once in New (RLIMIT_NOFILE
-	// -derived total, floored at maxUDPFlows) or overridden by WithUDPFlowBudget;
+	// -derived total, floored at MaxUDPFlows) or overridden by WithUDPFlowBudget;
 	// read-only after construction, and a mutex-guarded leaf that mutates its own
 	// state under its own lock and never calls back into a relay — no proxy lock
 	// needed.
@@ -293,7 +293,7 @@ func WithNetdHelper(socketPath string) Option {
 // the root-gated lo0 alias manager; pass options to override (e.g. a logger).
 //
 // The relay-global UDP fd budget defaults to half the process's enforced soft fd
-// limit (RLIMIT_NOFILE.Cur), floored at maxUDPFlows so a low launchd soft limit
+// limit (the smaller of RLIMIT_NOFILE.Cur and kern.maxfilesperproc), floored at MaxUDPFlows so a low launchd soft limit
 // never regresses a single VIP below its per-VIP capacity; WithUDPFlowBudget
 // lets the k3sm assembler size the relay subsystem's fd slice against the whole
 // process (the TCP proxy + control plane spend from the same table).
@@ -342,22 +342,46 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 }
 
 // defaultUDPFlowBudget is the relay-global UDP upstream-socket budget when the
-// assembler sets none (WithUDPFlowBudget). It is half the process's enforced soft fd
-// limit (RLIMIT_NOFILE.Cur — not Max, which may be unlimited), leaving the other half
-// for the TCP proxy, the listeners, and the co-resident control plane, but floored at
-// maxUDPFlows so a low launchd soft limit never regresses a single VIP's capacity
-// below its per-VIP bound. A Getrlimit error falls back to the floor.
+// assembler sets none (WithUDPFlowBudget). It is half the process's usable fd
+// limit, leaving the other half for the TCP proxy, the listeners, and the
+// co-resident control plane, but floored at MaxUDPFlows so a low limit never
+// regresses a single VIP's capacity below its per-VIP bound. The usable limit is
+// the smaller of the enforced soft RLIMIT_NOFILE (Cur, not Max, which may be
+// unlimited) and kern.maxfilesperproc.
+//
+// The kernel caps fd allocation at kern.maxfilesperproc regardless of the
+// rlimit, so a launchd soft limit above it overstates what the process can
+// open (verified 2026-09-26: 10240 on an 8 GB Mac granted a 131072 soft limit,
+// EMFILE at exactly 10240 opens). A sysctl error falls back to the rlimit alone;
+// a Getrlimit error falls back to the floor.
 //
 // The reservation only leaves real headroom for the co-resident control plane when
-// the daemon's soft RLIMIT_NOFILE is provisioned above 2*maxUDPFlows (the launchd
-// plist NumberOfFiles) or the k3sm assembler passes WithUDPFlowBudget; below that
-// the floor dominates and the budget bounds only a single VIP.
+// the usable limit is above 2*MaxUDPFlows (the launchd plist NumberOfFiles and the
+// host's kern.maxfilesperproc) or the k3sm assembler passes WithUDPFlowBudget; below
+// that the floor dominates and the budget bounds only a single VIP.
 func defaultUDPFlowBudget() int64 {
 	var rl unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rl); err != nil {
-		return maxUDPFlows
+		return MaxUDPFlows
 	}
-	return max(int64(maxUDPFlows), int64(rl.Cur)/2)
+	perProc, err := maxFilesPerProc()
+	if err != nil {
+		perProc = 0
+	}
+	return UDPFlowBudgetFor(rl.Cur, perProc)
+}
+
+// UDPFlowBudgetFor is the relay-global UDP flow budget rule: half of
+// min(rlimitCur, maxFilesPerProc), floored at MaxUDPFlows, where rlimitCur is the
+// soft RLIMIT_NOFILE and maxFilesPerProc is kern.maxfilesperproc (zero means
+// unknown and is ignored). defaultUDPFlowBudget applies it to the live values; it
+// is pure so a consumer sizing those limits can evaluate the same rule.
+func UDPFlowBudgetFor(rlimitCur, maxFilesPerProc uint64) int64 {
+	usable := rlimitCur
+	if maxFilesPerProc != 0 {
+		usable = min(usable, maxFilesPerProc)
+	}
+	return max(int64(MaxUDPFlows), int64(usable)/2)
 }
 
 // portWorker owns one ClusterIP:port. It is the single goroutine that may open
