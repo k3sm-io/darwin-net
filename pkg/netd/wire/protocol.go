@@ -140,8 +140,10 @@ type LoadPFAnchorArgs struct {
 	MSSClamp int `json:"mssClamp"`
 }
 
-// BindPortArgs requests a listening socket on a SPECIFIC node address (never the
-// wildcard) and port. Protocol defaults to "tcp".
+// BindPortArgs requests a listening socket on a node address and port. A specific
+// address is the norm. A wildcard address is accepted only for a privileged
+// (<1024) port and only when the daemon's port authorizer grants it; a wildcard on
+// a port at or above 1024 is refused. Protocol defaults to "tcp".
 type BindPortArgs struct {
 	Port     int    `json:"port"`
 	NodeAddr string `json:"nodeAddr"`
