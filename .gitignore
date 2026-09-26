@@ -18,3 +18,6 @@ go.work.sum
 .DS_Store
 .idea/
 .vscode/
+
+# B350 lab-tier recurrence evidence is operator-held, never committed (hack/lab/runs/README.md).
+hack/acceptance/.b350-evidence/
