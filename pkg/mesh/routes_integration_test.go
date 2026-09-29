@@ -211,6 +211,11 @@ func TestKernelRouteTableAnswersPresentAndAbsent(t *testing.T) {
 	requireRoot(t)
 	ctx := context.Background()
 	rt := kernelRouteTable{}
+	// The fixed test prefixes sit inside the cluster pod range, so on a host whose
+	// own mesh holds that block the first add fails as EEXIST on the wrong utun and
+	// reads as a broken add rather than a busy host. Say which it is, like the
+	// inbound-tunnel test does.
+	requireNoLiveMesh(t, rt)
 
 	_, iface := newTestUTUN(t)
 	linkIP, err := podnet.MeshLinkIP(routeTestSelf)
@@ -257,6 +262,10 @@ func TestKernelRouteTableAnswersPresentAndAbsent(t *testing.T) {
 
 	t.Run("a host route lands as a /32 and deletes", func(t *testing.T) {
 		mustAdd(t, routeTestHost)
+		// The negative on the CONTAINING /24 is the point of the case, not a
+		// redundancy: a read-back that dropped the prefix length would report the
+		// /32 as its /24 and still pass a positive check on the host route alone,
+		// masking exactly the regression this pins. Keep both assertions.
 		if routeIsOn(t, rt, routeTestPeer, iface) {
 			t.Fatalf("the /32 add reads back as its /24 %s; the read-back lost the prefix length", routeTestPeer)
 		}
@@ -274,6 +283,11 @@ func TestKernelRouteTableAnswersPresentAndAbsent(t *testing.T) {
 // utun, so an echo injected on this test's bare utun is answered by that node's
 // stack, not by the path under test. The test needs a Mac with nothing up; saying
 // so is better than a timeout that reads as a datapath failure.
+//
+// Today this fires only on a lab Mac with a joined node. Once the server enrolls
+// itself as mesh peer zero (k3sm M14.2) every single-Mac dev host with a running
+// server owns the pod range on a utun, so the skip becomes the ordinary outcome
+// there: run these tests with the node stopped, not against a live cluster.
 func requireNoLiveMesh(t *testing.T, rt kernelRouteTable) {
 	t.Helper()
 	have, err := rt.List(context.Background())
