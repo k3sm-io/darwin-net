@@ -67,8 +67,21 @@ limitations under the License.
 // libk3sm_getaddrinfo_shim.dylib. It is not Go cgo: darwin-net's Go
 // stays CGO_ENABLED=0, and a DYLD interposer must be a plain C dylib with a
 // __DATA,__interpose section anyway. The shim reads its DNSConfig from the
-// environment (K3SM_DNS_* variables the runtime sets per pod) and talks UDP DNS
-// to the VIP.
+// environment (K3SM_DNS_* variables the runtime sets per pod; env.go is the Go
+// side of that ABI and ConfigToEnvChecked its one encoder) and talks UDP DNS to
+// the configured servers.
+//
+// A ClusterFirst pod gets one server, the cluster DNS VIP (K3SM_DNS_SERVER), and
+// a name the cluster resolver does not answer falls through to the host
+// resolver. A dnsPolicy None pod gets its own IPv4 nameservers
+// (K3SM_DNS_SERVERS, at most MaxNameservers) and exclusive mode
+// (K3SM_DNS_EXCLUSIVE=1): servers are walked attempt-outer/server-inner with a
+// per-call dead-server memo, and no name ever falls through to the host. The
+// residual host paths in exclusive mode resolve no name or answer only RFC 6761
+// loopback names: numeric IPv4/IPv6 literals, AI_NUMERICHOST, and localhost /
+// *.localhost. Every host consult passes one traced chokepoint
+// (TestShimHostCallsUseChokepoint). The Go reference resolver implements the
+// same walk, and TestDNSWireClassificationDifferential holds the two in parity.
 //
 // # Test tiers (and the cross-repo caveat)
 //
@@ -191,7 +204,7 @@ limitations under the License.
 //
 // # Search-list normalization is single-homed
 //
-// Four consumers read a DNSConfig's SearchDomains: ConfigToEnv (the host-process
+// Four consumers read a DNSConfig's SearchDomains: ConfigToEnvChecked (the host-process
 // shim env), GuestResolvConf (the vm-guest /etc/resolv.conf), candidateNames (the Go
 // reference resolver), and MergeDNSConfig itself. They all normalize through one
 // helper, normalizeSearch (normalize.go) = sanitizeSearch + capSearch: it TrimSpaces
@@ -204,7 +217,7 @@ limitations under the License.
 // validatePodDNSConfig admission gate (whose [a-z0-9.-] charset the allowlist is a
 // superset of), so it is a no-op for every admission-valid config and the live
 // cluster-DNS keystone stays byte-identical; single-homing it is what keeps the four
-// views dropping the same domain and truncating at the same cap. ConfigToEnv and
+// views dropping the same domain and truncating at the same cap. ConfigToEnvChecked and
 // GuestResolvConf additionally clamp ndots to the exported RES_MAXNDOTS ceiling
 // (MaxNDots == 15).
 //
@@ -225,6 +238,10 @@ limitations under the License.
 //     NDots field cannot distinguish an explicit 0 from absent, so it is not
 //     honored.
 //   - dnsConfig.nameservers and non-ndots dnsConfig.options are not honored under
-//     ClusterFirst: the getaddrinfo shim is single-server (one cluster VIP), so a
-//     pod can neither add nameservers nor set arbitrary resolver options here.
+//     ClusterFirst: a ClusterFirst pod always queries the one cluster VIP, so it
+//     can neither add nameservers nor set arbitrary resolver options here.
+//   - Under dnsPolicy None the native shim serves IPv4 nameservers only (IPv6
+//     entries are dropped and reported via ErrNameserversDropped; an all-IPv6
+//     config is ErrNoUsableNameserver) and consumes no option other than ndots;
+//     the vm guest's resolv.conf carries the options verbatim.
 package dns

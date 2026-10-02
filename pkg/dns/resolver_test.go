@@ -399,3 +399,88 @@ func TestLookupHostClosedPortIsTempFail(t *testing.T) {
 		t.Fatalf("ECONNREFUSED collapsed into ErrNotFound: %v", err)
 	}
 }
+
+// noneConfig is a DNSPolicyNone config with the given nameservers; the
+// addresses are placeholders that withServerAddrs points at stubs.
+func noneConfig(search []string, ns ...string) netv1.DNSConfig {
+	return netv1.DNSConfig{
+		Policy:        netv1.DNSPolicyNone,
+		Nameservers:   ns,
+		SearchDomains: search,
+		NDots:         5,
+	}
+}
+
+// TestLookupHostPolicyNone pins the reference resolver's DNSPolicyNone walk:
+// servers in order, the per-lookup dead-server memo, and exclusive verdicts.
+func TestLookupHostPolicyNone(t *testing.T) {
+	t.Parallel()
+	want := netip.MustParseAddr("10.9.9.9")
+
+	t.Run("a dead first server is asked once per lookup, not once per candidate", func(t *testing.T) {
+		t.Parallel()
+		dead := newStubDNS(t, map[string]netip.Addr{})
+		defer dead.close()
+		dead.setSilent()
+		live := newStubDNS(t, map[string]netip.Addr{"web.b.example": want})
+		defer live.close()
+
+		r, err := NewResolver(noneConfig([]string{"a.example", "b.example"}, "192.0.2.1", "192.0.2.2"),
+			withServerAddrs(dead.addr(), live.addr()), WithTimeout(200*time.Millisecond))
+		if err != nil {
+			t.Fatalf("NewResolver: %v", err)
+		}
+		addrs, err := r.LookupHost(context.Background(), "web")
+		if err != nil || len(addrs) != 1 || addrs[0] != want {
+			t.Fatalf("LookupHost(web) = %v, %v; want [%v]", addrs, err, want)
+		}
+		if n := dead.queryCount(); n != 1 {
+			t.Fatalf("dead server asked %d times, want 1 (dead for the rest of the lookup)", n)
+		}
+		if !live.asked("web.a.example") || !live.asked("web.b.example") {
+			t.Fatalf("live server did not see both candidates")
+		}
+	})
+
+	t.Run("SERVFAIL advances to the next server without marking it dead", func(t *testing.T) {
+		t.Parallel()
+		first := newStubDNS(t, map[string]netip.Addr{"web.example": want})
+		defer first.close()
+		first.setServfail("web.example")
+		second := newStubDNS(t, map[string]netip.Addr{"web.example": want})
+		defer second.close()
+
+		r, err := NewResolver(noneConfig(nil, "192.0.2.1", "192.0.2.2"),
+			withServerAddrs(first.addr(), second.addr()), WithTimeout(time.Second))
+		if err != nil {
+			t.Fatalf("NewResolver: %v", err)
+		}
+		addrs, err := r.LookupHost(context.Background(), "web.example.")
+		if err != nil || len(addrs) != 1 || addrs[0] != want {
+			t.Fatalf("LookupHost = %v, %v; want [%v]", addrs, err, want)
+		}
+	})
+
+	t.Run("an external transient fails closed in exclusive mode", func(t *testing.T) {
+		t.Parallel()
+		stub := newStubDNS(t, map[string]netip.Addr{})
+		defer stub.close()
+		stub.setServfail("github.com")
+
+		r, err := NewResolver(noneConfig(nil, "192.0.2.1"), withServerAddrs(stub.addr()), WithTimeout(time.Second))
+		if err != nil {
+			t.Fatalf("NewResolver: %v", err)
+		}
+		_, err = r.LookupHost(context.Background(), "github.com.")
+		if !errors.Is(err, ErrTempFail) {
+			t.Fatalf("LookupHost(github.com.) err = %v, want ErrTempFail (no host fall-through)", err)
+		}
+	})
+
+	t.Run("all-IPv6 nameservers are refused", func(t *testing.T) {
+		t.Parallel()
+		if _, err := NewResolver(noneConfig(nil, "2620:fe::fe")); !errors.Is(err, ErrNoUsableNameserver) {
+			t.Fatalf("NewResolver(all-IPv6) err = %v, want ErrNoUsableNameserver", err)
+		}
+	})
+}

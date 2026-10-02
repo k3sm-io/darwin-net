@@ -169,3 +169,24 @@ func TestMergeDNSConfigDoesNotMutateBase(t *testing.T) {
 		}
 	}
 }
+
+// TestMergeDNSConfigClusterFirstOnly pins that the merge is a ClusterFirst
+// primitive: a DNSPolicyNone base is returned unchanged with nothing dropped,
+// because a None pod's search list and ndots are its own, not an augmentation of
+// cluster defaults.
+func TestMergeDNSConfigClusterFirstOnly(t *testing.T) {
+	base := netv1.DNSConfig{
+		Policy:        netv1.DNSPolicyNone,
+		Nameservers:   []string{"1.1.1.1"},
+		SearchDomains: []string{"a.example"},
+		NDots:         2,
+	}
+	got, dropped := MergeDNSConfig(base, []string{"b.example"}, 7)
+	if dropped != 0 {
+		t.Fatalf("dropped = %d, want 0", dropped)
+	}
+	if !slices.Equal(got.SearchDomains, base.SearchDomains) || got.NDots != base.NDots ||
+		!slices.Equal(got.Nameservers, base.Nameservers) || got.Policy != base.Policy {
+		t.Fatalf("MergeDNSConfig(None) = %+v, want base unchanged %+v", got, base)
+	}
+}

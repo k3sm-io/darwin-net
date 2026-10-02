@@ -50,6 +50,9 @@ type stubDNS struct {
 	servfail    map[string]bool
 	truncate    map[string]bool
 	truncateTCP map[string]bool
+	// silent makes the stub record every query and answer none of them: a server
+	// that is reachable but dead, whose queries can still be counted.
+	silent bool
 	// EDNS0 OPT observed on the most recent query (any transport): optSeen is set
 	// when the query carried an OPT pseudo-RR, and optUDPSize is its advertised
 	// UDP payload size (the OPT ResourceHeader Class field).
@@ -98,6 +101,21 @@ func (s *stubDNS) dropNext(name string, n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.drop[normalizeName(name)] = n
+}
+
+// setSilent makes the stub record every query and never answer: the client
+// times out against it, and queryCount still sees each query.
+func (s *stubDNS) setSilent() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.silent = true
+}
+
+// queryCount returns how many queries (UDP and TCP) the stub has received.
+func (s *stubDNS) queryCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.queries) + len(s.tcpQueries)
 }
 
 // setServfail makes every query for name answer SERVFAIL.
@@ -251,6 +269,10 @@ func (s *stubDNS) respond(query []byte, transport string) ([]byte, bool) {
 	} else {
 		s.queries = append(s.queries, qname)
 	}
+	if s.silent {
+		s.mu.Unlock()
+		return nil, false
+	}
 	if transport == "udp" && s.drop[qname] > 0 {
 		s.drop[qname]--
 		s.mu.Unlock()
@@ -313,4 +335,18 @@ func toLowerASCII(s string) string {
 		}
 	}
 	return string(b)
+}
+
+// newBlackholeDNS binds a UDP socket on 127.0.0.1 that never reads or answers,
+// and returns its port. A client querying it waits out its full timeout, which
+// is what a nameserver that silently drops traffic costs. The socket closes at
+// test cleanup.
+func newBlackholeDNS(t *testing.T) int {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("bind blackhole DNS: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn.LocalAddr().(*net.UDPAddr).Port
 }

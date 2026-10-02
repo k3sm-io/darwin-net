@@ -34,15 +34,33 @@
  * darwin-net's Go stays CGO_ENABLED=0, and a DYLD interposer must be a C dylib
  * with a __DATA,__interpose section regardless.
  *
- * Configuration comes from the environment (the runtime sets these per pod):
- *   K3SM_DNS_SERVER  - cluster DNS VIP (IPv4), e.g. "10.43.0.10"
- *   K3SM_DNS_PORT    - DNS port (optional, default 53)
- *   K3SM_DNS_DOMAIN  - cluster domain, e.g. "cluster.local"
- *   K3SM_DNS_SEARCH  - space-separated search list
- *   K3SM_DNS_NDOTS   - ndots (optional, default 5)
+ * Configuration comes from the environment (the runtime sets these per pod;
+ * ../pkg/dns/env.go is the Go side of this ABI and documents each name):
+ *   K3SM_DNS_SERVER    - cluster DNS VIP (IPv4), e.g. "10.43.0.10" (ClusterFirst)
+ *   K3SM_DNS_SERVERS   - space-separated nameserver list, at most K3SM_MAX_NS
+ *                        usable tokens, each "ipv4" or "ipv4:port" (dnsPolicy
+ *                        None); when set and non-empty it wins over
+ *                        K3SM_DNS_SERVER
+ *   K3SM_DNS_EXCLUSIVE - "1" selects exclusive mode: no host-resolver
+ *                        fall-through for any name
+ *   K3SM_DNS_PORT      - DNS port (optional, default 53) for every server
+ *                        without its own ":port"
+ *   K3SM_DNS_DOMAIN    - cluster domain, e.g. "cluster.local"
+ *   K3SM_DNS_SEARCH    - space-separated search list
+ *   K3SM_DNS_NDOTS     - ndots (optional, default 5)
+ *   K3SM_DNS_DEBUG     - any value enables the stderr trace
  *
- * If K3SM_DNS_SERVER is unset, the shim transparently defers to the real
- * getaddrinfo for every call, so a non-pod process loading it is unaffected.
+ * With no usable server and K3SM_DNS_EXCLUSIVE not "1", the shim transparently
+ * defers to the real getaddrinfo for every call, so a non-pod process loading it
+ * is unaffected. With K3SM_DNS_EXCLUSIVE "1" and no usable server it fails every
+ * name lookup closed (EAI_AGAIN) instead.
+ *
+ * HOST CHOKEPOINT. Every consult of the host resolver for a node goes through
+ * k3sm_host_getaddrinfo, which traces "k3sm-dns: HOST <reason> node=..." under
+ * K3SM_DNS_DEBUG; the only other call to the real getaddrinfo is the
+ * service-only lookup in k3sm_service_port (a NULL node, no name resolution).
+ * ../pkg/dns TestShimHostCallsUseChokepoint pins both facts, so a test that sees
+ * no HOST line has seen every host path.
  */
 
 #include <arpa/inet.h>
@@ -55,6 +73,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -95,6 +114,13 @@ __attribute__((used)) static const interpose_t k3sm_interposers[]
 /* -------- config from environment -------- */
 
 #define K3SM_MAX_SEARCH 8
+
+/*
+ * The most nameservers the shim keeps from K3SM_DNS_SERVERS (extra tokens are
+ * ignored). It equals the upstream kubelet's MaxDNSNameservers;
+ * ../pkg/dns TestShimMaxNameserversMatchesC binds it to netv1.MaxNameservers.
+ */
+#define K3SM_MAX_NS 3
 
 /*
  * K3SM_DNS_MAX_NAME_LEN is the ONE shared boundary for how long a candidate name
@@ -141,8 +167,16 @@ _Static_assert(K3SM_MAX_NAME >= K3SM_DNS_MAX_NAME_LEN + 1,
                "candidate buffer must hold a boundary-length name plus its NUL");
 
 typedef struct {
+    /* enabled: at least one server is configured (nservers > 0). */
     int enabled;
-    char server[64];
+    /* exclusive: K3SM_DNS_EXCLUSIVE == "1" — never fall through to the host
+     * resolver for a name, even with no usable server. */
+    int exclusive;
+    /* servers[i]/ports[i]: nameserver i and its port, in query order. */
+    char servers[K3SM_MAX_NS][64];
+    char ports[K3SM_MAX_NS][8];
+    int nservers;
+    /* port: the K3SM_DNS_PORT default for a server without its own ":port". */
     char port[8];
     char domain[K3SM_MAX_NAME];
     char search[K3SM_MAX_SEARCH][K3SM_MAX_NAME];
@@ -150,21 +184,114 @@ typedef struct {
     int ndots;
 } k3sm_cfg_t;
 
+/*
+ * Parse one K3SM_DNS_SERVERS token, "ipv4" or "ipv4:port", into server/port
+ * (defport when the token carries no port). The list is IPv4-only, so a single
+ * ':' is unambiguous. Returns 0 for a usable token and -1 to skip it: a token of
+ * 64 bytes or more, an address inet_pton(AF_INET) rejects, or a port that is not
+ * 1..5 decimal digits in 1..65535.
+ */
+static int k3sm_parse_server_token(const char *tok, const char *defport,
+                                   char server[64], char port[8]) {
+    size_t n = strlen(tok);
+    if (n == 0 || n >= 64) {
+        return -1;
+    }
+    char buf[64];
+    memcpy(buf, tok, n + 1);
+    const char *p = defport;
+    char *colon = strchr(buf, ':');
+    if (colon != NULL) {
+        *colon = '\0';
+        const char *ps = colon + 1;
+        size_t pl = strlen(ps);
+        if (pl == 0 || pl > 5) {
+            return -1;
+        }
+        long v = 0;
+        for (size_t i = 0; i < pl; i++) {
+            if (ps[i] < '0' || ps[i] > '9') {
+                return -1;
+            }
+            v = v * 10 + (ps[i] - '0');
+        }
+        if (v < 1 || v > 65535) {
+            return -1;
+        }
+        p = ps;
+    }
+    struct in_addr a;
+    if (inet_pton(AF_INET, buf, &a) != 1) {
+        return -1;
+    }
+    snprintf(server, 64, "%s", buf);
+    snprintf(port, 8, "%s", p);
+    return 0;
+}
+
+/*
+ * Fill c->servers from a K3SM_DNS_SERVERS value: split on " \t" over a bounded
+ * copy, keep the first K3SM_MAX_NS usable tokens, skip unusable ones. A value
+ * longer than the copy is cut at its last separator, so a token truncated by
+ * the copy is dropped rather than read as a different (shorter) address.
+ */
+static void k3sm_load_servers(k3sm_cfg_t *c, const char *list) {
+    char buf[512];
+    size_t n = strlen(list);
+    snprintf(buf, sizeof(buf), "%s", list);
+    if (n >= sizeof(buf)) {
+        char *cut = strrchr(buf, ' ');
+        char *tab = strrchr(buf, '\t');
+        if (tab != NULL && (cut == NULL || tab > cut)) {
+            cut = tab;
+        }
+        if (cut == NULL) {
+            return; /* one over-long token: unusable */
+        }
+        *cut = '\0';
+    }
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, " \t", &save);
+         tok != NULL && c->nservers < K3SM_MAX_NS;
+         tok = strtok_r(NULL, " \t", &save)) {
+        if (k3sm_parse_server_token(tok, c->port, c->servers[c->nservers],
+                                    c->ports[c->nservers]) == 0) {
+            c->nservers++;
+        }
+    }
+}
+
 static void k3sm_load_cfg(k3sm_cfg_t *c) {
     memset(c, 0, sizeof(*c));
-    const char *server = getenv("K3SM_DNS_SERVER");
-    if (server == NULL || server[0] == '\0') {
-        c->enabled = 0;
-        return;
-    }
-    c->enabled = 1;
-    snprintf(c->server, sizeof(c->server), "%s", server);
 
     const char *port = getenv("K3SM_DNS_PORT");
     if (port == NULL || port[0] == '\0') {
         port = "53";
     }
     snprintf(c->port, sizeof(c->port), "%s", port);
+
+    const char *servers = getenv("K3SM_DNS_SERVERS");
+    if (servers != NULL && servers[0] != '\0') {
+        k3sm_load_servers(c, servers);
+    } else {
+        /*
+         * The single-server key. It is how every ClusterFirst pod is configured,
+         * and it is also a pod-lifetime skew reader: a pod created before
+         * K3SM_DNS_SERVERS existed keeps only this key in its environment for
+         * its whole life, and new processes in it load this dylib. The value is
+         * taken verbatim (inet_pton happens at query time), exactly as before.
+         */
+        const char *server = getenv("K3SM_DNS_SERVER");
+        if (server != NULL && server[0] != '\0') {
+            snprintf(c->servers[0], sizeof(c->servers[0]), "%s", server);
+            snprintf(c->ports[0], sizeof(c->ports[0]), "%s", c->port);
+            c->nservers = 1;
+        }
+    }
+    c->enabled = c->nservers > 0;
+
+    const char *exclusive = getenv("K3SM_DNS_EXCLUSIVE");
+    c->exclusive = exclusive != NULL && strcmp(exclusive, "1") == 0;
 
     const char *domain = getenv("K3SM_DNS_DOMAIN");
     if (domain != NULL) {
@@ -343,6 +470,15 @@ static int k3sm_has_suffix_domain(const char *name, const char *suffix) {
  * bare-label and fully-qualified cluster forms keep the EAI_AGAIN guarantee.
  */
 static int k3sm_candidate_fail_closed(const k3sm_cfg_t *c, const char *cand) {
+    /*
+     * Exclusive mode: there is no host resolver to fall through to, so EVERY
+     * candidate fails closed. Deciding it here, inside the classifier, rather
+     * than at the call sites also settles an empty cluster domain uniformly:
+     * a dotted name under no domain is external only outside exclusive mode.
+     */
+    if (c->exclusive) {
+        return 1;
+    }
     if (strchr(cand, '.') == NULL) {
         return 1; /* bare label: a cluster short name, never external */
     }
@@ -546,12 +682,12 @@ static int k3sm_build_query(const char *fqdn, uint8_t qbuf[512]) {
     return (int)pos;
 }
 
-/* Fill sa from the configured server/port. Returns 0 or -1. */
-static int k3sm_server_addr(const k3sm_cfg_t *c, struct sockaddr_in *sa) {
+/* Fill sa from configured server si and its port. Returns 0 or -1. */
+static int k3sm_server_addr(const k3sm_cfg_t *c, int si, struct sockaddr_in *sa) {
     memset(sa, 0, sizeof(*sa));
     sa->sin_family = AF_INET;
-    sa->sin_port = htons((uint16_t)atoi(c->port));
-    if (inet_pton(AF_INET, c->server, &sa->sin_addr) != 1) {
+    sa->sin_port = htons((uint16_t)atoi(c->ports[si]));
+    if (inet_pton(AF_INET, c->servers[si], &sa->sin_addr) != 1) {
         return -1;
     }
     return 0;
@@ -669,11 +805,11 @@ static ssize_t k3sm_write_deadline(int fd, const void *buf, size_t len,
     }
 }
 
-/* One UDP round-trip. Returns response length into rbuf, or -1. */
-static ssize_t k3sm_udp_exchange(const k3sm_cfg_t *c, const uint8_t *qbuf,
+/* One UDP round-trip with server si. Returns response length into rbuf, or -1. */
+static ssize_t k3sm_udp_exchange(const k3sm_cfg_t *c, int si, const uint8_t *qbuf,
                                  size_t qlen, uint8_t *rbuf, size_t rcap) {
     struct sockaddr_in sa;
-    if (k3sm_server_addr(c, &sa) != 0) {
+    if (k3sm_server_addr(c, si, &sa) != 0) {
         return -1;
     }
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -714,10 +850,10 @@ static ssize_t k3sm_udp_exchange(const k3sm_cfg_t *c, const uint8_t *qbuf,
  * One TCP round-trip with RFC 1035 §4.2.2 length framing — the refetch path
  * when a UDP response has TC set (the answer set did not fit a datagram).
  */
-static ssize_t k3sm_tcp_exchange(const k3sm_cfg_t *c, const uint8_t *qbuf,
+static ssize_t k3sm_tcp_exchange(const k3sm_cfg_t *c, int si, const uint8_t *qbuf,
                                  size_t qlen, uint8_t *rbuf, size_t rcap) {
     struct sockaddr_in sa;
-    if (k3sm_server_addr(c, &sa) != 0) {
+    if (k3sm_server_addr(c, si, &sa) != 0) {
         return -1;
     }
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -863,12 +999,22 @@ static int k3sm_parse_a(const uint8_t *rbuf, ssize_t rn, const uint8_t *qbuf,
 }
 
 /*
- * Query the configured DNS server for an A record of fqdn: one UDP round-trip,
+ * Query configured server si for an A record of fqdn: one UDP round-trip,
  * refetched over TCP when the response is truncated. Returns K3SM_DNS_HIT
  * (addr4 filled), K3SM_DNS_MISS (definitive), or K3SM_DNS_TEMPFAIL.
+ *
+ * *transport_err (when non-NULL) is set when the TEMPFAIL came from the
+ * transport — the UDP exchange or the TCP refetch failed to send, receive, or
+ * connect (a timeout, or an error such as ECONNREFUSED) — as opposed to a reply
+ * that arrived but was unusable (SERVFAIL, malformed). The server walk marks a
+ * server dead on the former only; the Go reference's errTransport draws the
+ * same line.
  */
-static int k3sm_query_a(const k3sm_cfg_t *c, const char *fqdn,
-                        uint8_t addr4[4]) {
+static int k3sm_query_a(const k3sm_cfg_t *c, int si, const char *fqdn,
+                        uint8_t addr4[4], int *transport_err) {
+    if (transport_err != NULL) {
+        *transport_err = 0;
+    }
     uint8_t qbuf[512];
     int qlen = k3sm_build_query(fqdn, qbuf);
     if (qlen < 0) {
@@ -882,8 +1028,11 @@ static int k3sm_query_a(const k3sm_cfg_t *c, const char *fqdn,
      * phantom timeout. Couple the two at compile time. */
     _Static_assert(K3SM_EDNS_UDP_SIZE <= sizeof(rbuf),
                    "EDNS UDP payload size must fit the UDP receive buffer");
-    ssize_t rn = k3sm_udp_exchange(c, qbuf, (size_t)qlen, rbuf, sizeof(rbuf));
+    ssize_t rn = k3sm_udp_exchange(c, si, qbuf, (size_t)qlen, rbuf, sizeof(rbuf));
     if (rn < 0) {
+        if (transport_err != NULL) {
+            *transport_err = 1;
+        }
         return K3SM_DNS_TEMPFAIL;
     }
     int truncated = 0;
@@ -905,9 +1054,12 @@ static int k3sm_query_a(const k3sm_cfg_t *c, const char *fqdn,
     if (tbuf == NULL) {
         return K3SM_DNS_TEMPFAIL;
     }
-    rn = k3sm_tcp_exchange(c, qbuf, (size_t)qlen, tbuf, 65535);
+    rn = k3sm_tcp_exchange(c, si, qbuf, (size_t)qlen, tbuf, 65535);
     if (rn < 0) {
         free(tbuf);
+        if (transport_err != NULL) {
+            *transport_err = 1;
+        }
         return K3SM_DNS_TEMPFAIL;
     }
     truncated = 0;
@@ -960,19 +1112,161 @@ static int k3sm_make_result(const uint8_t addr4[4], uint16_t port,
  * Every path that finishes a candidate calls this exactly once (callers gate on
  * the debug flag). Note it prints cands[i] as STORED — for an over-long name
  * those are the truncated bytes, a storage fact, not a name anything queried.
+ * si is the server that gave the verdict (the last one asked for a TEMPFAIL),
+ * or -1 when every server was already dead and none was asked.
  */
-static void k3sm_trace_verdict(const k3sm_cfg_t *c, const char *cand, int rc) {
-    fprintf(stderr, "k3sm-dns:   query %s @ %s:%s -> %s\n", cand, c->server, c->port,
+static void k3sm_trace_verdict(const k3sm_cfg_t *c, const char *cand, int si, int rc) {
+    fprintf(stderr, "k3sm-dns:   query %s @ %s:%s -> %s\n", cand,
+            si >= 0 ? c->servers[si] : "(none)", si >= 0 ? c->ports[si] : "-",
             rc == K3SM_DNS_HIT    ? "HIT"
             : rc == K3SM_DNS_MISS ? "miss"
                                   : "TEMPFAIL");
 }
 
 /*
- * The interposed getaddrinfo. When the shim is configured (K3SM_DNS_SERVER set)
- * and the request is a plain hostname (not a numeric literal, not a service-only
- * lookup), it resolves via CoreDNS using ndots/search expansion. Anything it
- * cannot or should not handle falls through to the real getaddrinfo.
+ * The server walk for one candidate. With a single server it is the classic
+ * loop: K3SM_DNS_ATTEMPTS tries, stopping at the first definitive answer. With
+ * several it is glibc-shaped — attempt loop outer, server loop inner: a HIT or
+ * a definitive MISS (NXDOMAIN/NODATA) from any server ends the candidate, a
+ * SERVFAIL or malformed reply moves to the next server, and a server whose
+ * exchange failed at the transport level (a timeout or a send/recv error) is
+ * marked in dead[] and not asked again for the rest of this getaddrinfo call.
+ * So a call costs at most nservers x K3SM_DNS_TIMEOUT_SEC in timeouts however
+ * many candidates it expands to. *si receives the server that gave the
+ * returned verdict (the last one asked), or -1 if none was asked. Mirrors the
+ * Go reference's queryCandidate.
+ */
+static int k3sm_query_candidate(const k3sm_cfg_t *c, const char *cand,
+                                uint8_t addr4[4], int dead[K3SM_MAX_NS], int *si) {
+    int rc = K3SM_DNS_TEMPFAIL;
+    if (c->nservers == 1) {
+        *si = 0;
+        for (int attempt = 0; attempt < K3SM_DNS_ATTEMPTS && rc == K3SM_DNS_TEMPFAIL;
+             attempt++) {
+            rc = k3sm_query_a(c, 0, cand, addr4, NULL);
+        }
+        return rc;
+    }
+    *si = -1;
+    for (int attempt = 0; attempt < K3SM_DNS_ATTEMPTS; attempt++) {
+        int live = 0;
+        for (int s = 0; s < c->nservers; s++) {
+            if (dead[s]) {
+                continue;
+            }
+            live = 1;
+            int transport_err = 0;
+            rc = k3sm_query_a(c, s, cand, addr4, &transport_err);
+            *si = s;
+            if (rc != K3SM_DNS_TEMPFAIL) {
+                return rc;
+            }
+            if (transport_err) {
+                dead[s] = 1;
+            }
+        }
+        if (!live) {
+            break;
+        }
+    }
+    return K3SM_DNS_TEMPFAIL;
+}
+
+/*
+ * The host-resolver chokepoint: the ONLY function that passes a node to the
+ * real getaddrinfo. Under K3SM_DNS_DEBUG it traces every consult as
+ * "k3sm-dns: HOST <reason> node=<node>", so the absence of that line is proof
+ * that no host path was taken. Keep every host call routed through here; see
+ * TestShimHostCallsUseChokepoint.
+ */
+static int k3sm_host_getaddrinfo(const char *reason, const char *node,
+                                 const char *service,
+                                 const struct addrinfo *hints,
+                                 struct addrinfo **res) {
+    if (getenv("K3SM_DNS_DEBUG") != NULL) {
+        fprintf(stderr, "k3sm-dns: HOST %s node=%s service=%s\n", reason,
+                node ? node : "(null)", service ? service : "(null)");
+    }
+    return getaddrinfo(node, service, hints, res);
+}
+
+/*
+ * Map a NAMED service ("https") to its port for exclusive mode, where the name
+ * itself resolves through the pod's own servers. It asks the real getaddrinfo
+ * for the service ONLY — a literal NULL node, so no name resolution happens and
+ * nothing reaches a DNS server; the lookup reads /etc/services. Unlike
+ * getservbyname it is thread-safe, which matters because this code runs
+ * interposed on arbitrary app threads. The socket type follows the caller's
+ * hints. An unknown service is EAI_SERVICE. Returns 0 or an EAI_* code.
+ */
+static int k3sm_service_port(const char *service, const struct addrinfo *hints,
+                             uint16_t *port) {
+    struct addrinfo h;
+    memset(&h, 0, sizeof(h));
+    h.ai_family = AF_INET;
+    h.ai_socktype = hints != NULL ? hints->ai_socktype : 0;
+    struct addrinfo *r = NULL;
+    int rc = getaddrinfo(NULL, service, &h, &r);
+    if (rc == EAI_MEMORY) {
+        return rc;
+    }
+    if (rc != 0) {
+        return EAI_SERVICE;
+    }
+    int out = EAI_SERVICE;
+    for (struct addrinfo *p = r; p != NULL; p = p->ai_next) {
+        if (p->ai_family == AF_INET && p->ai_addr != NULL &&
+            p->ai_addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
+            *port = ntohs(((const struct sockaddr_in *)p->ai_addr)->sin_port);
+            out = 0;
+            break;
+        }
+    }
+    freeaddrinfo(r);
+    return out;
+}
+
+/*
+ * True for the RFC 6761 loopback names: "localhost" or any name ending in
+ * ".localhost" (a non-empty label before it), compared case-insensitively with
+ * one trailing dot tolerated. "LOCALHOST." and "a.localhost" match;
+ * "notlocalhost" and "localhost.example" do not. An upstream dnsPolicy None pod
+ * answers these from its /etc/hosts before DNS, so exclusive mode leaves them
+ * to the host resolver.
+ */
+static int k3sm_is_localhost(const char *node) {
+    static const char lh[] = "localhost";
+    const size_t l = sizeof(lh) - 1;
+    size_t n = strlen(node);
+    if (n > 0 && node[n - 1] == '.') {
+        n--;
+    }
+    if (n < l || strncasecmp(node + n - l, lh, l) != 0) {
+        return 0;
+    }
+    if (n == l) {
+        return 1;
+    }
+    return n > l + 1 && node[n - l - 1] == '.';
+}
+
+/*
+ * The interposed getaddrinfo. When the shim is configured (a usable
+ * K3SM_DNS_SERVERS or K3SM_DNS_SERVER) and the request is a plain hostname (not
+ * a numeric literal, not a service-only lookup), it resolves via the configured
+ * servers using ndots/search expansion.
+ *
+ * Outside exclusive mode, anything it cannot or should not handle falls through
+ * to the real getaddrinfo (through k3sm_host_getaddrinfo, traced as HOST).
+ *
+ * In exclusive mode (K3SM_DNS_EXCLUSIVE "1", dnsPolicy None) no name ever falls
+ * through: every candidate fails closed, a transient failure is EAI_AGAIN, all
+ * candidates missing is EAI_NONAME, AF_INET6-only hints are EAI_NONAME (the
+ * shim serves no AAAA), a named service gets its port from k3sm_service_port,
+ * and no usable server at all is EAI_AGAIN. The residual host paths perform no
+ * name resolution, or answer the RFC 6761 loopback names the way an upstream
+ * pod's /etc/hosts would: a NULL/empty node, a numeric IPv4 literal,
+ * AI_NUMERICHOST, a numeric IPv6 literal, and localhost / *.localhost.
  */
 int k3sm_getaddrinfo(const char *node, const char *service,
                      const struct addrinfo *hints, struct addrinfo **res) {
@@ -980,47 +1274,87 @@ int k3sm_getaddrinfo(const char *node, const char *service,
     k3sm_load_cfg(&cfg);
 
     /* Diagnostic trace, gated on K3SM_DNS_DEBUG: report exactly what the shim sees
-     * (whether K3SM_DNS_SERVER was inherited, the config, and each cluster-query
-     * outcome) so an in-pod "no such host" localizes to env-not-seen vs query-miss.
-     * Off by default (unset env) — zero overhead and no workload stderr noise. */
+     * (whether a server was inherited, the config, each cluster-query outcome, and
+     * every host-resolver consult) so an in-pod "no such host" localizes to
+     * env-not-seen vs query-miss. Off by default (unset env) — zero overhead and
+     * no workload stderr noise. */
     int dbg = getenv("K3SM_DNS_DEBUG") != NULL;
     if (dbg) {
-        fprintf(stderr, "k3sm-dns: getaddrinfo node=%s enabled=%d server=%s port=%s domain=%s nsearch=%d ndots=%d\n",
-                node ? node : "(null)", cfg.enabled, cfg.server[0] ? cfg.server : "(unset)",
-                cfg.port, cfg.domain[0] ? cfg.domain : "(unset)", cfg.nsearch, cfg.ndots);
+        fprintf(stderr, "k3sm-dns: getaddrinfo node=%s enabled=%d exclusive=%d nservers=%d server=%s port=%s domain=%s nsearch=%d ndots=%d\n",
+                node ? node : "(null)", cfg.enabled, cfg.exclusive, cfg.nservers,
+                cfg.nservers > 0 ? cfg.servers[0] : "(unset)",
+                cfg.nservers > 0 ? cfg.ports[0] : cfg.port,
+                cfg.domain[0] ? cfg.domain : "(unset)", cfg.nsearch, cfg.ndots);
     }
 
-    /* Not configured, or no hostname to resolve: defer to the system. */
-    if (!cfg.enabled || node == NULL || node[0] == '\0') {
-        if (dbg) {
-            fprintf(stderr, "k3sm-dns: DEFER node=%s (enabled=%d) — K3SM_DNS_SERVER not seen in-pod\n",
-                    node ? node : "(null)", cfg.enabled);
-        }
-        return getaddrinfo(node, service, hints, res);
+    /* No hostname to resolve (a service-only lookup): the system handles it. */
+    if (node == NULL || node[0] == '\0') {
+        return k3sm_host_getaddrinfo("no-node", node, service, hints, res);
+    }
+    /* Not configured and not exclusive: defer to the system. */
+    if (!cfg.enabled && !cfg.exclusive) {
+        return k3sm_host_getaddrinfo("unconfigured", node, service, hints, res);
     }
     /* AI_NUMERICHOST or a literal IPv4: let the system parse it. */
     struct in_addr tmp;
     if (inet_pton(AF_INET, node, &tmp) == 1) {
-        return getaddrinfo(node, service, hints, res);
+        return k3sm_host_getaddrinfo("numeric", node, service, hints, res);
     }
     if (hints != NULL && (hints->ai_flags & AI_NUMERICHOST)) {
-        return getaddrinfo(node, service, hints, res);
+        return k3sm_host_getaddrinfo("numerichost", node, service, hints, res);
     }
-    /* Only IPv4 is served by the cluster path; for AF_INET6-only requests defer. */
-    if (hints != NULL && hints->ai_family == AF_INET6) {
-        return getaddrinfo(node, service, hints, res);
+    if (cfg.exclusive) {
+        /* A numeric IPv6 literal needs no resolution. Checked BEFORE the
+         * AF_INET6-hints rule below, so ("::1", AF_INET6) still parses. */
+        struct in6_addr tmp6;
+        if (inet_pton(AF_INET6, node, &tmp6) == 1) {
+            return k3sm_host_getaddrinfo("numeric6", node, service, hints, res);
+        }
+        if (k3sm_is_localhost(node)) {
+            return k3sm_host_getaddrinfo("localhost", node, service, hints, res);
+        }
+        if (cfg.nservers == 0) {
+            /* Exclusive with no usable server: fail closed, never the host. */
+            if (dbg) {
+                fprintf(stderr, "k3sm-dns: EAI_AGAIN node=%s — exclusive mode with no usable server\n", node);
+            }
+            return EAI_AGAIN;
+        }
+        if (hints != NULL && hints->ai_family == AF_INET6) {
+            /* The shim serves no AAAA, and exclusive mode forbids asking the
+             * host resolver for one. */
+            if (dbg) {
+                fprintf(stderr, "k3sm-dns: EAI_NONAME node=%s — AF_INET6 in exclusive mode\n", node);
+            }
+            return EAI_NONAME;
+        }
+    } else if (hints != NULL && hints->ai_family == AF_INET6) {
+        /* Only IPv4 is served by the cluster path; for AF_INET6-only requests defer. */
+        return k3sm_host_getaddrinfo("inet6", node, service, hints, res);
     }
 
     /* Resolve the service to a numeric port up front. Only a numeric service
      * out of the uint16 range is a hard EAI_SERVICE here; a NAMED service
-     * ("http") sets named_service and the walk below defers to the system
-     * resolver wherever it would otherwise have to fabricate the port (see
-     * k3sm_parse_port). */
+     * ("http") sets named_service. Outside exclusive mode the walk below defers
+     * to the system resolver wherever it would otherwise have to fabricate the
+     * port (see k3sm_parse_port). In exclusive mode the port comes from a
+     * service-only lookup instead, so the name still resolves through the pod's
+     * servers and an unknown service fails before any query. */
     uint16_t port = 0;
     int named_service = 0;
     int serr = k3sm_parse_port(service, &port, &named_service);
     if (serr != 0) {
         return serr;
+    }
+    if (named_service && cfg.exclusive) {
+        serr = k3sm_service_port(service, hints, &port);
+        if (serr != 0) {
+            if (dbg) {
+                fprintf(stderr, "k3sm-dns: service %s unresolved (rc=%d)\n", service, serr);
+            }
+            return serr;
+        }
+        named_service = 0;
     }
 
     char cands[K3SM_MAX_SEARCH + 1][K3SM_MAX_NAME];
@@ -1028,13 +1362,17 @@ int k3sm_getaddrinfo(const char *node, const char *service,
      * a definitive miss decided without any wire I/O (see the walk below). */
     int bad[K3SM_MAX_SEARCH + 1] = {0};
     int ncand = k3sm_candidates(&cfg, node, cands, bad, K3SM_MAX_SEARCH + 1);
+    /* dead[s]: server s failed at the transport level earlier in THIS call and
+     * is not asked again (see k3sm_query_candidate). */
+    int dead[K3SM_MAX_NS] = {0};
     /*
      * cluster_tempfail records that a CLUSTER-scoped candidate failed
      * transiently. We keep walking past it (a later EXTERNAL absolute candidate
      * may still fall through to the host and keep external DNS alive across a
      * resolver bounce), and only fail closed with EAI_AGAIN at the end if no
      * external fall-through happened. A transient on an EXTERNAL candidate falls
-     * through to the host immediately.
+     * through to the host immediately. In exclusive mode every candidate is
+     * cluster-scoped (k3sm_candidate_fail_closed), so nothing falls through.
      */
     int cluster_tempfail = 0;
     for (int i = 0; i < ncand; i++) {
@@ -1053,7 +1391,7 @@ int k3sm_getaddrinfo(const char *node, const char *service,
          */
         if (bad[i]) {
             if (dbg) {
-                k3sm_trace_verdict(&cfg, cands[i], K3SM_DNS_MISS);
+                k3sm_trace_verdict(&cfg, cands[i], 0, K3SM_DNS_MISS);
             }
             continue;
         }
@@ -1070,28 +1408,20 @@ int k3sm_getaddrinfo(const char *node, const char *service,
         }
         if (named_service && !k3sm_candidate_fail_closed(&cfg, cands[i])) {
             /*
-             * EXTERNAL candidate + NAMED service: even a HIT would need a
-             * fabricated port, and the system resolver handles both the name
-             * and the service natively — defer the whole call without querying.
-             * (An up-front EAI_SERVICE here once broke previously-working
-             * external lookups like ("api.github.com", "https").)
+             * EXTERNAL candidate + NAMED service (never in exclusive mode): even
+             * a HIT would need a fabricated port, and the system resolver
+             * handles both the name and the service natively — defer the whole
+             * call without querying. (An up-front EAI_SERVICE here once broke
+             * previously-working external lookups like ("api.github.com",
+             * "https").)
              */
-            if (dbg) {
-                fprintf(stderr,
-                        "k3sm-dns: DEFER node=%s service=%s — external candidate %s "
-                        "with named service\n",
-                        node, service, cands[i]);
-            }
-            return getaddrinfo(node, service, hints, res);
+            return k3sm_host_getaddrinfo("named-service-external", node, service, hints, res);
         }
         uint8_t addr4[4];
-        int rc = K3SM_DNS_TEMPFAIL;
-        for (int attempt = 0; attempt < K3SM_DNS_ATTEMPTS && rc == K3SM_DNS_TEMPFAIL;
-             attempt++) {
-            rc = k3sm_query_a(&cfg, cands[i], addr4);
-        }
+        int si = 0;
+        int rc = k3sm_query_candidate(&cfg, cands[i], addr4, dead, &si);
         if (dbg) {
-            k3sm_trace_verdict(&cfg, cands[i], rc);
+            k3sm_trace_verdict(&cfg, cands[i], si, rc);
         }
         if (rc == K3SM_DNS_HIT) {
             if (named_service) {
@@ -1100,7 +1430,8 @@ int k3sm_getaddrinfo(const char *node, const char *service,
                  * is named (external ones deferred above), and the A-record
                  * path cannot map "http" to a port for the fabricated
                  * sockaddr — refuse honestly rather than return port 0. Use a
-                 * numeric port for cluster names.
+                 * numeric port for cluster names. (Exclusive mode resolved the
+                 * port up front and cleared named_service.)
                  */
                 return EAI_SERVICE;
             }
@@ -1125,13 +1456,7 @@ int k3sm_getaddrinfo(const char *node, const char *service,
              * fall through to the host resolver — this keeps github.com and
              * other external names resolving across a resolver blip.
              */
-            if (dbg) {
-                fprintf(stderr,
-                        "k3sm-dns: DEFER node=%s — external candidate %s transient, "
-                        "falling through to host\n",
-                        node, cands[i]);
-            }
-            return getaddrinfo(node, service, hints, res);
+            return k3sm_host_getaddrinfo("external-tempfail", node, service, hints, res);
         }
         /* K3SM_DNS_MISS: definitive — try the next search candidate. */
     }
@@ -1143,18 +1468,23 @@ int k3sm_getaddrinfo(const char *node, const char *service,
          */
         if (dbg) {
             fprintf(stderr,
-                    "k3sm-dns: EAI_AGAIN node=%s — cluster resolver unreachable "
-                    "(%d candidate(s), %d attempts each)\n",
-                    node, ncand, K3SM_DNS_ATTEMPTS);
+                    "k3sm-dns: EAI_AGAIN node=%s — resolver unreachable "
+                    "(%d candidate(s), %d server(s), %d attempts)\n",
+                    node, ncand, cfg.nservers, K3SM_DNS_ATTEMPTS);
         }
         return EAI_AGAIN;
     }
+    if (cfg.exclusive) {
+        /* Every candidate definitively missed, and exclusive mode has no host
+         * resolver to ask: the name does not exist for this pod. */
+        if (dbg) {
+            fprintf(stderr, "k3sm-dns: EAI_NONAME node=%s — every candidate missed (exclusive)\n", node);
+        }
+        return EAI_NONAME;
+    }
     /* Every candidate definitively missed: an external name — fall through so
      * the host resolver can answer it. */
-    if (dbg) {
-        fprintf(stderr, "k3sm-dns: DEFER node=%s — cluster resolver missed all %d candidate(s)\n", node, ncand);
-    }
-    return getaddrinfo(node, service, hints, res);
+    return k3sm_host_getaddrinfo("all-missed", node, service, hints, res);
 }
 
 /* ==================================================================== */

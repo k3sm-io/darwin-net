@@ -18,6 +18,10 @@ package dns
 
 import (
 	"context"
+	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"maps"
 	"net"
 	"net/netip"
@@ -31,6 +35,23 @@ import (
 
 	netv1 "k3sm.io/apis/net/v1"
 )
+
+// shimABIEnvNames is the complete set of environment names the getaddrinfo shim
+// reads with getenv("K3SM_DNS_…"): the one want-list both the C<->Go canary
+// (TestShimEnvNamesMatchC) and the encoder tests read, so a name added on one
+// side and not the other fails a test rather than silently disabling DNS. It
+// lives with the tests because only tests read it; TestShimEnvNamesMatchC
+// parses env.go and fails if an exported EnvDNS* const is missing from it.
+var shimABIEnvNames = []string{
+	EnvDNSServer,
+	EnvDNSPort,
+	EnvDNSDomain,
+	EnvDNSSearch,
+	EnvDNSNdots,
+	EnvDNSDebug,
+	EnvDNSServers,
+	EnvDNSExclusive,
+}
 
 func TestConfigToEnv(t *testing.T) {
 	tests := []struct {
@@ -193,11 +214,240 @@ func TestShimEnvNamesMatchC(t *testing.T) {
 	}
 	slices.Sort(got)
 
-	want := []string{EnvDNSServer, EnvDNSPort, EnvDNSDomain, EnvDNSSearch, EnvDNSNdots, EnvDNSDebug}
+	want := slices.Clone(shimABIEnvNames)
 	slices.Sort(want)
 
 	if !slices.Equal(got, want) {
-		t.Errorf("getaddrinfo-shim ABI drift between %s and pkg/dns consts:\n  C shim getenv names: %v\n  Go env-name consts:  %v", shimPath, got, want)
+		t.Errorf("getaddrinfo-shim ABI drift between %s and pkg/dns shimABIEnvNames:\n  C shim getenv names: %v\n  Go shimABIEnvNames:  %v", shimPath, got, want)
+	}
+
+	// The want-list must itself cover every exported EnvDNS* const in env.go, so a
+	// new ABI const that was never added to shimABIEnvNames cannot slip past the
+	// canary above. go/parser reads the declarations, not a regex over text.
+	t.Run("every exported EnvDNS const is in shimABIEnvNames", func(t *testing.T) {
+		consts := envDNSConsts(t, "env.go")
+		if len(consts) == 0 {
+			t.Fatal("no EnvDNS* consts found in env.go — parser or layout drifted")
+		}
+		for name, value := range consts {
+			if !slices.Contains(shimABIEnvNames, value) {
+				t.Errorf("env.go const %s = %q is not in shimABIEnvNames", name, value)
+			}
+		}
+	})
+}
+
+// envDNSConsts parses path and returns every exported const whose name starts
+// with "EnvDNS", mapped to its string-literal value.
+func envDNSConsts(t *testing.T, path string) map[string]string {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	out := map[string]string{}
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs := spec.(*ast.ValueSpec)
+			for i, id := range vs.Names {
+				if !id.IsExported() || !strings.HasPrefix(id.Name, "EnvDNS") {
+					continue
+				}
+				if i >= len(vs.Values) {
+					t.Fatalf("const %s has no explicit value", id.Name)
+				}
+				lit, ok := vs.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					t.Fatalf("const %s is not a string literal", id.Name)
+				}
+				v, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					t.Fatalf("unquote const %s: %v", id.Name, err)
+				}
+				out[id.Name] = v
+			}
+		}
+	}
+	return out
+}
+
+// TestShimMaxNameserversMatchesC binds the C shim's nameserver cap
+// (`#define K3SM_MAX_NS`, the size of its servers[] table) to
+// netv1.MaxNameservers, the bound Validate enforces on a DNSPolicyNone config.
+// A drift would let a config validate with more servers than the shim keeps, or
+// make the shim keep fewer than the type allows.
+func TestShimMaxNameserversMatchesC(t *testing.T) {
+	if cMax := shimDefine(t, "K3SM_MAX_NS"); cMax != netv1.MaxNameservers {
+		t.Errorf("getaddrinfo-shim nameserver-cap drift: #define K3SM_MAX_NS = %d, but netv1.MaxNameservers = %d", cMax, netv1.MaxNameservers)
+	}
+}
+
+// TestConfigToEnvPolicyNone pins the DNSPolicyNone encoding and binds the
+// encoder's OUTPUT to the canary's want-list: every key emitted for either
+// policy must be a name the C shim reads.
+func TestConfigToEnvPolicyNone(t *testing.T) {
+	t.Parallel()
+	none := func(ns ...string) netv1.DNSConfig {
+		return netv1.DNSConfig{
+			Policy:        netv1.DNSPolicyNone,
+			Nameservers:   ns,
+			SearchDomains: []string{"a.example", "b.example"},
+			NDots:         2,
+		}
+	}
+	tests := []struct {
+		name    string
+		cfg     netv1.DNSConfig
+		want    map[string]string
+		wantErr error
+	}{
+		{
+			name: "IPv4 nameservers are emitted in pod order with exclusive mode",
+			cfg:  none("1.1.1.1", "9.9.9.9"),
+			want: map[string]string{
+				EnvDNSServers:   "1.1.1.1 9.9.9.9",
+				EnvDNSExclusive: "1",
+				EnvDNSSearch:    "a.example b.example",
+				EnvDNSNdots:     "2",
+			},
+		},
+		{
+			name: "a set cluster domain is emitted; it carries no policy meaning",
+			cfg: func() netv1.DNSConfig {
+				c := none("1.1.1.1")
+				c.ClusterDomain = "corp.example"
+				return c
+			}(),
+			want: map[string]string{
+				EnvDNSServers:   "1.1.1.1",
+				EnvDNSExclusive: "1",
+				EnvDNSDomain:    "corp.example",
+				EnvDNSSearch:    "a.example b.example",
+				EnvDNSNdots:     "2",
+			},
+		},
+		{
+			name: "zero ndots defaults and empty search still emits both keys",
+			cfg:  netv1.DNSConfig{Policy: netv1.DNSPolicyNone, Nameservers: []string{"1.1.1.1"}},
+			want: map[string]string{
+				EnvDNSServers:   "1.1.1.1",
+				EnvDNSExclusive: "1",
+				EnvDNSSearch:    "",
+				EnvDNSNdots:     "5",
+			},
+		},
+		{
+			name: "an IPv4-mapped IPv6 nameserver is kept in dotted form",
+			cfg:  none("::ffff:1.1.1.1"),
+			want: map[string]string{
+				EnvDNSServers:   "1.1.1.1",
+				EnvDNSExclusive: "1",
+				EnvDNSSearch:    "a.example b.example",
+				EnvDNSNdots:     "2",
+			},
+		},
+		{
+			name: "IPv6 nameservers are dropped and reported, the IPv4 subset kept in order",
+			cfg:  none("2606:4700:4700::1111", "1.1.1.1", "9.9.9.9"),
+			want: map[string]string{
+				EnvDNSServers:   "1.1.1.1 9.9.9.9",
+				EnvDNSExclusive: "1",
+				EnvDNSSearch:    "a.example b.example",
+				EnvDNSNdots:     "2",
+			},
+			wantErr: ErrNameserversDropped,
+		},
+		{
+			name:    "all-IPv6 nameservers yield no env and ErrNoUsableNameserver",
+			cfg:     none("2606:4700:4700::1111", "2620:fe::fe"),
+			want:    nil,
+			wantErr: ErrNoUsableNameserver,
+		},
+		{
+			name:    "an invalid None config (cluster DNS IP set) yields no env",
+			cfg:     netv1.DNSConfig{Policy: netv1.DNSPolicyNone, Nameservers: []string{"1.1.1.1"}, ClusterDNSIP: "10.43.0.10"},
+			want:    nil,
+			wantErr: netv1.ErrInvalid,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ConfigToEnvChecked(tt.cfg)
+			if tt.wantErr == nil && err != nil {
+				t.Fatalf("ConfigToEnvChecked() err = %v, want nil", err)
+			}
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Fatalf("ConfigToEnvChecked() err = %v, want %v", err, tt.wantErr)
+			}
+			if !maps.Equal(got, tt.want) {
+				t.Fatalf("ConfigToEnvChecked() = %v, want %v", got, tt.want)
+			}
+			if _, ok := got[EnvDNSServer]; ok {
+				t.Fatalf("a None config emitted %s; the two encodings must be disjoint", EnvDNSServer)
+			}
+			assertKeysInShimABI(t, got)
+			// The ClusterFirst-only wrapper never encodes a None config.
+			if env := ConfigToEnv(tt.cfg); env != nil {
+				t.Fatalf("ConfigToEnv(None) = %v, want nil (ClusterFirst-only wrapper)", env)
+			}
+		})
+	}
+
+	t.Run("dropped error names the dropped servers", func(t *testing.T) {
+		t.Parallel()
+		_, err := ConfigToEnvChecked(none("2606:4700:4700::1111", "1.1.1.1"))
+		if err == nil || !strings.Contains(err.Error(), "2606:4700:4700::1111") {
+			t.Fatalf("err = %v, want it to name the dropped server", err)
+		}
+	})
+
+	t.Run("ClusterFirst output is unchanged and inside the shim ABI", func(t *testing.T) {
+		t.Parallel()
+		cfg := netv1.DNSConfig{
+			ClusterDNSIP:  "10.43.0.10",
+			ClusterDomain: "cluster.local",
+			SearchDomains: []string{"default.svc.cluster.local", "svc.cluster.local", "cluster.local"},
+		}
+		got, err := ConfigToEnvChecked(cfg)
+		if err != nil {
+			t.Fatalf("ConfigToEnvChecked(ClusterFirst) err = %v", err)
+		}
+		want := map[string]string{
+			EnvDNSServer: "10.43.0.10",
+			EnvDNSDomain: "cluster.local",
+			EnvDNSSearch: "default.svc.cluster.local svc.cluster.local cluster.local",
+			EnvDNSNdots:  "5",
+		}
+		if !maps.Equal(got, want) {
+			t.Fatalf("ConfigToEnvChecked(ClusterFirst) = %v, want %v", got, want)
+		}
+		if wrapped := ConfigToEnv(cfg); !maps.Equal(wrapped, got) {
+			t.Fatalf("ConfigToEnv = %v, want the checked encoder's %v", wrapped, got)
+		}
+		assertKeysInShimABI(t, got)
+	})
+
+	t.Run("ClusterFirst invalid config returns the validation error", func(t *testing.T) {
+		t.Parallel()
+		got, err := ConfigToEnvChecked(netv1.DNSConfig{ClusterDomain: "cluster.local"})
+		if got != nil || !errors.Is(err, netv1.ErrInvalid) {
+			t.Fatalf("ConfigToEnvChecked(no VIP) = %v, %v; want nil, ErrInvalid", got, err)
+		}
+	})
+}
+
+// assertKeysInShimABI fails when env carries a key the C shim does not read.
+func assertKeysInShimABI(t *testing.T, env map[string]string) {
+	t.Helper()
+	for k := range env {
+		if !slices.Contains(shimABIEnvNames, k) {
+			t.Errorf("encoder emitted %s, which is not in shimABIEnvNames (the C shim never reads it)", k)
+		}
 	}
 }
 
