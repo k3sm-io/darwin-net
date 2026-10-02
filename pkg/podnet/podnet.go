@@ -105,11 +105,6 @@ func WithLogger(l *slog.Logger) Option {
 	return func(n *Network) { n.log = l }
 }
 
-// withAliasManager overrides the alias manager (tests inject the rootless fake).
-func withAliasManager(a aliasManager) Option {
-	return func(n *Network) { n.alias = a }
-}
-
 // WithNetdHelper routes lo0 alias plumbing through the root netd daemon at
 // socketPath (empty uses the default socket) instead of the direct, root-gated
 // ifconfig manager, so an unprivileged process can run the pod network. It is the
