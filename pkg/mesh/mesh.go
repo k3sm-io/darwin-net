@@ -100,12 +100,6 @@ func WithUTUNName(name string) Option {
 	}
 }
 
-// withDevice injects a Device, bypassing the default wireguard device (tests use
-// it to drive the reconcile logic without privilege).
-func withDevice(d Device) Option {
-	return func(m *Mesh) { m.dev = d }
-}
-
 // WithNetdHelper routes the privileged mesh datapath through the root netd daemon
 // at socketPath: the device sends ConfigureMesh/RemoveMesh and the daemon (which
 // holds the private key, resolved from privKeyRef) creates the utun, programs

@@ -269,11 +269,6 @@ func WithPolicyTable(t *PolicyTable) Option {
 	return func(p *Proxy) { p.policy = t }
 }
 
-// withAliasManager overrides the alias manager (tests inject the rootless fake).
-func withAliasManager(a aliasManager) Option {
-	return func(p *Proxy) { p.alias = a }
-}
-
 // WithNetdHelper routes both privileged proxy operations — the lo0 VIP alias and
 // the privileged-port (<1024) ClusterIP bind — through the root netd daemon at
 // socketPath (empty uses the default socket), so the Service proxy runs
