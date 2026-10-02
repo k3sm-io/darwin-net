@@ -90,11 +90,6 @@ func WithTimeout(d time.Duration) Option {
 	return func(r *Resolver) { r.timeout = d }
 }
 
-// withDialer overrides the UDP dialer; tests use it to reach a stub server.
-func withDialer(d func(ctx context.Context, network, addr string) (net.Conn, error)) Option {
-	return func(r *Resolver) { r.dial = d }
-}
-
 // NewResolver builds a Resolver for cfg. It returns an error if cfg is not usable
 // (missing cluster DNS IP or domain). The DNS server port defaults to 53.
 func NewResolver(cfg netv1.DNSConfig, opts ...Option) (*Resolver, error) {
