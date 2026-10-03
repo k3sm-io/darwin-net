@@ -28,65 +28,26 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 )
 
-// udpEchoBackend is a loopback UDP echo server standing in for a pod backend: it
-// echoes every datagram back to its sender and records each distinct source it
-// observed. Because the relay opens ONE connected upstream socket per client flow,
-// the count of distinct observed sources equals the number of flows — so the test
-// can assert a single client's datagrams were relayed through one flow (Pick called
-// once), not re-picked per datagram.
-type udpEchoBackend struct {
-	conn net.PacketConn
-	wg   sync.WaitGroup
+// fakeRelayVIP and fakeRelayBackend are the addresses the fake relays are keyed
+// on. Nothing binds them: the VIP socket and the upstreams are in-memory fakes
+// (fakeudp_test.go), so a privileged port and a non-loopback address cost nothing.
+var (
+	fakeRelayVIP     = netip.MustParseAddrPort("10.43.0.53:53")
+	fakeRelayBackend = netip.MustParseAddrPort("10.42.0.9:5353")
+)
 
-	mu   sync.Mutex
-	srcs map[string]int
-}
-
-// newUDPEchoBackend stands up the echo server on 127.0.0.1 and starts its read
-// loop. Close stops it.
-func newUDPEchoBackend(t *testing.T) *udpEchoBackend {
-	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen udp echo backend: %v", err)
-	}
-	b := &udpEchoBackend{conn: pc, srcs: make(map[string]int)}
-	b.wg.Add(1)
-	go func() {
-		defer b.wg.Done()
-		buf := make([]byte, 65535)
-		for {
-			n, addr, err := pc.ReadFrom(buf)
-			if err != nil {
-				return // closed
-			}
-			b.mu.Lock()
-			b.srcs[addr.String()]++
-			b.mu.Unlock()
-			_, _ = pc.WriteTo(buf[:n], addr)
-		}
-	}()
-	return b
-}
-
-// addrPort returns the backend's listen IP and port for registration as an
-// endpoint.
-func (b *udpEchoBackend) addrPort() (string, int32) {
-	ap := b.conn.LocalAddr().(*net.UDPAddr)
-	return ap.IP.String(), int32(ap.Port)
-}
-
-// uniqueSrcs reports how many distinct upstream sources the backend observed.
-func (b *udpEchoBackend) uniqueSrcs() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.srcs)
-}
-
-// close stops the echo server and joins its goroutine.
-func (b *udpEchoBackend) close() {
-	_ = b.conn.Close()
-	b.wg.Wait()
+// newFakeRelay builds an UNSTARTED relay on a fake VIP socket, with one Ready
+// backend (fakeRelayBackend) in its routing table and be's dial as its upstream
+// dial. Call start to run the dispatcher and sweeper; the fake VIP socket is
+// r.conn.(*fakeVIPConn).
+func newFakeRelay(be *fakeUDPBackend, idle time.Duration, perSourceCap int, budget *udpBudget) *udpRelay {
+	conn := newFakeVIPConn(fakeRelayVIP)
+	key := PortKey{ClusterIP: fakeRelayVIP.Addr().String(), Port: int32(fakeRelayVIP.Port()), Protocol: netv1.ProtocolUDP}
+	tbl := NewRoutingTable(netip.Prefix{})
+	tbl.SetEndpoints(key, []netv1.Endpoint{{IP: fakeRelayBackend.Addr().String(), Port: int32(fakeRelayBackend.Port()), Ready: true}})
+	r := newUDPRelay(conn, key, tbl, egressScope{}, idle, perSourceCap, budget, slog.Default())
+	r.dial = be.dial
+	return r
 }
 
 // flowCount reports the number of live flows. It is a test accessor for the
@@ -131,142 +92,138 @@ func (b *udpBudget) liveSources() int {
 	return len(b.bySource)
 }
 
-// TestUDPDatagramRelayRoundTrip is the B23 gate: a ClusterIP UDP Service relays a
-// client datagram to a Ready backend and the echoed payload round-trips back. It
-// drives the full Proxy reconcile path (so openListener builds the relay) with the
-// rootless noop alias manager and a 127.0.0.1 VIP on a free high port, exactly as
-// the TCP proxy tests do. On main the UDP path opens no datagram socket, so this
-// round-trip cannot complete — that is the red-before.
+// TestUDPDatagramRelayRoundTrip is the ClusterIP UDP gate, in two halves that
+// together cover what one real-socket round trip did (that version survives as
+// TestUDPDatagramRelayRoundTripReal under the integration tag).
 //
-// It also asserts a second datagram from the SAME client reuses the SAME
-// flow/backend (the backend observes a single upstream source), proving the relay
-// picks a backend once per flow rather than per datagram.
+// The reconcile half drives the full Proxy path: a ClusterIP UDP Service binds the
+// relay's datagram socket through the listenUDP seam at exactly the VIP address and
+// port, ensures the lo0 alias first, and ReconcileDelete closes that socket.
+//
+// The data-path half runs a started relay: a client datagram is forwarded to the
+// picked backend and the echo comes back to that client, and a second datagram from
+// the SAME client reuses the SAME flow — one dial, one upstream carrying both —
+// proving the relay picks a backend once per flow rather than per datagram.
 func TestUDPDatagramRelayRoundTrip(t *testing.T) {
 	t.Parallel()
-	const vip = "127.0.0.1"
 
-	be := newUDPEchoBackend(t)
-	defer be.close()
-	beIP, bePort := be.addrPort()
+	t.Run("reconcile binds the VIP socket and delete closes it", func(t *testing.T) {
+		t.Parallel()
+		vip := fakeRelayVIP.Addr()
+		bound := make(chan *fakeVIPConn, 1)
+		listen := func(ap netip.AddrPort) (udpVIPConn, error) {
+			c := newFakeVIPConn(ap)
+			bound <- c
+			return c, nil
+		}
+		alias := newNoopAliasManager()
+		tbl := NewRoutingTable(netip.Prefix{})
+		p := New(tbl, withAliasManager(alias), withListenUDP(listen))
 
-	// 127/8 is real on loopback, so the relay binds the specific VIP with no alias
-	// or privilege; freePort returns an ephemeral (>=1024) port.
-	port := freePort(t, vip)
-	alias := newNoopAliasManager()
-	tbl := NewRoutingTable(netip.Prefix{})
-	p := New(tbl, withAliasManager(alias))
+		ctx, cancel := context.WithCancel(context.Background())
+		runDone := make(chan struct{})
+		go func() { defer close(runDone); _ = p.Run(ctx) }()
+		defer func() { cancel(); <-runDone }()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	runDone := make(chan struct{})
-	go func() { defer close(runDone); _ = p.Run(ctx) }()
+		sp := &netv1.ServicePort{Port: int32(fakeRelayVIP.Port()), TargetPort: 5353, Protocol: netv1.ProtocolUDP}
+		eps := []netv1.Endpoint{{IP: fakeRelayBackend.Addr().String(), Port: int32(fakeRelayBackend.Port()), Ready: true}}
+		if err := p.Reconcile(vip.String(), sp, eps); err != nil {
+			t.Fatalf("reconcile udp: %v", err)
+		}
 
-	sp := &netv1.ServicePort{Port: port, TargetPort: bePort, Protocol: netv1.ProtocolUDP}
-	eps := []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}}
-	if err := p.Reconcile(vip, sp, eps); err != nil {
-		t.Fatalf("reconcile udp: %v", err)
-	}
+		var conn *fakeVIPConn
+		select {
+		case conn = <-bound:
+		case <-time.After(fakeHandledTimeout):
+			t.Fatal("the UDP reconcile never bound a VIP datagram socket")
+		}
+		if conn.local != fakeRelayVIP {
+			t.Fatalf("VIP socket bound at %v, want exactly %v", conn.local, fakeRelayVIP)
+		}
+		// openListener ensures the alias before it binds, and the bind is ordered
+		// before this read by the channel, so the count is already final.
+		if alias.ensures(vip) == 0 {
+			t.Fatalf("UDP relay did not ensure the lo0 alias")
+		}
 
-	key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolUDP}
-	waitBackends(t, tbl, key, 1)
+		p.ReconcileDelete(PortKey{ClusterIP: vip.String(), Port: int32(fakeRelayVIP.Port()), Protocol: netv1.ProtocolUDP})
+		select {
+		case <-conn.done:
+		case <-time.After(fakeHandledTimeout):
+			t.Fatal("ReconcileDelete did not close the VIP datagram socket")
+		}
+	})
 
-	vipAddr := &net.UDPAddr{IP: net.ParseIP(vip), Port: int(port)}
-	c, err := net.DialUDP("udp", nil, vipAddr)
-	if err != nil {
-		t.Fatalf("dial vip udp: %v", err)
-	}
-	defer c.Close()
+	t.Run("one flow per client, echoed back to that client", func(t *testing.T) {
+		t.Parallel()
+		be := newFakeUDPBackend(true)
+		relay := newFakeRelay(be, time.Hour, maxUDPFlowsPerSource, newUDPBudget(MaxUDPFlows, MaxUDPFlows))
+		vip := relay.conn.(*fakeVIPConn)
+		relay.start()
+		defer relay.Close()
 
-	// Phase 1: establish the flow and round-trip the first payload, tolerating the
-	// brief window before the relay's datagram socket is bound (a datagram sent too
-	// early is dropped / ICMP-refused). Every send is from the same client socket,
-	// so they all map to one flow once the relay is up.
-	const first = "hello-udp"
-	if got := udpRoundTripRetry(t, c, first, 3*time.Second); got != first {
-		t.Fatalf("first datagram did not round-trip: got %q, want %q", got, first)
-	}
+		client := netip.MustParseAddrPort("10.42.1.7:40000")
+		for _, payload := range []string{"hello-udp", "world-udp"} {
+			vip.deliver(t, client, payload)
+			got := vip.reply(t)
+			if string(got.data) != payload || got.addr != client {
+				t.Fatalf("reply = %q to %v, want %q to %v", got.data, got.addr, payload, client)
+			}
+		}
 
-	// Phase 2: the relay is up; a second datagram from the SAME client must reuse the
-	// SAME flow (one Pick, one connected upstream socket), not open a new one.
-	const second = "world-udp"
-	if got := udpRoundTrip(t, c, second, 2*time.Second); got != second {
-		t.Fatalf("second datagram round-trip: got %q, want %q", got, second)
-	}
+		if d := be.dials(); d != 1 {
+			t.Fatalf("relay dialed %d upstreams for one client, want 1 (flow/backend must be reused per client)", d)
+		}
+		if s := be.flowsSeen(); s != 1 {
+			t.Fatalf("backend saw %d flows, want 1", s)
+		}
+		up := be.upstream(0)
+		if up.remote != fakeRelayBackend {
+			t.Fatalf("upstream dialed %v, want the Ready backend %v", up.remote, fakeRelayBackend)
+		}
+		if w := up.wrote(); w != 2 {
+			t.Fatalf("upstream carried %d datagrams, want 2", w)
+		}
 
-	// The backend observed every relayed datagram from a SINGLE upstream source
-	// socket — proof the relay picked a backend once per flow and reused the
-	// connected upstream socket rather than re-picking per datagram.
-	if u := be.uniqueSrcs(); u != 1 {
-		t.Fatalf("backend saw %d distinct upstream sources, want 1 (flow/backend must be reused per client)", u)
-	}
-
-	// The relay ensured the lo0 alias for the VIP, like the TCP path.
-	if alias.ensures(netip.MustParseAddr(vip)) == 0 {
-		t.Fatalf("UDP relay did not ensure the lo0 alias")
-	}
-
-	// Teardown via the per-port delete (relay.Close) then full shutdown; both join
-	// the relay's goroutines leak-free (-race proves it).
-	p.ReconcileDelete(key)
-	cancel()
-	<-runDone
+		// Close joins the dispatcher, the sweeper, and the flow's reader (-race
+		// proves the join) and closes every socket it owned.
+		if err := relay.Close(); err != nil {
+			t.Fatalf("relay close: %v", err)
+		}
+		if !vip.closed() || !up.closed() {
+			t.Fatalf("after Close: vip closed=%v upstream closed=%v, want both", vip.closed(), up.closed())
+		}
+	})
 }
 
 // TestUDPRelayIdleFlowGC asserts the relay idle-GCs a flow that falls silent, in
 // two phases that are deliberately NOT run against the same relay.
 //
-// Phase 1 uses a LONG idle timeout. With a short one the background sweeper races
-// the in-flight reply: it reaps the flow — closing the upstream socket, killing
-// that flow's reader — before the echo comes back, and the round-trip times out
-// through no fault of the relay. That is what a loaded box does to a 200ms idle
-// window, and it is the failure captured under B207. A GC test must not make its
-// own round-trip the thing being GC'd. The reap is then forced through
-// sweepExpired, the seam factored out for exactly this, with a clock past the
-// threshold — deterministic, no polling, no clock luck.
+// Phase 1 uses a LONG idle timeout so the background sweeper cannot race the
+// round trip, and forces the reap through sweepExpired, the seam factored out for
+// exactly this, with a clock past the threshold — deterministic, no clock luck.
 //
 // Phase 2 is what phase 1 gives up: proof that the sweeper GOROUTINE performs that
 // reap on its own timer with nobody calling sweepExpired. It seeds a flow
-// synchronously through upstreamFor (a non-nil return IS the proof the flow
-// existed) and then asserts only that the count reaches zero. That claim is
-// monotone: load can delay it, never falsify it, and a reap that beats the first
-// observation is a pass, not a flake.
+// synchronously through upstreamFor and waits for the sweeper to close that flow's
+// upstream. The wait is monotone: load can delay it, never falsify it.
 func TestUDPRelayIdleFlowGC(t *testing.T) {
 	t.Parallel()
 
-	be := newUDPEchoBackend(t)
-	defer be.close()
-	beIP, bePort := be.addrPort()
-
-	newRelay := func(t *testing.T, idle time.Duration) *udpRelay {
-		t.Helper()
-		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-		if err != nil {
-			t.Fatalf("listen vip udp: %v", err)
-		}
-		vipAddr := pc.LocalAddr().(*net.UDPAddr)
-		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
-		tbl := NewRoutingTable(netip.Prefix{})
-		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
-		r := newUDPRelay(pc, key, tbl, egressScope{}, idle, maxUDPFlowsPerSource, newUDPBudget(MaxUDPFlows, MaxUDPFlows), slog.Default())
-		r.start()
-		t.Cleanup(func() { _ = r.Close() })
-		return r
-	}
-
 	t.Run("a silent flow is reaped, and its accounting with it", func(t *testing.T) {
+		t.Parallel()
 		const idle = time.Minute
-		relay := newRelay(t, idle)
+		be := newFakeUDPBackend(true)
+		budget := newUDPBudget(MaxUDPFlows, MaxUDPFlows)
+		relay := newFakeRelay(be, idle, maxUDPFlowsPerSource, budget)
+		vip := relay.conn.(*fakeVIPConn)
+		relay.start()
+		defer relay.Close()
 
-		c, err := net.DialUDP("udp", nil, relay.conn.LocalAddr().(*net.UDPAddr))
-		if err != nil {
-			t.Fatalf("dial vip udp: %v", err)
-		}
-		defer c.Close()
-
-		// The VIP socket is bound before this write, so the datagram is queued rather
-		// than dropped; the budget is a liveness backstop for a starved dispatcher,
-		// not a performance measurement.
-		if got := udpRoundTrip(t, c, "x", 10*time.Second); got != "x" {
-			t.Fatalf("datagram did not round-trip: got %q", got)
+		client := netip.MustParseAddrPort("10.42.1.8:40000")
+		vip.deliver(t, client, "x")
+		if got := vip.reply(t); string(got.data) != "x" {
+			t.Fatalf("datagram did not round-trip: got %q", got.data)
 		}
 		if got := relay.flowCount(); got != 1 {
 			t.Fatalf("flow count after first datagram = %d, want 1", got)
@@ -276,24 +233,38 @@ func TestUDPRelayIdleFlowGC(t *testing.T) {
 		if got := relay.flowCount(); got != 0 {
 			t.Fatalf("flow count after an expired sweep = %d, want 0", got)
 		}
+		if !be.upstream(0).closed() {
+			t.Fatal("the reaped flow's upstream socket was not closed")
+		}
+		if n, s := budget.liveTotal(), budget.liveSources(); n != 0 || s != 0 {
+			t.Fatalf("after the reap: budgetTotal=%d budgetSources=%d, want 0/0", n, s)
+		}
 	})
 
 	t.Run("the sweeper goroutine drives the reap on its own timer", func(t *testing.T) {
+		t.Parallel()
 		const idle = 200 * time.Millisecond
-		relay := newRelay(t, idle)
+		be := newFakeUDPBackend(true)
+		relay := newFakeRelay(be, idle, maxUDPFlowsPerSource, newUDPBudget(MaxUDPFlows, MaxUDPFlows))
+		relay.start()
+		defer relay.Close()
 
 		var lastWarn time.Time
 		if up := relay.upstreamFor(netip.MustParseAddrPort("10.0.5.1:45000"), &lastWarn); up == nil {
 			t.Fatal("upstreamFor admitted no flow, so this test would assert nothing")
 		}
-		deadline := time.Now().Add(30 * time.Second)
-		for time.Now().Before(deadline) {
-			if relay.flowCount() == 0 {
-				return // the sweeper's own timer reaped it
-			}
-			time.Sleep(10 * time.Millisecond)
+		// Nobody but the sweeper's timer closes this upstream before relay.Close,
+		// which has not run yet.
+		select {
+		case <-be.upstream(0).done:
+		case <-time.After(fakeHandledTimeout):
+			t.Fatalf("idle flow was not GC'd by the sweeper: flow count still %d", relay.flowCount())
 		}
-		t.Fatalf("idle flow was not GC'd by the sweeper: flow count still %d", relay.flowCount())
+		// The sweep closes and deletes under one hold of mu, so once the close is
+		// visible the delete is too.
+		if got := relay.flowCount(); got != 0 {
+			t.Fatalf("flow count after the sweeper's reap = %d, want 0", got)
+		}
 	})
 }
 
@@ -301,9 +272,8 @@ func TestUDPRelayIdleFlowGC(t *testing.T) {
 // fair-share sub-cap, the relay-GLOBAL fd budget, second-lock-authoritative
 // admission, and PURE counter accounting. It drives upstreamFor DIRECTLY with
 // fabricated client addresses (distinct 10.0.0.N source IPs) so the per-source
-// counter is exercised without a rootless 127.0.0.2 bind (macOS refuses it); only
-// the per-flow upstream DialUDP to a real loopback echo backend is a live fd,
-// bounded by the tiny injected caps.
+// counter is exercised without a rootless 127.0.0.2 bind (macOS refuses it). The
+// VIP socket and every per-flow upstream are in-memory fakes, so no fd is opened.
 //
 // Non-vacuity: with the per-source check removed, PerSourceFairShare's "(cap+1)th
 // dropped" assertion fails (the extra flow is admitted); with any decrement dropped,
@@ -311,26 +281,16 @@ func TestUDPRelayIdleFlowGC(t *testing.T) {
 func TestUDPRelayPerSourceFairShare(t *testing.T) {
 	t.Parallel()
 
-	be := newUDPEchoBackend(t)
-	defer be.close()
-	beIP, bePort := be.addrPort()
+	be := newFakeUDPBackend(true)
 
 	// newRelay builds an UNSTARTED relay (upstreamFor is driven directly, so no
 	// dispatcher/sweeper goroutine runs) with the shared echo backend registered and
 	// the injected caps. A long idle timeout means only an explicit sweepExpired reaps.
 	newRelay := func(budget *udpBudget, perSourceCap int) *udpRelay {
-		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-		if err != nil {
-			t.Fatalf("listen vip udp: %v", err)
-		}
-		vipAddr := pc.LocalAddr().(*net.UDPAddr)
-		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
-		tbl := NewRoutingTable(netip.Prefix{})
-		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
-		return newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, perSourceCap, budget, slog.Default())
+		return newFakeRelay(be, time.Hour, perSourceCap, budget)
 	}
 	// client fabricates a distinct client address; the per-source counter keys on the
-	// parsed IP, decoupled from any real loopback bind.
+	// parsed IP, decoupled from any socket address.
 	client := func(a, b, c, d byte, port int) netip.AddrPort {
 		return netip.AddrPortFrom(netip.AddrFrom4([4]byte{a, b, c, d}), uint16(port))
 	}
@@ -475,8 +435,8 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 // flows across ALL VIPs, not per VIP, so a pod fanning flows across N distinct UDP
 // VIPs cannot consume the whole relay-global budget and starve every other pod on
 // every VIP. It drives upstreamFor DIRECTLY on TWO relays (two VIPs) sharing ONE tiny
-// budget (maxTotal=8, maxPerSource=2), with fabricated client source IPs, so only the
-// per-flow upstream DialUDP to a real loopback echo backend is a live fd.
+// budget (maxTotal=8, maxPerSource=2), with fabricated client source IPs, on the
+// in-memory VIP and upstream fakes.
 //
 // Non-vacuity: B48's per-VIP-only per-source cap would let the SAME source IP hold
 // maxPerSource flows on EACH VIP (2×maxPerSource across two VIPs); this gate asserts
@@ -486,25 +446,15 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 func TestUDPRelayPerSourceGlobalCap(t *testing.T) {
 	t.Parallel()
 
-	be := newUDPEchoBackend(t)
-	defer be.close()
-	beIP, bePort := be.addrPort()
+	be := newFakeUDPBackend(true)
 
 	// newRelay builds an UNSTARTED relay (upstreamFor is driven directly) on its own
-	// VIP socket, sharing the caller's budget, with the echo backend registered and a
+	// fake VIP socket, sharing the caller's budget, with the echo backend registered and a
 	// per-VIP per-source cap (100) high enough that the per-source-GLOBAL budget cap —
 	// not the per-VIP one — is the binding constraint. A long idle timeout means only
 	// an explicit Close reaps.
 	newRelay := func(budget *udpBudget) *udpRelay {
-		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-		if err != nil {
-			t.Fatalf("listen vip udp: %v", err)
-		}
-		vipAddr := pc.LocalAddr().(*net.UDPAddr)
-		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
-		tbl := NewRoutingTable(netip.Prefix{})
-		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
-		return newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, 100, budget, slog.Default())
+		return newFakeRelay(be, time.Hour, 100, budget)
 	}
 	client := func(a, b, c, d byte, port int) netip.AddrPort {
 		return netip.AddrPortFrom(netip.AddrFrom4([4]byte{a, b, c, d}), uint16(port))
@@ -596,7 +546,7 @@ func TestUDPRelayPerSourceGlobalCap(t *testing.T) {
 	}
 }
 
-// countingDialer wraps a real dial func and records how many times it was invoked,
+// countingDialer wraps a dial func and records how many times it was invoked,
 // so a test can assert the relay's first-lock early reject drops a globally-capped new
 // flow BEFORE ever paying the connect(2). It is -race safe: count is mutex-guarded.
 type countingDialer struct {
@@ -635,29 +585,19 @@ func (d *countingDialer) calls() int {
 func TestUDPRelayFirstLockPerSourceGlobalReject(t *testing.T) {
 	t.Parallel()
 
-	be := newUDPEchoBackend(t)
-	defer be.close()
-	beIP, bePort := be.addrPort()
+	be := newFakeUDPBackend(true)
 
 	client := func(a, b, c, d byte, port int) netip.AddrPort {
 		return netip.AddrPortFrom(netip.AddrFrom4([4]byte{a, b, c, d}), uint16(port))
 	}
 
-	// newRelay builds an UNSTARTED relay (upstreamFor is driven directly) on its own VIP
-	// socket, sharing the caller's budget, with a per-VIP per-source cap (100) high
+	// newRelay builds an UNSTARTED relay (upstreamFor is driven directly) on its own fake
+	// VIP socket, sharing the caller's budget, with a per-VIP per-source cap (100) high
 	// enough that ONLY the shared budget's caps bind. It injects a counting dialer that
-	// wraps net.DialUDP to a real loopback echo backend, so a not-capped flow dials once
-	// and a capped flow never dials. A long idle timeout means only explicit Close reaps.
+	// wraps the fake backend's dial, so a not-capped flow dials once and a capped flow
+	// never dials. A long idle timeout means only explicit Close reaps.
 	newRelay := func(budget *udpBudget) (*udpRelay, *countingDialer) {
-		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-		if err != nil {
-			t.Fatalf("listen vip udp: %v", err)
-		}
-		vipAddr := pc.LocalAddr().(*net.UDPAddr)
-		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
-		tbl := NewRoutingTable(netip.Prefix{})
-		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
-		r := newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, 100, budget, slog.Default())
+		r := newFakeRelay(be, time.Hour, 100, budget)
 		cd := &countingDialer{inner: r.dial}
 		r.dial = cd.dial
 		return r, cd
@@ -752,65 +692,6 @@ func TestUDPRelayFirstLockPerSourceGlobalReject(t *testing.T) {
 	}
 }
 
-// udpRoundTrip sends payload on the connected UDP socket c and returns the reply
-// read back within timeout. It fails the test on a write/read error.
-func udpRoundTrip(t *testing.T, c *net.UDPConn, payload string, timeout time.Duration) string {
-	t.Helper()
-	if _, err := c.Write([]byte(payload)); err != nil {
-		t.Fatalf("write %q: %v", payload, err)
-	}
-	deadline := time.Now().Add(timeout)
-	buf := make([]byte, maxUDPDatagram)
-	// Skip datagrams that echo an EARLIER payload. UDP has no request/reply
-	// correlation, and udpRoundTripRetry deliberately re-sends its payload until one
-	// reply arrives — so a slow relay can leave extra echoes of the previous phase
-	// queued on this socket. Reading the first datagram unconditionally attributes a
-	// stale echo to this send (B207: "got \"hello-udp\", want \"world-udp\"").
-	// A genuinely wrong reply still fails, on the deadline, naming what was seen.
-	var last string
-	for time.Now().Before(deadline) {
-		_ = c.SetReadDeadline(deadline)
-		n, err := c.Read(buf)
-		if err != nil {
-			t.Fatalf("read reply for %q: %v (last datagram %q)", payload, err, last)
-		}
-		last = string(buf[:n])
-		if last == payload {
-			return last
-		}
-		t.Logf("skipping stale echo %q while awaiting %q", last, payload)
-	}
-	t.Fatalf("no reply matching %q within %v (last datagram %q)", payload, timeout, last)
-	return ""
-}
-
-// udpRoundTripRetry repeatedly sends payload until it reads a reply or the overall
-// deadline expires, returning the last reply (empty on timeout). It absorbs the
-// startup window in which the relay's datagram socket is not yet bound (early
-// datagrams are dropped / ICMP-refused) without giving up. All sends use the same
-// socket, so they map to one relay flow.
-func udpRoundTripRetry(t *testing.T, c *net.UDPConn, payload string, overall time.Duration) string {
-	t.Helper()
-	deadline := time.Now().Add(overall)
-	buf := make([]byte, maxUDPDatagram)
-	for time.Now().Before(deadline) {
-		if _, err := c.Write([]byte(payload)); err != nil {
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
-		_ = c.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-		n, err := c.Read(buf)
-		if err != nil {
-			continue // relay not up yet (timeout or ICMP refused) → retry
-		}
-		// NOTE: every retry that timed out may still have been relayed, so its echo
-		// can be in flight behind this one. Those duplicates are the caller's problem
-		// to skip — udpRoundTrip does, by matching the payload.
-		return string(buf[:n])
-	}
-	return ""
-}
-
 // TestUDPRelayFlowKey pins the canonical flow key: a 4-in-6 and a plain v4 form of
 // one client map to one key, so they share one flow and one fair-share bucket. The
 // table covers the pure function; the subtest drives upstreamFor with both forms of
@@ -843,20 +724,10 @@ func TestUDPRelayFlowKey(t *testing.T) {
 		})
 	}
 
-	be := newUDPEchoBackend(t)
-	defer be.close()
-	beIP, bePort := be.addrPort()
+	be := newFakeUDPBackend(true)
 	newRelay := func(t *testing.T) *udpRelay {
 		t.Helper()
-		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-		if err != nil {
-			t.Fatalf("listen vip udp: %v", err)
-		}
-		vipAddr := pc.LocalAddr().(*net.UDPAddr)
-		key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
-		tbl := NewRoutingTable(netip.Prefix{})
-		tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
-		r := newUDPRelay(pc, key, tbl, egressScope{}, time.Hour, maxUDPFlowsPerSource, newUDPBudget(MaxUDPFlows, MaxUDPFlows), slog.Default())
+		r := newFakeRelay(be, time.Hour, maxUDPFlowsPerSource, newUDPBudget(MaxUDPFlows, MaxUDPFlows))
 		t.Cleanup(func() { _ = r.Close() })
 		return r
 	}
@@ -901,19 +772,9 @@ func TestUDPRelayFlowKey(t *testing.T) {
 func TestUDPRelayFoundFlowStampedUnderLock(t *testing.T) {
 	t.Parallel()
 
-	be := newUDPEchoBackend(t)
-	defer be.close()
-	beIP, bePort := be.addrPort()
-	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatalf("listen vip udp: %v", err)
-	}
-	vipAddr := pc.LocalAddr().(*net.UDPAddr)
-	key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vipAddr.Port), Protocol: netv1.ProtocolUDP}
-	tbl := NewRoutingTable(netip.Prefix{})
-	tbl.SetEndpoints(key, []netv1.Endpoint{{IP: beIP, Port: bePort, Ready: true}})
+	be := newFakeUDPBackend(true)
 	const idle = time.Hour
-	relay := newUDPRelay(pc, key, tbl, egressScope{}, idle, maxUDPFlowsPerSource, newUDPBudget(MaxUDPFlows, MaxUDPFlows), slog.Default())
+	relay := newFakeRelay(be, idle, maxUDPFlowsPerSource, newUDPBudget(MaxUDPFlows, MaxUDPFlows))
 	defer relay.Close()
 
 	client := netip.MustParseAddrPort("10.0.8.1:40000")

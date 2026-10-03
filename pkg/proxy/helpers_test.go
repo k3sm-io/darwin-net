@@ -27,6 +27,12 @@ func withAliasManager(a aliasManager) Option {
 	return func(p *Proxy) { p.alias = a }
 }
 
+// withListenUDP overrides the ClusterIP datagram bind (tests inject an in-memory
+// VIP socket).
+func withListenUDP(f func(netip.AddrPort) (udpVIPConn, error)) Option {
+	return func(p *Proxy) { p.listenUDP = f }
+}
+
 // noopAliasManager is the rootless aliasManager unit tests inject: it performs no
 // syscalls and records the Ensure/Remove calls so a test can assert the reconcile
 // drove the expected sequence without touching lo0. In production the proxy
