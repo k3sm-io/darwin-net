@@ -1,0 +1,260 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package podnet
+
+import (
+	"context"
+	"errors"
+	"net/netip"
+	"os"
+	"slices"
+	"strings"
+	"testing"
+
+	xroute "golang.org/x/net/route"
+	"golang.org/x/sys/unix"
+)
+
+// opRecorder records the ifconfig and route operations an alias manager drives,
+// in order, and can be told to fail a route operation.
+type opRecorder struct {
+	ops        []string
+	clearErr   error
+	installErr error
+}
+
+func (r *opRecorder) ifconfig(_ context.Context, iface, verb, arg string) error {
+	r.ops = append(r.ops, "ifconfig "+iface+" "+verb+" "+arg)
+	return nil
+}
+
+func (r *opRecorder) Install(_ context.Context, ip netip.Addr) error {
+	r.ops = append(r.ops, "install-blackhole "+ip.String())
+	return r.installErr
+}
+
+func (r *opRecorder) Clear(_ context.Context, ip netip.Addr) error {
+	r.ops = append(r.ops, "clear-blackhole "+ip.String())
+	return r.clearErr
+}
+
+// newRecordedAliasManager returns a lo0AliasManager for nodeCIDR whose ifconfig
+// and route operations go to a fresh recorder.
+func newRecordedAliasManager(nodeCIDR netip.Prefix) (*lo0AliasManager, *opRecorder) {
+	rec := &opRecorder{}
+	m := newLo0AliasManager(nodeCIDR)
+	m.ifconfig = rec.ifconfig
+	m.routes = rec
+	return m, rec
+}
+
+// TestAliasTeardownInstallsBlackhole pins the pod-alias teardown ordering: a
+// removed pod address is blackholed right after its alias goes (the alias's host
+// route must be gone first or the add is EEXIST), a re-Remove stays a success,
+// the next Ensure clears the blackhole BEFORE re-aliasing and fails if the clear
+// fails, and an address outside the node's pod range is never blackholed.
+func TestAliasTeardownInstallsBlackhole(t *testing.T) {
+	ctx := context.Background()
+	node := netip.MustParsePrefix("100.64.3.0/24")
+	pod := netip.MustParseAddr("100.64.3.17")
+
+	t.Run("remove then re-remove", func(t *testing.T) {
+		m, rec := newRecordedAliasManager(node)
+		if err := m.Ensure(ctx, pod); err != nil {
+			t.Fatalf("Ensure: %v", err)
+		}
+		rec.ops = nil
+		if err := m.Remove(ctx, pod); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+		want := []string{"ifconfig lo0 -alias 100.64.3.17", "install-blackhole 100.64.3.17"}
+		if !slices.Equal(rec.ops, want) {
+			t.Fatalf("Remove ops = %q, want %q", rec.ops, want)
+		}
+		rec.ops = nil
+		if err := m.Remove(ctx, pod); err != nil {
+			t.Fatalf("re-Remove: %v (must be idempotent)", err)
+		}
+		if n := countPrefix(rec.ops, "install-blackhole"); n > 1 {
+			t.Fatalf("re-Remove ops = %q: more than one install", rec.ops)
+		}
+	})
+
+	t.Run("ensure clears the blackhole before aliasing", func(t *testing.T) {
+		m, rec := newRecordedAliasManager(node)
+		if err := m.Ensure(ctx, pod); err != nil {
+			t.Fatalf("Ensure: %v", err)
+		}
+		want := []string{"clear-blackhole 100.64.3.17", "ifconfig lo0 alias 100.64.3.17/32"}
+		if !slices.Equal(rec.ops, want) {
+			t.Fatalf("Ensure ops = %q, want %q", rec.ops, want)
+		}
+	})
+
+	t.Run("a failed clear fails ensure and plumbs nothing", func(t *testing.T) {
+		m, rec := newRecordedAliasManager(node)
+		rec.clearErr = errors.New("routing socket refused")
+		if err := m.Ensure(ctx, pod); err == nil {
+			t.Fatal("Ensure succeeded although the stale blackhole could not be cleared")
+		}
+		if n := countPrefix(rec.ops, "ifconfig"); n != 0 {
+			t.Fatalf("Ensure ran ifconfig after a failed clear: %q", rec.ops)
+		}
+		if _, tracked := m.aliased[pod]; tracked {
+			t.Fatal("a failed Ensure tracked the address as aliased")
+		}
+	})
+
+	t.Run("a failed install is returned after the alias is gone", func(t *testing.T) {
+		m, rec := newRecordedAliasManager(node)
+		if err := m.Ensure(ctx, pod); err != nil {
+			t.Fatalf("Ensure: %v", err)
+		}
+		rec.installErr = errors.New("routing socket refused")
+		if err := m.Remove(ctx, pod); err == nil {
+			t.Fatal("Remove hid a failed blackhole install")
+		}
+		// The retry converges: the alias is untracked, the delete is tolerated, and
+		// the install runs again.
+		rec.installErr, rec.ops = nil, nil
+		if err := m.Remove(ctx, pod); err != nil {
+			t.Fatalf("retried Remove: %v", err)
+		}
+		if n := countPrefix(rec.ops, "install-blackhole"); n != 1 {
+			t.Fatalf("retried Remove ops = %q, want one install", rec.ops)
+		}
+	})
+
+	t.Run("addresses outside the node pod range are never blackholed", func(t *testing.T) {
+		for _, s := range []string{"10.43.0.80", "100.64.4.17", "100.64.3.1", "100.64.3.255", "127.0.0.151"} {
+			m, rec := newRecordedAliasManager(node)
+			ip := netip.MustParseAddr(s)
+			if err := m.Ensure(ctx, ip); err != nil {
+				t.Fatalf("Ensure %s: %v", s, err)
+			}
+			if err := m.Remove(ctx, ip); err != nil {
+				t.Fatalf("Remove %s: %v", s, err)
+			}
+			if n := countPrefix(rec.ops, "install-blackhole") + countPrefix(rec.ops, "clear-blackhole"); n != 0 {
+				t.Fatalf("%s: route ops %q, want none", s, rec.ops)
+			}
+		}
+	})
+}
+
+// countPrefix counts the ops that start with prefix.
+func countPrefix(ops []string, prefix string) int {
+	n := 0
+	for _, op := range ops {
+		if strings.HasPrefix(op, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestIsPodAddress pins the blackhole scope: the allocatable hosts of the node
+// /24 and nothing else.
+func TestIsPodAddress(t *testing.T) {
+	node := netip.MustParsePrefix("100.64.3.0/24")
+	cases := []struct {
+		cidr netip.Prefix
+		ip   string
+		want bool
+	}{
+		{node, "100.64.3.2", true},
+		{node, "100.64.3.254", true},
+		{node, "100.64.3.0", false},
+		{node, "100.64.3.1", false},
+		{node, "100.64.3.255", false},
+		{node, "100.64.4.2", false},
+		{node, "10.43.0.10", false},
+		{node, "::ffff:100.64.3.9", true},
+		{netip.Prefix{}, "100.64.3.9", false},
+		{netip.MustParsePrefix("100.64.0.0/16"), "100.64.3.9", false},
+	}
+	for _, c := range cases {
+		if got := IsPodAddress(c.cidr, netip.MustParseAddr(c.ip)); got != c.want {
+			t.Errorf("IsPodAddress(%s, %s) = %v, want %v", c.cidr, c.ip, got, c.want)
+		}
+	}
+}
+
+// TestBlackholeMessage pins the routing-message encoding: the add is a static
+// host route through 127.0.0.1 flagged RTF_BLACKHOLE (what route(8) builds for
+// `add -host <ip> 127.0.0.1 -blackhole`); delete and get name the host only.
+func TestBlackholeMessage(t *testing.T) {
+	ip := netip.MustParseAddr("100.64.3.17")
+	add := blackholeMessage(unix.RTM_ADD, ip, 7)
+	if add.Type != unix.RTM_ADD || add.Seq != 7 || add.ID != uintptr(os.Getpid()) {
+		t.Fatalf("add header = type %d seq %d id %d", add.Type, add.Seq, add.ID)
+	}
+	wantFlags := unix.RTF_UP | unix.RTF_STATIC | unix.RTF_HOST | unix.RTF_GATEWAY | unix.RTF_BLACKHOLE
+	if add.Flags != wantFlags {
+		t.Fatalf("add flags = %#x, want %#x", add.Flags, wantFlags)
+	}
+	if len(add.Addrs) != 2 {
+		t.Fatalf("add addrs = %v, want dst and gateway only (no netmask: a host route)", add.Addrs)
+	}
+	if dst := add.Addrs[unix.RTAX_DST].(*xroute.Inet4Addr); netip.AddrFrom4(dst.IP) != ip {
+		t.Fatalf("add dst = %v, want %s", dst.IP, ip)
+	}
+	if gw := add.Addrs[unix.RTAX_GATEWAY].(*xroute.Inet4Addr); gw.IP != [4]byte{127, 0, 0, 1} {
+		t.Fatalf("add gateway = %v, want 127.0.0.1", gw.IP)
+	}
+	if _, err := add.Marshal(); err != nil {
+		t.Fatalf("marshal add: %v", err)
+	}
+	for _, typ := range []int{unix.RTM_DELETE, unix.RTM_GET} {
+		m := blackholeMessage(typ, ip, 8)
+		if m.Flags&unix.RTF_HOST == 0 || len(m.Addrs) != 1 {
+			t.Fatalf("type %d: flags %#x addrs %v, want a host destination only", typ, m.Flags, m.Addrs)
+		}
+		if _, err := m.Marshal(); err != nil {
+			t.Fatalf("marshal type %d: %v", typ, err)
+		}
+	}
+}
+
+// TestHostRouteFlags pins how an RTM_GET reply is read: only ip's own host route
+// counts; the longest-prefix match the kernel returns for an address with no host
+// route (an aggregate, the default route) is "no host route".
+func TestHostRouteFlags(t *testing.T) {
+	ip := netip.MustParseAddr("100.64.3.17")
+	host := func(a [4]byte, flags int) *xroute.RouteMessage {
+		return &xroute.RouteMessage{Flags: flags, Addrs: []xroute.Addr{&xroute.Inet4Addr{IP: a}}}
+	}
+	cases := []struct {
+		name      string
+		reply     *xroute.RouteMessage
+		wantFound bool
+		wantErr   bool
+	}{
+		{"own blackhole host route", host([4]byte{100, 64, 3, 17}, unix.RTF_HOST|unix.RTF_BLACKHOLE), true, false},
+		{"aggregate match", host([4]byte{100, 64, 0, 0}, unix.RTF_UP), false, false},
+		{"another host route", host([4]byte{100, 64, 3, 18}, unix.RTF_HOST), false, false},
+		{"own address without RTF_HOST", host([4]byte{100, 64, 3, 17}, unix.RTF_UP), false, false},
+		{"ESRCH reply", &xroute.RouteMessage{Err: unix.ESRCH}, false, false},
+		{"other reply error", &xroute.RouteMessage{Err: unix.EPERM}, false, true},
+	}
+	for _, c := range cases {
+		_, found, err := hostRouteFlags(c.reply, ip)
+		if found != c.wantFound || (err != nil) != c.wantErr {
+			t.Errorf("%s: found=%v err=%v, want found=%v err=%v", c.name, found, err, c.wantFound, c.wantErr)
+		}
+	}
+}

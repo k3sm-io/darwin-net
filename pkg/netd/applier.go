@@ -60,19 +60,45 @@ type Privileged interface {
 	BindPort(ctx context.Context, network string, addr netip.AddrPort) (*os.File, error)
 }
 
+// blackholer installs and clears the lo0 blackhole host route that holds a pod
+// address while its alias is torn down (podnet.BlackholeRoutes in production).
+type blackholer interface {
+	// Install adds the blackhole host route for ip (idempotent).
+	Install(ctx context.Context, ip netip.Addr) error
+	// Clear removes ip's blackhole host route if there is one, and nothing else.
+	Clear(ctx context.Context, ip netip.Addr) error
+}
+
 // darwinApplier is the production Privileged: it shells out to ifconfig and
 // binds sockets directly, and drives the real wireguard mesh device (pkg/mesh).
 // It runs as root inside the daemon; unit tests inject a fake Privileged instead,
-// so this code path is exercised only in the root-gated integration tier.
+// so this code path is exercised only in the root-gated integration tier, apart
+// from the alias path, whose command runner and route seam a unit test replaces.
+//
+// A pod address of the node /24 (podnet.IsPodAddress) is blackholed on lo0 when
+// its alias is removed and un-blackholed just before it is aliased again, so a
+// connection still open to a departed pod cannot re-route onto the mesh utun (see
+// podnet.BlackholeRoutes). A Service VIP is aliased and removed plainly: with no
+// alias it falls to the default route, never the utun.
 //
 // Locking discipline: the lazily-built mesh device, its up/iface state, and the
 // node CIDR the mesh addresses derive from are guarded by mu, so concurrent
 // ConfigureMesh/RemoveMesh/SetNodePodCIDR calls (from different
-// connections) serialize. Alias and port operations are independent (the kernel
-// serializes them) and take no lock here.
+// connections) serialize. Alias operations serialize on aliasMu, so an alias
+// change and its blackhole step are one critical section; they read nodePodCIDR
+// under mu briefly and never hold mu across a command (lock order: aliasMu, then
+// mu). Port operations are independent (the kernel serializes them) and take no
+// lock here.
 type darwinApplier struct {
 	utunName string
 	log      *slog.Logger
+	// command runs a root-gated command and routes installs and clears the
+	// pod-address blackhole. Both are set by newDarwinApplier and replaced only by
+	// unit tests.
+	command func(ctx context.Context, name string, args ...string) error
+	routes  blackholer
+
+	aliasMu sync.Mutex
 
 	mu          sync.Mutex
 	nodePodCIDR netip.Prefix
@@ -98,22 +124,53 @@ func newDarwinApplier(nodePodCIDR netip.Prefix, log *slog.Logger) *darwinApplier
 		linkIP:      linkIP,
 		utunName:    "utun",
 		log:         log,
+		command:     run,
+		routes:      podnet.BlackholeRoutes{},
 	}
 }
 
-// EnsureAlias adds ip as a /32 alias on lo0.
+// isPodAddress reports whether ip is a pod address of the node /24 this applier
+// currently serves, reading nodePodCIDR under mu.
+func (a *darwinApplier) isPodAddress(ip netip.Addr) bool {
+	a.mu.Lock()
+	cidr := a.nodePodCIDR
+	a.mu.Unlock()
+	return podnet.IsPodAddress(cidr, ip)
+}
+
+// EnsureAlias adds ip as a /32 alias on lo0. For a pod address it first clears
+// any blackhole left by the address's previous teardown — a stale blackhole must
+// never shadow a new pod — and fails if that clear fails.
 func (a *darwinApplier) EnsureAlias(ctx context.Context, ip netip.Addr) error {
-	if err := run(ctx, "ifconfig", "lo0", "alias", fmt.Sprintf("%s/32", ip)); err != nil {
+	a.aliasMu.Lock()
+	defer a.aliasMu.Unlock()
+	if a.isPodAddress(ip) {
+		if err := a.routes.Clear(ctx, ip); err != nil {
+			return fmt.Errorf("ensure lo0 alias %s: %w", ip, err)
+		}
+	}
+	if err := a.command(ctx, "ifconfig", "lo0", "alias", fmt.Sprintf("%s/32", ip)); err != nil {
 		return fmt.Errorf("ifconfig lo0 alias %s/32: %w", ip, err)
 	}
 	return nil
 }
 
-// RemoveAlias removes ip's lo0 alias. An absent alias is tolerated (leak-free
-// teardown), so the error is logged, not returned.
+// RemoveAlias removes ip's lo0 alias and, for a pod address, installs its
+// blackhole host route right after. An absent alias is tolerated (leak-free
+// teardown), so the ifconfig error is logged, not returned. A failed blackhole
+// install IS returned: the client keeps the address allocated and retries the
+// teardown (the retry's tolerated -alias and idempotent install converge), so the
+// address is never reused while a departed pod's connections could re-route.
 func (a *darwinApplier) RemoveAlias(ctx context.Context, ip netip.Addr) error {
-	if err := run(ctx, "ifconfig", "lo0", "-alias", ip.String()); err != nil {
+	a.aliasMu.Lock()
+	defer a.aliasMu.Unlock()
+	if err := a.command(ctx, "ifconfig", "lo0", "-alias", ip.String()); err != nil {
 		a.log.Debug("ifconfig lo0 -alias tolerated (address may be absent)", "ip", ip.String(), "err", err)
+	}
+	if a.isPodAddress(ip) {
+		if err := a.routes.Install(ctx, ip); err != nil {
+			return fmt.Errorf("remove lo0 alias %s: %w", ip, err)
+		}
 	}
 	return nil
 }

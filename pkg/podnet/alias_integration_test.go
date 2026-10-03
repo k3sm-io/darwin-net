@@ -63,7 +63,7 @@ func lo0HasAddr(t *testing.T, ip netip.Addr) bool {
 func TestLo0AliasIdempotentLeakFree(t *testing.T) {
 	requireRoot(t)
 	ctx := context.Background()
-	mgr := newLo0AliasManager()
+	mgr := newLo0AliasManager(netip.Prefix{})
 	// An address unlikely to collide with anything real on the host.
 	ip := netip.MustParseAddr("127.0.0.151")
 
@@ -99,7 +99,7 @@ func TestLo0AliasIdempotentLeakFree(t *testing.T) {
 func TestLo0AliasChurn(t *testing.T) {
 	requireRoot(t)
 	ctx := context.Background()
-	mgr := newLo0AliasManager()
+	mgr := newLo0AliasManager(netip.Prefix{})
 	ips := []netip.Addr{
 		netip.MustParseAddr("127.0.0.161"),
 		netip.MustParseAddr("127.0.0.162"),

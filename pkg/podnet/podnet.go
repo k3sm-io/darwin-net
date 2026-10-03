@@ -125,7 +125,7 @@ func New(nodeCIDR netip.Prefix, opts ...Option) (*Network, error) {
 	}
 	n := &Network{
 		alloc:   alloc,
-		alias:   newLo0AliasManager(),
+		alias:   newLo0AliasManager(alloc.CIDR()),
 		log:     slog.Default(),
 		byPod:   make(map[string]podEntry),
 		inverse: make(map[netip.Addr]string),

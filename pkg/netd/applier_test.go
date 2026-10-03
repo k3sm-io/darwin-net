@@ -18,8 +18,10 @@ package netd
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 
@@ -68,6 +70,114 @@ func TestDarwinApplierRefusesMeshWithoutBothAddresses(t *testing.T) {
 	if !strings.Contains(err.Error(), "100.64.0.0/16") {
 		t.Errorf("error %q does not name the offending podCIDR", err)
 	}
+}
+
+// applierOps records the commands and route operations a darwinApplier drives,
+// in order, and can be told to fail a route operation.
+type applierOps struct {
+	ops        []string
+	clearErr   error
+	installErr error
+}
+
+func (r *applierOps) command(_ context.Context, name string, args ...string) error {
+	r.ops = append(r.ops, name+" "+strings.Join(args, " "))
+	return nil
+}
+
+func (r *applierOps) Install(_ context.Context, ip netip.Addr) error {
+	r.ops = append(r.ops, "install-blackhole "+ip.String())
+	return r.installErr
+}
+
+func (r *applierOps) Clear(_ context.Context, ip netip.Addr) error {
+	r.ops = append(r.ops, "clear-blackhole "+ip.String())
+	return r.clearErr
+}
+
+// TestRemoveAliasInstallsBlackhole pins the helper path's pod-alias teardown: a
+// pod address of the node /24 is blackholed right after its -alias, and the next
+// EnsureAlias clears the blackhole before re-aliasing (failing if the clear
+// fails); a Service VIP is never blackholed.
+func TestRemoveAliasInstallsBlackhole(t *testing.T) {
+	ctx := context.Background()
+	newApplier := func() (*darwinApplier, *applierOps) {
+		a := newDarwinApplier(netip.MustParsePrefix("100.64.3.0/24"), quietLogger())
+		rec := &applierOps{}
+		a.command = rec.command
+		a.routes = rec
+		return a, rec
+	}
+	pod := netip.MustParseAddr("100.64.3.17")
+	vip := netip.MustParseAddr("10.43.0.80")
+
+	t.Run("pod address is blackholed after its alias goes", func(t *testing.T) {
+		a, rec := newApplier()
+		if err := a.RemoveAlias(ctx, pod); err != nil {
+			t.Fatalf("RemoveAlias: %v", err)
+		}
+		want := []string{"ifconfig lo0 -alias 100.64.3.17", "install-blackhole 100.64.3.17"}
+		if !slices.Equal(rec.ops, want) {
+			t.Fatalf("RemoveAlias ops = %q, want %q", rec.ops, want)
+		}
+	})
+
+	t.Run("ensure clears the blackhole before aliasing", func(t *testing.T) {
+		a, rec := newApplier()
+		if err := a.EnsureAlias(ctx, pod); err != nil {
+			t.Fatalf("EnsureAlias: %v", err)
+		}
+		want := []string{"clear-blackhole 100.64.3.17", "ifconfig lo0 alias 100.64.3.17/32"}
+		if !slices.Equal(rec.ops, want) {
+			t.Fatalf("EnsureAlias ops = %q, want %q", rec.ops, want)
+		}
+	})
+
+	t.Run("a failed clear fails ensure and plumbs nothing", func(t *testing.T) {
+		a, rec := newApplier()
+		rec.clearErr = errors.New("routing socket refused")
+		if err := a.EnsureAlias(ctx, pod); err == nil {
+			t.Fatal("EnsureAlias succeeded although the stale blackhole could not be cleared")
+		}
+		if want := []string{"clear-blackhole 100.64.3.17"}; !slices.Equal(rec.ops, want) {
+			t.Fatalf("EnsureAlias ops = %q, want %q", rec.ops, want)
+		}
+	})
+
+	t.Run("a failed install is returned", func(t *testing.T) {
+		a, rec := newApplier()
+		rec.installErr = errors.New("routing socket refused")
+		if err := a.RemoveAlias(ctx, pod); err == nil {
+			t.Fatal("RemoveAlias hid a failed blackhole install")
+		}
+	})
+
+	t.Run("a Service VIP is never blackholed", func(t *testing.T) {
+		a, rec := newApplier()
+		if err := a.EnsureAlias(ctx, vip); err != nil {
+			t.Fatalf("EnsureAlias: %v", err)
+		}
+		if err := a.RemoveAlias(ctx, vip); err != nil {
+			t.Fatalf("RemoveAlias: %v", err)
+		}
+		want := []string{"ifconfig lo0 alias 10.43.0.80/32", "ifconfig lo0 -alias 10.43.0.80"}
+		if !slices.Equal(rec.ops, want) {
+			t.Fatalf("VIP ops = %q, want %q", rec.ops, want)
+		}
+	})
+
+	t.Run("the scope follows an adopted node podCIDR", func(t *testing.T) {
+		a, rec := newApplier()
+		if err := a.SetNodePodCIDR(ctx, netip.MustParsePrefix("100.64.9.0/24")); err != nil {
+			t.Fatalf("SetNodePodCIDR: %v", err)
+		}
+		if err := a.RemoveAlias(ctx, pod); err != nil {
+			t.Fatalf("RemoveAlias: %v", err)
+		}
+		if want := []string{"ifconfig lo0 -alias 100.64.3.17"}; !slices.Equal(rec.ops, want) {
+			t.Fatalf("ops after adopting another /24 = %q, want %q (no longer this node's pod)", rec.ops, want)
+		}
+	})
 }
 
 // quietLogger is a logger the applier tests can pass without emitting output. The
