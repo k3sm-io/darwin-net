@@ -16,8 +16,7 @@ limitations under the License.
 
 // Package netd is the logic of k3sm's minimal root network daemon (k3sm-netd):
 // the ONLY component that performs the irreducibly-root darwin network operations
-// (lo0 /32 aliases, the wireguard utun + routes, the pf MSS-clamp anchor, binding
-// privileged ports), so everything else runs as the unprivileged _k3sm user and
+// (lo0 /32 aliases, the wireguard utun + routes, binding privileged ports), so everything else runs as the unprivileged _k3sm user and
 // reaches it over a unix socket.
 //
 // It ships as a library, not a main: the production entry is the single signed
@@ -38,8 +37,8 @@ limitations under the License.
 //   - A closed verb set carrying only typed scalars. The protocol never accepts
 //     route/pf/wireguard-UAPI text or a filesystem path. The daemon RE-DERIVES and
 //     RE-VALIDATES every parameter (CIDR containment via pkg/podnet, the route set
-//     via pkg/mesh.RouteSet/ValidatePlan, the port policy) and RENDERS the UAPI and
-//     pf rules itself, reusing the existing pkg/podnet and pkg/mesh logic rather
+//     via pkg/mesh.RouteSet/ValidatePlan, the port policy) and RENDERS the UAPI
+//     itself, reusing the existing pkg/podnet and pkg/mesh logic rather
 //     than trusting or re-implementing it.
 //   - fd-out only. The sole descriptor that ever crosses the socket is the
 //     listening socket BindPort returns to the client via SCM_RIGHTS; no inbound fd

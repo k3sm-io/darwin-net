@@ -17,8 +17,6 @@ limitations under the License.
 package mesh
 
 import (
-	"fmt"
-
 	netv1 "k3sm.io/apis/net/v1"
 )
 
@@ -41,25 +39,15 @@ const DefaultListenPort = 51820
 // fragmentation across the tunnel.
 const tcpIPv4HeaderBytes = 40
 
-// MSSClamp is the TCP MSS the pf scrub anchor clamps to on the utun egress: the
-// mesh MTU minus the IPv4+TCP headers. A pod socket bound to an lo0 alias sees the
-// loopback MTU (16384) and would otherwise advertise an MSS too large for the 1380
-// utun, blackholing large-payload cross-node TCP.
-const MSSClamp = MTU - tcpIPv4HeaderBytes
+// TunnelMSS is the TCP MSS the kernel derives for a connection across the mesh:
+// the tunnel MTU minus the IPv4+TCP headers (1380 - 40 = 1340). XNU sizes a
+// connection's MSS from the route to the destination, and every peer pod CIDR
+// routes to the utun at MTU, so a pod socket bound to an lo0 alias (loopback MTU
+// 16384) still advertises this value toward a peer. It is documentation of the
+// expected on-wire MSS, not a value the mesh programs; no pf rule clamps it.
+const TunnelMSS = MTU - tcpIPv4HeaderBytes
 
 // MaxMSS returns the largest TCP MSS (payload) that fits in an IPv4 segment on a
-// link of the given MTU. It is the derivation behind MSSClamp, exposed so the
-// clamp value is table-tested rather than asserted as a bare literal.
+// link of the given MTU. It is the derivation behind TunnelMSS, exposed so the
+// value is table-tested rather than asserted as a bare literal.
 func MaxMSS(mtu int) int { return mtu - tcpIPv4HeaderBytes }
-
-// PFMSSClampRule renders the minimal pf scrub rule that clamps TCP MSS on the
-// mesh utun egress. It is scoped `on <utun>` to the tunnel only — clamping lo0
-// (MTU 16384) would needlessly shrink same-node loopback segments. This is the
-// rule text loaded into the io.k3sm.mesh pf anchor; wiring the anchor into the
-// main ruleset is the root netd boundary's job — only this minimal MSS clamp is
-// wired here; the full pf sub-anchor is not built. It is exported so the netd
-// daemon renders the same rule for the standalone MSS-clamp verb, never
-// accepting pf text over the wire.
-func PFMSSClampRule(utun string, mss int) string {
-	return fmt.Sprintf("scrub out on %s proto tcp from any to any max-mss %d\n", utun, mss)
-}

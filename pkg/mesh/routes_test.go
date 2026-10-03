@@ -81,7 +81,7 @@ func (f *fakeRouteTable) List(context.Context) ([]Route, error) {
 // resolved, so the route reconcile can be driven without privilege (no utun, no
 // wireguard: reconcileRoutes touches neither).
 func routeDevice(fake *fakeRouteTable) *WGDevice {
-	d := newWGDevice(wgLink{name: "utun", mtu: MTU, mss: MSSClamp, listenPort: DefaultListenPort}, discardLogger())
+	d := newWGDevice(wgLink{name: "utun", mtu: MTU, listenPort: DefaultListenPort}, discardLogger())
 	d.rt = fake
 	d.iface = "utun9"
 	return d

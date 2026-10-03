@@ -92,8 +92,6 @@ const (
 	VerbConfigureMesh Verb = "ConfigureMesh"
 	// VerbRemoveMesh tears the wireguard mesh down.
 	VerbRemoveMesh Verb = "RemoveMesh"
-	// VerbLoadPFAnchor loads the utun-scoped MSS-clamp pf anchor.
-	VerbLoadPFAnchor Verb = "LoadPFAnchor"
 	// VerbBindPort binds a listening socket and returns its fd via SCM_RIGHTS.
 	VerbBindPort Verb = "BindPort"
 )
@@ -135,11 +133,6 @@ type ConfigureMeshArgs struct {
 	Peers       []MeshPeerArg `json:"peers,omitempty"`
 }
 
-// LoadPFAnchorArgs carries the TCP MSS the daemon clamps to on the mesh utun.
-type LoadPFAnchorArgs struct {
-	MSSClamp int `json:"mssClamp"`
-}
-
 // BindPortArgs requests a listening socket on a node address and port. A specific
 // address is the norm. A wildcard address is accepted only for a privileged
 // (<1024) port and only when the daemon's port authorizer grants it; a wildcard on
@@ -158,7 +151,6 @@ type Request struct {
 	EnsureAlias   *EnsureAliasArgs   `json:"ensureAlias,omitempty"`
 	RemoveAlias   *RemoveAliasArgs   `json:"removeAlias,omitempty"`
 	ConfigureMesh *ConfigureMeshArgs `json:"configureMesh,omitempty"`
-	LoadPFAnchor  *LoadPFAnchorArgs  `json:"loadPFAnchor,omitempty"`
 	BindPort      *BindPortArgs      `json:"bindPort,omitempty"`
 }
 

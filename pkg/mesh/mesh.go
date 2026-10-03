@@ -103,7 +103,7 @@ func WithUTUNName(name string) Option {
 // WithNetdHelper routes the privileged mesh datapath through the root netd daemon
 // at socketPath: the device sends ConfigureMesh/RemoveMesh and the daemon (which
 // holds the private key, resolved from privKeyRef) creates the utun, programs
-// wireguard, installs the per-peer routes, and loads the MSS-clamp anchor. It is
+// wireguard, and installs the per-peer routes. It is
 // the one construction-time selection of the mesh backend — the direct wireguard
 // device (WithPrivateKey) remains for an explicit run-as-root mode. The base64
 // private key never crosses the socket; only privKeyRef does, which the daemon
@@ -149,7 +149,6 @@ func New(self netip.Prefix, opts ...Option) (*Mesh, error) {
 			m.dev = NewDevice(DeviceConfig{
 				UTUNName:      m.utunName,
 				MTU:           MTU,
-				MSS:           MSSClamp,
 				MeshIP:        meshIP,
 				LinkIP:        linkIP,
 				PrivateKeyB64: m.privateKeyB64,
@@ -168,8 +167,8 @@ func (m *Mesh) CIDR() netip.Prefix { return m.self }
 // dialer to this via proxy.WithMeshEgressSource).
 func (m *Mesh) MeshIP() netip.Addr { return m.meshIP }
 
-// Start brings the mesh device up: the utun, wireguard, the mesh-egress alias, and
-// the MSS-clamp pf anchor. It is idempotent (a second Start is a no-op).
+// Start brings the mesh device up: the utun, wireguard, the mesh-link address, and
+// the mesh-egress alias. It is idempotent (a second Start is a no-op).
 func (m *Mesh) Start(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -211,7 +210,7 @@ func (m *Mesh) Reconcile(ctx context.Context, peers []netv1.MeshPeerSpec) error 
 	return nil
 }
 
-// Close tears the mesh down (routes, pf anchor, mesh-egress alias, wireguard
+// Close tears the mesh down (routes, legacy pf anchor flush, mesh-egress alias, wireguard
 // device), leak-free. It is idempotent.
 func (m *Mesh) Close(ctx context.Context) error {
 	m.mu.Lock()

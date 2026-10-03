@@ -55,21 +55,19 @@ type Privileged interface {
 	// live; an executor that cannot serve the new CIDR returns an error and the
 	// adoption is refused.
 	SetNodePodCIDR(ctx context.Context, cidr netip.Prefix) error
-	// LoadPFAnchor loads the utun-scoped MSS-clamp rule (mssClamp already validated).
-	LoadPFAnchor(ctx context.Context, mssClamp int) error
 	// BindPort binds a listening socket on the specific addr and returns it; the
 	// caller passes the fd to the client and closes this copy.
 	BindPort(ctx context.Context, network string, addr netip.AddrPort) (*os.File, error)
 }
 
-// darwinApplier is the production Privileged: it shells out to ifconfig/pfctl and
+// darwinApplier is the production Privileged: it shells out to ifconfig and
 // binds sockets directly, and drives the real wireguard mesh device (pkg/mesh).
 // It runs as root inside the daemon; unit tests inject a fake Privileged instead,
 // so this code path is exercised only in the root-gated integration tier.
 //
 // Locking discipline: the lazily-built mesh device, its up/iface state, and the
 // node CIDR the mesh addresses derive from are guarded by mu, so concurrent
-// ConfigureMesh/RemoveMesh/LoadPFAnchor/SetNodePodCIDR calls (from different
+// ConfigureMesh/RemoveMesh/SetNodePodCIDR calls (from different
 // connections) serialize. Alias and port operations are independent (the kernel
 // serializes them) and take no lock here.
 type darwinApplier struct {
@@ -197,27 +195,6 @@ func (a *darwinApplier) RemoveMesh(ctx context.Context) error {
 		return fmt.Errorf("mesh down: %w", err)
 	}
 	a.meshUp = false
-	return nil
-}
-
-// LoadPFAnchor loads the MSS-clamp rule scoped to the live mesh utun. It requires
-// the mesh to be up (the clamp is meaningless without a utun to scope it to); the
-// rule text is rendered here from the validated clamp, never accepted over the wire.
-func (a *darwinApplier) LoadPFAnchor(ctx context.Context, mssClamp int) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.dev == nil || !a.meshUp {
-		return fmt.Errorf("load pf anchor: mesh not configured (no utun to scope the MSS clamp)")
-	}
-	iface := a.dev.Interface()
-	if iface == "" {
-		return fmt.Errorf("load pf anchor: mesh utun not resolved")
-	}
-	cmd := exec.CommandContext(ctx, "pfctl", "-a", mesh.PFAnchor, "-f", "-")
-	cmd.Stdin = bytes.NewBufferString(mesh.PFMSSClampRule(iface, mssClamp))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("pfctl load %s: %w: %s", mesh.PFAnchor, err, bytes.TrimSpace(out))
-	}
 	return nil
 }
 

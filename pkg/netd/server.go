@@ -54,11 +54,6 @@ const DefaultSocketPath = wire.DefaultSocketPath
 // is still alive waits this long between frames.
 const DefaultIdleTimeout = 2 * time.Minute
 
-// minMSSClamp is the smallest TCP MSS the daemon will load into the clamp anchor.
-// A clamp below this is nonsensical (smaller than the headers leave room for) and
-// is rejected; the ceiling is the mesh link's own max MSS.
-const minMSSClamp = 216
-
 // ErrPolicy is the base error a request that violates daemon policy wraps. It is
 // surfaced to the client in the response Error string.
 var ErrPolicy = errors.New("netd: request denied by policy")
@@ -527,8 +522,6 @@ func (s *Server) dispatch(ctx context.Context, st *connState, payload []byte) (w
 		return s.handleConfigureMesh(ctx, st, req.ConfigureMesh), nil
 	case wire.VerbRemoveMesh:
 		return s.handleRemoveMesh(ctx), nil
-	case wire.VerbLoadPFAnchor:
-		return s.handleLoadPFAnchor(ctx, req.LoadPFAnchor), nil
 	case wire.VerbBindPort:
 		return s.handleBindPort(ctx, st, req.BindPort)
 	default:
@@ -757,23 +750,6 @@ func (s *Server) handleRemoveMesh(ctx context.Context) wire.Response {
 	return s.okResp()
 }
 
-// handleLoadPFAnchor validates the clamp against the mesh link MSS bounds and loads
-// the anchor (the rule text is rendered daemon-side from the clamp).
-func (s *Server) handleLoadPFAnchor(ctx context.Context, args *wire.LoadPFAnchorArgs) wire.Response {
-	if args == nil {
-		return s.errResp("loadPFAnchor: missing args")
-	}
-	if err := validateMSSClamp(args.MSSClamp); err != nil {
-		s.log.Warn("netd: pf clamp rejected", "mss", args.MSSClamp, "err", err)
-		return s.errResp(err.Error())
-	}
-	if err := s.priv.LoadPFAnchor(ctx, args.MSSClamp); err != nil {
-		return s.errResp(fmt.Sprintf("loadPFAnchor: %v", err))
-	}
-	s.log.Info("netd: pf clamp anchor loaded", "mss", args.MSSClamp)
-	return s.okResp()
-}
-
 // handleBindPort validates the address and authorizes the port, then binds and
 // returns the listening socket fd for the server to pass over SCM_RIGHTS. A
 // specific address is authorized as before (the PortAuthorizer gates a privileged
@@ -876,17 +852,6 @@ func (s *Server) authorizePort(ctx context.Context, port int, nodeAddr string) e
 			return fmt.Errorf("%w: privileged port %d not authorized: %w", ErrPolicy, port, err)
 		}
 		return nil
-	}
-	return nil
-}
-
-// validateMSSClamp bounds the clamp to a sane TCP MSS window: at least minMSSClamp
-// and no larger than the mesh link's own max MSS (a larger clamp would be a no-op
-// that defeats the anchor's purpose).
-func validateMSSClamp(mss int) error {
-	max := mesh.MaxMSS(mesh.MTU)
-	if mss < minMSSClamp || mss > max {
-		return fmt.Errorf("%w: mss clamp %d outside [%d,%d]", ErrPolicy, mss, minMSSClamp, max)
 	}
 	return nil
 }

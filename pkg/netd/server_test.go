@@ -54,7 +54,6 @@ type fakePriv struct {
 	meshKeys    []string
 	meshPlans   []mesh.Plan
 	meshRemoved int
-	pfClamps    []int
 	bound       []netip.AddrPort
 	adopted     []netip.Prefix
 }
@@ -94,13 +93,6 @@ func (f *fakePriv) RemoveMesh(_ context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.meshRemoved++
-	return nil
-}
-
-func (f *fakePriv) LoadPFAnchor(_ context.Context, mssClamp int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.pfClamps = append(f.pfClamps, mssClamp)
 	return nil
 }
 
@@ -704,9 +696,6 @@ func TestServerHappyPathVerbs(t *testing.T) {
 	peers := []wire.MeshPeerArg{{PubKey: genKeyB64(t), Endpoint: "192.0.2.10:51820", AllowedIPs: []string{"100.64.1.0/24"}}}
 	if err := c.ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers); err != nil {
 		t.Fatalf("ConfigureMesh: %v", err)
-	}
-	if err := c.LoadPFAnchor(ctx, mesh.MSSClamp); err != nil {
-		t.Fatalf("LoadPFAnchor: %v", err)
 	}
 	if err := c.RemoveMesh(ctx); err != nil {
 		t.Fatalf("RemoveMesh: %v", err)

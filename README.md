@@ -36,20 +36,21 @@ around.
 | [`pkg/dns`](pkg/dns) | Pod DNS: the pure-Go reference resolver (`ndots`/search-domain expansion) that the `getaddrinfo` shim mirrors, the per-pod DNS config the shim consumes, and `/etc/resolv.conf` rendering for Linux VM guests. |
 | [`pkg/ingress`](pkg/ingress) | An in-process L7 HTTP(S) reverse proxy fronting the ClusterIP VIPs the Service proxy already owns — host/path routing, in-memory-only TLS termination, no bundled Traefik or nginx binary. |
 | [`pkg/netbind`](pkg/netbind) | The shared listener-bind seam used by the Service proxy and the ingress proxy: bind directly, or ask the root daemon to bind and adopt the resulting socket over `SCM_RIGHTS`. |
-| [`pkg/netd`](pkg/netd) | The logic of the root network daemon: `lo0` alias management, the WireGuard `utun` and its routes, the `pf` MSS-clamp anchor, and privileged port binds. See "Privilege split" below. |
+| [`pkg/netd`](pkg/netd) | The logic of the root network daemon: `lo0` alias management, the WireGuard `utun` and its routes, and privileged port binds. See "Privilege split" below. |
 | [`shim/getaddrinfo_shim.c`](shim/getaddrinfo_shim.c) | A `DYLD_INSERT_LIBRARIES` dylib, built with `clang` rather than cgo, that interposes `getaddrinfo`, `bind`, and `connect` inside a pod process: it resolves cluster names against the in-process cluster resolver, rewrites a wildcard bind onto the pod's own IP, and pins an outbound connection's source address for mesh-egress traffic. |
 
 ## Privilege split
 
-macOS requires root for `lo0` alias creation, `utun` device creation, `pf` anchor loads, and
-binding a port below 1024. `pkg/netd` is the only component in this repository that performs those
+macOS requires root for `lo0` alias creation, `utun` device creation, and binding a port below
+1024. The mesh loads no `pf` rule; on teardown it only flushes the `io.k3sm.mesh` anchor an older
+release may have loaded. `pkg/netd` is the only component in this repository that performs those
 operations. It ships as a library, not a standalone binary: in deployment the single `k3sm` binary
 re-execs itself in a "netd" mode and imports `netd.Server` to run it. Everything else —
 `pkg/podnet`, `pkg/proxy`, `pkg/mesh`, `pkg/ingress` — runs as an unprivileged user and reaches the
 daemon over a Unix socket when it needs a privileged operation.
 
-The protocol (`pkg/netd/wire`) is a closed, versioned set of six verbs — `EnsureAlias`,
-`RemoveAlias`, `ConfigureMesh`, `RemoveMesh`, `LoadPFAnchor`, `BindPort` — each carrying only typed
+The protocol (`pkg/netd/wire`) is a closed, versioned set of five verbs — `EnsureAlias`,
+`RemoveAlias`, `ConfigureMesh`, `RemoveMesh`, `BindPort` — each carrying only typed
 scalars (an IP, a port, a typed peer list). It never accepts raw route, `pf`, or WireGuard
 configuration text, and it never accepts a filesystem path. The daemon does not trust its caller:
 it re-derives and re-validates every parameter (CIDR containment, route sets, port authorization)

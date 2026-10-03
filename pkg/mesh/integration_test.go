@@ -43,8 +43,8 @@ func genWGKeyB64(t *testing.T) string {
 }
 
 // TestMeshDeviceBringUpOnRealUTUN exercises the real, privileged datapath: it
-// creates a utun, runs wireguard over it, plumbs the mesh-egress lo0 alias, loads
-// the utun-scoped MSS-clamp pf anchor, installs a peer route, reconverges on an
+// creates a utun, runs wireguard over it, plumbs the mesh-egress lo0 alias,
+// installs a peer route, reconverges on an
 // endpoint change, and tears it all down leak-free. It is root-gated (t.Skip
 // without root) and does NOT run in the unit pass.
 //
@@ -54,7 +54,7 @@ func genWGKeyB64(t *testing.T) string {
 // assert.
 func TestMeshDeviceBringUpOnRealUTUN(t *testing.T) {
 	if os.Geteuid() != 0 {
-		t.Skip("requires root: creates a utun, installs kernel routes, loads a pf anchor")
+		t.Skip("requires root: creates a utun, installs kernel routes")
 	}
 
 	self := netip.MustParsePrefix("100.64.0.0/24")
