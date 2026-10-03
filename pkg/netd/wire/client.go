@@ -221,16 +221,6 @@ func (c *Client) RemoveMesh(ctx context.Context) error {
 	return err
 }
 
-// LoadPFAnchor asks the daemon to load the utun-scoped MSS-clamp pf anchor.
-func (c *Client) LoadPFAnchor(ctx context.Context, mssClamp int) error {
-	_, err := c.roundTrip(ctx, Request{
-		Version:      CurrentVersion(),
-		Verb:         VerbLoadPFAnchor,
-		LoadPFAnchor: &LoadPFAnchorArgs{MSSClamp: mssClamp},
-	})
-	return err
-}
-
 // BindPort asks the daemon to bind a listening socket on the specific addr and
 // return it via SCM_RIGHTS. The returned *os.File owns the descriptor; wrap it with
 // net.FileListener (TCP) and close the *os.File afterward.

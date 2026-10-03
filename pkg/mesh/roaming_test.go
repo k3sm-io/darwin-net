@@ -286,9 +286,10 @@ func TestMeshReconcileDoesNotStompRoamedEndpoint(t *testing.T) {
 // every peer with it) forgets what it programmed and the next apply re-programs
 // every CR endpoint. Were the memory held above the device, the post-restart
 // resync would suppress every endpoint and the mesh would never come back up.
-// Down on a never-upped device performs no privileged operation.
+// Down's host commands go through a no-op seam, so nothing privileged runs.
 func TestWGDeviceForgetsAppliedEndpointsOnDown(t *testing.T) {
-	d := newWGDevice(wgLink{name: "utun", mtu: MTU, mss: MSSClamp, listenPort: DefaultListenPort}, discardLogger())
+	d := newWGDevice(wgLink{name: "utun", mtu: MTU, listenPort: DefaultListenPort}, discardLogger())
+	d.command = func(context.Context, string, ...string) ([]byte, error) { return nil, nil }
 	d.applied = AppliedEndpoints{keyHex(t, 0x42): "192.0.2.10:51820"}
 	if err := d.Down(context.Background()); err != nil {
 		t.Fatalf("Down: %v", err)

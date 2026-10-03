@@ -30,19 +30,27 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-// PFAnchor is the pf anchor the mesh loads its MSS-clamp rule into. Wiring the
-// anchor into the main ruleset (anchor "io.k3sm.mesh") is the root netd boundary's
-// job — the full pf sub-anchor is not built; this minimal clamp is pulled
-// forward on its own here. It is exported so the netd daemon
-// (k3sm.io/darwin-net/pkg/netd) loads the standalone MSS-clamp verb into the
-// same anchor.
+// PFAnchor is the pf anchor name older releases loaded a TCP MSS-clamp rule into.
+// Nothing loads it now: the main pf ruleset never referenced it, so the rule was
+// never evaluated, and k3sm does not own pf. The name is kept only so teardown
+// (WGDevice.Down) and the k3sm uninstall can flush an anchor an older release left
+// behind.
 const PFAnchor = "io.k3sm.mesh"
+
+// commandFunc runs one host command and returns its combined output. It is the
+// single seam every command the WGDevice spawns goes through, so the full set of
+// host mutations bring-up and teardown make is observable in an unprivileged test.
+type commandFunc func(ctx context.Context, name string, args ...string) ([]byte, error)
+
+// execCommand is the production commandFunc.
+func execCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
 
 // wgLink is the immutable configuration of the real wireguard device.
 type wgLink struct {
 	name          string // requested utun name ("utun" lets the kernel pick a unit)
 	mtu           int
-	mss           int
 	meshIP        netip.Addr
 	linkIP        netip.Addr
 	privateKeyB64 string
@@ -53,14 +61,12 @@ type wgLink struct {
 // is the exported seam the netd daemon (k3sm.io/darwin-net/pkg/netd) uses to build
 // the real datapath after it has authenticated the peer and validated+rendered a
 // Plan; the Mesh controller builds the same device internally from its options.
-// Zero fields take the package defaults (MTU, MSSClamp, DefaultListenPort, "utun").
+// Zero fields take the package defaults (MTU, DefaultListenPort, "utun").
 type DeviceConfig struct {
 	// UTUNName is the requested utun name; "" or "utun" lets the kernel pick the unit.
 	UTUNName string
 	// MTU is the tunnel MTU; 0 uses MTU.
 	MTU int
-	// MSS is the TCP MSS the pf scrub anchor clamps to on the utun egress; 0 uses MSSClamp.
-	MSS int
 	// MeshIP is the node's reserved mesh-egress /32 (podnet.MeshEgressIP), plumbed as
 	// an lo0 alias so the Service proxy can bind it as the backend dialer source.
 	MeshIP netip.Addr
@@ -102,9 +108,10 @@ type DeviceConfig struct {
 // Locking discipline: all mutable state (the device handle, the actual interface
 // name, and the installed-route set) is guarded by mu, so Up/Apply/Down serialize.
 type WGDevice struct {
-	cfg wgLink
-	log *slog.Logger
-	rt  routeTable
+	cfg     wgLink
+	log     *slog.Logger
+	rt      routeTable
+	command commandFunc // every spawned host command (ifconfig, pfctl) goes through it
 
 	mu    sync.Mutex
 	iface string // resolved interface name after CreateTUN (e.g. "utun4")
@@ -113,10 +120,9 @@ type WGDevice struct {
 	// routes is the set of prefixes this device has VERIFIED in the kernel table,
 	// re-derived from a read-back on every apply — never a record of the route
 	// requests that were made (an accepted write is not a route in the table).
-	routes    map[netip.Prefix]struct{}
-	applied   AppliedEndpoints // endpoints this device last programmed, per peer key
-	lastUAPI  string           // the peer update IpcSet last accepted; "" once the device is gone
-	pfApplied bool
+	routes   map[netip.Prefix]struct{}
+	applied  AppliedEndpoints // endpoints this device last programmed, per peer key
+	lastUAPI string           // the peer update IpcSet last accepted; "" once the device is gone
 }
 
 // wgControl is the slice of *device.Device the applier drives: the UAPI write,
@@ -148,10 +154,6 @@ func NewDevice(cfg DeviceConfig, log *slog.Logger) *WGDevice {
 	if mtu == 0 {
 		mtu = MTU
 	}
-	mss := cfg.MSS
-	if mss == 0 {
-		mss = MSSClamp
-	}
 	port := cfg.ListenPort
 	if port == 0 {
 		port = DefaultListenPort
@@ -159,7 +161,6 @@ func NewDevice(cfg DeviceConfig, log *slog.Logger) *WGDevice {
 	return newWGDevice(wgLink{
 		name:          name,
 		mtu:           mtu,
-		mss:           mss,
 		meshIP:        cfg.MeshIP,
 		linkIP:        cfg.LinkIP,
 		privateKeyB64: cfg.PrivateKeyB64,
@@ -174,16 +175,16 @@ func newWGDevice(cfg wgLink, log *slog.Logger) *WGDevice {
 		log = slog.Default()
 	}
 	return &WGDevice{
-		cfg:    cfg,
-		log:    log,
-		rt:     kernelRouteTable{},
-		routes: make(map[netip.Prefix]struct{}),
+		cfg:     cfg,
+		log:     log,
+		rt:      kernelRouteTable{},
+		command: execCommand,
+		routes:  make(map[netip.Prefix]struct{}),
 	}
 }
 
 // Interface returns the resolved utun name (e.g. "utun4") once Up has run, or the
-// empty string before. It lets the netd daemon scope a standalone MSS-clamp pf
-// rule to the live tunnel.
+// empty string before.
 func (d *WGDevice) Interface() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -191,8 +192,10 @@ func (d *WGDevice) Interface() string {
 }
 
 // Up creates the utun, starts wireguard with the node's private key + listen port,
-// assigns the utun's own mesh-link address, plumbs the mesh-egress lo0 alias, and
-// loads the MSS-clamp pf anchor. It fails fast if the private key or the mesh-link
+// and plumbs the host side (plumb: the utun's own mesh-link address and the
+// mesh-egress lo0 alias). It loads no pf rule: XNU takes a connection's TCP MSS
+// from the route to the destination, which for a peer pod CIDR is the utun at
+// MTU. It fails fast if the private key or the mesh-link
 // address is missing (hard cut — the operator provisions them; no embedded default)
 // and is idempotent (a second Up is a no-op once the device is running).
 func (d *WGDevice) Up(ctx context.Context) error {
@@ -233,26 +236,9 @@ func (d *WGDevice) Up(ctx context.Context) error {
 		return fmt.Errorf("bring wireguard device up: %w", err)
 	}
 
-	// The utun's own point-to-point address. It is what makes the per-peer routes
-	// installable: macOS resolves an interface-bound route's source address from an
-	// address on that interface, so RTM_ADD against an ADDRESSLESS utun is rejected
-	// with ENETUNREACH. Every peer route silently failed to land before this
-	// address existed (the applier then drove route(8), which prints that refusal
-	// and still exits 0, so a caller that trusted the exit status never saw it).
-	if err := d.run(ctx, "ifconfig", name, "inet", d.cfg.linkIP.String(), d.cfg.linkIP.String(), "netmask", "255.255.255.255", "up"); err != nil {
+	if err := d.plumb(ctx, name); err != nil {
 		dev.Close()
-		return fmt.Errorf("assign mesh link address %s to %s: %w", d.cfg.linkIP, name, err)
-	}
-	// Mesh-egress source as an lo0 /32 alias (locally bindable by the proxy dialer).
-	if err := d.run(ctx, "ifconfig", "lo0", "alias", fmt.Sprintf("%s/32", d.cfg.meshIP)); err != nil {
-		dev.Close()
-		return fmt.Errorf("plumb mesh-egress alias %s: %w", d.cfg.meshIP, err)
-	}
-	// Minimal utun-scoped MSS clamp (never lo0).
-	if err := d.loadPF(ctx, name); err != nil {
-		_ = d.run(ctx, "ifconfig", "lo0", "-alias", d.cfg.meshIP.String())
-		dev.Close()
-		return fmt.Errorf("load mesh pf anchor: %w", err)
+		return err
 	}
 
 	d.iface = name
@@ -263,8 +249,28 @@ func (d *WGDevice) Up(ctx context.Context) error {
 	// programs every peer's CR endpoint.
 	d.applied = nil
 	d.lastUAPI = ""
-	d.pfApplied = true
-	d.log.Info("mesh device up", "iface", name, "meshIP", d.cfg.meshIP.String(), "linkIP", d.cfg.linkIP.String(), "mtu", d.cfg.mtu, "mss", d.cfg.mss, "listenPort", d.cfg.listenPort)
+	d.log.Info("mesh device up", "iface", name, "meshIP", d.cfg.meshIP.String(), "linkIP", d.cfg.linkIP.String(), "mtu", d.cfg.mtu, "listenPort", d.cfg.listenPort)
+	return nil
+}
+
+// plumb performs the host-side bring-up on the created utun name: it assigns the
+// utun's own point-to-point mesh-link address and plumbs the mesh-egress source as
+// an lo0 /32 alias. Every command goes through d.command, so it is driven without
+// privilege in tests. The caller holds mu and closes the device on error.
+func (d *WGDevice) plumb(ctx context.Context, name string) error {
+	// The utun's own point-to-point address. It is what makes the per-peer routes
+	// installable: macOS resolves an interface-bound route's source address from an
+	// address on that interface, so RTM_ADD against an ADDRESSLESS utun is rejected
+	// with ENETUNREACH. Every peer route silently failed to land before this
+	// address existed (the applier then drove route(8), which prints that refusal
+	// and still exits 0, so a caller that trusted the exit status never saw it).
+	if err := d.run(ctx, "ifconfig", name, "inet", d.cfg.linkIP.String(), d.cfg.linkIP.String(), "netmask", "255.255.255.255", "up"); err != nil {
+		return fmt.Errorf("assign mesh link address %s to %s: %w", d.cfg.linkIP, name, err)
+	}
+	// Mesh-egress source as an lo0 /32 alias (locally bindable by the proxy dialer).
+	if err := d.run(ctx, "ifconfig", "lo0", "alias", fmt.Sprintf("%s/32", d.cfg.meshIP)); err != nil {
+		return fmt.Errorf("plumb mesh-egress alias %s: %w", d.cfg.meshIP, err)
+	}
 	return nil
 }
 
@@ -405,9 +411,9 @@ func (d *WGDevice) reconcileRoutes(ctx context.Context, want []netip.Prefix) (in
 	return len(verified) - len(lingering), nil
 }
 
-// Down removes every route the device installed, unloads the pf anchor, removes
-// the mesh-egress alias, and closes the wireguard device. It is leak-free and
-// idempotent.
+// Down removes every route the device installed, flushes the legacy PFAnchor,
+// removes the mesh-egress alias, and closes the wireguard device. It is leak-free
+// and idempotent.
 func (d *WGDevice) Down(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -417,11 +423,12 @@ func (d *WGDevice) Down(ctx context.Context) error {
 		}
 		delete(d.routes, r)
 	}
-	if d.pfApplied {
-		if err := d.run(ctx, "pfctl", "-a", PFAnchor, "-F", "all"); err != nil {
-			d.log.Warn("flush mesh pf anchor", "anchor", PFAnchor, "err", err)
-		}
-		d.pfApplied = false
+	// Backstop, not a feature: this release loads nothing into PFAnchor, but an
+	// older one loaded an MSS-clamp rule there. Flushing it unconditionally on every
+	// teardown means an upgraded node self-cleans on its first Down. Best-effort and
+	// warn-only: an empty or absent anchor, or no privilege, must not fail teardown.
+	if err := d.run(ctx, "pfctl", "-a", PFAnchor, "-F", "all"); err != nil {
+		d.log.Warn("flush legacy mesh pf anchor", "anchor", PFAnchor, "err", err)
 	}
 	if d.cfg.meshIP.IsValid() {
 		_ = d.run(ctx, "ifconfig", "lo0", "-alias", d.cfg.meshIP.String())
@@ -439,19 +446,10 @@ func (d *WGDevice) Down(ctx context.Context) error {
 	return nil
 }
 
-// loadPF loads the utun-scoped MSS-clamp rule into the mesh pf anchor.
-func (d *WGDevice) loadPF(ctx context.Context, iface string) error {
-	cmd := exec.CommandContext(ctx, "pfctl", "-a", PFAnchor, "-f", "-")
-	cmd.Stdin = bytes.NewBufferString(PFMSSClampRule(iface, d.cfg.mss))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
-	}
-	return nil
-}
-
-// run invokes a root-gated command, wrapping any failure with its combined output.
+// run invokes a root-gated command through the command seam, wrapping any failure
+// with its combined output.
 func (d *WGDevice) run(ctx context.Context, name string, args ...string) error {
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	out, err := d.command(ctx, name, args...)
 	if err != nil {
 		return fmt.Errorf("%s %v: %w: %s", name, args, err, bytes.TrimSpace(out))
 	}

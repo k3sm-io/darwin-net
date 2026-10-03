@@ -170,11 +170,10 @@ func TestMeshAllowedIPsEqualsCIDR(t *testing.T) {
 	}
 }
 
-// TestMeshConstantsAndMSSClamp pins the link constants and the MSS-clamp
-// derivation: the clamp must be the mesh MTU minus the IPv4+TCP headers, the value
-// a pf scrub uses so a pod socket on the lo0 MTU (16384) cannot advertise an MSS
-// too large for the 1380 utun (a large-payload cross-node TCP blackhole).
-func TestMeshConstantsAndMSSClamp(t *testing.T) {
+// TestMeshConstantsAndTunnelMSS pins the link constants and the documented
+// expected TCP MSS across the mesh: the tunnel MTU minus the IPv4+TCP headers,
+// which is what XNU derives from the route to a peer pod CIDR (the utun).
+func TestMeshConstantsAndTunnelMSS(t *testing.T) {
 	if MTU != 1380 {
 		t.Fatalf("MTU = %d, want 1380", MTU)
 	}
@@ -187,23 +186,11 @@ func TestMeshConstantsAndMSSClamp(t *testing.T) {
 	if got := MaxMSS(1500); got != 1460 {
 		t.Fatalf("MaxMSS(1500) = %d, want 1460", got)
 	}
-	if MSSClamp != 1340 {
-		t.Fatalf("MSSClamp = %d, want 1340 (MTU-40)", MSSClamp)
+	if got := MaxMSS(MTU); got != 1340 {
+		t.Fatalf("MaxMSS(MTU) = %d, want 1340 (MTU-40)", got)
 	}
-}
-
-// TestMeshPFClampScopedToUTUN proves the pf scrub rule is scoped to the utun
-// egress and clamps the MSS, and is NOT applied to lo0 (clamping loopback would
-// needlessly shrink same-node segments).
-func TestMeshPFClampScopedToUTUN(t *testing.T) {
-	rule := PFMSSClampRule("utun4", MSSClamp)
-	for _, want := range []string{"scrub out", "on utun4", "proto tcp", "max-mss 1340"} {
-		if !strings.Contains(rule, want) {
-			t.Fatalf("pf rule %q missing %q", rule, want)
-		}
-	}
-	if strings.Contains(rule, "lo0") {
-		t.Fatalf("pf rule clamps lo0 (must be utun-only): %q", rule)
+	if TunnelMSS != MaxMSS(MTU) {
+		t.Fatalf("TunnelMSS = %d, want MaxMSS(MTU) = %d", TunnelMSS, MaxMSS(MTU))
 	}
 }
 

@@ -29,8 +29,7 @@ import (
 
 // netdDevice is the helper-backed Device: instead of creating a utun and driving
 // wireguard itself, it sends the typed peer set to the root netd daemon over a
-// unix socket and the daemon renders the UAPI, installs the routes, and loads the
-// MSS-clamp anchor. It lets an unprivileged process run the mesh controller while
+// unix socket and the daemon renders the UAPI and installs the routes. It lets an unprivileged process run the mesh controller while
 // the irreducibly-root datapath stays behind the daemon boundary.
 //
 // It satisfies Device. The daemon's ConfigureMesh is the combined bring-up + apply
@@ -64,8 +63,8 @@ func newNetdDevice(socketPath, privKeyRef string, listenPort int, self netip.Pre
 }
 
 // Up brings the mesh tunnel up via the daemon with no peers yet (the daemon
-// creates the utun, sets the resolved private key + listen port, and loads the
-// MSS-clamp anchor). It is idempotent: the daemon's ConfigureMesh is.
+// creates the utun and sets the resolved private key + listen port). It is
+// idempotent: the daemon's ConfigureMesh is.
 func (d *netdDevice) Up(ctx context.Context) error {
 	return d.client.ConfigureMesh(ctx, d.privKeyRef, d.listenPort, d.self, nil)
 }

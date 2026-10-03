@@ -24,15 +24,15 @@ limitations under the License.
 // # Why the pure logic is separated from the privileged device
 //
 // Bringing the mesh up touches root-only state (creating a utun, installing
-// kernel routes, loading a pf anchor), so those operations live behind the Device
+// kernel routes, plumbing lo0 aliases), so those operations live behind the Device
 // seam and run inside the netd daemon boundary in deployment. Everything that
 // decides WHAT to program is pure and table-tested without privilege: the route
 // set (RouteSet), the AllowedIPs==podCIDR equality check (AllowedIPsMatchCIDR),
 // the wireguard UAPI config (Plan.UAPI), the public-key encoding (publicKeyHex),
-// and the MTU/MSS constants. BuildPlan turns a MeshPeer snapshot into a Plan; the
+// and the MTU constants. BuildPlan turns a MeshPeer snapshot into a Plan; the
 // Device applies it.
 //
-// # Four load-bearing mechanics (each blackholes traffic if dropped)
+// # Three load-bearing mechanics (each blackholes traffic if dropped)
 //
 //   - Per-peer kernel routes, distinct from wireguard AllowedIPs. wireguard-go is
 //     the library over a raw utun; unlike wg-quick it installs NO kernel routes,
@@ -56,10 +56,14 @@ limitations under the License.
 //   - The node /24 as a single source of truth. AllowedIPs == the podnet IPAM CIDR
 //     == node.spec.podCIDR; the mesh asserts equality, not merely symmetry, because
 //     a symmetric-but-wrong AllowedIPs still blackholes.
-//   - An MSS clamp scoped to the utun egress. A pod socket bound to an lo0 alias
-//     sees the loopback MTU (16384) and can advertise an MSS too large for the 1380
-//     utun, blackholing large-payload cross-node TCP; a minimal pf scrub anchor
-//     (built ahead of the full pf sub-anchor) clamps max-mss on the utun only, never lo0.
+//
+// TCP segment size across the tunnel needs no pf rule: the mesh relies on the
+// tunnel MTU (1380). XNU takes a connection's TCP MSS from the route to the
+// destination, not from the source address's interface, so a pod socket bound to
+// an lo0 alias (MTU 16384) still advertises the tunnel's MSS (TunnelMSS, 1340)
+// toward a peer's pod CIDR, because that route resolves to the utun. Nothing in
+// this package loads a pf rule; teardown only flushes the PFAnchor an older
+// release may have loaded.
 //
 // # The endpoint-roaming contract
 //

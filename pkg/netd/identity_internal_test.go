@@ -64,8 +64,6 @@ func (p *recordingPriv) SetNodePodCIDR(_ context.Context, cidr netip.Prefix) err
 	return nil
 }
 
-func (p *recordingPriv) LoadPFAnchor(context.Context, int) error { p.served = true; return nil }
-
 func (p *recordingPriv) BindPort(context.Context, string, netip.AddrPort) (*os.File, error) {
 	p.served = true
 	return nil, errors.New("not used by this test")
