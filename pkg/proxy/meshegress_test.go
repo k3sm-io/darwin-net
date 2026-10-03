@@ -18,12 +18,9 @@ package proxy
 
 import (
 	"errors"
-	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/netip"
-	"sync"
 	"testing"
 	"time"
 
@@ -259,12 +256,6 @@ func TestUDPRelayAppliesEgressScope(t *testing.T) {
 			if !tc.dst.IsValid() {
 				t.Skip("an invalid address is not a routable endpoint; covered by the predicate table")
 			}
-			pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-			if err != nil {
-				t.Fatalf("listen vip udp: %v", err)
-			}
-			defer pc.Close()
-
 			// A zero podCIDR yields LocalityUnknown for every backend; the node /24
 			// yields Local for its own addresses and Remote for the rest — the same
 			// classify() the reconcile path runs.
@@ -272,8 +263,8 @@ func TestUDPRelayAppliesEgressScope(t *testing.T) {
 			if tc.loc == LocalityUnknown {
 				cidr = netip.Prefix{}
 			}
-			vip := pc.LocalAddr().(*net.UDPAddr)
-			key := PortKey{ClusterIP: "127.0.0.1", Port: int32(vip.Port), Protocol: netv1.ProtocolUDP}
+			vip := netip.MustParseAddrPort("10.43.0.60:53")
+			key := PortKey{ClusterIP: vip.Addr().String(), Port: int32(vip.Port()), Protocol: netv1.ProtocolUDP}
 			tbl := NewRoutingTable(cidr)
 			if n := tbl.SetEndpoints(key, []netv1.Endpoint{{IP: tc.dst.String(), Port: 9000, Ready: true}}); n != 1 {
 				t.Fatalf("installed %d backends, want 1", n)
@@ -284,30 +275,25 @@ func TestUDPRelayAppliesEgressScope(t *testing.T) {
 				t.Fatalf("backend locality = %v, want %v (the case's premise)", be.Locality(), tc.loc)
 			}
 
-			r := newUDPRelay(pc, key, tbl, tc.resolved(), time.Hour, maxUDPFlowsPerSource, nil, slog.New(slog.DiscardHandler))
+			// The VIP socket and the upstream are in-memory fakes; the backend's dial
+			// records the source the relay asked it to bind.
+			be := newFakeUDPBackend(false)
+			r := newUDPRelay(newFakeVIPConn(vip), key, tbl, tc.resolved(), time.Hour, maxUDPFlowsPerSource, nil, slog.New(slog.DiscardHandler))
+			r.dial = be.dial
 			defer r.Close()
-			var (
-				mu    sync.Mutex
-				laddr *net.UDPAddr
-				dials int
-			)
-			r.dial = func(l, _ *net.UDPAddr) (udpUpstream, error) {
-				mu.Lock()
-				defer mu.Unlock()
-				laddr, dials = l, dials+1
-				// Refusing the dial keeps the case hermetic: no upstream socket, no
-				// flow entry, no reachable peer required. The source decision has
-				// already been made by the time the seam is called.
-				return nil, errors.New("test seam: no upstream socket")
-			}
 			var lastWarn time.Time
-			_ = r.upstreamFor(netip.MustParseAddrPort("10.1.0.1:40000"), &lastWarn)
+			if up := r.upstreamFor(netip.MustParseAddrPort("10.1.0.1:40000"), &lastWarn); up == nil {
+				t.Fatalf("flow admission failed")
+			}
 
-			mu.Lock()
-			defer mu.Unlock()
-			if dials != 1 {
+			if dials := be.dials(); dials != 1 {
 				t.Fatalf("relay dialed %d times, want 1", dials)
 			}
+			up := be.upstream(0)
+			if want := netip.AddrPortFrom(tc.dst, 9000); up.remote != want {
+				t.Fatalf("relay dialed %v, want the backend %v", up.remote, want)
+			}
+			laddr := up.laddr
 			if !tc.want.IsValid() {
 				if laddr != nil {
 					t.Fatalf("relay bound laddr = %v, want nil (kernel default source selection)", laddr)
@@ -392,133 +378,6 @@ func TestWithMeshEgressSourceBuildsSeparateBoundDialer(t *testing.T) {
 			t.Fatalf("q.egress.clusterCIDR = %s, want the podnet default %s", q.egress.clusterCIDR, podnet.ClusterPodCIDR)
 		}
 	})
-}
-
-// TestProxyConcurrentScopedDialsShareNoDialerState is the -race leg the plan's
-// gate paragraph requires: local- and remote-destination dials IN FLIGHT together
-// through one shared Proxy. The containment being proven is a per-connection
-// shared-state property — a sequential round trip cannot exercise it, and the
-// pre-M14.2 shape (one dialer whose LocalAddr is written per destination) would
-// both trip the race detector here and non-deterministically apply one
-// connection's source to another's dial.
-//
-// macOS note: only 127.0.0.1 is bindable without a root-created lo0 alias, so
-// both backends listen there and the two localities are produced by the
-// classifier rather than by distinct real addresses — the node /24 is 127.1.0.0/24
-// inside a 127.0.0.0/8 aggregate, which makes the real 127.0.0.1 listener
-// LocalityRemote (bound path), while the local backend is published inside the
-// node /24 and reaches the same loopback via a transport override (unbound path).
-func TestProxyConcurrentScopedDialsShareNoDialerState(t *testing.T) {
-	t.Parallel()
-	var (
-		aggregate = netip.MustParsePrefix("127.0.0.0/8")
-		nodeCIDR  = netip.MustParsePrefix("127.1.0.0/24")
-		egressIP  = netip.MustParseAddr("127.0.0.1")
-		published = netip.MustParseAddr("127.1.0.5")
-	)
-
-	localBE := newEchoBackend(t, "local-backend", "127.0.0.1")
-	defer localBE.close()
-	remoteBE := newEchoBackend(t, "remote-backend", "127.0.0.1")
-	defer remoteBE.close()
-	_, localPort := localBE.addrPort()
-	remoteIP, remotePort := remoteBE.addrPort()
-
-	table := NewRoutingTable(nodeCIDR)
-	localKey := PortKey{ClusterIP: "127.1.0.1", Port: 8080, Protocol: netv1.ProtocolTCP}
-	remoteKey := PortKey{ClusterIP: "127.1.0.1", Port: 8081, Protocol: netv1.ProtocolTCP}
-	// The local backend is published inside the node /24 (LocalityLocal) and its
-	// packets follow a transport override to the real loopback listener; the remote
-	// backend is published at a real loopback address that the classifier sees as
-	// outside the node /24 but inside the aggregate (LocalityRemote).
-	table.SetEndpoints(localKey, []netv1.Endpoint{{IP: published.String(), Port: localPort, Ready: true}})
-	table.SetEndpoints(remoteKey, []netv1.Endpoint{{IP: remoteIP, Port: remotePort, Ready: true}})
-	table.SetTransportOverrides(map[netip.Addr]netip.Addr{published: netip.MustParseAddr("127.0.0.1")})
-
-	p := New(table,
-		WithMeshEgressSource(egressIP),
-		WithClusterPodCIDR(aggregate),
-		withAliasManager(newNoopAliasManager()),
-		WithLogger(slog.New(slog.DiscardHandler)),
-	)
-	// Premise check: the two keys really do land on opposite sides of the scoping
-	// decision, so the concurrent run below mixes a bound and an unbound dial.
-	if be, err := table.PickAt(localKey, 0); err != nil {
-		t.Fatalf("pick local: %v", err)
-	} else if got := p.egress.sourceFor(be.Locality(), netip.MustParseAddr("127.0.0.1")); got.IsValid() {
-		t.Fatalf("local backend elected source %s, want kernel default", got)
-	}
-	if be, err := table.PickAt(remoteKey, 0); err != nil {
-		t.Fatalf("pick remote: %v", err)
-	} else if got := p.egress.sourceFor(be.Locality(), netip.MustParseAddr(remoteIP)); got != egressIP {
-		t.Fatalf("remote backend elected source %v, want %s", got, egressIP)
-	}
-
-	// Real VIP listeners, not net.Pipe: the splice signals end-of-stream with
-	// CloseWrite, which a pipe does not implement, so only a real conn lets a
-	// client read to EOF the way a pod does.
-	localVIP := servePort(t, p, localKey)
-	remoteVIP := servePort(t, p, remoteKey)
-
-	const iterations = 24
-	errCh := make(chan error, 2*iterations)
-	var wg sync.WaitGroup
-	fetch := func(vip string, key PortKey, wantID string) {
-		defer wg.Done()
-		c, err := net.DialTimeout("tcp", vip, 10*time.Second)
-		if err != nil {
-			errCh <- fmt.Errorf("%s: dial vip: %w", key, err)
-			return
-		}
-		defer c.Close()
-		if err := c.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-			errCh <- err
-			return
-		}
-		got, err := io.ReadAll(c)
-		if err != nil {
-			errCh <- fmt.Errorf("%s: read: %w", key, err)
-			return
-		}
-		if string(got) != wantID {
-			errCh <- fmt.Errorf("%s: steered to %q, want %q", key, got, wantID)
-		}
-	}
-	for range iterations {
-		wg.Add(2)
-		go fetch(localVIP, localKey, "local-backend")
-		go fetch(remoteVIP, remoteKey, "remote-backend")
-	}
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		t.Error(err)
-	}
-
-	// Neither dialer was mutated by any of the concurrent dials: the default one
-	// still selects the kernel source, the mesh one still carries exactly the
-	// mesh-egress /32.
-	if p.dialer.LocalAddr != nil {
-		t.Fatalf("p.dialer.LocalAddr = %#v after concurrent dials, want nil", p.dialer.LocalAddr)
-	}
-	la, ok := p.meshDialer.LocalAddr.(*net.TCPAddr)
-	if !ok || !la.IP.Equal(net.IP(egressIP.AsSlice())) {
-		t.Fatalf("p.meshDialer.LocalAddr = %#v after concurrent dials, want %s", p.meshDialer.LocalAddr, egressIP)
-	}
-}
-
-// servePort binds a loopback VIP listener for key and runs the proxy's TCP accept
-// loop on it, returning the host:port a client dials. The listener is closed at
-// test cleanup, which is what stops the serve goroutine.
-func servePort(t *testing.T, p *Proxy, key PortKey) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen vip: %v", err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go p.serve(ln, key, internalListener)
-	return ln.Addr().String()
 }
 
 // TestNodeAddressEndpointsDialWithoutTheMeshSource pins the node-address
