@@ -18,7 +18,9 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
 	"sync"
@@ -26,7 +28,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/informers"
@@ -39,6 +43,15 @@ import (
 // every further event inside the window is absorbed, so convergence latency is
 // bounded by informer propagation + this window even under sustained churn.
 const policyRecomputeDebounce = 100 * time.Millisecond
+
+// Watch-error reporting cadence (see watchErrState).
+const (
+	// policyWatchErrThrottle bounds how often a still-failing informer re-warns.
+	policyWatchErrThrottle = 10 * time.Minute
+	// policyWatchRecoveryPoll is how often Run checks a failing informer for
+	// recovery, so the Info line and the re-arm happen without a further error.
+	policyWatchRecoveryPoll = 15 * time.Second
+)
 
 // PolicyWatcher resolves NetworkPolicies into the PolicyTable's concrete verdict
 // state. It is the selector-aware half of the NetworkPolicy L4 subset: it watches
@@ -57,10 +70,15 @@ const policyRecomputeDebounce = 100 * time.Millisecond
 // Fail-open before sync: the table starts empty (allow everything) and Run
 // installs the first resolved state only after WaitForCacheSync, so a restarting
 // proxy never denies on a partial cache; convergence after an API change is
-// bounded by informer latency + policyRecomputeDebounce.
+// bounded by informer latency + policyRecomputeDebounce. An informer that cannot
+// list or watch (for example, refused by the authorizer) keeps the table in that
+// fail-open state, and the watcher says so through its own throttled watch-error
+// handler rather than client-go's per-retry log line.
 type PolicyWatcher struct {
-	table      *PolicyTable
-	factory    informers.SharedInformerFactory
+	table *PolicyTable
+	// factories are every informer factory the watcher owns: the cluster-wide one,
+	// plus a node-scoped Pods factory under WithPodNodeScope. Run starts them all.
+	factories  []informers.SharedInformerFactory
 	policies   cache.SharedIndexInformer
 	pods       cache.SharedIndexInformer
 	namespaces cache.SharedIndexInformer
@@ -79,24 +97,100 @@ type PolicyWatcher struct {
 	// an unguarded map write across goroutines is a fatal runtime throw).
 	warnMu         sync.Mutex
 	warnedPolicies map[string]bool
+
+	// watchErrs holds one watch-error reporting state per informer, keyed by
+	// resource name ("networkpolicies", "pods", "namespaces"). The map itself is
+	// fixed at construction; each state carries its own mutex.
+	watchErrs map[string]*watchErrState
+	// recoveryPoll is the Run-side recovery check interval (tests may shrink it).
+	recoveryPoll time.Duration
+}
+
+// PolicyWatcherOption configures a PolicyWatcher at construction.
+type PolicyWatcherOption func(*policyWatcherConfig)
+
+type policyWatcherConfig struct {
+	podNodeName string
+}
+
+// WithPodNodeScope narrows the watcher's Pods informer to the pods bound to
+// nodeName: its list and watch carry the field selector spec.nodeName=<nodeName>,
+// from a separate informer factory, while Namespaces and NetworkPolicies stay
+// cluster-wide. An empty nodeName leaves the Pods informer cluster-wide.
+//
+// This is the shape a worker node's own identity is authorized for: the Node
+// authorizer lets a node list and watch only the pods bound to it, so the
+// cluster-wide Pods informer is refused and the table would never be installed.
+//
+// Semantics under node scope: the table resolves both the selected (destination)
+// pods and the peer (source) pods against this node's pods only. That narrowing
+// is widen-only, because the enforcement point is this node's Service proxy, whose
+// clients are local pods; traffic a peer node re-originates arrives from that
+// node's mesh-egress /32, an always-allow seed. So a policy selecting a backend on
+// another node is unseen here and that backend stays allowed, and a remote pod IP
+// presented as a source is unknown and fails open. No verdict moves from allow to
+// deny relative to the cluster-wide view, except that policies selecting local
+// backends are now actually enforced instead of never being installed.
+func WithPodNodeScope(nodeName string) PolicyWatcherOption {
+	return func(c *policyWatcherConfig) { c.podNodeName = nodeName }
 }
 
 // NewPolicyWatcher builds a PolicyWatcher over client feeding table. It wires
 // NetworkPolicy, Pod, and Namespace informers but does not start them; call Run.
-func NewPolicyWatcher(client kubernetes.Interface, table *PolicyTable, log *slog.Logger) *PolicyWatcher {
+func NewPolicyWatcher(client kubernetes.Interface, table *PolicyTable, log *slog.Logger, opts ...PolicyWatcherOption) *PolicyWatcher {
 	if log == nil {
 		log = slog.Default()
 	}
+	var cfg policyWatcherConfig
+	for _, o := range opts {
+		if o != nil {
+			o(&cfg)
+		}
+	}
 	f := informers.NewSharedInformerFactory(client, 0)
-	return &PolicyWatcher{
+	factories := []informers.SharedInformerFactory{f}
+	podFactory := f
+	if cfg.podNodeName != "" {
+		sel := fields.OneTermEqualSelector("spec.nodeName", cfg.podNodeName).String()
+		podFactory = informers.NewSharedInformerFactoryWithOptions(client, 0,
+			informers.WithTweakListOptions(func(o *metav1.ListOptions) { o.FieldSelector = sel }))
+		factories = append(factories, podFactory)
+	}
+	w := &PolicyWatcher{
 		table:          table,
-		factory:        f,
+		factories:      factories,
 		policies:       f.Networking().V1().NetworkPolicies().Informer(),
-		pods:           f.Core().V1().Pods().Informer(),
+		pods:           podFactory.Core().V1().Pods().Informer(),
 		namespaces:     f.Core().V1().Namespaces().Informer(),
 		log:            log,
 		kick:           make(chan struct{}, 1),
 		warnedPolicies: make(map[string]bool),
+		recoveryPoll:   policyWatchRecoveryPoll,
+	}
+	w.watchErrs = map[string]*watchErrState{
+		"networkpolicies": newWatchErrState("networkpolicies", w.policies, log),
+		"pods":            newWatchErrState("pods", w.pods, log),
+		"namespaces":      newWatchErrState("namespaces", w.namespaces, log),
+	}
+	return w
+}
+
+// informerFor maps a watchErrs key to its informer.
+func (w *PolicyWatcher) informerFor(resource string) cache.SharedIndexInformer {
+	switch resource {
+	case "networkpolicies":
+		return w.policies
+	case "pods":
+		return w.pods
+	default:
+		return w.namespaces
+	}
+}
+
+// checkWatchRecovery runs the recovery check of every informer's state.
+func (w *PolicyWatcher) checkWatchRecovery() {
+	for _, st := range w.watchErrs {
+		st.checkRecovered()
 	}
 }
 
@@ -124,11 +218,33 @@ func (w *PolicyWatcher) Run(ctx context.Context) error {
 	if _, err := w.namespaces.AddEventHandler(poke); err != nil {
 		return fmt.Errorf("add namespace handler: %w", err)
 	}
+	for resource, st := range w.watchErrs {
+		if err := w.informerFor(resource).SetWatchErrorHandlerWithContext(st.handle); err != nil {
+			return fmt.Errorf("set %s watch error handler: %w", resource, err)
+		}
+	}
 
-	w.factory.Start(ctx.Done())
+	for _, f := range w.factories {
+		f.Start(ctx.Done())
+	}
+	// The recovery poll lives exactly as long as Run: it stops on ctx, and Run
+	// returns only on ctx (or a sync failure, which is itself ctx cancellation).
+	go func() {
+		t := time.NewTicker(w.recoveryPoll)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				w.checkWatchRecovery()
+			}
+		}
+	}()
 	if !cache.WaitForCacheSync(ctx.Done(), w.policies.HasSynced, w.pods.HasSynced, w.namespaces.HasSynced) {
 		return fmt.Errorf("networkpolicy informer cache sync failed")
 	}
+	w.checkWatchRecovery()
 	// First authoritative install: only after sync, so the empty (allow-everything)
 	// table is never replaced by a verdict computed from a partial cache.
 	w.recompute()
@@ -416,4 +532,122 @@ func toNetworkPolicy(obj any) (*networkingv1.NetworkPolicy, bool) {
 		}
 	}
 	return nil, false
+}
+
+// watchErrState replaces client-go's default watch-error handler for one of the
+// watcher's informers. The default logs one line per reflector retry, which for
+// a persistent failure (an authorizer refusal) is hundreds of identical lines
+// that never say what the failure costs. This state logs the transition into
+// failing once at Warn, re-warns at most once per throttle while the failure
+// persists, and logs the recovery once at Info, re-arming for the next episode.
+//
+// Recovery signal: client-go calls the handler only on failure, so recovery is
+// observed by polling (checkRecovered, run on a ticker by Run and once after
+// cache sync). An informer counts as recovered when it reports HasSynced and,
+// if it had already synced when the failure began, its last-synced resource
+// version has moved since then: a list or watch event succeeded after the
+// error. The check is conservative, so the Info line may lag the real recovery
+// by a poll interval or, for an idle resource whose version does not move, until
+// the next change; it never reports a recovery that did not happen.
+//
+// The same idiom exists in k3sm's cluster-mirror source. It is deliberately not
+// shared: darwin-net cannot import k3sm.
+type watchErrState struct {
+	resource string
+	log      *slog.Logger
+	// synced and rv read the informer (both are safe for concurrent use); tests
+	// substitute them.
+	synced func() bool
+	rv     func() string
+	// now and throttle are the re-warn clock; tests substitute them.
+	now      func() time.Time
+	throttle time.Duration
+
+	// mu guards every field below. Logging happens after it is released.
+	mu           sync.Mutex
+	failing      bool
+	syncedAtFail bool
+	rvAtFail     string
+	since        time.Time
+	lastWarn     time.Time
+	suppressed   int
+}
+
+func newWatchErrState(resource string, inf cache.SharedIndexInformer, log *slog.Logger) *watchErrState {
+	return &watchErrState{
+		resource: resource,
+		log:      log,
+		synced:   inf.HasSynced,
+		rv:       inf.LastSyncResourceVersion,
+		now:      time.Now,
+		throttle: policyWatchErrThrottle,
+	}
+}
+
+// failOpenConsequence is the cost of a failing informer, stated in every Warn.
+const failOpenConsequence = "NetworkPolicy enforcement on this node stays fail-open (allow-everything) until this informer syncs"
+
+// handle is the informer's cache.WatchErrorHandlerWithContext. The benign cases
+// client-go's default treats as routine (an expired resource version, a cleanly
+// closed watch) are not failures and change no state.
+func (s *watchErrState) handle(_ context.Context, _ *cache.Reflector, err error) {
+	if err == nil {
+		return
+	}
+	if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		s.log.Debug("networkpolicy watcher: watch closed; relisting", "resource", s.resource, "err", err)
+		return
+	}
+	forbidden := apierrors.IsForbidden(err)
+	now := s.now()
+
+	s.mu.Lock()
+	var msg string
+	var failingFor time.Duration
+	suppressed := 0
+	switch {
+	case !s.failing:
+		s.failing = true
+		s.syncedAtFail = s.synced()
+		s.rvAtFail = s.rv()
+		s.since = now
+		s.lastWarn = now
+		s.suppressed = 0
+		msg = "networkpolicy watcher: informer cannot list/watch; " + failOpenConsequence
+	case now.Sub(s.lastWarn) >= s.throttle:
+		s.lastWarn = now
+		suppressed = s.suppressed
+		s.suppressed = 0
+		failingFor = now.Sub(s.since)
+		msg = "networkpolicy watcher: informer still cannot list/watch; " + failOpenConsequence
+	default:
+		s.suppressed++
+	}
+	s.mu.Unlock()
+
+	if msg == "" {
+		return
+	}
+	attrs := []any{"resource", s.resource, "forbidden", forbidden, "err", err}
+	if failingFor > 0 {
+		attrs = append(attrs, "failingFor", failingFor.Round(time.Second), "suppressedErrors", suppressed)
+	}
+	s.log.Warn(msg, attrs...)
+}
+
+// checkRecovered ends a failing episode once the informer has demonstrably
+// listed or watched successfully since the failure began (see the type comment),
+// logging the recovery once at Info.
+func (s *watchErrState) checkRecovered() {
+	s.mu.Lock()
+	if !s.failing || !s.synced() || (s.syncedAtFail && s.rv() == s.rvAtFail) {
+		s.mu.Unlock()
+		return
+	}
+	failingFor := s.now().Sub(s.since)
+	s.failing = false
+	s.suppressed = 0
+	s.mu.Unlock()
+	s.log.Info("networkpolicy watcher: informer recovered; enforcement resumes from the synced cache",
+		"resource", s.resource, "failingFor", failingFor.Round(time.Second))
 }
