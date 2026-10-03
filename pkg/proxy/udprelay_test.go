@@ -600,14 +600,14 @@ func TestUDPRelayPerSourceGlobalCap(t *testing.T) {
 // so a test can assert the relay's first-lock early reject drops a globally-capped new
 // flow BEFORE ever paying the connect(2). It is -race safe: count is mutex-guarded.
 type countingDialer struct {
-	inner func(laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
+	inner func(laddr, raddr *net.UDPAddr) (udpUpstream, error)
 
 	mu    sync.Mutex
 	count int
 }
 
 // dial records the call then delegates to the wrapped dialer.
-func (d *countingDialer) dial(laddr, raddr *net.UDPAddr) (*net.UDPConn, error) {
+func (d *countingDialer) dial(laddr, raddr *net.UDPAddr) (udpUpstream, error) {
 	d.mu.Lock()
 	d.count++
 	d.mu.Unlock()

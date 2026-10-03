@@ -291,7 +291,7 @@ func TestUDPRelayAppliesEgressScope(t *testing.T) {
 				laddr *net.UDPAddr
 				dials int
 			)
-			r.dial = func(l, _ *net.UDPAddr) (*net.UDPConn, error) {
+			r.dial = func(l, _ *net.UDPAddr) (udpUpstream, error) {
 				mu.Lock()
 				defer mu.Unlock()
 				laddr, dials = l, dials+1
