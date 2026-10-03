@@ -17,8 +17,9 @@ limitations under the License.
 package proxy
 
 import (
-	"net"
 	"net/netip"
+
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // egressScope is the destination-scoped mesh-egress source decision: given a
@@ -69,7 +70,7 @@ import (
 //
 // The value is immutable: it is built once by New (options) and read by every
 // per-connection handle goroutine and every UDP relay with no lock, which is the
-// property that makes the shared *net.Dialer safe (see Proxy.dialerFor).
+// property that makes the shared *tcpseg.Dialer safe (see Proxy.dialerFor).
 type egressScope struct {
 	// src is this node's reserved mesh-egress /32 (podnet.MeshEgressIP), or the
 	// zero Addr on a single node. The zero Addr disables binding entirely.
@@ -108,7 +109,7 @@ func (s egressScope) sourceFor(loc Locality, dst netip.Addr) netip.Addr {
 	return s.src
 }
 
-// dialerFor returns the *net.Dialer a TCP backend dial must use for a backend with
+// dialerFor returns the *tcpseg.Dialer a TCP backend dial must use for a backend with
 // locality loc at transport address dst: the mesh-source-bound dialer when
 // egressScope.sourceFor elects a bind (a LocalityRemote pod inside the cluster
 // aggregate), otherwise the default-source dialer, which carries no LocalAddr.
@@ -122,7 +123,7 @@ func (s egressScope) sourceFor(loc Locality, dst netip.Addr) netip.Addr {
 // would be a data race across those goroutines and would non-deterministically
 // apply one connection's source to another's dial — the wrong-source blackhole,
 // intermittently.
-func (p *Proxy) dialerFor(loc Locality, dst netip.Addr) *net.Dialer {
+func (p *Proxy) dialerFor(loc Locality, dst netip.Addr) *tcpseg.Dialer {
 	if p.meshDialer != nil && p.egress.sourceFor(loc, dst).IsValid() {
 		return p.meshDialer
 	}
