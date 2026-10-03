@@ -1,3 +1,5 @@
+//go:build integration
+
 /*
 Copyright The k3sm Authors.
 
@@ -14,6 +16,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// The stub serves real loopback UDP and TCP for the differential and shim
+// tests, which reach it the way libc does. They need no privilege; run with:
+//
+//	CGO_ENABLED=0 go test -tags integration -run 'Differential|Shim' ./pkg/dns/
+
 package dns
 
 import (
@@ -24,40 +31,18 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"golang.org/x/net/dns/dnsmessage"
 )
 
-// stubDNS is a minimal in-process UDP DNS server answering A queries from a fixed
-// name->addr zone. It stands in for CoreDNS so the resolver's wire path and (in
-// the integration tier) the C shim's interpose can be tested without an external
-// CoreDNS binary. Names are matched case-insensitively with the trailing dot
-// normalized; an unknown name gets an empty (NXDOMAIN-like) answer.
+// stubDNS serves a stubZone (stubzone_test.go) on real loopback sockets: one
+// port answering both UDP and TCP. It stands in for CoreDNS so the C shim's
+// interpose can be tested without an external CoreDNS binary; the zone, the
+// fault injection, and the query log are the stubZone's, so the unit tier's
+// in-memory fakeDNS and this server answer identically.
 type stubDNS struct {
+	*stubZone
+
 	conn  *net.UDPConn
 	tcpLn net.Listener
-	zone  map[string]netip.Addr
-
-	mu         sync.Mutex
-	queries    []string
-	tcpQueries []string
-	// Fault injection, keyed by normalized name: drop swallows the next N UDP
-	// queries for the name (no response — the client times out); servfail
-	// answers with RCodeServerFailure; truncate answers UDP with TC set and no
-	// answers; truncateTCP answers even the TCP refetch with TC set and no
-	// answers (a malformed server, to exercise the TC-over-TCP transient path).
-	drop        map[string]int
-	servfail    map[string]bool
-	truncate    map[string]bool
-	truncateTCP map[string]bool
-	// silent makes the stub record every query and answer none of them: a server
-	// that is reachable but dead, whose queries can still be counted.
-	silent bool
-	// EDNS0 OPT observed on the most recent query (any transport): optSeen is set
-	// when the query carried an OPT pseudo-RR, and optUDPSize is its advertised
-	// UDP payload size (the OPT ResourceHeader Class field).
-	optSeen    bool
-	optUDPSize int
 
 	wg   sync.WaitGroup
 	done chan struct{}
@@ -70,14 +55,10 @@ func newStubDNS(t *testing.T, zone map[string]netip.Addr) *stubDNS {
 	t.Helper()
 	conn, tcpLn := bindSamePortPair(t, bindPairAttempts)
 	s := &stubDNS{
-		conn:        conn,
-		tcpLn:       tcpLn,
-		zone:        zone,
-		drop:        map[string]int{},
-		servfail:    map[string]bool{},
-		truncate:    map[string]bool{},
-		truncateTCP: map[string]bool{},
-		done:        make(chan struct{}),
+		stubZone: newStubZone(zone),
+		conn:     conn,
+		tcpLn:    tcpLn,
+		done:     make(chan struct{}),
 	}
 	s.wg.Add(2)
 	go s.serve()
@@ -94,86 +75,6 @@ func (s *stubDNS) close() {
 	_ = s.conn.Close()
 	_ = s.tcpLn.Close()
 	s.wg.Wait()
-}
-
-// dropNext makes the stub swallow the next n UDP queries for name.
-func (s *stubDNS) dropNext(name string, n int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.drop[normalizeName(name)] = n
-}
-
-// setSilent makes the stub record every query and never answer: the client
-// times out against it, and queryCount still sees each query.
-func (s *stubDNS) setSilent() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.silent = true
-}
-
-// queryCount returns how many queries (UDP and TCP) the stub has received.
-func (s *stubDNS) queryCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.queries) + len(s.tcpQueries)
-}
-
-// setServfail makes every query for name answer SERVFAIL.
-func (s *stubDNS) setServfail(name string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.servfail[normalizeName(name)] = true
-}
-
-// setTruncateUDP makes UDP queries for name answer with TC set and no answers;
-// the TCP listener still serves the zone answer.
-func (s *stubDNS) setTruncateUDP(name string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.truncate[normalizeName(name)] = true
-}
-
-// setTruncateTCP makes even the TCP refetch for name answer with TC set and no
-// answers — a malformed server, used to exercise the TC-over-TCP transient path.
-func (s *stubDNS) setTruncateTCP(name string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.truncateTCP[normalizeName(name)] = true
-}
-
-// lastOPT returns whether the most recent query carried an EDNS0 OPT record and
-// the UDP payload size it advertised.
-func (s *stubDNS) lastOPT() (seen bool, udpSize int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.optSeen, s.optUDPSize
-}
-
-// askedTCP reports whether the server received a TCP query for the given name.
-func (s *stubDNS) askedTCP(name string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	want := normalizeName(name)
-	for _, q := range s.tcpQueries {
-		if q == want {
-			return true
-		}
-	}
-	return false
-}
-
-// asked reports whether the server received a query for the given name (trailing
-// dot optional).
-func (s *stubDNS) asked(name string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	want := normalizeName(name)
-	for _, q := range s.queries {
-		if q == want {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *stubDNS) serve() {
@@ -231,110 +132,6 @@ func (s *stubDNS) serveTCP() {
 			_, _ = conn.Write(framed)
 		}()
 	}
-}
-
-// respond decodes a query and builds an A response from the zone, honoring the
-// per-name fault injection for the given transport.
-func (s *stubDNS) respond(query []byte, transport string) ([]byte, bool) {
-	var p dnsmessage.Parser
-	hdr, err := p.Start(query)
-	if err != nil {
-		return nil, false
-	}
-	q, err := p.Question()
-	if err != nil {
-		return nil, false
-	}
-	qname := normalizeName(q.Name.String())
-
-	// Record whether the query carried an EDNS0 OPT pseudo-RR and its advertised
-	// UDP payload size. A full Unpack is simplest here (the streaming parser above
-	// only read the question); the OPT lives in the Additional section.
-	optSeen, optSize := false, 0
-	var full dnsmessage.Message
-	if err := full.Unpack(query); err == nil {
-		for _, a := range full.Additionals {
-			if a.Header.Type == dnsmessage.TypeOPT {
-				optSeen = true
-				optSize = int(a.Header.Class)
-			}
-		}
-	}
-
-	s.mu.Lock()
-	s.optSeen = optSeen
-	s.optUDPSize = optSize
-	if transport == "tcp" {
-		s.tcpQueries = append(s.tcpQueries, qname)
-	} else {
-		s.queries = append(s.queries, qname)
-	}
-	if s.silent {
-		s.mu.Unlock()
-		return nil, false
-	}
-	if transport == "udp" && s.drop[qname] > 0 {
-		s.drop[qname]--
-		s.mu.Unlock()
-		return nil, false
-	}
-	fail := s.servfail[qname]
-	trunc := (transport == "udp" && s.truncate[qname]) ||
-		(transport == "tcp" && s.truncateTCP[qname])
-	s.mu.Unlock()
-
-	rb := dnsmessage.NewBuilder(nil, dnsmessage.Header{
-		ID:            hdr.ID,
-		Response:      true,
-		Authoritative: true,
-		Truncated:     trunc,
-	})
-	if fail {
-		rb = dnsmessage.NewBuilder(nil, dnsmessage.Header{
-			ID:       hdr.ID,
-			Response: true,
-			RCode:    dnsmessage.RCodeServerFailure,
-		})
-	}
-	if err := rb.StartQuestions(); err != nil {
-		return nil, false
-	}
-	if err := rb.Question(q); err != nil {
-		return nil, false
-	}
-	addr, found := s.zone[qname]
-	if found && q.Type == dnsmessage.TypeA && !fail && !trunc {
-		if err := rb.StartAnswers(); err != nil {
-			return nil, false
-		}
-		ah := dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 30}
-		if err := rb.AResource(ah, dnsmessage.AResource{A: addr.As4()}); err != nil {
-			return nil, false
-		}
-	}
-	out, err := rb.Finish()
-	if err != nil {
-		return nil, false
-	}
-	return out, true
-}
-
-// normalizeName lowercases a DNS name and strips a single trailing dot.
-func normalizeName(n string) string {
-	if len(n) > 0 && n[len(n)-1] == '.' {
-		n = n[:len(n)-1]
-	}
-	return toLowerASCII(n)
-}
-
-func toLowerASCII(s string) string {
-	b := []byte(s)
-	for i, c := range b {
-		if c >= 'A' && c <= 'Z' {
-			b[i] = c + ('a' - 'A')
-		}
-	}
-	return string(b)
 }
 
 // newBlackholeDNS binds a UDP socket on 127.0.0.1 that never reads or answers,
