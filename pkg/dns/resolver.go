@@ -30,6 +30,7 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // defaultQueryTimeout bounds a single CoreDNS query attempt.
@@ -105,8 +106,10 @@ type Resolver struct {
 	// exclusive is set for DNSPolicyNone: every candidate fails closed.
 	exclusive bool
 	timeout   time.Duration
-	// dial is the UDP dial seam; tests point it at a stub DNS server. It defaults
-	// to net.Dialer.DialContext.
+	// dial is the UDP and TCP dial seam; tests point it at a stub DNS server. It
+	// defaults to tcpseg.Dialer.DialContext, so the TCP refetch toward the DNS VIP
+	// (an lo0 alias) has its segment size clamped like every other connection the
+	// node opens to a VIP; a UDP socket passes through the clamp untouched.
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	// onCandidate, when set, is called once for every candidate LookupHost
 	// queries (not for one it skips), with that candidate's outcome. It is a test
@@ -143,7 +146,7 @@ func NewResolver(cfg netv1.DNSConfig, opts ...Option) (*Resolver, error) {
 	for i, s := range servers {
 		addrs[i] = net.JoinHostPort(s, "53")
 	}
-	d := &net.Dialer{}
+	d := &tcpseg.Dialer{}
 	r := &Resolver{
 		cfg:       cfg.WithDefaults(),
 		servers:   addrs,
