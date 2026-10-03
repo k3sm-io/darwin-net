@@ -1,3 +1,5 @@
+//go:build integration
+
 /*
 Copyright The k3sm Authors.
 
@@ -13,6 +15,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+// These reach the daemon only over its real unix socket (startServer, rawCall
+// in server_test.go). They need no privilege; run with:
+//
+//	CGO_ENABLED=0 go test -tags integration -run 'NodePodCIDR' ./pkg/netd/
 
 package netd_test
 
