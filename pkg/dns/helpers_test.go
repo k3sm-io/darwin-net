@@ -19,9 +19,30 @@ package dns
 import (
 	"context"
 	"net"
+	"net/netip"
 )
 
 // withDialer overrides the UDP dialer; tests use it to reach a stub server.
 func withDialer(d func(ctx context.Context, network, addr string) (net.Conn, error)) Option {
 	return func(r *Resolver) { r.dial = d }
+}
+
+// withServerAddrs replaces the resolver's per-server "ip:port" list, so a test
+// can point each configured nameserver at its own stub — the Go analog of the
+// shim's "ipv4:port" K3SM_DNS_SERVERS tokens. It must keep the server count the
+// config implies for the walk to mean what the config says.
+func withServerAddrs(addrs ...string) Option {
+	return func(r *Resolver) { r.servers = addrs }
+}
+
+// withCandidateTrace installs the per-candidate seam LookupHost calls once for
+// each candidate it queries, mirroring the shim's per-candidate debug line.
+func withCandidateTrace(f func(cand string, addrs []netip.Addr, err error)) Option {
+	return func(r *Resolver) { r.onCandidate = f }
+}
+
+// lookupCandidate resolves one FQDN on its own, with a fresh dead-server memo:
+// the per-candidate altitude the drift guards and the wire differential read.
+func (r *Resolver) lookupCandidate(ctx context.Context, fqdn string) ([]netip.Addr, error) {
+	return r.queryCandidate(ctx, fqdn, make([]bool, len(r.servers)))
 }

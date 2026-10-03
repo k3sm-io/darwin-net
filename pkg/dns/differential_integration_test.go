@@ -136,6 +136,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -146,6 +147,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	netv1 "k3sm.io/apis/net/v1"
 )
 
 // wireVerdict is the three-way per-candidate classification both engines produce.
@@ -223,9 +226,47 @@ type templateDNS struct {
 
 	mu      sync.Mutex
 	queries []wireQuery
+	// The walk rows' per-server behaviour (see configure): silent records a
+	// query and never answers; drop swallows the next N UDP queries for a name;
+	// seq, when set, is a log shared by every stub of one engine, so the order
+	// in which a walk visited its servers is observable.
+	label  string
+	seq    *seqLog
+	silent bool
+	drop   map[string]int
 
 	wg   sync.WaitGroup
 	done chan struct{}
+}
+
+// seqLog is an ordered "<server label>:<name>" query log shared by several
+// stubs.
+type seqLog struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (l *seqLog) add(e string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.entries = append(l.entries, e)
+}
+
+func (l *seqLog) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.entries...)
+}
+
+// configure sets the walk-row behaviour of a stub before any query reaches it.
+func (s *templateDNS) configure(label string, seq *seqLog, silent bool, drop map[string]int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.label, s.seq, s.silent = label, seq, silent
+	s.drop = map[string]int{}
+	for k, v := range drop {
+		s.drop[k] = v
+	}
 }
 
 // newTemplateDNS starts a template stub on an ephemeral loopback port (the same
@@ -323,6 +364,16 @@ func (s *templateDNS) respond(query []byte, transport string) ([]byte, bool) {
 	}
 	s.mu.Lock()
 	s.queries = append(s.queries, wireQuery{transport: transport, name: qname})
+	if s.seq != nil {
+		s.seq.add(s.label + ":" + qname)
+	}
+	if s.silent || (transport == "udp" && s.drop[qname] > 0) {
+		if !s.silent {
+			s.drop[qname]--
+		}
+		s.mu.Unlock()
+		return nil, false
+	}
 	fx, known := s.byHost[qname]
 	s.mu.Unlock()
 
@@ -897,6 +948,15 @@ func TestDNSWireClassificationDifferential(t *testing.T) {
 			}
 		})
 	}
+
+	// The whole-call rows: multi-server order, the dead-server memo, and the
+	// exclusive (dnsPolicy None) verdicts, each compared candidate by
+	// candidate, on the final outcome, and on the order the servers were asked.
+	for _, w := range walkCases(t) {
+		t.Run(w.name, func(t *testing.T) {
+			runWalkCase(t, dylib, probe, w)
+		})
+	}
 }
 
 // runMultiCandidate is the MULTI-CANDIDATE half of the differential: it drives a
@@ -973,5 +1033,281 @@ func assertQueriedOnce(t *testing.T, side string, stub *templateDNS, want string
 	if obs[0].name != want {
 		t.Fatalf("%s queried %q (%d bytes), want %q (%d bytes) — a name at the encodable ceiling must go on the wire verbatim",
 			side, obs[0].name, len(obs[0].name), want, len(want))
+	}
+}
+
+// walkServer is one nameserver of a walk row: the templates it answers from
+// (any other name gets the synthesized NXDOMAIN), whether it is silent (reads
+// and never answers: the client times out), and how many UDP queries per name
+// it swallows before answering.
+type walkServer struct {
+	byHost map[string]wireFixture
+	silent bool
+	drop   map[string]int
+}
+
+// walkCase is a WHOLE-CALL row: unlike the per-candidate rows above, both
+// engines run their full candidate walk over one or more servers — the server
+// order, the per-call dead-server memo, and the exclusive (dnsPolicy None)
+// verdicts — and are compared on three things: the verdict of every candidate
+// they queried (keyed by name), the call's final outcome, and the order in which
+// the servers were asked.
+//
+// The Go side is LookupHost with the per-candidate seam, which fires exactly
+// where the shim prints its per-candidate trace line; the C side is the real
+// dylib with K3SM_DNS_SERVERS "127.0.0.1:<port>" tokens pointing at the same
+// kind of stubs (a fresh set per engine, so each query log is attributable).
+type walkCase struct {
+	name string
+	// host is the probe argument and the LookupHost name: absolute (trailing
+	// dot) for a single candidate, bare for a search expansion.
+	host      string
+	search    []string
+	ndots     int
+	domain    string // "" leaves K3SM_DNS_DOMAIN unset / ClusterDomain empty
+	exclusive bool   // dnsPolicy None: K3SM_DNS_SERVERS + K3SM_DNS_EXCLUSIVE=1
+	servers   []walkServer
+	// wantVerdicts is the verdict of every QUERIED candidate (a candidate the
+	// walk skips has no entry on either engine).
+	wantVerdicts map[string]wireVerdict
+	// wantFinal is the call's outcome: "HIT", "EAI_NONAME" or "EAI_AGAIN". The
+	// Go reference maps addresses to HIT, ErrNotFound to EAI_NONAME and
+	// ErrTempFail to EAI_AGAIN.
+	wantFinal string
+	// wantOrder is the shared "s<i>:<name>" query log, in arrival order.
+	wantOrder []string
+	why       string
+}
+
+func walkCases(t *testing.T) []walkCase {
+	t.Helper()
+	servfail := wireFixture{udp: readFixture(t, "servfail.golden.wire")}
+	hit := wireFixture{udp: readFixture(t, "cname_then_a.golden.wire")}
+	return []walkCase{
+		{
+			name: "multi_server_order", host: "order.test.invalid.", ndots: 5, exclusive: true,
+			servers: []walkServer{
+				{byHost: map[string]wireFixture{"order.test.invalid": servfail}},
+				{byHost: map[string]wireFixture{"order.test.invalid": hit}},
+			},
+			wantVerdicts: map[string]wireVerdict{"order.test.invalid": verdictHit},
+			wantFinal:    "HIT",
+			wantOrder:    []string{"s0:order.test.invalid", "s1:order.test.invalid"},
+			why:          "a SERVFAIL from server 1 advances to server 2 in the same attempt, which answers",
+		},
+		{
+			name: "dead_server_memo", host: "memo", search: []string{"a.invalid", "b.invalid"}, ndots: 5, exclusive: true,
+			servers: []walkServer{
+				{silent: true},
+				{byHost: map[string]wireFixture{"memo.b.invalid": hit}},
+			},
+			wantVerdicts: map[string]wireVerdict{"memo.a.invalid": verdictMiss, "memo.b.invalid": verdictHit},
+			wantFinal:    "HIT",
+			wantOrder:    []string{"s0:memo.a.invalid", "s1:memo.a.invalid", "s1:memo.b.invalid"},
+			why:          "server 1 times out once and is dead for the rest of the call: the second candidate goes straight to server 2",
+		},
+		{
+			name: "exclusive_miss", host: "miss.test.invalid.", ndots: 5, exclusive: true,
+			servers:      []walkServer{{}, {}},
+			wantVerdicts: map[string]wireVerdict{"miss.test.invalid": verdictMiss},
+			wantFinal:    "EAI_NONAME",
+			wantOrder:    []string{"s0:miss.test.invalid"},
+			why:          "NXDOMAIN from the first server is definitive; exclusive mode then reports not-found with no host fall-through",
+		},
+		{
+			name: "exclusive_external_transient", host: "ext.test.invalid.", ndots: 5, exclusive: true, domain: "cluster.local",
+			servers: []walkServer{
+				{byHost: map[string]wireFixture{"ext.test.invalid": servfail}},
+			},
+			wantVerdicts: map[string]wireVerdict{"ext.test.invalid": verdictTempFail},
+			wantFinal:    "EAI_AGAIN",
+			wantOrder:    []string{"s0:ext.test.invalid", "s0:ext.test.invalid"},
+			why:          "a dotted name outside the cluster domain is external under ClusterFirst, but exclusive mode fails it closed; one server keeps the classic retry",
+		},
+		{
+			name: "none_empty_domain_dotted_name", host: "a.b.invalid", ndots: 5, exclusive: true,
+			servers: []walkServer{
+				{byHost: map[string]wireFixture{"a.b.invalid": servfail}},
+			},
+			wantVerdicts: map[string]wireVerdict{"a.b.invalid": verdictTempFail},
+			wantFinal:    "EAI_AGAIN",
+			wantOrder:    []string{"s0:a.b.invalid", "s0:a.b.invalid"},
+			why:          "None with an empty ClusterDomain and an empty search list: the dotted name is the only candidate and fails closed on both engines",
+		},
+		{
+			name: "single_server_lost_datagram_retried", host: "retry.test.invalid.", ndots: 5, domain: "cluster.local",
+			servers: []walkServer{
+				{byHost: map[string]wireFixture{"retry.test.invalid": hit}, drop: map[string]int{"retry.test.invalid": 1}},
+			},
+			wantVerdicts: map[string]wireVerdict{"retry.test.invalid": verdictHit},
+			wantFinal:    "HIT",
+			wantOrder:    []string{"s0:retry.test.invalid", "s0:retry.test.invalid"},
+			why:          "ClusterFirst with one server: a lost datagram is retried on the same server, never marked dead",
+		},
+		{
+			name: "exclusive_all_servers_servfail_order", host: "sf.test.invalid.", ndots: 5, exclusive: true,
+			servers: []walkServer{
+				{byHost: map[string]wireFixture{"sf.test.invalid": servfail}},
+				{byHost: map[string]wireFixture{"sf.test.invalid": servfail}},
+			},
+			wantVerdicts: map[string]wireVerdict{"sf.test.invalid": verdictTempFail},
+			wantFinal:    "EAI_AGAIN",
+			wantOrder:    []string{"s0:sf.test.invalid", "s1:sf.test.invalid", "s0:sf.test.invalid", "s1:sf.test.invalid"},
+			why:          "attempt loop outer, server loop inner: SERVFAIL never marks a server dead, so each attempt walks both",
+		},
+	}
+}
+
+// walkStubs starts one template stub per walk server, all logging into seq.
+func walkStubs(t *testing.T, w walkCase, seq *seqLog) []*templateDNS {
+	t.Helper()
+	stubs := make([]*templateDNS, len(w.servers))
+	for i, ws := range w.servers {
+		st := newTemplateDNS(t, ws.byHost)
+		st.configure("s"+strconv.Itoa(i), seq, ws.silent, ws.drop)
+		stubs[i] = st
+	}
+	return stubs
+}
+
+// goWalk runs the Go reference's full LookupHost walk for w and returns the
+// per-candidate verdicts and the final outcome.
+func goWalk(t *testing.T, w walkCase, stubs []*templateDNS) (map[string]wireVerdict, string) {
+	t.Helper()
+	cfg := netv1.DNSConfig{
+		ClusterDomain: w.domain,
+		SearchDomains: w.search,
+		NDots:         int32(w.ndots),
+	}
+	if w.exclusive {
+		cfg.Policy = netv1.DNSPolicyNone
+		for i := range stubs {
+			// Distinct placeholders (Validate refuses a repeat); withServerAddrs
+			// points each at its stub.
+			cfg.Nameservers = append(cfg.Nameservers, "192.0.2."+strconv.Itoa(i+1))
+		}
+	} else {
+		if len(stubs) != 1 {
+			t.Fatalf("a ClusterFirst walk row has exactly one server, got %d", len(stubs))
+		}
+		cfg.ClusterDNSIP = "10.43.0.10"
+	}
+	addrs := make([]string, len(stubs))
+	for i, st := range stubs {
+		addrs[i] = st.addr()
+	}
+	verdicts := map[string]wireVerdict{}
+	r, err := NewResolver(cfg, withServerAddrs(addrs...), WithTimeout(2*time.Second),
+		withCandidateTrace(func(cand string, got []netip.Addr, err error) {
+			switch {
+			case err != nil && errors.Is(err, ErrTempFail):
+				verdicts[cand] = verdictTempFail
+			case err != nil:
+				t.Errorf("candidate %q: non-transient hard error %v", cand, err)
+			case len(got) > 0:
+				verdicts[cand] = verdictHit
+			default:
+				verdicts[cand] = verdictMiss
+			}
+		}))
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	got, err := r.LookupHost(context.Background(), w.host)
+	switch {
+	case err == nil && len(got) > 0:
+		return verdicts, "HIT"
+	case errors.Is(err, ErrTempFail):
+		return verdicts, "EAI_AGAIN"
+	case errors.Is(err, ErrNotFound):
+		return verdicts, "EAI_NONAME"
+	}
+	t.Fatalf("LookupHost(%q) = %v, %v; not a walk outcome", w.host, got, err)
+	return nil, ""
+}
+
+// eaiRE reads the probe's failure line ("getaddrinfo: EAI_X ...").
+var eaiRE = regexp.MustCompile(`(?m)^getaddrinfo: (EAI_[A-Z]+) `)
+
+// cWalk runs the real dylib for w and returns the per-candidate verdicts, the
+// final outcome, and whether any host-resolver consult was traced.
+func cWalk(t *testing.T, dylib, probe string, w walkCase, stubs []*templateDNS) (map[string]wireVerdict, string, bool) {
+	t.Helper()
+	env := append(os.Environ(),
+		EnvDNSSearch+"="+strings.Join(w.search, " "),
+		EnvDNSNdots+"="+strconv.Itoa(w.ndots),
+		EnvDNSDebug+"=1",
+		"DYLD_INSERT_LIBRARIES="+dylib,
+	)
+	if w.domain != "" {
+		env = append(env, EnvDNSDomain+"="+w.domain)
+	}
+	if w.exclusive {
+		toks := make([]string, len(stubs))
+		for i, st := range stubs {
+			toks[i] = "127.0.0.1:" + strconv.Itoa(st.port())
+		}
+		env = append(env, EnvDNSServers+"="+strings.Join(toks, " "), EnvDNSExclusive+"=1")
+	} else {
+		// The ClusterFirst row speaks the single-server ABI a ClusterFirst pod
+		// actually receives.
+		env = append(env, EnvDNSServer+"=127.0.0.1", EnvDNSPort+"="+strconv.Itoa(stubs[0].port()))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), probeDeadline)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, probe, w.host)
+	cmd.Env = env
+	raw, _ := cmd.CombinedOutput()
+	out := string(raw)
+	ms := traceRE.FindAllStringSubmatch(out, -1)
+	if len(ms) == 0 {
+		t.Fatalf("no shim verdict trace line for %q — the dylib did not load or the trace wording drifted:\n%s", w.host, out)
+	}
+	verdicts := map[string]wireVerdict{}
+	for _, m := range ms {
+		if _, dup := verdicts[m[1]]; dup {
+			t.Fatalf("shim traced candidate %q twice:\n%s", m[1], out)
+		}
+		verdicts[m[1]] = parseTraceVerdict(t, m[3])
+	}
+	final := "HIT"
+	if m := eaiRE.FindStringSubmatch(out); m != nil {
+		final = m[1]
+	}
+	return verdicts, final, strings.Contains(out, "k3sm-dns: HOST ")
+}
+
+// runWalkCase compares the two engines on one walk row.
+func runWalkCase(t *testing.T, dylib, probe string, w walkCase) {
+	t.Helper()
+	goSeq, cSeq := &seqLog{}, &seqLog{}
+	goStubs := walkStubs(t, w, goSeq)
+	cStubs := walkStubs(t, w, cSeq)
+	defer func() {
+		for _, st := range append(goStubs, cStubs...) {
+			st.close()
+		}
+	}()
+
+	goVerdicts, goFinal := goWalk(t, w, goStubs)
+	cVerdicts, cFinal, cHost := cWalk(t, dylib, probe, w, cStubs)
+
+	if !reflect.DeepEqual(goVerdicts, cVerdicts) {
+		t.Fatalf("C<->Go per-candidate drift on %s (%s):\n  Go reference resolver: %v\n  C getaddrinfo shim:    %v", w.name, w.why, goVerdicts, cVerdicts)
+	}
+	if !reflect.DeepEqual(goVerdicts, w.wantVerdicts) {
+		t.Fatalf("both engines classify %s (%s) as %v, want %v", w.name, w.why, goVerdicts, w.wantVerdicts)
+	}
+	if goFinal != cFinal {
+		t.Fatalf("C<->Go final-outcome drift on %s (%s): Go %s, C %s", w.name, w.why, goFinal, cFinal)
+	}
+	if goFinal != w.wantFinal {
+		t.Fatalf("both engines end %s (%s) as %s, want %s", w.name, w.why, goFinal, w.wantFinal)
+	}
+	if goOrder, cOrder := goSeq.snapshot(), cSeq.snapshot(); !reflect.DeepEqual(goOrder, cOrder) || !reflect.DeepEqual(goOrder, w.wantOrder) {
+		t.Fatalf("server walk order on %s (%s):\n  Go: %v\n  C:  %v\n  want: %v", w.name, w.why, goOrder, cOrder, w.wantOrder)
+	}
+	if w.exclusive && cHost {
+		t.Fatalf("the shim consulted the host resolver on exclusive row %s", w.name)
 	}
 }

@@ -9,6 +9,12 @@
  * the system resolver, for named services) filled in. On failure it prints the
  * symbolic EAI_* name for the codes the tests assert on, so assertions don't
  * depend on gai_strerror wording or numeric values.
+ *
+ * usage: probe <name> [service] [inet|inet6|unspec]
+ * A service of "-" means NULL. The family defaults to inet (AF_INET), which is
+ * what every caller that passes no third argument gets. IPv6 results are
+ * printed too ("::1", or "::1:port" with a service); with AF_INET hints none
+ * are ever returned.
  */
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -34,9 +40,22 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *service = argc > 2 ? argv[2] : NULL;
+    if (service != NULL && strcmp(service, "-") == 0) {
+        service = NULL;
+    }
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
+    if (argc > 3) {
+        if (strcmp(argv[3], "inet6") == 0) {
+            hints.ai_family = AF_INET6;
+        } else if (strcmp(argv[3], "unspec") == 0) {
+            hints.ai_family = AF_UNSPEC;
+        } else if (strcmp(argv[3], "inet") != 0) {
+            fprintf(stderr, "probe: unknown family %s\n", argv[3]);
+            return 2;
+        }
+    }
     hints.ai_socktype = SOCK_STREAM;
 
     struct addrinfo *res = NULL;
@@ -47,13 +66,20 @@ int main(int argc, char **argv) {
     }
     char buf[64];
     for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
-        if (p->ai_family != AF_INET) {
+        int port;
+        if (p->ai_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)p->ai_addr;
+            inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+            port = (int)ntohs(sin->sin_port);
+        } else if (p->ai_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)p->ai_addr;
+            inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf));
+            port = (int)ntohs(sin6->sin6_port);
+        } else {
             continue;
         }
-        struct sockaddr_in *sin = (struct sockaddr_in *)p->ai_addr;
-        inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
         if (service != NULL) {
-            printf("%s:%d\n", buf, (int)ntohs(sin->sin_port));
+            printf("%s:%d\n", buf, port);
         } else {
             printf("%s\n", buf);
         }
