@@ -17,118 +17,129 @@ limitations under the License.
 package ingress
 
 import (
-	"bufio"
 	"bytes"
-	"fmt"
+	"errors"
+	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"net/url"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
-// backendFromURL converts an httptest server URL into the Backend that dials it.
-func backendFromURL(t *testing.T, raw string) Backend {
-	t.Helper()
-	u, err := url.Parse(raw)
-	if err != nil {
-		t.Fatalf("parse backend url: %v", err)
-	}
-	ap, err := netip.ParseAddrPort(u.Host)
-	if err != nil {
-		t.Fatalf("parse backend hostport: %v", err)
-	}
-	return Backend{VIP: ap.Addr(), Port: ap.Port()}
+// The handler's datapath tests run on fakes: the request enters through
+// ServeHTTP with an httptest.Recorder, and the handler's ReverseProxy Transport
+// is replaced by a fakeTransport, so the outbound request is inspected without a
+// socket. The Upgrade passthrough needs a hijackable connection and lives in
+// handler_integration_test.go.
+
+// fakeTransport is an http.RoundTripper standing in for the backend dial. It
+// records every outbound request and answers with status, or fails with err.
+type fakeTransport struct {
+	status int
+	err    error
+
+	mu  sync.Mutex
+	got []*http.Request // the outbound requests, guarded by mu
 }
 
-// recordedRequest is what the fake backend observed.
-type recordedRequest struct {
-	host   string
-	header http.Header
+func (f *fakeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	f.mu.Lock()
+	f.got = append(f.got, r.Clone(r.Context()))
+	f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &http.Response{
+		StatusCode: f.status,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader("")),
+		Request:    r,
+	}, nil
 }
 
-// TestIngressProxyHeaderDiscipline is the M10.3 datapath gate, end-to-end
-// through real 127.0.0.1:0 listeners: the backend must see X-Forwarded-For
-// OVERWRITTEN with the direct peer (a spoofed inbound chain is gone, never
-// appended to), inbound Forwarded / X-Real-IP stripped, and the inbound Host
-// preserved (virtual hosting). An unrouted host gets the router-level 404.
+func (f *fakeTransport) requests() []*http.Request {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*http.Request(nil), f.got...)
+}
+
+// fakeHandler builds the datapath handler over table with its backend dial
+// replaced by rt.
+func fakeHandler(table *RouteTable, log *slog.Logger, rt http.RoundTripper) *handler {
+	h := newHandler(table, log)
+	h.rp.Transport = rt
+	return h
+}
+
+// TestIngressProxyHeaderDiscipline is the datapath header gate: the backend must
+// see X-Forwarded-For OVERWRITTEN with the direct peer (a spoofed inbound chain
+// is gone, never appended to), inbound Forwarded / X-Real-IP stripped, the
+// inbound Host preserved (virtual hosting), and the request sent to the matched
+// backend VIP. An unrouted host gets the router-level 404 and never reaches a
+// backend.
 func TestIngressProxyHeaderDiscipline(t *testing.T) {
-	var (
-		mu  sync.Mutex
-		got recordedRequest
-	)
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		got = recordedRequest{host: r.Host, header: r.Header.Clone()}
-		mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer backend.Close()
-
+	backend := Backend{VIP: netip.MustParseAddr("10.43.0.17"), Port: 8080}
 	table := NewRouteTable()
 	table.Update([]Rule{{
 		Host: "app.example.com", Path: "/", PathType: PathTypePrefix,
-		Backend: backendFromURL(t, backend.URL),
+		Backend: backend,
 	}}, nil)
-	front := httptest.NewServer(newHandler(table, slog.New(slog.DiscardHandler)))
-	defer front.Close()
+	rt := &fakeTransport{status: http.StatusOK}
+	h := fakeHandler(table, slog.New(slog.DiscardHandler), rt)
 
-	req, err := http.NewRequest(http.MethodGet, front.URL+"/some/path", nil)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-	req.Host = "app.example.com" // routed virtual host, preserved to the backend
+	req := httptest.NewRequest(http.MethodGet, "http://app.example.com/some/path", nil)
+	req.RemoteAddr = "198.51.100.7:40312" // the direct peer
 	req.Header.Set("X-Forwarded-For", "203.0.113.9")
 	req.Header.Set("Forwarded", "for=203.0.113.9")
 	req.Header.Set("X-Real-IP", "203.0.113.9")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("do request: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if got.host != "app.example.com" {
-		t.Errorf("backend saw Host %q, want app.example.com (inbound Host must be preserved)", got.host)
+	reqs := rt.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("backend saw %d requests, want 1", len(reqs))
 	}
-	if xff := got.header.Get("X-Forwarded-For"); xff != "127.0.0.1" {
-		t.Errorf("backend saw X-Forwarded-For %q, want exactly the peer 127.0.0.1 (overwrite, never append)", xff)
+	got := reqs[0]
+	if got.URL.Host != "10.43.0.17:8080" || got.URL.Scheme != "http" {
+		t.Errorf("outbound URL = %s, want http://10.43.0.17:8080 (the matched backend VIP)", got.URL)
 	}
-	if v, present := got.header["Forwarded"]; present {
+	if got.URL.Path != "/some/path" {
+		t.Errorf("outbound path = %q, want /some/path", got.URL.Path)
+	}
+	if got.Host != "app.example.com" {
+		t.Errorf("backend saw Host %q, want app.example.com (inbound Host must be preserved)", got.Host)
+	}
+	if xff := got.Header.Get("X-Forwarded-For"); xff != "198.51.100.7" {
+		t.Errorf("backend saw X-Forwarded-For %q, want exactly the peer 198.51.100.7 (overwrite, never append)", xff)
+	}
+	if v, present := got.Header["Forwarded"]; present {
 		t.Errorf("inbound Forwarded header reached the backend: %v", v)
 	}
-	if v, present := got.header["X-Real-Ip"]; present {
+	if v, present := got.Header["X-Real-Ip"]; present {
 		t.Errorf("inbound X-Real-IP header reached the backend: %v", v)
 	}
-	if xfh := got.header.Get("X-Forwarded-Host"); xfh != "app.example.com" {
+	if xfh := got.Header.Get("X-Forwarded-Host"); xfh != "app.example.com" {
 		t.Errorf("backend saw X-Forwarded-Host %q, want app.example.com", xfh)
 	}
-	if xfp := got.header.Get("X-Forwarded-Proto"); xfp != "http" {
+	if xfp := got.Header.Get("X-Forwarded-Proto"); xfp != "http" {
 		t.Errorf("backend saw X-Forwarded-Proto %q, want http", xfp)
 	}
 
 	t.Run("unrouted host gets the router 404", func(t *testing.T) {
-		req, err := http.NewRequest(http.MethodGet, front.URL+"/some/path", nil)
-		if err != nil {
-			t.Fatalf("new request: %v", err)
+		req := httptest.NewRequest(http.MethodGet, "http://unknown.example.com/some/path", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", rec.Code)
 		}
-		req.Host = "unknown.example.com"
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("do request: %v", err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("status = %d, want 404", resp.StatusCode)
+		if n := len(rt.requests()); n != 1 {
+			t.Fatalf("backend saw %d requests after the unrouted one, want still 1", n)
 		}
 	})
 }
@@ -137,14 +148,6 @@ func TestIngressProxyHeaderDiscipline(t *testing.T) {
 // client while the backend-down Warn is throttled to one per backend per
 // interval (the per-request path must not flood the log during an outage).
 func TestIngressProxyBackend502Throttled(t *testing.T) {
-	// A port that refuses connections: bind, capture, close.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	deadAP := netip.MustParseAddrPort(ln.Addr().String())
-	_ = ln.Close()
-
 	var logBuf bytes.Buffer
 	var logMu sync.Mutex
 	log := slog.New(slog.NewTextHandler(lockedWriter{&logMu, &logBuf}, nil))
@@ -152,25 +155,21 @@ func TestIngressProxyBackend502Throttled(t *testing.T) {
 	table := NewRouteTable()
 	table.Update([]Rule{{
 		Host: "app.example.com", Path: "/", PathType: PathTypePrefix,
-		Backend: Backend{VIP: deadAP.Addr(), Port: deadAP.Port()},
+		Backend: Backend{VIP: netip.MustParseAddr("10.43.0.18"), Port: 80},
 	}}, nil)
-	front := httptest.NewServer(newHandler(table, log))
-	defer front.Close()
+	rt := &fakeTransport{err: errors.New("dial tcp 10.43.0.18:80: connect: connection refused")}
+	h := fakeHandler(table, log, rt)
 
-	for i := 0; i < 3; i++ {
-		req, err := http.NewRequest(http.MethodGet, front.URL+"/", nil)
-		if err != nil {
-			t.Fatalf("new request: %v", err)
+	for i := range 3 {
+		req := httptest.NewRequest(http.MethodGet, "http://app.example.com/", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("request %d: status = %d, want 502", i, rec.Code)
 		}
-		req.Host = "app.example.com"
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("do request %d: %v", i, err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusBadGateway {
-			t.Fatalf("request %d: status = %d, want 502", i, resp.StatusCode)
-		}
+	}
+	if n := len(rt.requests()); n != 3 {
+		t.Fatalf("backend dial attempted %d times, want 3", n)
 	}
 	logMu.Lock()
 	warns := strings.Count(logBuf.String(), "ingress backend unreachable")
@@ -191,65 +190,4 @@ func (l lockedWriter) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.w.Write(p)
-}
-
-// TestIngressProxyUpgradePassthrough proves an HTTP/1.1 Upgrade (the websocket
-// shape) passes through the stdlib ReverseProxy datapath: the 101 reaches the
-// client and bytes flow both ways on the switched protocol.
-func TestIngressProxyUpgradePassthrough(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Upgrade") != "echo" {
-			http.Error(w, "expected upgrade", http.StatusBadRequest)
-			return
-		}
-		conn, rw, err := w.(http.Hijacker).Hijack()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n")
-		_ = rw.Flush()
-		line, err := rw.ReadString('\n')
-		if err != nil {
-			return
-		}
-		_, _ = rw.WriteString(line)
-		_ = rw.Flush()
-	}))
-	defer backend.Close()
-
-	table := NewRouteTable()
-	table.Update([]Rule{{
-		Host: "up.example.com", Path: "/", PathType: PathTypePrefix,
-		Backend: backendFromURL(t, backend.URL),
-	}}, nil)
-	front := httptest.NewServer(newHandler(table, slog.New(slog.DiscardHandler)))
-	defer front.Close()
-
-	conn, err := net.DialTimeout("tcp", front.Listener.Addr().String(), 3*time.Second)
-	if err != nil {
-		t.Fatalf("dial front: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: up.example.com\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n")
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, nil)
-	if err != nil {
-		t.Fatalf("read upgrade response: %v", err)
-	}
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("status = %d, want 101", resp.StatusCode)
-	}
-	if _, err := fmt.Fprintf(conn, "ping over switched protocol\n"); err != nil {
-		t.Fatalf("write payload: %v", err)
-	}
-	echoed, err := br.ReadString('\n')
-	if err != nil {
-		t.Fatalf("read echo: %v", err)
-	}
-	if echoed != "ping over switched protocol\n" {
-		t.Fatalf("echoed %q", echoed)
-	}
 }
