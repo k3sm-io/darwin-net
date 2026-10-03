@@ -16,10 +16,15 @@ limitations under the License.
 
 package dns
 
+// The resolver's wire path runs here against fakeDNS (fakedns_test.go): the
+// same stubZone the integration-tier stub serves, reached through the dial seam
+// over in-memory conns that keep UDP's one-message-per-read and TCP's
+// length-prefixed framing. The one test that needs the kernel (ECONNREFUSED
+// from a closed port) is in resolver_integration_test.go.
+
 import (
 	"context"
 	"errors"
-	"net"
 	"net/netip"
 	"strings"
 	"testing"
@@ -28,30 +33,18 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 )
 
-// dialToStub returns a dialer Option that redirects the resolver's CoreDNS
-// queries to the stub server, regardless of the configured ClusterDNSIP. This
-// lets the resolver carry a realistic 10.43.0.10 VIP in its DNSConfig while the
-// query actually lands on the in-process stub.
-func dialToStub(s *stubDNS) Option {
-	return withDialer(func(ctx context.Context, network, _ string) (net.Conn, error) {
-		d := net.Dialer{}
-		return d.DialContext(ctx, network, s.addr())
-	})
-}
-
 // TestLookupHostShortNameViaSearch proves the resolver resolves a SHORT name
-// (e.g. "web") by search expansion over the real UDP wire to a stub CoreDNS —
+// (e.g. "web") by search expansion over its DNS wire path to a stub CoreDNS —
 // the end-to-end analog of the shim's job. The stub only knows the FQDN form, so
 // a resolver that skipped search expansion would fail to resolve "web".
 func TestLookupHostShortNameViaSearch(t *testing.T) {
 	t.Parallel()
 	want := netip.MustParseAddr("10.43.0.42")
-	stub := newStubDNS(t, map[string]netip.Addr{
+	stub := newFakeDNS("10.43.0.10:53", map[string]netip.Addr{
 		"web.default.svc.cluster.local": want,
 	})
-	defer stub.close()
 
-	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(time.Second))
+	r, err := NewResolver(stdConfig(), dialFakes(stub), WithTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
@@ -76,12 +69,11 @@ func TestLookupHostTriesCandidatesInOrder(t *testing.T) {
 	t.Parallel()
 	want := netip.MustParseAddr("10.43.0.99")
 	// Only the svc.cluster.local form exists, not the default.svc form.
-	stub := newStubDNS(t, map[string]netip.Addr{
+	stub := newFakeDNS("10.43.0.10:53", map[string]netip.Addr{
 		"kube-dns.svc.cluster.local": want,
 	})
-	defer stub.close()
 
-	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(time.Second))
+	r, err := NewResolver(stdConfig(), dialFakes(stub), WithTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
@@ -98,10 +90,9 @@ func TestLookupHostTriesCandidatesInOrder(t *testing.T) {
 // yields ErrNotFound.
 func TestLookupHostNotFound(t *testing.T) {
 	t.Parallel()
-	stub := newStubDNS(t, map[string]netip.Addr{})
-	defer stub.close()
+	stub := newFakeDNS("10.43.0.10:53", map[string]netip.Addr{})
 
-	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(time.Second))
+	r, err := NewResolver(stdConfig(), dialFakes(stub), WithTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
@@ -116,12 +107,11 @@ func TestLookupHostNotFound(t *testing.T) {
 func TestLookupHostAbsoluteName(t *testing.T) {
 	t.Parallel()
 	want := netip.MustParseAddr("10.43.0.1")
-	stub := newStubDNS(t, map[string]netip.Addr{
+	stub := newFakeDNS("10.43.0.10:53", map[string]netip.Addr{
 		"kubernetes.default.svc.cluster.local": want,
 	})
-	defer stub.close()
 
-	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(time.Second))
+	r, err := NewResolver(stdConfig(), dialFakes(stub), WithTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
@@ -150,13 +140,12 @@ func TestNewResolverRejectsBadConfig(t *testing.T) {
 func TestLookupHostRetriesLostDatagram(t *testing.T) {
 	t.Parallel()
 	want := netip.MustParseAddr("10.43.0.42")
-	stub := newStubDNS(t, map[string]netip.Addr{
+	stub := newFakeDNS("10.43.0.10:53", map[string]netip.Addr{
 		"web.default.svc.cluster.local": want,
 	})
-	defer stub.close()
 	stub.dropNext("web.default.svc.cluster.local", 1)
 
-	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(200*time.Millisecond))
+	r, err := NewResolver(stdConfig(), dialFakes(stub), WithTimeout(200*time.Millisecond))
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
@@ -177,13 +166,12 @@ func TestLookupHostServfailIsTempFailNotNotFound(t *testing.T) {
 	t.Parallel()
 	// The later candidate exists — a resolver that slid past the SERVFAIL
 	// would "resolve" kube-dns from the wrong search domain.
-	stub := newStubDNS(t, map[string]netip.Addr{
+	stub := newFakeDNS("10.43.0.10:53", map[string]netip.Addr{
 		"kube-dns.svc.cluster.local": netip.MustParseAddr("10.43.0.99"),
 	})
-	defer stub.close()
 	stub.setServfail("kube-dns.default.svc.cluster.local")
 
-	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(time.Second))
+	r, err := NewResolver(stdConfig(), dialFakes(stub), WithTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
@@ -205,13 +193,12 @@ func TestLookupHostServfailIsTempFailNotNotFound(t *testing.T) {
 func TestLookupHostTruncatedRefetchesTCP(t *testing.T) {
 	t.Parallel()
 	want := netip.MustParseAddr("10.43.0.7")
-	stub := newStubDNS(t, map[string]netip.Addr{
+	stub := newFakeDNS("10.43.0.10:53", map[string]netip.Addr{
 		"big.default.svc.cluster.local": want,
 	})
-	defer stub.close()
 	stub.setTruncateUDP("big.default.svc.cluster.local")
 
-	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(time.Second))
+	r, err := NewResolver(stdConfig(), dialFakes(stub), WithTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
@@ -225,6 +212,15 @@ func TestLookupHostTruncatedRefetchesTCP(t *testing.T) {
 	if !stub.askedTCP("big.default.svc.cluster.local") {
 		t.Fatalf("resolver never re-fetched the truncated answer over TCP")
 	}
+	// The refetch is the SAME query (RFC 1035 §4.2.2): same question, same ID,
+	// sent once over UDP and then once over TCP.
+	qs := stub.queriesFor("big.default.svc.cluster.local")
+	if len(qs) != 2 || qs[0].transport != "udp" || qs[1].transport != "tcp" {
+		t.Fatalf("queries for the truncated name = %+v, want one udp then one tcp", qs)
+	}
+	if qs[0].id != qs[1].id || qs[0].qtype != qs[1].qtype {
+		t.Fatalf("tcp refetch %+v is not the truncated udp query %+v (same ID and question)", qs[1], qs[0])
+	}
 }
 
 // TestLookupHostTruncatedTCPStaysTruncatedIsTempFail asserts that when even the
@@ -234,15 +230,14 @@ func TestLookupHostTruncatedRefetchesTCP(t *testing.T) {
 // not trustworthy. Mirrors the C shim's TEMPFAIL on TC-over-TCP.
 func TestLookupHostTruncatedTCPStaysTruncatedIsTempFail(t *testing.T) {
 	t.Parallel()
-	stub := newStubDNS(t, map[string]netip.Addr{
+	stub := newFakeDNS("10.43.0.10:53", map[string]netip.Addr{
 		"big.default.svc.cluster.local": netip.MustParseAddr("10.43.0.7"),
 	})
-	defer stub.close()
 	// UDP truncates → resolver refetches over TCP; TCP also truncates.
 	stub.setTruncateUDP("big.default.svc.cluster.local")
 	stub.setTruncateTCP("big.default.svc.cluster.local")
 
-	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(300*time.Millisecond))
+	r, err := NewResolver(stdConfig(), dialFakes(stub), WithTimeout(300*time.Millisecond))
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
@@ -265,12 +260,11 @@ func TestLookupHostTruncatedTCPStaysTruncatedIsTempFail(t *testing.T) {
 func TestLookupHostQueryCarriesEDNSOPT(t *testing.T) {
 	t.Parallel()
 	want := netip.MustParseAddr("10.43.0.42")
-	stub := newStubDNS(t, map[string]netip.Addr{
+	stub := newFakeDNS("10.43.0.10:53", map[string]netip.Addr{
 		"web.default.svc.cluster.local": want,
 	})
-	defer stub.close()
 
-	r, err := NewResolver(stdConfig(), dialToStub(stub), WithTimeout(time.Second))
+	r, err := NewResolver(stdConfig(), dialFakes(stub), WithTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
@@ -325,18 +319,9 @@ func TestUnencodableLabelDefinitiveMiss(t *testing.T) {
 // LookupHost altitude — with zero exchanges on the wire.
 func assertUnencodableDefinitiveMiss(t *testing.T, fqdn string) {
 	t.Helper()
-	stub := newStubDNS(t, map[string]netip.Addr{})
-	defer stub.close()
+	stub := newFakeDNS("10.43.0.10:53", map[string]netip.Addr{})
 
-	// dials counts every exchange the resolver attempts. It is written only from
-	// the resolver's synchronous dial seam on this goroutine, so it needs no lock.
-	dials := 0
-	counting := withDialer(func(ctx context.Context, network, _ string) (net.Conn, error) {
-		dials++
-		d := net.Dialer{}
-		return d.DialContext(ctx, network, stub.addr())
-	})
-	r, err := NewResolver(stdConfig(), counting, WithTimeout(200*time.Millisecond))
+	r, err := NewResolver(stdConfig(), dialFakes(stub), WithTimeout(200*time.Millisecond))
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
@@ -348,7 +333,7 @@ func assertUnencodableDefinitiveMiss(t *testing.T, fqdn string) {
 	if len(addrs) != 0 {
 		t.Fatalf("lookupCandidate(%q) = %v, want no addresses", fqdn, addrs)
 	}
-	if dials != 0 {
+	if dials := stub.dials.Load(); dials != 0 {
 		t.Fatalf("resolver attempted %d exchange(s) for an unencodable name; want 0", dials)
 	}
 	if stub.asked(fqdn) {
@@ -364,44 +349,13 @@ func assertUnencodableDefinitiveMiss(t *testing.T, fqdn string) {
 	if errors.Is(err, ErrTempFail) {
 		t.Fatalf("unencodable name reported as transient: %v", err)
 	}
-	if dials != 0 {
+	if dials := stub.dials.Load(); dials != 0 {
 		t.Fatalf("LookupHost attempted %d exchange(s) for an unencodable name; want 0", dials)
 	}
 }
 
-// TestLookupHostClosedPortIsTempFail points the resolver at a closed loopback
-// port: a connected-UDP exchange gets an immediate ECONNREFUSED, which is a
-// TRANSIENT failure (ErrTempFail), never ErrNotFound — the Go analog of the
-// shim's EAI_AGAIN when the cluster resolver is unreachable.
-func TestLookupHostClosedPortIsTempFail(t *testing.T) {
-	t.Parallel()
-	// Reserve then release a loopback UDP port so it is (near-certainly) closed.
-	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		t.Fatalf("reserve closed port: %v", err)
-	}
-	closedAddr := c.LocalAddr().String()
-	_ = c.Close()
-
-	dialClosed := withDialer(func(ctx context.Context, network, _ string) (net.Conn, error) {
-		d := net.Dialer{}
-		return d.DialContext(ctx, network, closedAddr)
-	})
-	r, err := NewResolver(stdConfig(), dialClosed, WithTimeout(300*time.Millisecond))
-	if err != nil {
-		t.Fatalf("NewResolver: %v", err)
-	}
-	_, err = r.LookupHost(context.Background(), "web")
-	if !errors.Is(err, ErrTempFail) {
-		t.Fatalf("LookupHost against a closed port err = %v, want ErrTempFail", err)
-	}
-	if errors.Is(err, ErrNotFound) {
-		t.Fatalf("ECONNREFUSED collapsed into ErrNotFound: %v", err)
-	}
-}
-
-// noneConfig is a DNSPolicyNone config with the given nameservers; the
-// addresses are placeholders that withServerAddrs points at stubs.
+// noneConfig is a DNSPolicyNone config with the given nameservers; each test
+// puts a fakeDNS at <nameserver>:53.
 func noneConfig(search []string, ns ...string) netv1.DNSConfig {
 	return netv1.DNSConfig{
 		Policy:        netv1.DNSPolicyNone,
@@ -419,14 +373,12 @@ func TestLookupHostPolicyNone(t *testing.T) {
 
 	t.Run("a dead first server is asked once per lookup, not once per candidate", func(t *testing.T) {
 		t.Parallel()
-		dead := newStubDNS(t, map[string]netip.Addr{})
-		defer dead.close()
+		dead := newFakeDNS("192.0.2.1:53", map[string]netip.Addr{})
 		dead.setSilent()
-		live := newStubDNS(t, map[string]netip.Addr{"web.b.example": want})
-		defer live.close()
+		live := newFakeDNS("192.0.2.2:53", map[string]netip.Addr{"web.b.example": want})
 
 		r, err := NewResolver(noneConfig([]string{"a.example", "b.example"}, "192.0.2.1", "192.0.2.2"),
-			withServerAddrs(dead.addr(), live.addr()), WithTimeout(200*time.Millisecond))
+			dialFakes(dead, live), WithTimeout(200*time.Millisecond))
 		if err != nil {
 			t.Fatalf("NewResolver: %v", err)
 		}
@@ -444,14 +396,12 @@ func TestLookupHostPolicyNone(t *testing.T) {
 
 	t.Run("SERVFAIL advances to the next server without marking it dead", func(t *testing.T) {
 		t.Parallel()
-		first := newStubDNS(t, map[string]netip.Addr{"web.example": want})
-		defer first.close()
+		first := newFakeDNS("192.0.2.1:53", map[string]netip.Addr{"web.example": want})
 		first.setServfail("web.example")
-		second := newStubDNS(t, map[string]netip.Addr{"web.example": want})
-		defer second.close()
+		second := newFakeDNS("192.0.2.2:53", map[string]netip.Addr{"web.example": want})
 
 		r, err := NewResolver(noneConfig(nil, "192.0.2.1", "192.0.2.2"),
-			withServerAddrs(first.addr(), second.addr()), WithTimeout(time.Second))
+			dialFakes(first, second), WithTimeout(time.Second))
 		if err != nil {
 			t.Fatalf("NewResolver: %v", err)
 		}
@@ -459,15 +409,17 @@ func TestLookupHostPolicyNone(t *testing.T) {
 		if err != nil || len(addrs) != 1 || addrs[0] != want {
 			t.Fatalf("LookupHost = %v, %v; want [%v]", addrs, err, want)
 		}
+		if !first.asked("web.example") || !second.asked("web.example") {
+			t.Fatalf("the walk did not ask both servers in order")
+		}
 	})
 
 	t.Run("an external transient fails closed in exclusive mode", func(t *testing.T) {
 		t.Parallel()
-		stub := newStubDNS(t, map[string]netip.Addr{})
-		defer stub.close()
+		stub := newFakeDNS("192.0.2.1:53", map[string]netip.Addr{})
 		stub.setServfail("github.com")
 
-		r, err := NewResolver(noneConfig(nil, "192.0.2.1"), withServerAddrs(stub.addr()), WithTimeout(time.Second))
+		r, err := NewResolver(noneConfig(nil, "192.0.2.1"), dialFakes(stub), WithTimeout(time.Second))
 		if err != nil {
 			t.Fatalf("NewResolver: %v", err)
 		}

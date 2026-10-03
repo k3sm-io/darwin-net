@@ -174,10 +174,13 @@ func (c *fakeVIPConn) reply(t *testing.T) fakeDatagram {
 type fakeUpstream struct {
 	local  netip.AddrPort
 	remote netip.AddrPort
-	echo   bool
-	rx     chan []byte
-	done   chan struct{}
-	once   sync.Once
+	// laddr is the source address the relay asked the dial to bind (nil for
+	// kernel default source selection), recorded as passed.
+	laddr *net.UDPAddr
+	echo  bool
+	rx    chan []byte
+	done  chan struct{}
+	once  sync.Once
 
 	mu     sync.Mutex
 	writes int
@@ -262,13 +265,15 @@ func newFakeUDPBackend(echo bool) *fakeUDPBackend {
 	return &fakeUDPBackend{echo: echo}
 }
 
-// dial matches udpRelay.dial: it opens one fake upstream toward raddr.
-func (b *fakeUDPBackend) dial(_, raddr *net.UDPAddr) (udpUpstream, error) {
+// dial matches udpRelay.dial: it opens one fake upstream toward raddr, recording
+// the laddr the relay asked it to bind.
+func (b *fakeUDPBackend) dial(laddr, raddr *net.UDPAddr) (udpUpstream, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	u := &fakeUpstream{
 		local:  netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(50000+len(b.ups))),
 		remote: raddr.AddrPort(),
+		laddr:  laddr,
 		echo:   b.echo,
 		rx:     make(chan []byte, fakeQueueDepth),
 		done:   make(chan struct{}),

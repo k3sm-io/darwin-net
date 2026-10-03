@@ -1,3 +1,5 @@
+//go:build integration
+
 /*
 Copyright The k3sm Authors.
 
@@ -13,6 +15,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+// The daemon contract is the unix socket itself: these tests serve the
+// protocol on a real socket file, check the peer's credentials, and receive
+// bound listeners over SCM_RIGHTS, none of which has a seam. They need no
+// privilege; run with:
+//
+//	CGO_ENABLED=0 go test -tags integration -run '^TestServer|^TestBindPort' ./pkg/netd/
 
 package netd_test
 

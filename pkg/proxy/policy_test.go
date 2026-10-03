@@ -22,7 +22,6 @@ import (
 	"net"
 	"net/netip"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,79 +32,27 @@ import (
 // hangs the subtest for at most this long instead of wedging the suite.
 const policyTestTimeout = 5 * time.Second
 
-// fakeSrcConn wraps a net.Conn (one end of a net.Pipe) overriding RemoteAddr, so
-// p.handle sees a chosen pod source IP: unit tests cannot originate real
-// connections from arbitrary pod /32s, and a real loopback dial would collapse
-// every source into the always-allowed 127.0.0.1.
-type fakeSrcConn struct {
-	net.Conn
-	remote net.Addr
-}
-
-func (c fakeSrcConn) RemoteAddr() net.Addr { return c.remote }
-
-// tcpBanner is a loopback TCP server standing in for a pod backend: it writes a
-// one-line banner to every accepted connection and closes it, counting accepts so
-// a test can assert a denied connection never reached the backend.
-type tcpBanner struct {
-	ln      net.Listener
-	accepts atomic.Int32
-	done    chan struct{}
-}
-
-// newTCPBanner listens on addr ("127.0.0.1:0" or "[::1]:0" — the two loopback
-// addresses bindable on Darwin without an lo0 alias, giving tests two DISTINCT
-// backend pod IPs) and serves the banner until closed.
-func newTCPBanner(t *testing.T, addr string) *tcpBanner {
-	t.Helper()
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		t.Fatalf("listen banner backend %s: %v", addr, err)
-	}
-	b := &tcpBanner{ln: ln, done: make(chan struct{})}
-	go func() {
-		defer close(b.done)
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			b.accepts.Add(1)
-			_, _ = conn.Write([]byte("ok"))
-			_ = conn.Close()
-		}
-	}()
-	t.Cleanup(func() {
-		_ = ln.Close()
-		<-b.done
-	})
-	return b
-}
-
-// addrPort returns the backend's bound address as a netip.AddrPort.
-func (b *tcpBanner) addrPort() netip.AddrPort {
-	return b.ln.Addr().(*net.TCPAddr).AddrPort()
-}
-
-// endpoint returns the backend as a Ready netv1.Endpoint for the routing table.
-func (b *tcpBanner) endpoint() netv1.Endpoint {
-	ap := b.addrPort()
-	return netv1.Endpoint{IP: ap.Addr().String(), Port: int32(ap.Port()), Ready: true}
-}
-
-// handleVIP drives ONE VIP-mediated connection through the real TCP accept path
-// (p.handle, internal scope) with a forged pod source IP, and reports whether it
-// reached a backend (read the banner) or was refused (closed with no data — the
-// deny shape AND the no-backend shape; the caller disambiguates via backend
-// accept counts).
+// handleVIP drives ONE VIP-mediated connection through the TCP accept path
+// (p.handle, internal scope) from a pod source IP, and reports whether it reached
+// a backend (read the "ok" banner) or was refused (closed with no data — the deny
+// shape AND the no-backend shape; the caller disambiguates via backend accept
+// counts). The accepted conn is a pipe reporting real TCP addresses, so the
+// verdict runs on exactly the source named: unit tests cannot originate real
+// connections from arbitrary pod /32s, and a loopback dial would collapse every
+// source into the always-allowed 127.0.0.1.
 func handleVIP(t *testing.T, p *Proxy, key PortKey, src netip.Addr) bool {
 	t.Helper()
 	clientEnd, proxyEnd := net.Pipe()
 	defer clientEnd.Close()
+	accepted := tcpPipeConn{
+		Conn:   proxyEnd,
+		local:  net.TCPAddrFromAddrPort(netip.AddrPortFrom(netip.MustParseAddr(key.ClusterIP), uint16(key.Port))),
+		remote: net.TCPAddrFromAddrPort(netip.AddrPortFrom(src, 34567)),
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		p.handle(fakeSrcConn{Conn: proxyEnd, remote: &net.TCPAddr{IP: src.AsSlice(), Port: 34567}}, key, internalListener)
+		p.handle(accepted, key, internalListener)
 	}()
 	_ = clientEnd.SetReadDeadline(time.Now().Add(policyTestTimeout))
 	buf := make([]byte, 2)
@@ -117,13 +64,15 @@ func handleVIP(t *testing.T, p *Proxy, key PortKey, src netip.Addr) bool {
 }
 
 // newPolicyProxy builds a rootless Proxy over a fresh routing table with the
-// given policy table wired (no Run, no sockets: the tests drive p.handle
-// directly, so no alias manager or listener is ever touched). The logger is
-// discarded — the throttled deny Info is asserted separately via a capture
+// given policy table wired (no Run: the tests drive p.handle directly, so no
+// alias manager or listener is ever touched). opts adds to it — the unit tests
+// pass withDialBackend(fakeTCPNet.dial), so nothing dials a socket. The logger
+// is discarded — the throttled deny Info is asserted separately via a capture
 // handler, not scraped from test output.
-func newPolicyProxy(pt *PolicyTable) (*Proxy, *RoutingTable) {
+func newPolicyProxy(pt *PolicyTable, opts ...Option) (*Proxy, *RoutingTable) {
 	table := NewRoutingTable(netip.Prefix{})
-	return New(table, WithPolicyTable(pt), WithLogger(slog.New(slog.DiscardHandler))), table
+	opts = append([]Option{WithPolicyTable(pt), WithLogger(slog.New(slog.DiscardHandler))}, opts...)
+	return New(table, opts...), table
 }
 
 // podIPSet builds a known-pod-IP attribution set.
@@ -150,15 +99,16 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 
 	t.Run("a: selected backend default-denies unlisted sources; unselected backend allows", func(t *testing.T) {
 		t.Parallel()
-		p4 := newTCPBanner(t, "127.0.0.1:0") // backend pod P (policy-selected)
-		q6 := newTCPBanner(t, "[::1]:0")     // backend pod Q (unselected)
+		backends := newFakeTCPNet()
+		p4 := backends.add(t, "10.42.0.20:8080", "ok") // backend pod P (policy-selected)
+		q6 := backends.add(t, "10.42.0.21:8080", "ok") // backend pod Q (unselected)
 
 		pt := NewPolicyTable()
 		pt.Update(map[netip.Addr][]PolicyRule{
 			p4.addrPort().Addr(): {{Sources: podIPSet(srcA)}}, // from: srcA only, all ports
 		}, podIPSet(srcA, srcB))
 
-		p, table := newPolicyProxy(pt)
+		p, table := newPolicyProxy(pt, withDialBackend(backends.dial))
 		keyP := PortKey{ClusterIP: "10.43.1.1", Port: 80, Protocol: netv1.ProtocolTCP}
 		keyQ := PortKey{ClusterIP: "10.43.1.2", Port: 80, Protocol: netv1.ProtocolTCP}
 		table.SetEndpoints(keyP, []netv1.Endpoint{p4.endpoint()})
@@ -180,9 +130,10 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 
 	t.Run("b: one Service fronting policy-heterogeneous pods — verdict follows the PICKED backend", func(t *testing.T) {
 		t.Parallel()
-		q6 := newTCPBanner(t, "[::1]:0") // unselected, dialable
-		// P is a selected, DENIED backend that is never dialed, so it needs no
-		// listener; its v4 address sorts before Q's v6 one, fixing round-robin order.
+		backends := newFakeTCPNet()
+		q6 := backends.add(t, "10.42.0.6:8080", "ok") // unselected, dialable
+		// P is a selected, DENIED backend that is never dialed, so it is not
+		// registered; its address sorts before Q's, fixing round-robin order.
 		pAddr := netip.MustParseAddr("10.42.0.5")
 
 		pt := NewPolicyTable()
@@ -190,14 +141,14 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 			pAddr: {{Sources: podIPSet(srcA)}},
 		}, podIPSet(srcA, srcB))
 
-		p, table := newPolicyProxy(pt)
+		p, table := newPolicyProxy(pt, withDialBackend(backends.dial))
 		key := PortKey{ClusterIP: "10.43.1.3", Port: 80, Protocol: netv1.ProtocolTCP}
 		table.SetEndpoints(key, []netv1.Endpoint{
 			{IP: pAddr.String(), Port: 9999, Ready: true},
 			q6.endpoint(),
 		})
 
-		// Fresh table → cursor 0: pick 1 = P (v4 sorts first) → denied for srcB;
+		// Fresh table → cursor 0: pick 1 = P (sorts first) → denied for srcB;
 		// pick 2 = Q → allowed. Same source, same VIP, opposite verdicts: the
 		// verdict is per PICKED backend, never per Service.
 		if handleVIP(t, p, key, srcB) {
@@ -206,21 +157,25 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 		if !handleVIP(t, p, key, srcB) {
 			t.Errorf("pick 2 (unselected backend Q): srcB must pass on the SAME VIP")
 		}
+		if got := q6.accepts.Load(); got != 1 {
+			t.Errorf("unselected backend accepts = %d, want 1", got)
+		}
 	})
 
 	t.Run("c: ports — wrong backend port refused, right port passes", func(t *testing.T) {
 		t.Parallel()
-		b1 := newTCPBanner(t, "127.0.0.1:0")
-		b2 := newTCPBanner(t, "127.0.0.1:0")
+		backends := newFakeTCPNet()
+		b1 := backends.add(t, "10.42.0.22:8080", "ok")
+		b2 := backends.add(t, "10.42.0.22:8081", "ok")
 
 		pt := NewPolicyTable()
 		pt.Update(map[netip.Addr][]PolicyRule{
-			// Both banner backends share the pod IP 127.0.0.1; the policy allows srcA
-			// on b1's port only.
+			// Both backends share the pod IP 10.42.0.22; the policy allows srcA on
+			// b1's port only.
 			b1.addrPort().Addr(): {{Sources: podIPSet(srcA), Ports: map[uint16]struct{}{b1.addrPort().Port(): {}}}},
 		}, podIPSet(srcA))
 
-		p, table := newPolicyProxy(pt)
+		p, table := newPolicyProxy(pt, withDialBackend(backends.dial))
 		key1 := PortKey{ClusterIP: "10.43.1.4", Port: 80, Protocol: netv1.ProtocolTCP}
 		key2 := PortKey{ClusterIP: "10.43.1.5", Port: 81, Protocol: netv1.ProtocolTCP}
 		table.SetEndpoints(key1, []netv1.Endpoint{b1.endpoint()})
@@ -285,21 +240,22 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 
 	t.Run("e: asserted bypass — direct pod-IP traffic never consults the table (the honest ceiling)", func(t *testing.T) {
 		t.Parallel()
-		be := newTCPBanner(t, "127.0.0.1:0")
+		backends := newFakeTCPNet()
+		be := backends.add(t, "10.42.0.24:8080", "ok")
 
 		pt := NewPolicyTable()
 		// Deny-all on the backend: if ANY seam consulted the table for the direct
 		// path, this is the policy that would deny it.
 		pt.Update(map[netip.Addr][]PolicyRule{be.addrPort().Addr(): nil}, podIPSet(srcA))
 
-		p, table := newPolicyProxy(pt)
+		p, table := newPolicyProxy(pt, withDialBackend(backends.dial))
 		key := PortKey{ClusterIP: "10.43.1.6", Port: 80, Protocol: netv1.ProtocolTCP}
 		table.SetEndpoints(key, []netv1.Endpoint{be.endpoint()})
 
 		// Direct pod-IP dial (per-pod /32 path, no VIP): succeeds DESPITE deny-all,
 		// and consults the verdict table zero times — M10.4 is a VIP-mediated hint,
 		// not isolation (the M10.1 causal link: per-pod /32s bypass the proxy).
-		conn, err := net.DialTimeout("tcp", be.addrPort().String(), policyTestTimeout)
+		conn, err := backends.dial(nil, "tcp", be.addrPort().String())
 		if err != nil {
 			t.Fatalf("direct pod-IP dial: %v", err)
 		}
@@ -323,12 +279,7 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 
 	t.Run("f: UDP flow admission — denied flow never created, allowed flow relays", func(t *testing.T) {
 		t.Parallel()
-		bp, err := net.ListenPacket("udp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("listen udp backend: %v", err)
-		}
-		defer bp.Close()
-		beAP := bp.LocalAddr().(*net.UDPAddr).AddrPort()
+		beAP := netip.MustParseAddrPort("10.42.0.25:53")
 
 		pt := NewPolicyTable()
 		pt.log = slog.New(slog.DiscardHandler)
@@ -340,11 +291,9 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 		key := PortKey{ClusterIP: "10.43.1.7", Port: 53, Protocol: netv1.ProtocolUDP}
 		table.SetEndpoints(key, []netv1.Endpoint{{IP: beAP.Addr().String(), Port: int32(beAP.Port()), Ready: true}})
 
-		vip, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-		if err != nil {
-			t.Fatalf("listen vip socket: %v", err)
-		}
-		r := newUDPRelay(vip, key, table, egressScope{}, time.Minute, maxUDPFlowsPerSource, nil, slog.New(slog.DiscardHandler))
+		be := newFakeUDPBackend(false)
+		r := newUDPRelay(newFakeVIPConn(netip.MustParseAddrPort("10.43.1.7:53")), key, table, egressScope{}, time.Minute, maxUDPFlowsPerSource, nil, slog.New(slog.DiscardHandler))
+		r.dial = be.dial
 		r.policy = pt
 		defer func() { _ = r.Close() }()
 
@@ -356,6 +305,9 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 		if got := r.flowCount(); got != 0 {
 			t.Fatalf("denied flow was created: flowCount = %d, want 0", got)
 		}
+		if got := be.dials(); got != 0 {
+			t.Fatalf("denied flow dialed %d upstreams, want 0 (denied before the dial)", got)
+		}
 		// Allowed source: flow created and relays to the backend.
 		up := r.upstreamFor(netip.AddrPortFrom(srcA, 5002), &lastWarn)
 		if up == nil {
@@ -364,14 +316,17 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 		if got := r.flowCount(); got != 1 {
 			t.Fatalf("flowCount = %d, want 1", got)
 		}
+		if got := be.dials(); got != 1 {
+			t.Fatalf("allowed flow dialed %d upstreams, want 1", got)
+		}
+		if got := be.upstream(0).remote; got != beAP {
+			t.Fatalf("admitted flow dialed %v, want the backend %v", got, beAP)
+		}
 		if _, err := up.Write([]byte("ping")); err != nil {
 			t.Fatalf("write via admitted flow: %v", err)
 		}
-		_ = bp.SetReadDeadline(time.Now().Add(policyTestTimeout))
-		buf := make([]byte, 16)
-		n, _, err := bp.ReadFrom(buf)
-		if err != nil || string(buf[:n]) != "ping" {
-			t.Fatalf("backend must receive the admitted flow's datagram (read %q, err %v)", buf[:n], err)
+		if got := be.upstream(0).wrote(); got != 1 {
+			t.Fatalf("backend received %d datagrams from the admitted flow, want 1", got)
 		}
 	})
 
@@ -390,8 +345,9 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 		}
 
 		// Through the real accept path: a proxy with an empty policy table serves.
-		be := newTCPBanner(t, "127.0.0.1:0")
-		p, table := newPolicyProxy(empty)
+		backends := newFakeTCPNet()
+		be := backends.add(t, "10.42.0.26:8080", "ok")
+		p, table := newPolicyProxy(empty, withDialBackend(backends.dial))
 		key := PortKey{ClusterIP: "10.43.1.8", Port: 80, Protocol: netv1.ProtocolTCP}
 		table.SetEndpoints(key, []netv1.Endpoint{be.endpoint()})
 		if !handleVIP(t, p, key, anySrc) {

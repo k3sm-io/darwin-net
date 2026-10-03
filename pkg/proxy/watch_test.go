@@ -384,15 +384,24 @@ func orderSlice(backendIP string, backendPort int32) *discoveryv1.EndpointSlice 
 	}
 }
 
-// newOrderProxy builds a rootless Proxy (noop alias manager) plus its routing
-// table and starts its supervision loop, tearing it down at test end. The routing
-// table is the observation seam: runWorker calls SetEndpointsPolicy from the event
-// payload BEFORE it touches any listener, so a backend appearing there proves a
-// reconcile carried it — the listener-open retry cannot fabricate one.
+// orderVIP and orderPort are the Service the ordering tests reconcile. Each test
+// builds its own Proxy over an in-memory binder, so nothing is bound and every
+// test may use the same address.
+const (
+	orderVIP  = "10.43.0.50"
+	orderPort = 80
+)
+
+// newOrderProxy builds a rootless Proxy (noop alias manager, in-memory binder)
+// plus its routing table and starts its supervision loop, tearing it down at test
+// end. The routing table is the observation seam: runWorker calls
+// SetEndpointsPolicy from the event payload BEFORE it touches any listener, so a
+// backend appearing there proves a reconcile carried it — the listener-open retry
+// cannot fabricate one.
 func newOrderProxy(t *testing.T) (*Proxy, *RoutingTable) {
 	t.Helper()
 	tbl := NewRoutingTable(netip.Prefix{})
-	px := New(tbl, withAliasManager(newNoopAliasManager()), WithLogger(slog.New(slog.DiscardHandler)))
+	px := New(tbl, withAliasManager(newNoopAliasManager()), withBinder(newRecordingBinder()), WithLogger(slog.New(slog.DiscardHandler)))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); _ = px.Run(ctx) }()
@@ -446,8 +455,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 
 	t.Run("real informers: slice observed before its Service still lands in the routing table", func(t *testing.T) {
 		t.Parallel()
-		const vip = "127.0.0.1"
-		port := freePort(t, vip)
+		vip, port := orderVIP, int32(orderPort)
 		key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
 
 		// The slice pre-exists, so it arrives in the EndpointSlice informer's initial
@@ -509,8 +517,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				t.Parallel()
-				const vip = "127.0.0.1"
-				port := freePort(t, vip)
+				vip, port := orderVIP, int32(orderPort)
 				key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
 
 				px, tbl := newOrderProxy(t)
@@ -554,8 +561,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 		// them. Every interleaving — Service first, slice first, or simultaneous —
 		// must converge on the backend. Repeated so a narrow window would surface.
 		for i := 0; i < 20; i++ {
-			const vip = "127.0.0.1"
-			port := freePort(t, vip)
+			vip, port := orderVIP, int32(orderPort)
 			key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
 
 			client := fake.NewSimpleClientset()
@@ -612,8 +618,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 		t.Parallel()
 		// Pins the MECHANISM the two cases above are about: with the slice cached but
 		// its Service absent, onSlice reconciles nothing at all.
-		const vip = "127.0.0.1"
-		port := freePort(t, vip)
+		vip, port := orderVIP, int32(orderPort)
 		key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
 
 		px, tbl := newOrderProxy(t)
@@ -646,13 +651,13 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 func TestReconcileSnapshotIsNotOvertaken(t *testing.T) {
 	t.Parallel()
 	const (
-		vip        = "127.0.0.1"
+		vip        = orderVIP
+		port       = orderPort
 		iterations = 50
 		padding    = 400
 	)
 
 	for i := 0; i < iterations; i++ {
-		port := freePort(t, vip)
 		key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
 
 		px, tbl := newOrderProxy(t)
