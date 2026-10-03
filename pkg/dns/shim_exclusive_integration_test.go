@@ -334,6 +334,19 @@ func TestGetaddrinfoShimExclusive(t *testing.T) {
 				t.Fatalf("an IPv6 literal reached the pod's server (%d queries)", n)
 			}
 		})
+		t.Run("zoned IPv6 literal under "+family+" is the numeric host residual", func(t *testing.T) {
+			s := newStubDNS(t, map[string]netip.Addr{})
+			defer s.close()
+
+			// The host resolver gets the original "fe80::1%lo0"; its own answer is
+			// not asserted (it depends on the host's interfaces), only that the
+			// shim took the numeric path and never queried the pod's server.
+			run := h.run(t, []string{serversEnv(s.port()), excl}, "fe80::1%lo0", "-", family)
+			run.assertHost(t, "numeric6")
+			if n := s.queryCount(); n != 0 {
+				t.Fatalf("a zoned IPv6 literal reached the pod's server (%d queries)", n)
+			}
+		})
 	}
 
 	for _, name := range []string{"a.localhost", "LOCALHOST.", "Sub.LocalHost"} {

@@ -54,6 +54,11 @@ type ResolvConfFields struct {
 // for DNSPolicyNone the IPv4 subset of cfg.Nameservers in pod order, with each
 // cfg.Options entry appended verbatim after ndots ("name", or "name:value").
 //
+// IPv6 nameservers are dropped SILENTLY here as long as one IPv4 nameserver
+// remains: the resolv.conf simply omits them and no error is returned.
+// ConfigToEnvChecked, run on the same config, is where a caller learns of the
+// drop (ErrNameserversDropped).
+//
 // It returns an error if cfg is not usable (cfg.Validate fails) — the same
 // validity check GuestResolvConf applies — and an error wrapping
 // ErrNoUsableNameserver for a DNSPolicyNone config with no IPv4 nameserver.

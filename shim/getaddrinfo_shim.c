@@ -1227,6 +1227,26 @@ static int k3sm_service_port(const char *service, const struct addrinfo *hints,
 }
 
 /*
+ * True when node is a numeric IPv6 literal, scoped or not. inet_pton rejects a
+ * "%zone" suffix ("fe80::1%en0"), so the address part is tested from a bounded
+ * local copy with the suffix cut off; the caller still hands the ORIGINAL node
+ * to the host resolver, which understands the zone. A value too long to be an
+ * address is not a literal.
+ */
+static int k3sm_is_ipv6_literal(const char *node) {
+    char buf[INET6_ADDRSTRLEN];
+    const char *pct = strchr(node, '%');
+    size_t n = pct != NULL ? (size_t)(pct - node) : strlen(node);
+    if (n == 0 || n >= sizeof(buf)) {
+        return 0;
+    }
+    memcpy(buf, node, n);
+    buf[n] = '\0';
+    struct in6_addr a;
+    return inet_pton(AF_INET6, buf, &a) == 1;
+}
+
+/*
  * True for the RFC 6761 loopback names: "localhost" or any name ending in
  * ".localhost" (a non-empty label before it), compared case-insensitively with
  * one trailing dot tolerated. "LOCALHOST." and "a.localhost" match;
@@ -1266,7 +1286,8 @@ static int k3sm_is_localhost(const char *node) {
  * and no usable server at all is EAI_AGAIN. The residual host paths perform no
  * name resolution, or answer the RFC 6761 loopback names the way an upstream
  * pod's /etc/hosts would: a NULL/empty node, a numeric IPv4 literal,
- * AI_NUMERICHOST, a numeric IPv6 literal, and localhost / *.localhost.
+ * AI_NUMERICHOST, a numeric IPv6 literal (scoped or not), and localhost /
+ * *.localhost.
  */
 int k3sm_getaddrinfo(const char *node, const char *service,
                      const struct addrinfo *hints, struct addrinfo **res) {
@@ -1306,8 +1327,7 @@ int k3sm_getaddrinfo(const char *node, const char *service,
     if (cfg.exclusive) {
         /* A numeric IPv6 literal needs no resolution. Checked BEFORE the
          * AF_INET6-hints rule below, so ("::1", AF_INET6) still parses. */
-        struct in6_addr tmp6;
-        if (inet_pton(AF_INET6, node, &tmp6) == 1) {
+        if (k3sm_is_ipv6_literal(node)) {
             return k3sm_host_getaddrinfo("numeric6", node, service, hints, res);
         }
         if (k3sm_is_localhost(node)) {

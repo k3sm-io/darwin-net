@@ -78,10 +78,24 @@ limitations under the License.
 // (K3SM_DNS_EXCLUSIVE=1): servers are walked attempt-outer/server-inner with a
 // per-call dead-server memo, and no name ever falls through to the host. The
 // residual host paths in exclusive mode resolve no name or answer only RFC 6761
-// loopback names: numeric IPv4/IPv6 literals, AI_NUMERICHOST, and localhost /
+// loopback names: numeric IPv4/IPv6 literals (an IPv6 one with or without a
+// %zone), AI_NUMERICHOST, and localhost /
 // *.localhost. Every host consult passes one traced chokepoint
 // (TestShimHostCallsUseChokepoint). The Go reference resolver implements the
 // same walk, and TestDNSWireClassificationDifferential holds the two in parity.
+//
+// Timeouts differ in one place between the engines: the C shim gives the TCP
+// refetch after a truncated UDP reply its own K3SM_DNS_TIMEOUT_SEC deadline,
+// while the Go reference runs the UDP exchange and the TCP refetch under one
+// shared per-query deadline. Verdicts agree; worst-case latency does not.
+//
+// Per-call bound with a single server in exclusive mode: the dead-server memo
+// does not apply, so each candidate may cost up to attempts x timeout (the C
+// shim adds a refetch timeout to any attempt that is truncated). A candidate
+// that exhausts its attempts fails the call closed, since every remaining
+// candidate is cluster-scoped and skipped; but candidates that each miss just
+// inside the timeout can chain, so the bound is candidates x attempts x
+// timeout. With several servers it is nservers x timeout in timeouts.
 //
 // # Test tiers (and the cross-repo caveat)
 //
