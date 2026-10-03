@@ -1,0 +1,25 @@
+# Untagged test files that still open a real socket (loopback included), read by
+# TestNoUntaggedRealSocketTests. Format:
+#
+#   <module-relative path> until=YYYY-MM-DD # <why>
+#
+# This list only shrinks. When a file is converted to fakes or moved behind
+# //go:build integration, delete its line (the gate fails on a stale entry). An
+# entry past its date fails, and no entry may be dated more than 183 days out.
+
+pkg/dns/env_test.go until=2026-12-31 # loopback resolver servers dialed through a real Dialer; a later change tags or converts it
+pkg/dns/portpair_test.go until=2026-12-31 # binds real loopback UDP/TCP port pairs; a later change tags or converts it
+pkg/dns/resolver_test.go until=2026-12-31 # loopback upstream DNS servers dialed through a real Dialer; a later change tags or converts it
+pkg/dns/stubserver_test.go until=2026-12-31 # loopback stub server sockets; a later change tags or converts it
+pkg/ingress/handler_test.go until=2026-12-31 # httptest backend servers; a later change tags or converts it
+pkg/ingress/server_test.go until=2026-12-31 # real loopback ingress listeners; a later change tags or converts it
+pkg/ingress/tls_test.go until=2026-12-31 # real loopback TLS listeners; a later change tags or converts it
+pkg/netd/server_test.go until=2026-12-31 # unix-domain daemon socket and loopback TCP listeners; a later change tags or converts it
+pkg/netd/watchdog_internal_test.go until=2026-12-31 # unix-domain socket listeners; a later change tags or converts it
+pkg/netd/watchdog_test.go until=2026-12-31 # unix-domain socket listeners; a later change tags or converts it
+pkg/proxy/meshegress_test.go until=2026-12-31 # loopback VIP sockets for the egress-source cases; a later change tags or converts it
+pkg/proxy/policy_test.go until=2026-12-31 # loopback echo backends for the policy verdicts; a later change tags or converts it
+pkg/proxy/proxy_test.go until=2026-12-31 # loopback echo backends and VIP listeners; a later change tags or converts it
+pkg/proxy/splice_test.go until=2026-12-31 # loopback TCP pairs for the splice copy path; a later change tags or converts it
+pkg/proxy/transport_test.go until=2026-12-31 # loopback backends for the transport-override dial; a later change tags or converts it
+pkg/proxy/udprelay_bench_test.go until=2026-12-31 # benchmarks measure the real loopback datagram path on purpose; a later change tags it

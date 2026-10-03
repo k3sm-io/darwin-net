@@ -18,6 +18,7 @@ package proxy
 
 import (
 	"context"
+	"net"
 	"net/netip"
 	"sync"
 )
@@ -25,6 +26,29 @@ import (
 // withAliasManager overrides the alias manager (tests inject the rootless fake).
 func withAliasManager(a aliasManager) Option {
 	return func(p *Proxy) { p.alias = a }
+}
+
+// withListenUDP overrides the ClusterIP datagram bind (tests inject an in-memory
+// VIP socket).
+func withListenUDP(f func(netip.AddrPort) (udpVIPConn, error)) Option {
+	return func(p *Proxy) { p.listenUDP = f }
+}
+
+// withBinder overrides the ClusterIP stream binder (tests inject an in-memory
+// listener).
+func withBinder(b binder) Option {
+	return func(p *Proxy) { p.binder = b }
+}
+
+// withListenNodePort overrides the wildcard NodePort listen (tests inject an
+// in-memory listener).
+func withListenNodePort(f func(network, address string) (net.Listener, error)) Option {
+	return func(p *Proxy) { p.listenNodePort = f }
+}
+
+// withDialBackend overrides the backend dial (tests inject an in-memory backend).
+func withDialBackend(f func(d *net.Dialer, network, address string) (net.Conn, error)) Option {
+	return func(p *Proxy) { p.dialBackend = f }
 }
 
 // noopAliasManager is the rootless aliasManager unit tests inject: it performs no

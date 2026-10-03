@@ -124,6 +124,25 @@ type Proxy struct {
 	// needed.
 	udpBudget *udpBudget
 
+	// listenUDP, listenNodePort, and dialBackend are the socket-opening calls the
+	// accept and reconcile paths make that do not already go through binder. Each is
+	// defaulted in New to exactly the call it replaces and is read-only thereafter;
+	// only an unexported test option overrides them, so unit tests can run the
+	// reconcile and splice paths without a real socket. They are never exported and
+	// never a runtime-flippable knob.
+	//
+	// listenUDP binds the ClusterIP datagram socket on the specific VIP address (the
+	// default is net.ListenUDP; binder is stream-only).
+	listenUDP func(ap netip.AddrPort) (udpVIPConn, error)
+	// listenNodePort binds the node-wide NodePort stream listener (the default is
+	// net.Listen). It is not binder: a binder binds one specific alias address, while
+	// NodePort binds the wildcard ":port" (both address families) so every node
+	// interface answers.
+	listenNodePort func(network, address string) (net.Listener, error)
+	// dialBackend dials a backend through the dialer dialerFor selected (the default
+	// is d.Dial), so the default-vs-mesh-bound dialer choice stays observable.
+	dialBackend func(d *net.Dialer, network, address string) (net.Conn, error)
+
 	mu      sync.Mutex
 	workers map[PortKey]*portWorker
 	// done is closed when the proxy is shutting down so workers stop accepting.
@@ -305,6 +324,10 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 		udpBudget:  newUDPBudget(maxTotal, udpPerSourceGlobalCap(maxTotal)),
 		workers:    make(map[PortKey]*portWorker),
 		done:       make(chan struct{}),
+
+		listenUDP:      listenUDPVIP,
+		listenNodePort: net.Listen,
+		dialBackend:    func(d *net.Dialer, network, address string) (net.Conn, error) { return d.Dial(network, address) },
 	}
 	for _, o := range opts {
 		o(p)
@@ -334,6 +357,17 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 		p.policy.log = p.log
 	}
 	return p
+}
+
+// listenUDPVIP is the production ClusterIP datagram bind: net.ListenUDP on the
+// specific VIP address. A failed bind returns a nil interface, never a typed-nil
+// *net.UDPConn boxed in one.
+func listenUDPVIP(ap netip.AddrPort) (udpVIPConn, error) {
+	c, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(ap))
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // defaultUDPFlowBudget is the relay-global UDP upstream-socket budget when the
@@ -707,7 +741,7 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 		// wildcard reply re-selects its source on a multi-homed node (wrong src IP,
 		// client drops it), needing IP_RECVDSTADDR/IP_SENDSRCADDR (out of scope).
 		clusterAP := netip.AddrPortFrom(ip, uint16(port.Port))
-		pc, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(clusterAP))
+		pc, err := p.listenUDP(clusterAP)
 		if err != nil {
 			_ = p.alias.Remove(ctx, ip)
 			return nil, fmt.Errorf("listen udp clusterIP %s: %w", clusterAP, err)
@@ -746,7 +780,7 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	// does not preserve client src IP, so eTP:Local is not honored either).
 	if port.NodePort != 0 {
 		nodeAddr := net.JoinHostPort("", strconv.Itoa(int(port.NodePort)))
-		nl, err := net.Listen("tcp", nodeAddr)
+		nl, err := p.listenNodePort("tcp", nodeAddr)
 		if err != nil {
 			_ = cl.Close()
 			_ = p.alias.Remove(ctx, ip)
@@ -839,7 +873,7 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 	// admits the reply; every other destination keeps kernel default source
 	// selection. dialerFor picks between two immutable dialers — nothing here
 	// mutates shared state, because handle runs once per accepted connection.
-	backendConn, err := p.dialerFor(be.Locality(), dst.Addr()).Dial("tcp", dst.String())
+	backendConn, err := p.dialBackend(p.dialerFor(be.Locality(), dst.Addr()), "tcp", dst.String())
 	if err != nil {
 		p.logger().Debug("dial backend", "vip", key.String(), "backend", be.Addr().String(), "transport", dst.String(), "err", err)
 		return
