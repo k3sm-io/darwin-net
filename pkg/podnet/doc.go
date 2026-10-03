@@ -37,6 +37,15 @@ limitations under the License.
 //     `ifconfig lo0 alias <ip>/32` (root-gated, run inside the netd daemon
 //     boundary in deployment). Tests use the rootless fakeAliasManager; the
 //     root-gated integration test drives the real one against a live lo0.
+//   - BlackholeRoutes (blackhole.go) holds a pod address on lo0 while its alias
+//     is torn down: removing the alias installs a `<ip> 127.0.0.1` RTF_BLACKHOLE
+//     host route, and the next alias of that address clears it first. Without it
+//     the address would fall through to the mesh route, and a connection still
+//     open to the departed pod — negotiated with lo0's 16384-byte MTU — would
+//     re-route onto the utun's skywalk netif and overrun its GSO buffer, a
+//     kernel panic. Both alias owners apply it (lo0AliasManager here, and the
+//     netd daemon's executor), to pod addresses of the node /24 only
+//     (IsPodAddress); a Service VIP falls to the default route, never the utun.
 //   - Network (podnet.go) implements PodNetwork, the seam the runtime calls during
 //     pod setup/teardown: Setup allocates an IP, plumbs the lo0 alias, and returns
 //     the bindable address; Teardown removes the alias and releases the IP. Setup
