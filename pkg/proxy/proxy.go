@@ -34,6 +34,7 @@ import (
 	"k3sm.io/darwin-net/pkg/netbind"
 	"k3sm.io/darwin-net/pkg/netd/wire"
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // dialTimeout bounds how long the proxy waits to connect to a chosen backend
@@ -86,13 +87,15 @@ type Proxy struct {
 	// kernel selects the source. It is built once in New and NEVER mutated — the
 	// per-connection handle goroutines share it, so writing LocalAddr on it would
 	// be a data race, and a race that silently applies one connection's source to
-	// another connection's dial (see Proxy.dialerFor).
-	dialer *net.Dialer
+	// another connection's dial (see Proxy.dialerFor). Like meshDialer it is a
+	// tcpseg.Dialer, so every backend connection has its TCP segment size clamped
+	// to the mesh MSS before the splice sends a byte on it.
+	dialer *tcpseg.Dialer
 	// meshDialer is the mesh-source-bound sibling of dialer, built once by
 	// WithMeshEgressSource on a multi-node mesh and nil on a single node. handle
 	// selects between the two per connection via dialerFor; neither is mutated
 	// after construction.
-	meshDialer *net.Dialer
+	meshDialer *tcpseg.Dialer
 	// egress is the destination-scoped mesh-egress source decision — the node's
 	// reserved mesh-egress /32 plus the cluster pod aggregate that scopes the bind
 	// — shared read-only by the TCP dial path and by every per-VIP UDP relay (the
@@ -140,8 +143,10 @@ type Proxy struct {
 	// interface answers.
 	listenNodePort func(network, address string) (net.Listener, error)
 	// dialBackend dials a backend through the dialer dialerFor selected (the default
-	// is d.Dial), so the default-vs-mesh-bound dialer choice stays observable.
-	dialBackend func(d *net.Dialer, network, address string) (net.Conn, error)
+	// is d.DialContext with a background context, the dialer's own Timeout bounding
+	// the connect), so the default-vs-mesh-bound dialer choice stays observable. Its
+	// parameter is a *tcpseg.Dialer, so no backend dial can bypass the segment clamp.
+	dialBackend func(d *tcpseg.Dialer, network, address string) (net.Conn, error)
 
 	mu      sync.Mutex
 	workers map[PortKey]*portWorker
@@ -213,7 +218,7 @@ func WithMeshEgressSource(src netip.Addr) Option {
 		// same decision); the zero Addr stays invalid and binds nothing.
 		p.egress.src = src
 		if src.IsValid() {
-			p.meshDialer = &net.Dialer{Timeout: dialTimeout, LocalAddr: &net.TCPAddr{IP: src.AsSlice()}}
+			p.meshDialer = &tcpseg.Dialer{Timeout: dialTimeout, LocalAddr: &net.TCPAddr{IP: src.AsSlice()}}
 		}
 	}
 }
@@ -318,7 +323,7 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 		alias:      newLo0AliasManager(),
 		binder:     directBinder{},
 		log:        slog.Default(),
-		dialer:     &net.Dialer{Timeout: dialTimeout},
+		dialer:     &tcpseg.Dialer{Timeout: dialTimeout},
 		egress:     egressScope{clusterCIDR: podnet.ClusterPodCIDR},
 		exemptVIPs: make(map[netip.Addr]struct{}),
 		udpBudget:  newUDPBudget(maxTotal, udpPerSourceGlobalCap(maxTotal)),
@@ -327,7 +332,7 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 
 		listenUDP:      listenUDPVIP,
 		listenNodePort: net.Listen,
-		dialBackend:    func(d *net.Dialer, network, address string) (net.Conn, error) { return d.Dial(network, address) },
+		dialBackend:    dialWith,
 	}
 	for _, o := range opts {
 		o(p)
@@ -765,11 +770,14 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	// default; under WithNetdHelper a privileged (<1024) VIP port is bound by the
 	// root daemon and the socket is passed back over SCM_RIGHTS.
 	clusterAP := netip.AddrPortFrom(ip, uint16(port.Port))
-	cl, err := p.binder.Listen(ctx, "tcp", clusterAP)
+	rawCL, err := p.binder.Listen(ctx, "tcp", clusterAP)
 	if err != nil {
 		_ = p.alias.Remove(ctx, ip)
 		return nil, fmt.Errorf("listen clusterIP %s: %w", clusterAP, err)
 	}
+	// The proxy's replies to a client pod ride the accepted connection, which was
+	// negotiated over lo0 like the backend side: clamp its segment size too.
+	cl := tcpseg.WrapListener(rawCL)
 	l.clusterIP = cl
 	go p.serve(cl, key, internalListener)
 
@@ -780,12 +788,13 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	// does not preserve client src IP, so eTP:Local is not honored either).
 	if port.NodePort != 0 {
 		nodeAddr := net.JoinHostPort("", strconv.Itoa(int(port.NodePort)))
-		nl, err := p.listenNodePort("tcp", nodeAddr)
+		rawNL, err := p.listenNodePort("tcp", nodeAddr)
 		if err != nil {
 			_ = cl.Close()
 			_ = p.alias.Remove(ctx, ip)
 			return nil, fmt.Errorf("listen nodePort %s: %w", nodeAddr, err)
 		}
+		nl := tcpseg.WrapListener(rawNL)
 		l.nodePort = nl
 		go p.serve(nl, key, externalListener)
 	}
@@ -880,6 +889,12 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 	}
 	defer backendConn.Close()
 	splice(client, backendConn)
+}
+
+// dialWith is the production dialBackend: a background-context dial through d,
+// whose Timeout bounds the connect exactly as the plain net.Dialer it replaced did.
+func dialWith(d *tcpseg.Dialer, network, address string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, address)
 }
 
 // logger returns p.log, or slog.Default() when it is nil. New copies the (possibly nil)

@@ -217,7 +217,7 @@ limitations under the License.
 // predicate (egressScope.sourceFor), so a same-node, node-LAN, loopback or
 // unclassifiable destination keeps kernel default source selection on the datagram
 // path exactly as it does on the stream path. The UDP path cannot reuse the mesh
-// *net.Dialer because a *net.TCPAddr LocalAddr fails to dial "udp", so it builds a
+// TCP dialer because a *net.TCPAddr LocalAddr fails to dial "udp", so it builds a
 // *net.UDPAddr from that same verdict. The relay has no conntrack-style flush, so a flow
 // stays pinned to its picked backend until idle GC reaps it, even if that endpoint
 // is removed mid-flow.
@@ -232,6 +232,18 @@ limitations under the License.
 // infra-VIP exemption (WithInfraVIPExemptions) steps the proxy aside before any
 // worker is created, so a legitimate user UDP Service on a non-exempt VIP is relayed
 // while kube-dns stays node-local on its own resolver.
+//
+// # TCP segment clamp
+//
+// Every backend dial goes through a tcpseg.Dialer and both stream listeners (the
+// ClusterIP listener and the *:NodePort listener) are wrapped with
+// tcpseg.WrapListener, so both legs of a splice have their TCP segment size lowered
+// to the mesh MSS right after connect. A connection to a pod or VIP negotiates over
+// lo0 (MTU 16384); if the destination's alias disappears mid-connection the flow
+// re-routes onto the mesh utun, and an lo0-sized segment there overruns the
+// skywalk netif's GSO buffer. TestBackendDialsClampTCPMaxSeg pins that no dial in
+// this package bypasses the clamp; the UDP relay is exempt (datagrams carry no
+// MSS).
 //
 // # ClientIP session affinity (TCP)
 //
