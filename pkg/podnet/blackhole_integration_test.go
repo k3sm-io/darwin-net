@@ -27,6 +27,7 @@ import (
 	"context"
 	"net/netip"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -82,6 +83,13 @@ func TestAliasTeardownBlackholeLive(t *testing.T) {
 	}
 	if f := routeGetFlags(t, ip); !strings.Contains(f, "BLACKHOLE") || !strings.Contains(f, "HOST") {
 		t.Fatalf("route -n get %s flags = %q after Remove, want a BLACKHOLE host route", ip, f)
+	}
+	listed, err := (BlackholeRoutes{}).List(ctx, node)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if !slices.Contains(listed, ip) {
+		t.Fatalf("List(%s) = %v after Remove, want it to report %s", node, listed, ip)
 	}
 	if err := mgr.Remove(ctx, ip); err != nil {
 		t.Fatalf("re-Remove: %v (must be idempotent)", err)

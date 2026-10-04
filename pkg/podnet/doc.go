@@ -46,6 +46,9 @@ limitations under the License.
 //     kernel panic. Both alias owners apply it (lo0AliasManager here, and the
 //     netd daemon's executor), to pod addresses of the node /24 only
 //     (IsPodAddress); a Service VIP falls to the default route, never the utun.
+//     Only an address that was actually aliased is blackholed, and the netd
+//     executor sweeps the blackholes of a /24 it stops serving and the stale
+//     ones it finds at start (BlackholeRoutes.List).
 //   - Network (podnet.go) implements PodNetwork, the seam the runtime calls during
 //     pod setup/teardown: Setup allocates an IP, plumbs the lo0 alias, and returns
 //     the bindable address; Teardown removes the alias and releases the IP. Setup

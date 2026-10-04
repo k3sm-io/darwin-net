@@ -30,15 +30,30 @@ import (
 )
 
 // opRecorder records the ifconfig and route operations an alias manager drives,
-// in order, and can be told to fail a route operation.
+// in order, and can be told to fail a route operation. It models lo0's alias
+// list the way ifconfig reports it: -alias of an address that is not aliased
+// fails.
 type opRecorder struct {
 	ops        []string
 	clearErr   error
 	installErr error
+	lo0        map[string]bool
 }
 
 func (r *opRecorder) ifconfig(_ context.Context, iface, verb, arg string) error {
 	r.ops = append(r.ops, "ifconfig "+iface+" "+verb+" "+arg)
+	if r.lo0 == nil {
+		r.lo0 = make(map[string]bool)
+	}
+	switch verb {
+	case "alias":
+		r.lo0[strings.TrimSuffix(arg, "/32")] = true
+	case "-alias":
+		if !r.lo0[arg] {
+			return errors.New("ifconfig: ioctl (SIOCDIFADDR): Can't assign requested address")
+		}
+		delete(r.lo0, arg)
+	}
 	return nil
 }
 
@@ -128,14 +143,39 @@ func TestAliasTeardownInstallsBlackhole(t *testing.T) {
 		if err := m.Remove(ctx, pod); err == nil {
 			t.Fatal("Remove hid a failed blackhole install")
 		}
-		// The retry converges: the alias is untracked, the delete is tolerated, and
-		// the install runs again.
+		// The retry converges: the address stays tracked as pending, so the retry
+		// skips the -alias and runs the install again.
 		rec.installErr, rec.ops = nil, nil
 		if err := m.Remove(ctx, pod); err != nil {
 			t.Fatalf("retried Remove: %v", err)
 		}
-		if n := countPrefix(rec.ops, "install-blackhole"); n != 1 {
-			t.Fatalf("retried Remove ops = %q, want one install", rec.ops)
+		if want := []string{"install-blackhole 100.64.3.17"}; !slices.Equal(rec.ops, want) {
+			t.Fatalf("retried Remove ops = %q, want %q", rec.ops, want)
+		}
+		if _, tracked := m.aliased[pod]; tracked {
+			t.Fatal("the address is still tracked after the blackhole went in")
+		}
+	})
+
+	t.Run("an address that was never aliased is not blackholed", func(t *testing.T) {
+		m, rec := newRecordedAliasManager(node)
+		if err := m.Remove(ctx, pod); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+		if want := []string{"ifconfig lo0 -alias 100.64.3.17"}; !slices.Equal(rec.ops, want) {
+			t.Fatalf("Remove ops = %q, want %q (no blackhole for an untracked, unplumbed address)", rec.ops, want)
+		}
+	})
+
+	t.Run("an alias a previous process left on lo0 is blackholed", func(t *testing.T) {
+		m, rec := newRecordedAliasManager(node)
+		rec.lo0 = map[string]bool{pod.String(): true}
+		if err := m.Remove(ctx, pod); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+		want := []string{"ifconfig lo0 -alias 100.64.3.17", "install-blackhole 100.64.3.17"}
+		if !slices.Equal(rec.ops, want) {
+			t.Fatalf("Remove ops = %q, want %q", rec.ops, want)
 		}
 	})
 
@@ -227,6 +267,32 @@ func TestBlackholeMessage(t *testing.T) {
 		if _, err := m.Marshal(); err != nil {
 			t.Fatalf("marshal type %d: %v", typ, err)
 		}
+	}
+}
+
+// TestBlackholesIn pins what List reports from a routing-table dump: blackhole
+// host routes to pod addresses of the node /24, and nothing else.
+func TestBlackholesIn(t *testing.T) {
+	node := netip.MustParsePrefix("100.64.3.0/24")
+	route := func(a [4]byte, flags int) *xroute.RouteMessage {
+		return &xroute.RouteMessage{Flags: flags, Addrs: []xroute.Addr{unix.RTAX_DST: &xroute.Inet4Addr{IP: a}}}
+	}
+	msgs := []xroute.Message{
+		route([4]byte{100, 64, 3, 17}, blackholeFlags),
+		route([4]byte{100, 64, 3, 18}, unix.RTF_UP|unix.RTF_HOST),         // a live alias's host route
+		route([4]byte{100, 64, 4, 17}, blackholeFlags),                    // another node's /24
+		route([4]byte{100, 64, 3, 1}, blackholeFlags),                     // the mesh-egress address
+		route([4]byte{100, 64, 3, 0}, unix.RTF_UP|unix.RTF_BLACKHOLE),     // a blackholed network route
+		route([4]byte{100, 64, 3, 200}, unix.RTF_HOST|unix.RTF_BLACKHOLE), // another pod's blackhole
+		&xroute.RouteMessage{Flags: blackholeFlags},                       // no destination
+	}
+	got := blackholesIn(msgs, node)
+	want := []netip.Addr{netip.MustParseAddr("100.64.3.17"), netip.MustParseAddr("100.64.3.200")}
+	if !slices.Equal(got, want) {
+		t.Fatalf("blackholesIn = %v, want %v", got, want)
+	}
+	if got := blackholesIn(msgs, netip.MustParsePrefix("100.64.0.0/16")); len(got) != 0 {
+		t.Fatalf("blackholesIn with a non-/24 node CIDR = %v, want none", got)
 	}
 }
 

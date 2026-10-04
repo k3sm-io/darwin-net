@@ -70,7 +70,13 @@ func IsPodAddress(nodeCIDR netip.Prefix, ip netip.Addr) bool {
 // connection keeps retransmitting for minutes and would re-route the moment the
 // route went. A pod address of this node's /24 is answered by no other node, so a
 // lingering blackhole is harmless and their number is bounded by the /24. Routes
-// live in the kernel and survive a daemon restart, so no state is kept here.
+// live in the kernel and survive a daemon restart, so no state is kept here; List
+// reads them back, which is how the netd daemon sweeps the blackholes of a /24 it
+// no longer serves and the stale ones it finds at start.
+//
+// Only an address its alias manager actually aliased is blackholed: the managers
+// track their aliases and skip the install for an address that was never plumbed,
+// so a teardown request cannot durably blackhole an unused address.
 type BlackholeRoutes struct{}
 
 // blackholeFlags are the flags of the route BlackholeRoutes installs: a static
@@ -141,6 +147,45 @@ func (BlackholeRoutes) Clear(ctx context.Context, ip netip.Addr) error {
 		return fmt.Errorf("clear blackhole route for %s: %w", ip, err)
 	}
 	return nil
+}
+
+// List returns the pod addresses of the node /24 nodeCIDR (IsPodAddress) that
+// hold a blackhole host route, read from a dump of the IPv4 routing table
+// (sysctl NET_RT_DUMP). Routes of any other kind, and blackholes outside the pod
+// range, are not reported. Reading the table needs no privilege.
+func (BlackholeRoutes) List(ctx context.Context, nodeCIDR netip.Prefix) ([]netip.Addr, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rib, err := xroute.FetchRIB(unix.AF_INET, xroute.RIBTypeRoute, 0)
+	if err != nil {
+		return nil, fmt.Errorf("list blackhole routes in %s: dump routing table: %w", nodeCIDR, err)
+	}
+	msgs, err := xroute.ParseRIB(xroute.RIBTypeRoute, rib)
+	if err != nil {
+		return nil, fmt.Errorf("list blackhole routes in %s: parse routing table: %w", nodeCIDR, err)
+	}
+	return blackholesIn(msgs, nodeCIDR), nil
+}
+
+// blackholesIn returns the destinations of the blackhole host routes in msgs that
+// are pod addresses of nodeCIDR, in table order. It is the pure half of List.
+func blackholesIn(msgs []xroute.Message, nodeCIDR netip.Prefix) []netip.Addr {
+	var out []netip.Addr
+	for _, msg := range msgs {
+		m, ok := msg.(*xroute.RouteMessage)
+		if !ok || m.Flags&unix.RTF_HOST == 0 || m.Flags&unix.RTF_BLACKHOLE == 0 || len(m.Addrs) <= unix.RTAX_DST {
+			continue
+		}
+		dst, ok := m.Addrs[unix.RTAX_DST].(*xroute.Inet4Addr)
+		if !ok {
+			continue
+		}
+		if ip := netip.AddrFrom4(dst.IP); IsPodAddress(nodeCIDR, ip) {
+			out = append(out, ip)
+		}
+	}
+	return out
 }
 
 // deleteHostRoute writes RTM_DELETE for ip's host route; an absent route (ESRCH)
