@@ -258,7 +258,7 @@ func routingExchange(ctx context.Context, b []byte, seq int32) (*xroute.RouteMes
 	if err := writeRouting(fd, b); err != nil {
 		return nil, err
 	}
-	pid := uint32(os.Getpid())
+	pid := uint32(os.Getpid()) // #nosec G115 -- rt_msghdr.rtm_pid is a pid_t on the wire; equality-compared only
 	buf := make([]byte, 4096)
 	for {
 		if time.Now().After(deadline) {
@@ -289,7 +289,7 @@ func matchReply(b []byte, pid uint32, seq int32) (*xroute.RouteMessage, bool) {
 	if len(b) < 24 || b[3] != unix.RTM_GET {
 		return nil, false
 	}
-	if binary.NativeEndian.Uint32(b[16:20]) != pid || int32(binary.NativeEndian.Uint32(b[20:24])) != seq {
+	if binary.NativeEndian.Uint32(b[16:20]) != pid || int32(binary.NativeEndian.Uint32(b[20:24])) != seq { // #nosec G115 -- rtm_seq is an int32 on the wire; equality-compared only
 		return nil, false
 	}
 	msgs, err := xroute.ParseRIB(xroute.RIBTypeRoute, b)
