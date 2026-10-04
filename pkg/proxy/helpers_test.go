@@ -28,6 +28,7 @@ import (
 	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // withAliasManager overrides the alias manager (tests inject the rootless fake).
@@ -54,7 +55,7 @@ func withListenNodePort(f func(network, address string) (net.Listener, error)) O
 }
 
 // withDialBackend overrides the backend dial (tests inject an in-memory backend).
-func withDialBackend(f func(d *net.Dialer, network, address string) (net.Conn, error)) Option {
+func withDialBackend(f func(d *tcpseg.Dialer, network, address string) (net.Conn, error)) Option {
 	return func(p *Proxy) { p.dialBackend = f }
 }
 
@@ -275,7 +276,7 @@ func (n *fakeTCPNet) add(t *testing.T, addr, id string) *fakeTCPBackend {
 }
 
 // dial matches Proxy.dialBackend.
-func (n *fakeTCPNet) dial(_ *net.Dialer, network, address string) (net.Conn, error) {
+func (n *fakeTCPNet) dial(_ *tcpseg.Dialer, network, address string) (net.Conn, error) {
 	ap, err := netip.ParseAddrPort(address)
 	b, ok := n.backends[ap]
 	if err != nil || !ok || network != "tcp" {

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // fakeListener is an in-memory net.Listener: connect hands Accept the server end
@@ -106,14 +107,14 @@ func (b fakeBinder) Listen(_ context.Context, network string, addr netip.AddrPor
 // once the first dial can happen.
 type fakeNodePortBackends struct {
 	ids  map[string]string // backend address → id it writes
-	want func() *net.Dialer
+	want func() *tcpseg.Dialer
 
 	mu          sync.Mutex
 	wrongDialer int
 }
 
 // dial matches Proxy.dialBackend.
-func (b *fakeNodePortBackends) dial(d *net.Dialer, network, address string) (net.Conn, error) {
+func (b *fakeNodePortBackends) dial(d *tcpseg.Dialer, network, address string) (net.Conn, error) {
 	if d != b.want() {
 		b.mu.Lock()
 		b.wrongDialer++
@@ -187,7 +188,7 @@ func TestNodePortBindsWildcard(t *testing.T) {
 		var p *Proxy
 		backends := &fakeNodePortBackends{
 			ids:  map[string]string{"10.42.0.1:8080": "np-1", "10.42.0.2:8080": "np-2"},
-			want: func() *net.Dialer { return p.dialer },
+			want: func() *tcpseg.Dialer { return p.dialer },
 		}
 		p = New(NewRoutingTable(netip.Prefix{}),
 			withAliasManager(newNoopAliasManager()),

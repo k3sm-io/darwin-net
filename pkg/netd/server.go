@@ -54,6 +54,10 @@ const DefaultSocketPath = wire.DefaultSocketPath
 // is still alive waits this long between frames.
 const DefaultIdleTimeout = 2 * time.Minute
 
+// startupSweepTimeout bounds the production executor's sweep of stale
+// pod-address blackholes when the daemon starts.
+const startupSweepTimeout = 10 * time.Second
+
 // ErrPolicy is the base error a request that violates daemon policy wraps. It is
 // surfaced to the client in the response Error string.
 var ErrPolicy = errors.New("netd: request denied by policy")
@@ -172,9 +176,10 @@ type Server struct {
 // NewServer constructs a Server from cfg, filling defaults: the cluster aggregate
 // (podnet.ClusterPodCIDR), the request cap and per-connection cap, the uid
 // PeerVerifier (ServiceUID), and the production darwin Privileged executor. Its
-// only I/O is the identity restore (Config.IdentityPath) and, when a caller
-// supplied its own executor and the restore moved the identity, the one call that
-// re-points that executor; call Serve to start accepting.
+// only I/O is the identity restore (Config.IdentityPath), the production
+// executor's sweep of stale pod-address blackholes in the node /24, and, when a
+// caller supplied its own executor and the restore moved the identity, the one
+// call that re-points that executor; call Serve to start accepting.
 //
 // The CONSTRUCTION ORDER is the production fix, and it is load-bearing. The
 // executor derives the mesh-egress lo0 alias and the utun's own link address from
@@ -223,7 +228,15 @@ func NewServer(cfg Config) *Server {
 	}
 	priv := cfg.Privileged
 	if priv == nil {
-		priv = newDarwinApplier(node, cfg.Logger)
+		a := newDarwinApplier(node, cfg.Logger)
+		// Clear the pod-address blackholes a previous daemon left in the node /24
+		// (see sweepStaleBlackholes). It reads the routing table and deletes only
+		// blackhole routes, so it is bounded; the timeout keeps a wedged routing
+		// socket from holding up the start.
+		ctx, cancel := context.WithTimeout(context.Background(), startupSweepTimeout)
+		a.sweepStaleBlackholes(ctx)
+		cancel()
+		priv = a
 	} else if node != configured {
 		// A caller-supplied executor (tests only; see above) was built for the
 		// configured prefix, so it is the one thing the restore cannot fix by
