@@ -339,6 +339,22 @@ limitations under the License.
 // atomically via PolicyTable.Update. Convergence after an API change is bounded
 // by informer latency plus the debounce window; the table is empty (allow
 // everything) until WaitForCacheSync — fail-open, never a partial-cache deny.
+// An informer that cannot list or watch keeps the table in that state; the
+// watcher reports it with its own handler (one Warn naming the resource and the
+// fail-open consequence, a re-warn at most every ten minutes while it persists,
+// one Info on recovery) instead of client-go's per-retry log line.
+//
+// Node-scoped mode and the worker ceiling: a worker's own identity may list and
+// watch only the pods bound to it, so a worker's watcher is built with
+// WithPodNodeScope and its Pods informer carries the spec.nodeName field selector
+// (Namespaces and NetworkPolicies stay cluster-wide). The worker's table then
+// resolves both selected backends and peer sources against its local pods only.
+// That is widen-only at this enforcement point, whose clients are local pods and
+// whose cross-node traffic arrives from a peer's always-allowed mesh-egress /32:
+// a policy selecting a pod on another node is unseen here, and a remote pod IP as
+// a source is unknown and fails open. Policies on local backends are enforced as
+// on the server; nothing moves from allow to deny relative to the cluster-wide
+// view.
 //
 // The honest ceiling (the per-pod-/32 causal link): once each pod has its own
 // /32, direct pod-IP→pod-IP traffic bypasses the userspace proxy entirely — the
