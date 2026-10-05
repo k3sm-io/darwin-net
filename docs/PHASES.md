@@ -157,7 +157,7 @@ phases:
         deliverables:
           - id: M5.1-d1
             done: true  # 2026-09-01 — delivered by M11.3: the NAT guest path is live (M11.3-d1 answered the delivery question with the guest's bare NAT default route; M11.3-d2 landed the two-address identity so the vm pod's podIP reaches EndpointSlices); proven by the M11 lab gate
-            desc: "Guest networking for the `vm` RuntimeClass (Linux micro-VM behind the existing swappable sandbox.Backend seam — runtimed:M5). The lo0-alias + IP_BOUND_IF bind-discipline model is HOST-PROCESS-ONLY: a Virtualization.framework guest has its OWN network stack, so pod connectivity comes from a VZNATNetworkDeviceAttachment (NAT, not bridged — bridged/raw-vmnet needs the Apple-restricted com.apple.vm.networking entitlement, ruled unobtainable; NAT needs only com.apple.security.virtualization), NOT an lo0 alias. LANDED (darwin-net, unit-verifiable): (1) the PATH-SELECTION FORK in pkg/podnet — Network.SetupGuest (BackendVM) allocates the pod IP from the same Allocator but plumbs NO lo0 alias and returns a GuestNetwork (PodIP, NAT gateway/subnet, cluster DNS VIP) for runtimed's VZ backend to apply; Setup (BackendHostProcess) is byte-unchanged; Teardown removes the lo0 alias only for host-process pods. darwin-net provides the config/decision as DATA — the live VZNATNetworkDeviceAttachment wiring is runtimed's (the DAG keeps the VZ backend out of darwin-net). LAB-GATED (scaffold + report, K3SM_LAB=1): the live NAT attach + guest→ClusterIP-VIP reachability (OPEN empirical question: does macOS NAT weak-host-deliver a guest datagram to a host lo0-alias VIP, or only expose the gateway? if not, a host route / a NEW netd route-verb is needed) + cross-node routing. A NAT-private guest IP is NOT yet a cross-node Service backend (same-node scope for M5). Deps apis:M5.1 (the runtime.k3sm.io handler-config mapping runtimeClassName: vm → SANDBOX_BACKEND_VM)."
+            desc: "Guest networking for the `vm` RuntimeClass (Linux micro-VM behind the existing swappable sandbox.Backend seam — runtimed:M5). The lo0-alias + IP_BOUND_IF bind-discipline model is HOST-PROCESS-ONLY: a Virtualization.framework guest has its OWN network stack, so pod connectivity comes from a VZNATNetworkDeviceAttachment (NAT, not bridged — bridged/raw-vmnet needs the Apple-restricted com.apple.vm.networking entitlement, ruled unobtainable; NAT needs only com.apple.security.virtualization), NOT an lo0 alias. LANDED (darwin-net, unit-verifiable): (1) the PATH-SELECTION FORK in pkg/podnet — Network.SetupGuest (BackendVM) allocates the pod IP from the same Allocator and returns a GuestNetwork (PodIP, NAT gateway/subnet, cluster DNS VIP) for runtimed's VZ backend to apply; Setup (BackendHostProcess) is byte-unchanged. Since B440 SetupGuest also aliases the pod's published /32 on lo0 for the pod's lifetime and the proxy relays TCP on it to the guest's live lease (TestVMPodSelectsVmnetPathAndAliasesPublished, TestPublishedVMPodAddressRelaysToLive); Teardown removes the alias for both pod kinds behind the blackhole. darwin-net provides the config/decision as DATA — the live VZNATNetworkDeviceAttachment wiring is runtimed's (the DAG keeps the VZ backend out of darwin-net). LAB-GATED (scaffold + report, K3SM_LAB=1): the live NAT attach + guest→ClusterIP-VIP reachability (OPEN empirical question: does macOS NAT weak-host-deliver a guest datagram to a host lo0-alias VIP, or only expose the gateway? if not, a host route / a NEW netd route-verb is needed) + cross-node routing. A NAT-private guest IP is NOT yet a cross-node Service backend (same-node scope for M5). Deps apis:M5.1 (the runtime.k3sm.io handler-config mapping runtimeClassName: vm → SANDBOX_BACKEND_VM)."
         acceptance:
           - id: M5.1-a1
             met: true  # 2026-09-01 — the M11 lab gate on the entitled rig: a vm pod gets its guest IP over NAT, reaches a ClusterIP Service and the cluster DNS VIP from inside the guest, and is reachable through its own ClusterIP (M11-lab 26/0/1, 2026-09-01)
@@ -165,7 +165,7 @@ phases:
             method: integration
           - id: M5.1-a2
             met: true
-            check: "networking config selects the VM (NAT) path — not the lo0-alias path — when the pod's backend is the VM; the host-process path is unaffected. Proven by the named pure-logic/faked unit test (no root) TestVMPodSelectsVmnetPathNotLo0: a vm pod (SetupGuest) ensures NO lo0 alias and returns a GuestNetwork, while a host-process pod (Setup) ensures exactly one lo0 alias and gets no vmnet config — asserting BOTH the taken and not-taken branch and that teardown removes an alias only for the host-process pod."
+            check: "networking config selects the VM (NAT) path when the pod's backend is the VM; the host-process path is unaffected. Proven by the named pure-logic/faked unit test (no root) TestVMPodSelectsVmnetPathAndAliasesPublished: a vm pod (SetupGuest) returns a GuestNetwork with the vmnet config, while a host-process pod (Setup) gets none; both pods' published /32 is aliased on lo0 for the pod's lifetime (since B440 a vm pod's alias is what makes its status.podIP live on its node) and teardown removes either alias behind the blackhole (TestGuestTeardownBlackholesPublishedAddress; TestReattachGuestOwnsPublishedAlias for a restart). The published address is served by the proxy's per-pod TCP relay to the guest's live lease on its declared and Service-targeted ports (darwin-net pkg/proxy TestPublishedVMPodAddressRelaysToLive, TestPodRelayPortSet, TestPodRelayRefusesClients, TestPodRelayRefusesOverrides, TestPodRelayFollowsReplaceAndDrop; real-socket twin TestPublishedVMPodAddressRelaysToLiveSockets)."
             method: unit
       - id: M5.2
         title: Guest-side cluster resolver (the DYLD shim is Darwin-only)
@@ -602,12 +602,19 @@ behind `sandbox.Backend`). The verifiable parts are unit; the live attach + reac
 - ⬜ `M5.1-a1` a pod under `runtimeClassName: vm` is assigned a guest IP via the
   `VZNATNetworkDeviceAttachment` and is reachable + can reach a ClusterIP Service and the cluster
   resolver — *method: integration* (lab)
-- ✅ `M5.1-a2` the networking config selects the VM (NAT) path (**not** the lo0-alias path) when the
-  pod's backend is the VM; the host-process path is unaffected — *method: unit* →
-  `TestVMPodSelectsVmnetPathNotLo0` (a vm pod via `SetupGuest` ensures **no** lo0 alias and returns a
-  `GuestNetwork`; a host-process pod via `Setup` ensures exactly one lo0 alias and gets no vmnet
-  config — asserting **both** the taken and not-taken branch, plus that teardown removes an alias only
-  for the host-process pod). Also `TestSetupGuestIdempotentAndBackendMismatch`, `TestBackendString`.
+- ✅ `M5.1-a2` the networking config selects the VM (NAT) path when the pod's backend is the VM; the
+  host-process path is unaffected — *method: unit* → `TestVMPodSelectsVmnetPathAndAliasesPublished`
+  (a vm pod via `SetupGuest` returns a `GuestNetwork`; a host-process pod via `Setup` gets no vmnet
+  config; both pods' published /32 is aliased on lo0 for the pod's lifetime and teardown removes
+  either alias behind the blackhole). Since B440 the vm pod's alias is what makes its `status.podIP`
+  live on its node: the proxy's per-pod relay listens on the published address and relays TCP to the
+  guest's live lease on its declared and Service-targeted ports (`pkg/proxy`
+  `TestPublishedVMPodAddressRelaysToLive`, `TestPodRelayPortSet`, `TestPodRelayRefusesClients`,
+  `TestPodRelayRefusesOverrides`, `TestPodRelayFollowsReplaceAndDrop`; real-socket twin
+  `TestPublishedVMPodAddressRelaysToLiveSockets`). Undeclared non-Service ports are refused and UDP
+  is not relayed. Also `TestGuestTeardownBlackholesPublishedAddress`,
+  `TestReattachGuestOwnsPublishedAlias`, `TestSetupGuestIdempotentAndBackendMismatch`,
+  `TestBackendString`.
 
 ### M5.2 — guest-side cluster resolver (the `DYLD` shim is Darwin-only) 🟡
 **Deliverables**
