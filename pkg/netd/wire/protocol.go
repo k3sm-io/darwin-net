@@ -41,11 +41,19 @@ const DefaultMaxRequestBytes = 1 << 16
 const DefaultMaxPerConn = 253
 
 // Protocol version. A peer with a different MAJOR cannot interoperate (the daemon
-// rejects it); a higher MINOR is additive/compatible and is accepted.
+// rejects it); a higher MINOR is additive/compatible and is accepted. Minor 1 adds
+// the direct-link verbs (ConfigureLink, RemoveLink) and ConfigureMeshArgs.
+// DirectRoutes. Every reply carries the daemon's own version, and a client sends
+// minor-1 fields only to a daemon that reported minor >= 1: a minor-0 daemon does
+// not decode strictly, so it would silently drop a field it does not know.
 const (
 	ProtocolVersionMajor = 1
-	ProtocolVersionMinor = 0
+	ProtocolVersionMinor = 1
 )
+
+// MinorDirectLinks is the first minor version that understands the direct-link
+// verbs and DirectRoutes.
+const MinorDirectLinks = 1
 
 // Sentinel errors. Compare with errors.Is, never by string match.
 var (
@@ -71,6 +79,12 @@ func CurrentVersion() Version {
 	return Version{Major: ProtocolVersionMajor, Minor: ProtocolVersionMinor}
 }
 
+// SupportsDirectLinks reports whether a daemon reporting v understands the
+// direct-link verbs and DirectRoutes.
+func (v Version) SupportsDirectLinks() bool {
+	return v.Major == ProtocolVersionMajor && v.Minor >= MinorDirectLinks
+}
+
 // Compatible reports whether a peer speaking v can interoperate with this build:
 // the MAJOR must match (an incompatible-major skew is rejected); any MINOR is
 // accepted because minor revisions are additive/compatible.
@@ -94,6 +108,13 @@ const (
 	VerbRemoveMesh Verb = "RemoveMesh"
 	// VerbBindPort binds a listening socket and returns its fd via SCM_RIGHTS.
 	VerbBindPort Verb = "BindPort"
+	// VerbConfigureLink configures a direct-link (Thunderbolt) port: out of the
+	// bridge, its derived /32 address, offload off, the on-link host route to the
+	// peer. Minor 1.
+	VerbConfigureLink Verb = "ConfigureLink"
+	// VerbRemoveLink tears a direct-link port down and restores its bridge
+	// membership. Minor 1.
+	VerbRemoveLink Verb = "RemoveLink"
 )
 
 // EnsureAliasArgs carries the host IP to alias on lo0 as a /32 (no prefix text —
@@ -131,6 +152,36 @@ type ConfigureMeshArgs struct {
 	// older client omits it and the daemon keeps its configured identity.
 	NodePodCIDR string        `json:"nodePodCIDR,omitempty"`
 	Peers       []MeshPeerArg `json:"peers,omitempty"`
+	// DirectRoutes are the peers to route over a configured direct link (minor 1;
+	// never sent to a minor-0 daemon). The daemon validates every one — the
+	// interface must be a link it configured with this gateway as its peer, the
+	// gateway must be the address derived for the node that owns PeerPodCIDR —
+	// and applies them with the rest of the plan, or rejects the whole request.
+	DirectRoutes []DirectRouteArg `json:"directRoutes,omitempty"`
+}
+
+// DirectRouteArg is one peer routed over a cable: the peer's pod /24, the peer's
+// direct-link address (the next hop), and the local cable interface.
+type DirectRouteArg struct {
+	PeerPodCIDR string `json:"peerPodCIDR"`
+	Gateway     string `json:"gateway"`
+	Iface       string `json:"iface"`
+}
+
+// ConfigureLinkArgs configures one direct-link port. The daemon derives the port's
+// address itself from the node identity and the Thunderbolt receptacle the
+// interface maps to; LinkIP, when sent, is only a cross-check. PeerLinkIP, when
+// sent, is the peer's address on the cable, for the on-link host route.
+type ConfigureLinkArgs struct {
+	Iface       string `json:"iface"`
+	PortOrdinal int    `json:"portOrdinal"`
+	LinkIP      string `json:"linkIP,omitempty"`
+	PeerLinkIP  string `json:"peerLinkIP,omitempty"`
+}
+
+// RemoveLinkArgs names the direct-link port to tear down.
+type RemoveLinkArgs struct {
+	Iface string `json:"iface"`
 }
 
 // BindPortArgs requests a listening socket on a node address and port. A specific
@@ -152,16 +203,22 @@ type Request struct {
 	RemoveAlias   *RemoveAliasArgs   `json:"removeAlias,omitempty"`
 	ConfigureMesh *ConfigureMeshArgs `json:"configureMesh,omitempty"`
 	BindPort      *BindPortArgs      `json:"bindPort,omitempty"`
+	ConfigureLink *ConfigureLinkArgs `json:"configureLink,omitempty"`
+	RemoveLink    *RemoveLinkArgs    `json:"removeLink,omitempty"`
 }
 
-// Response is the daemon's reply. For VerbBindPort an fd accompanies the response
-// out-of-band via SCM_RIGHTS when FDPassed is true.
+// Response is the daemon's reply. Version is the DAEMON's protocol version, on
+// every reply, success or not, so a client learns what the daemon understands
+// from any exchange. For VerbBindPort an fd accompanies the response out-of-band
+// via SCM_RIGHTS when FDPassed is true. For VerbConfigureLink, LinkIP is the
+// address the daemon derived and configured.
 type Response struct {
 	Version   Version `json:"version"`
 	OK        bool    `json:"ok"`
 	Error     string  `json:"error,omitempty"`
 	FDPassed  bool    `json:"fdPassed,omitempty"`
 	BoundAddr string  `json:"boundAddr,omitempty"`
+	LinkIP    string  `json:"linkIP,omitempty"`
 }
 
 // Frame returns payload prefixed with its 4-byte big-endian length. It is the
