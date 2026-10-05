@@ -285,3 +285,63 @@ func TestBuildPlanSkipsSelfAndInvalid(t *testing.T) {
 		t.Fatalf("Skipped = %+v, want nodeC (wrong allowedIPs) and nodeD (bad version)", plan.Skipped)
 	}
 }
+
+// TestBuildPlanWithSelfAtANonZeroIndex pins the plan an HA server joined at a
+// non-zero node index builds, from both ends. Every control-plane server's pod
+// /24 is the one its own --mesh-ip names, so the second server of a pair sits at
+// index 1 (100.64.1.0/24) while the first holds index 0. BuildPlan is
+// index-agnostic: it excludes self by CIDR equality and routes every other peer
+// — the first server at index 0 included — and an index-0 node routes the
+// index-1 server like any other peer.
+func TestBuildPlanWithSelfAtANonZeroIndex(t *testing.T) {
+	first := peerSpec("server-a", "100.64.0.0/24", "192.0.2.10:51820", 0x0a)
+	second := peerSpec("server-b", "100.64.1.0/24", "192.0.2.11:51820", 0x0b)
+	worker := peerSpec("worker-1", "100.64.2.0/24", "192.0.2.12:51820", 0x0c)
+	peers := []netv1.MeshPeerSpec{first, second, worker}
+
+	cases := []struct {
+		name       string
+		self       string
+		wantPeers  []string
+		wantRoutes []string
+	}{
+		{"the joined server at index 1", "100.64.1.0/24", []string{"server-a", "worker-1"}, []string{"100.64.0.0/24", "100.64.2.0/24"}},
+		{"the first server at index 0", "100.64.0.0/24", []string{"server-b", "worker-1"}, []string{"100.64.1.0/24", "100.64.2.0/24"}},
+		{"a worker at index 2", "100.64.2.0/24", []string{"server-a", "server-b"}, []string{"100.64.0.0/24", "100.64.1.0/24"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// ValidatePlan is BuildPlan plus the refusals ConfigureMesh applies, so
+			// a pass here is the plan a reconcile would program.
+			plan, err := ValidatePlan(netip.MustParsePrefix(tc.self), peers, nil)
+			if err != nil {
+				t.Fatalf("ValidatePlan: %v", err)
+			}
+			var names []string
+			for _, p := range plan.Peers {
+				names = append(names, p.NodeName)
+				if len(p.AllowedIPs) != 1 {
+					t.Errorf("peer %s AllowedIPs = %v, want exactly its /24", p.NodeName, p.AllowedIPs)
+				}
+			}
+			if strings.Join(names, ",") != strings.Join(tc.wantPeers, ",") {
+				t.Errorf("peers = %v, want %v (self excluded by CIDR, never by index)", names, tc.wantPeers)
+			}
+			if len(plan.Skipped) != 0 {
+				t.Errorf("Skipped = %+v, want none", plan.Skipped)
+			}
+			routes := routePrefixes(plan.Routes)
+			if len(routes) != len(tc.wantRoutes) {
+				t.Fatalf("routes = %v, want %v", routes, tc.wantRoutes)
+			}
+			for _, w := range tc.wantRoutes {
+				if !containsPrefix(routes, w) {
+					t.Errorf("routes = %v, missing %s", routes, w)
+				}
+			}
+			if containsPrefix(routes, tc.self) {
+				t.Errorf("routes = %v include this node's own %s", routes, tc.self)
+			}
+		})
+	}
+}
