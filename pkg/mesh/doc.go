@@ -65,6 +65,23 @@ limitations under the License.
 // this package loads a pf rule; teardown only flushes the PFAnchor an older
 // release may have loaded.
 //
+// # Direct links
+//
+// A Thunderbolt cable between two nodes becomes a preferred kernel route, never a
+// replacement for the tunnel. A peer routed over a cable keeps its utun /24 and
+// gains two more-specific /25 gateway routes through the peer's direct-link
+// address on the cable interface, sourced (RTAX_IFA) from the mesh-egress address;
+// the on-link host route to that address is the root helper's, installed before
+// the /25s and removed after them. When the cable goes the kernel deletes the
+// interface-bound routes and the /24 carries the traffic with no code in the path.
+// The choice is local and re-derived on every reconcile (EligibleDirectRoutes): the
+// resolved DirectLink status must say the port is up, the link must be up here
+// (link events), and the liveness probe must hear the peer. The peer's wireguard
+// endpoint follows the choice (the direct candidate while routed over the cable,
+// the underlay otherwise), so a dead cable re-programs the endpoint rather than
+// waiting for a packet wireguard will never receive. TunnelMSS is unchanged for
+// every path.
+//
 // # The endpoint-roaming contract
 //
 // A peer's endpoint is owned by wireguard once that peer has been heard from: the

@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -38,11 +39,31 @@ const defaultRPCTimeout = 10 * time.Second
 // per call keeps the fd-passing path simple (no interleaving of buffered reads and
 // SCM_RIGHTS) and bounds each connection's server-side resource accounting.
 //
-// Client is safe for concurrent use: each call opens its own connection and shares
-// no mutable state.
+// Client is safe for concurrent use: each call opens its own connection; the one
+// piece of shared state, the daemon version last reported, is guarded by mu.
 type Client struct {
 	socketPath string
 	maxResp    int
+
+	mu         sync.Mutex
+	helper     Version
+	helperSeen bool
+}
+
+// HelperVersion returns the protocol version the daemon reported in its most
+// recent reply (success or rejection), and false before any reply was decoded. A
+// daemon that predates minor 1 reports minor 0.
+func (c *Client) HelperVersion() (Version, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.helper, c.helperSeen
+}
+
+// observe records the version a decoded reply carried.
+func (c *Client) observe(v Version) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.helper, c.helperSeen = v, true
 }
 
 // NewClient returns a Client dialing socketPath; an empty socketPath uses
@@ -98,6 +119,7 @@ func (c *Client) roundTrip(ctx context.Context, req Request) (Response, error) {
 	if err := json.Unmarshal(respBytes, &resp); err != nil {
 		return Response{}, fmt.Errorf("decode %s response: %w", req.Verb, err)
 	}
+	c.observe(resp.Version)
 	if !resp.OK {
 		return resp, fmt.Errorf("netd %s rejected: %s", req.Verb, resp.Error)
 	}
@@ -136,6 +158,7 @@ func (c *Client) roundTripFD(ctx context.Context, req Request) (Response, *os.Fi
 	if err := json.Unmarshal(frame, &resp); err != nil {
 		return Response{}, nil, fmt.Errorf("decode %s response: %w", req.Verb, err)
 	}
+	c.observe(resp.Version)
 	if !resp.OK {
 		// Drain any fd the daemon may have sent so we do not leak it on a reject.
 		if f := firstFD(oob[:oobn]); f != nil {
@@ -198,11 +221,16 @@ func (c *Client) RemoveAlias(ctx context.Context, ip netip.Addr) error {
 // when it still holds the pre-join default and nothing is live (see
 // ConfigureMeshArgs.NodePodCIDR). The zero Prefix omits the field, which is exactly
 // what an older client sends and leaves the daemon's configured identity alone.
-func (c *Client) ConfigureMesh(ctx context.Context, privKeyRef string, listenPort int, nodePodCIDR netip.Prefix, peers []MeshPeerArg) error {
+//
+// direct is the minor-1 DirectRoutes. The caller is responsible for sending it
+// only to a daemon that reported minor >= 1 (HelperVersion) and only for links
+// that daemon configured; nil omits the field.
+func (c *Client) ConfigureMesh(ctx context.Context, privKeyRef string, listenPort int, nodePodCIDR netip.Prefix, peers []MeshPeerArg, direct []DirectRouteArg) error {
 	args := &ConfigureMeshArgs{
 		LocalPrivKeyRef: privKeyRef,
 		ListenPort:      listenPort,
 		Peers:           peers,
+		DirectRoutes:    direct,
 	}
 	if nodePodCIDR.IsValid() {
 		args.NodePodCIDR = nodePodCIDR.String()
@@ -211,6 +239,35 @@ func (c *Client) ConfigureMesh(ctx context.Context, privKeyRef string, listenPor
 		Version:       CurrentVersion(),
 		Verb:          VerbConfigureMesh,
 		ConfigureMesh: args,
+	})
+	return err
+}
+
+// ConfigureLink asks the daemon to configure a direct-link port and returns the
+// address the daemon derived and configured. A daemon that predates minor 1
+// rejects the verb as unknown; HelperVersion then reports its minor 0.
+func (c *Client) ConfigureLink(ctx context.Context, args ConfigureLinkArgs) (netip.Addr, error) {
+	resp, err := c.roundTrip(ctx, Request{
+		Version:       CurrentVersion(),
+		Verb:          VerbConfigureLink,
+		ConfigureLink: &args,
+	})
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	addr, err := netip.ParseAddr(resp.LinkIP)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("netd ConfigureLink: reply carries no usable link address %q: %w", resp.LinkIP, err)
+	}
+	return addr, nil
+}
+
+// RemoveLink asks the daemon to tear a direct-link port down.
+func (c *Client) RemoveLink(ctx context.Context, iface string) error {
+	_, err := c.roundTrip(ctx, Request{
+		Version:    CurrentVersion(),
+		Verb:       VerbRemoveLink,
+		RemoveLink: &RemoveLinkArgs{Iface: iface},
 	})
 	return err
 }

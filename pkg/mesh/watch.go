@@ -30,6 +30,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/linkwatch"
 )
 
 // meshPeerResource is the MeshPeer CRD resource name within net.k3sm.io/v1.
@@ -86,7 +87,17 @@ type Watcher struct {
 	// receiver is reconcileLoop. A full slot means a pass is already owed, so a
 	// further send is dropped, not queued — that is the coalescing.
 	kick chan struct{}
+
+	// links, when set (WatchLinks), is the link-event stream Run folds into the
+	// mesh; every event arms the same trigger a MeshPeer change does.
+	links linkwatch.LinkEvents
 }
+
+// WatchLinks makes Run consume src: each link event updates the mesh's local link
+// state (Mesh.HandleLinkEvent) and triggers the same full reconcile a MeshPeer
+// change does, so a pulled cable withdraws its direct routes in seconds rather
+// than at the next resync. Call it before Run.
+func (w *Watcher) WatchLinks(src linkwatch.LinkEvents) { w.links = src }
 
 // NewWatcher builds a Watcher over the cluster REST config for the given Mesh. It
 // registers the net.k3sm.io/v1 types (netv1.AddToScheme) into a private scheme,
@@ -117,7 +128,9 @@ func NewWatcher(cfg *rest.Config, mesh *Mesh, log *slog.Logger) (*Watcher, error
 
 	lw := cache.NewListWatchFromClient(client, meshPeerResource, metav1.NamespaceAll, fields.Everything())
 	informer := cache.NewSharedIndexInformer(lw, &netv1.MeshPeer{}, 0, cache.Indexers{})
-	return &Watcher{mesh: mesh, informer: informer, resyncPeriod: meshResyncPeriod, log: log, kick: make(chan struct{}, 1)}, nil
+	w := &Watcher{mesh: mesh, informer: informer, resyncPeriod: meshResyncPeriod, log: log, kick: make(chan struct{}, 1)}
+	mesh.setNotify(w.trigger)
+	return w, nil
 }
 
 // Run starts the informer and blocks until ctx is cancelled. It registers an event
@@ -126,18 +139,32 @@ func NewWatcher(cfg *rest.Config, mesh *Mesh, log *slog.Logger) (*Watcher, error
 // full resync per meshResyncPeriod tick — the path that reconverges the mesh after
 // a netd restart without a MeshPeer event. The adds delivered by the initial list
 // arm the trigger while the cache is still syncing, so the first pass runs once the
-// loop starts, against the synced cache, instead of once per listed peer.
+// loop starts, against the synced cache, instead of once per listed peer. It also
+// runs the direct-link liveness probe and, when WatchLinks set a stream, the
+// link-event consumer, both until ctx ends.
 func (w *Watcher) Run(ctx context.Context) error {
 	if _, err := w.informer.AddEventHandler(w.handler()); err != nil {
 		return fmt.Errorf("add meshpeer handler: %w", err)
 	}
 	go w.informer.Run(ctx.Done())
+	go w.mesh.RunProbes(ctx)
+	if w.links != nil {
+		go w.consumeLinks(ctx)
+	}
 	if !cache.WaitForCacheSync(ctx.Done(), w.informer.HasSynced) {
 		return fmt.Errorf("meshpeer informer cache sync failed")
 	}
 	ticker := time.NewTicker(w.resyncPeriod)
 	defer ticker.Stop()
 	return w.reconcileLoop(ctx, ticker.C)
+}
+
+// consumeLinks folds link events into the mesh until the stream closes (ctx).
+// HandleLinkEvent arms the trigger itself.
+func (w *Watcher) consumeLinks(ctx context.Context) {
+	for ev := range w.links.Events(ctx) {
+		w.mesh.HandleLinkEvent(ctx, ev)
+	}
 }
 
 // handler is the informer event handler: an add or a delete always arms the

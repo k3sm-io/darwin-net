@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/linkwatch"
 )
 
 // newTestWatcher builds a Watcher over an injected fakeDevice. A dummy REST config
@@ -359,4 +360,38 @@ func TestMeshWatcherCoalescesEvents(t *testing.T) {
 			t.Fatalf("the pass after the in-flight add applied %d peers, want 2 (the add must not be lost)", got)
 		}
 	})
+}
+
+// chanLinks is a LinkEvents over a test-fed channel.
+type chanLinks chan linkwatch.Event
+
+func (c chanLinks) Events(context.Context) <-chan linkwatch.Event { return c }
+
+// TestLinkEventsTriggerTheReconcile pins the link-watch wiring: a link event, a
+// DirectLink status update and a configured link each arm the same one-slot
+// trigger a MeshPeer change does, so the reconcile loop runs a full-snapshot pass
+// without waiting for the resync tick.
+func TestLinkEventsTriggerTheReconcile(t *testing.T) {
+	w, _ := newTestWatcher(t)
+	links := make(chanLinks)
+	w.WatchLinks(links)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.consumeLinks(ctx)
+
+	links <- linkwatch.Event{Iface: "en5", Up: true}
+	waitUntil(t, "a link event to arm the trigger", func() bool { return armed(w) })
+	<-w.kick
+	w.mesh.SetDirectLinkStatus(upStatus())
+	if !armed(w) {
+		t.Fatal("a DirectLink status update did not arm the trigger")
+	}
+	<-w.kick
+	w.mesh.mu.Lock()
+	up := w.mesh.linkUp["en5"]
+	w.mesh.mu.Unlock()
+	if !up {
+		t.Fatal("the link event did not reach the mesh's local link state")
+	}
+	close(links)
 }

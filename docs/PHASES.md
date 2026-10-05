@@ -3,7 +3,7 @@ repo: darwin-net
 schema: phases/v1
 current_phase: M7
 updated: 2026-10-05
-updated_by: orchestrator
+updated_by: m17-2-darwin-net-writeback
 
 phases:
   - id: M0
@@ -368,35 +368,36 @@ phases:
 
   - id: M17
     title: "Direct links — the darwin-net slice: link enumeration and events, the netd link verbs, the cable as a kernel route"
-    status: todo
+    status: in-progress
     strategy: "phased (named exception: wireguard MeshPeer protocol / AllowedIPs change)"
     depends_on: [apis:M17]
     note: "darwin-net's slice of the workspace M17 program (authoritative input: docs/m17-plan.md — Phase C encodes ONLY from that doc; its research findings F1-F7 and its BINDING resolutions R1-R15 are the inputs, and this block re-derives nothing). M17 adds direct links: a point-to-point Thunderbolt cable between two cluster Macs that k3sm discovers, addresses, routes over and prefers; this repo owns the enumeration (pkg/linkenum), the link events (pkg/linkwatch), the root-helper link verbs, and the mesh's choice of the cable as a kernel route. The named exception covers TWO contract surfaces and nothing else: (1) the mesh endpoint/route protocol across nodes — MeshPeerSpec gains the additive Endpoints[] candidate list and a direct peer gets gateway routes over the cable; AllowedIPs is unchanged; (2) the additive k3sm-netd helper IPC minor bump 1.0 -> 1.1, gated by the helper's reported version (the client sends DirectRoutes only to a helper whose reply reports >= 1.1, and only after a successful ConfigureLink on it; a 1.0 helper answers unknown verb to ConfigureLink and the client runs mesh-only with one Info-level line). MeshPeerSchemaVersion STAYS 1 (R12): BuildPlan skips any peer whose stamp differs (pkg/mesh/plan.go:188), so a bump would blackhole every new node from every old reader; Endpoint is still written for every node, so an old reader programs the tunnel exactly as today. The utun route for a peer /24 is NEVER removed (R14): the direct path is two more-specific /25 gateway routes over the Thunderbolt enX plus an on-link host route to the peer's link address, so when the cable goes the kernel deletes the interface-bound routes and pod traffic falls back to the utun /24 with no k3sm code in the path (no RTM_CHANGE; up = host route then /25s, down = /25s then host route). Addresses are derived, never allocated (R4): LinkIP(idx, port) is the one pure function in apis/net/v1alpha1 over the RFC 3927 reserved /24s of 169.254/16, and netd re-validates it root-side for the local address AND every gateway. TunnelMSS stays 1340 for every cross-node path and TSO/LRO are disabled on the Thunderbolt enX (R15). bridge0 ownership is member-only (R10): every Thunderbolt hardware port is removed from bridge0 as a member, re-removed on configd re-add, restored by k3sm link reset/uninstall; the bridge itself and non-Thunderbolt members are never touched. Rollout: any restart order is safe, server first for the feature; io.k3sm.netd restarts first on each node; the mixed-version lab rung (one Mac old, one new, cable live) is green before M17.2 merges."
     subphases:
       - id: M17.2
         title: linkenum + linkwatch + the netd link verbs + the mesh's direct routes
-        status: todo
+        status: done
+        completed: 2026-10-05
         strategy: "phased (named exception: wireguard MeshPeer protocol / AllowedIPs change)"
         depends_on: [apis:M17.1]
         deliverables:
           - id: M17.2-d1
-            done: false
+            done: true  # 2026-10-05 — pkg/linkenum (bc7575f): Exec runs system_profiler/networksetup/ibv_devices by absolute path, Join keys receptacle N to `Thunderbolt N`, HardwarePorts is the single networksetup mapping (ErrNoThunderboltService when none); recorded fixtures for a 6-port desktop and a 2-port laptop, cabled and uncabled, pinned by TestPortsFromRecordedFixtures / TestHardwarePortsMapsOnlyThunderboltNames; no cgo, no verbs.h
             desc: "pkg/linkenum — exec-only Thunderbolt port enumeration, run unprivileged as _k3sm: /usr/sbin/system_profiler SPThunderboltDataType -json + /usr/sbin/networksetup -listallhardwareports (plain executables by absolute path, no SPI, no cgo) joined exactly as F3 describes, plus ibv_devices (exec, parsed) for the RDMA device, behind a swappable interface with recorded-fixture canaries per macOS build (the symbol-canary idiom for text formats). Yields []Port{Iface, PortOrdinal, DomainUUID, PeerDomainUUID, SpeedGbps, RDMADevice}; RDMADevice = rdma_<iface> iff ibv_devices lists it. A port maps to a Thunderbolt hardware port ONLY by the networksetup `Thunderbolt N` hardware-port name, never by interface name; a deleted Thunderbolt Bridge service yields a NoThunderboltService condition; state is keyed by DomainUUID, never by a cached enX name. This is the SINGLE HardwarePorts implementation netd (root-side validation) and k3sm (pairing trust decision, the DirectLink writer) both call — production is its own networksetup parse, tests inject. No librdma link in any k3sm.io module at v1, and infiniband/verbs.h is barred from this repo."
           - id: M17.2-d2
-            done: false
+            done: true  # 2026-10-05 — pkg/linkwatch (86d4e76): LinkEvents with the mandatory 2 s Poller and a best-effort read-only PF_ROUTE RouteReader, merged and debounced 500 ms; Gone is its own event; pinned over a fake clock and lister (TestPollerReportsStateChangesAndVanishings, TestDebounceCoalescesABurstAndDropsRepeats); wired into mesh.Watcher.WatchLinks (TestLinkEventsTriggerTheReconcile)
             desc: "pkg/linkwatch — a consumer-defined LinkEvents interface with two implementations: a MANDATORY 2 s net.Interfaces() flag poll (primary, cheap, pure Go) and an unprivileged PF_ROUTE reader of RTM_IFINFO/RTM_NEWADDR/RTM_DELADDR as the latency optimisation (writes need root; reads do not). Events are debounced 500 ms and call the same Reconcile the MeshPeer informer calls; the 30 s resync stays the backstop. An interface that VANISHES is RemoveLink + re-ConfigureLink on reappearance, never a flag flip. If S1 shows PF_ROUTE silent for a Thunderbolt enX, the poll is the only source (R8)."
           - id: M17.2-d3
-            done: false
+            done: true  # 2026-10-05 — netd (82d3a5f): VerbConfigureLink/VerbRemoveLink, ConfigureMeshArgs.DirectRoutes validated in full then applied as one plan, minor 1.1 with the daemon version on every reply; root-side derivation of the link address and every gateway (TestGatewayDerivedFromPeerPodCIDR, TestConfigureLinkValidatesRootSide); bridge0 member-only removal, /32 alias, -tso/-lro with a TSO4/TSO6/LRO read-back, host route, rollback, start-up sweep of the reserved halves (TestApplier*); client gate (TestClientNeverSendsDirectRoutesToOldHelper)
             desc: "netd — two additive verbs and an atomic route set. ConfigureLink{Iface, PortOrdinal, LinkIP (omitempty, a cross-check only), PeerLinkIP (optional, the first-contact host route)}: bridge0 `deletem` of the member (an absent member is success; membership read back), the /32 alias (the utun alias form), TSO/LRO off (-tso4 -tso6 -lro), the on-link host route to the peer's link address (-interface enX), then a kernel read-back of the alias and host route before routeReady is reported; a failed member removal leaves no alias behind (never half-configured). RemoveLink{Iface}: removes the alias and routes and restores bridge membership. ConfigureMeshArgs grows DirectRoutes[]{PeerPodCIDR, Gateway, Iface}, validated in full then applied all-or-nothing in handleConfigureMesh so the route set stays one atomic authority. Protocol minor 1.0 -> 1.1, the daemon's version carried in its reply. Root-side validation through pkg/linkenum's HardwarePorts: the interface must map to a `Thunderbolt N` hardware port; LinkIP is recomputed as LinkIP(idxOf(NodePodCIDR), N-1) from the identity netd adopted at the first ConfigureMesh (the client's value is only a cross-check); every gateway must equal LinkIP(idxOf(PeerPodCIDR), p) for some p, so a compromised _k3sm client cannot redirect a peer's pods to an arbitrary cable; each PeerPodCIDR is a /24 inside the aggregate and not the node's own; at most 8 links. Startup reconcile removes any alias or route in the reserved halves netd does not own (crash-safe, idempotent). Every ConfigureLink/RemoveLink/member change is an os_log line under io.k3sm.netd."
           - id: M17.2-d4
-            done: false
+            done: true  # 2026-10-05 — pkg/mesh (069ecda): BuildPlan(self, peers, direct) with candidate selection and unknown-Link tolerance, RouteSpec{Prefix, Iface, Gateway} keeping the utun /24 and adding two /25 gateway routes with RTAX_IFA = the .1 mesh-egress address, gateway-and-flags read-back, ValidatePlan reserved-half gateways, EligibleDirectRoutes, the 5 s ICMP probe (3 misses), endpoint re-program on a dead path (TestDirectPathDeathReprogramsEndpoint); TunnelMSS unchanged
             desc: "pkg/mesh — BuildPlan(self, peers, direct DirectRoutes): per peer, PeerConfig.Endpoint is the `direct` candidate equal to the route's gateway, else the first `underlay` candidate, else Endpoint; unknown Link values are ignored. A peer is direct-eligible only when the local link is up AND the liveness probe is alive AND its DirectLink.status port is up (both ends routeReady) — never from server status alone, since in a cable-only cluster that update would arrive over the path that just died. Plan.Routes becomes []RouteSpec{Prefix, Iface, Gateway} (zero gateway = today's utun link route): the /24 utun route is KEPT and a direct peer adds two /25 gateway routes over enX carrying RTAX_IFA = the node's .1 mesh-egress address (so an unbound host dial falling back to the utun stays inside the peer's AllowedIPs); routes.go gains the gateway form (RTAX_GATEWAY, RTF_GATEWAY) and the read-back is extended to compare gateway and flags, not only interface and RTF_UP; ValidatePlan requires gateways derived as d3 says. Liveness is probed, not inferred: a 5 s ICMP echo to the peer's link address per direct link; three misses delete the /25s and clear routeReady, and the route returns only after the probe answers and the resolver re-asserts up. When the direct path dies the selected candidate changes and UAPIUpdate re-programs the wireguard endpoint to the underlay (wireguard-go roams only on a received packet). TunnelMSS stays 1340, unchanged, for every path. Every up/down transition is a Warn-level slog line naming the interface, the peer and the reason."
           - id: M17.2-d5
-            done: false
+            done: true  # 2026-10-05 — all five named tests present and passing: TestClientNeverSendsDirectRoutesToOldHelper and TestRouteOverrideNeverBlackholes and TestDirectRouteRequiresPeerRouteReady and TestOldReaderAcceptsEndpointsField (pkg/mesh), TestGatewayDerivedFromPeerPodCIDR (pkg/netd), plus the fixture and fake-routing-socket tables
             desc: "the named tests, plus table tests over fake enumerations and a fake routing socket: TestClientNeverSendsDirectRoutesToOldHelper (a 1.0 helper is never asked for DirectRoutes); TestRouteOverrideNeverBlackholes (up = host route then /25s, down = /25s then host route, the utun /24 never removed — ordering over a fake routing socket; the kernel property is the lab rung, not this test); TestDirectRouteRequiresPeerRouteReady (no /25s unless the peer's port is up with both ends routeReady and the link is up locally); TestGatewayDerivedFromPeerPodCIDR (netd refuses a gateway that is not LinkIP(idxOf(PeerPodCIDR), p)); TestOldReaderAcceptsEndpointsField (a pre-M17 BuildPlan fixture accepts a reserved-half Endpoint and skips no peer carrying Endpoints)."
         acceptance:
           - id: M17.2-a1
-            met: false
+            met: true  # 2026-10-05 — ran in the lane with GOWORK=<lane>/go.work: CGO_ENABLED=0 go vet ./... clean (and -tags integration), CGO_ENABLED=0 go test -race ./... green across every package, the five named tests of M17.2-d5 present and passing, GOWORK=off go mod tidy leaves no diff, staticcheck 2026.2.1 -tests=false clean. The kernel properties stay with M17.2-a2 (lab), not claimed here
             check: "CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test -race ./... green with the five named tests of M17.2-d5 present and passing, and go mod tidy leaves no diff"
             method: unit
           - id: M17.2-a2
@@ -841,7 +842,7 @@ d3 B113 attribution with a lease-change liveness contract; d4 the network-trust 
 **Acceptance** — frontmatter `M11.3-a1`: seams unit-proven; every live leg rides
 `hack/lab/m11.sh` (`K3SM_LAB=1`), never auto-greened.
 
-## M17 — Direct links (darwin-net slice) ⬜
+## M17 — Direct links (darwin-net slice) 🟡
 A Thunderbolt cable between two cluster Macs becomes a discovered, addressed, preferred data path
 (`docs/m17-plan.md` authoritative; §The shape 1 and 3, §Seams, R4, R8, R10, R12–R15 are the
 inputs). **Phased (named exception: wireguard MeshPeer protocol / AllowedIPs change)**, claimed for
@@ -853,7 +854,7 @@ reader. **The utun route never leaves**: a direct peer gets two more-specific /2
 over `enX`, so on unplug the kernel deletes them and traffic falls back to the utun /24 with no
 k3sm code in the path. `TunnelMSS` stays 1340 for every path; TSO/LRO off on the Thunderbolt `enX`.
 
-### M17.2 — linkenum, linkwatch, the netd link verbs, the mesh's direct routes ⬜
+### M17.2 — linkenum, linkwatch, the netd link verbs, the mesh's direct routes ✅
 **Cross-repo dep:** `apis:M17.1` (`EndpointCandidate`/`Endpoints`, the pure `LinkIP(idx, port)`
 over the RFC 3927 reserved /24s).
 **Deliverables** — frontmatter `M17.2-d1…d5`: d1 `pkg/linkenum`, exec-only enumeration
@@ -874,3 +875,5 @@ re-program on a dead direct path; d5 the named tests.
 `TestOldReaderAcceptsEndpointsField`, `go mod tidy` clean — *method: unit*. `M17.2-a2`: the kernel
 properties (unplug fallback by kernel deletion, no fault under a bulk flow, configd member re-add)
 ride k3sm's two-Mac `hack/lab/m17.sh` (`K3SM_LAB=1`), never auto-greened here — *method: lab*.
+**Status (2026-10-05):** d1–d5 delivered and `M17.2-a1` met in the unit tier; `M17.2-a2` stays open
+for the lab rung, and the mixed-version rung is still owed before this slice merges.
