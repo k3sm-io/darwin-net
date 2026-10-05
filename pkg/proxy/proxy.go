@@ -126,6 +126,14 @@ type Proxy struct {
 	// state under its own lock and never calls back into a relay — no proxy lock
 	// needed.
 	udpBudget *udpBudget
+	// vmnet is the node's vmnet segment (WithVMNetPrefix), the subnet its vm
+	// guests' live lease addresses come from. Read-only after New, which resolves
+	// it (falling back to the policy table's seed) before building relays.
+	vmnet netip.Prefix
+	// relays is the per-pod TCP relay manager on vm pods' published addresses
+	// (podrelay.go). Built by New when there is a routing table to observe, nil
+	// otherwise; Run drives it and shuts it down.
+	relays *podRelays
 
 	// listenUDP, listenNodePort, and dialBackend are the socket-opening calls the
 	// accept and reconcile paths make that do not already go through binder. Each is
@@ -283,6 +291,20 @@ func WithInfraVIPExemptions(vips ...netip.Addr) Option {
 	}
 }
 
+// WithVMNetPrefix sets the vmnet segment this node's vm-RuntimeClass guests are
+// attached to (the guest NAT subnet, e.g. 192.168.64.0/24). The per-pod relay on a
+// vm pod's published address (podrelay.go) relays only to a live address inside it
+// and refuses a client from inside it. Unset, the proxy uses the segment the policy
+// table was seeded with (NewPolicyTableVMNet), so a node assembles that decision
+// once; with neither, the node relays to no vm pod. An invalid prefix is ignored.
+func WithVMNetPrefix(prefix netip.Prefix) Option {
+	return func(p *Proxy) {
+		if prefix.IsValid() {
+			p.vmnet = prefix.Masked()
+		}
+	}
+}
+
 // WithPolicyTable wires the NetworkPolicy L4-subset verdict table: the
 // accept paths consult it per (source, PICKED backend pod IP, backend port) —
 // TCP in handle after the pick, UDP at relay flow admission — and refuse a denied
@@ -360,6 +382,16 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 	// nil-guards a WithLogger(nil) override, like the routing table's.
 	if p.policy != nil {
 		p.policy.log = p.log
+	}
+	// The vm pod relay observes the routing table's generations. The segment is
+	// the explicit WithVMNetPrefix or, failing that, the policy table's seed —
+	// the same segment, decided once by the assembler.
+	if !p.vmnet.IsValid() && p.policy != nil {
+		p.vmnet = p.policy.vmnet
+	}
+	if p.table != nil {
+		p.relays = newPodRelays(p, p.vmnet)
+		p.table.setObserver(p.relays.observe)
 	}
 	return p
 }
@@ -461,11 +493,12 @@ const (
 // reclaims bindings of clients that have gone completely silent (and never redialed).
 const affinitySweepInterval = 60 * time.Second
 
-// Run starts the proxy's worker supervision loop and the ClientIP affinity idle
-// sweeper, and blocks until ctx is cancelled, at which point it stops every worker
-// (closing all listeners and removing every lo0 alias it created), joins the sweeper,
-// and returns. Run is the single owner of the workers map mutation lifecycle and of
-// the affinity sweeper goroutine.
+// Run starts the proxy's worker supervision loop, the ClientIP affinity idle
+// sweeper and the vm pod relay reconciler, and blocks until ctx is cancelled, at
+// which point it stops every worker (closing all listeners and removing every lo0
+// alias it created), joins the sweeper, closes every vm pod relay and joins its
+// goroutines, and returns. Run is the single owner of the workers map mutation
+// lifecycle and of the affinity sweeper and relay goroutines.
 func (p *Proxy) Run(ctx context.Context) error {
 	sweeperDone := make(chan struct{})
 	go func() {
@@ -474,9 +507,20 @@ func (p *Proxy) Run(ctx context.Context) error {
 			p.sweepAffinity(ctx)
 		}
 	}()
+	relaysDone := make(chan struct{})
+	go func() {
+		defer close(relaysDone)
+		if p.relays != nil {
+			p.relays.run(ctx)
+		}
+	}()
 	<-ctx.Done()
 	p.shutdown()
 	<-sweeperDone
+	<-relaysDone
+	if p.relays != nil {
+		p.relays.shutdown()
+	}
 	return ctx.Err()
 }
 

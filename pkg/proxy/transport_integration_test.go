@@ -103,7 +103,7 @@ func TestTransportOverrideDialTarget(t *testing.T) {
 		port := be.addrPort().Port()
 
 		p, table := newPolicyProxy(nil)
-		table.SetTransportOverrides(map[netip.Addr]netip.Addr{vmPublished: be.addrPort().Addr()})
+		table.SetTransportOverrides(liveOnly(map[netip.Addr]netip.Addr{vmPublished: be.addrPort().Addr()}))
 		key := PortKey{ClusterIP: "10.43.2.1", Port: 80, Protocol: netv1.ProtocolTCP}
 		table.SetEndpoints(key, []netv1.Endpoint{{IP: vmPublished.String(), Port: int32(port), Ready: true}})
 
@@ -127,7 +127,7 @@ func TestTransportOverrideDialTarget(t *testing.T) {
 			t.Errorf("host-process backend must be reached with no overrides installed")
 		}
 		// A populated map that does not name this backend must not disturb it.
-		table.SetTransportOverrides(map[netip.Addr]netip.Addr{vmPublished: netip.MustParseAddr("192.168.64.5")})
+		table.SetTransportOverrides(liveOnly(map[netip.Addr]netip.Addr{vmPublished: netip.MustParseAddr("192.168.64.5")}))
 		if !handleVIP(t, p, key, src) {
 			t.Errorf("host-process backend must be reached while OTHER backends carry overrides")
 		}
@@ -151,7 +151,7 @@ func TestTransportOverrideDialTarget(t *testing.T) {
 		beAP := bp.LocalAddr().(*net.UDPAddr).AddrPort()
 
 		table := NewRoutingTable(netip.Prefix{})
-		table.SetTransportOverrides(map[netip.Addr]netip.Addr{vmPublished: beAP.Addr()})
+		table.SetTransportOverrides(liveOnly(map[netip.Addr]netip.Addr{vmPublished: beAP.Addr()}))
 		key := PortKey{ClusterIP: "10.43.2.3", Port: 53, Protocol: netv1.ProtocolUDP}
 		table.SetEndpoints(key, []netv1.Endpoint{{IP: vmPublished.String(), Port: int32(beAP.Port()), Ready: true}})
 
