@@ -613,13 +613,13 @@ func (s *Server) handleConfigureMesh(ctx context.Context, st *connState, args *w
 		s.log.Warn("netd: mesh peers rejected", "err", err)
 		return s.errResp(err.Error())
 	}
-	plan, err := mesh.ValidatePlan(s.nodeCIDR(), specs)
+	plan, err := mesh.ValidatePlan(s.nodeCIDR(), specs, nil)
 	if err != nil {
 		s.log.Warn("netd: mesh plan rejected", "err", err)
 		return s.errResp(fmt.Sprintf("configureMesh: %v", err))
 	}
 	for _, r := range plan.Routes {
-		if !s.cfg.ClusterAggregate.Contains(r.Addr()) {
+		if !s.cfg.ClusterAggregate.Contains(r.Prefix.Addr()) {
 			return s.errResp(fmt.Sprintf("%v: mesh route %s outside cluster aggregate %s", ErrPolicy, r, s.cfg.ClusterAggregate))
 		}
 	}

@@ -42,7 +42,7 @@ func keyHex(t *testing.T, seed byte) string {
 // the fixed test node /24.
 func planFor(t *testing.T, peers ...netv1.MeshPeerSpec) Plan {
 	t.Helper()
-	plan, err := BuildPlan(netip.MustParsePrefix("100.64.0.0/24"), peers)
+	plan, err := BuildPlan(netip.MustParsePrefix("100.64.0.0/24"), peers, nil)
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}
