@@ -103,7 +103,7 @@ limitations under the License.
 // NodePort is TCP only: the ClusterIP UDP datagram relay (below) is built, but the
 // UDP NodePort is deferred, because a wildcard *:NodePort UDP reply re-selects its
 // source by route lookup on a multi-homed node (the client would see the wrong
-// source IP and drop it). stockkitty's NodePort surface (VSCode SSH :22, the
+// source IP and drop it). A reference workload's NodePort surface (VSCode SSH :22, the
 // snapshot gRPC range) is all TCP, so UDP NodePort is not claimed.
 //
 // # Locality (load-bearing only for internalTrafficPolicy: Local)
