@@ -29,8 +29,8 @@ import (
 // process would re-allocate addresses still aliased for running pods
 // (collisions) and never remove aliases whose pods died with the old process
 // (leaks). The k3sm caller reconciles at startup, BEFORE serving any Setup:
-// ReattachPod for every still-running pod's recorded podID->IP binding (from
-// PodBox.pod_ip), then one SweepStale with that same known set to clear the
+// ReattachPod (ReattachGuest for a vm pod) for every still-running pod's recorded
+// podID->IP binding (from PodBox.pod_ip), then one SweepStale with that same known set to clear the
 // orphans. Both are no-op-clean on an empty node.
 
 // ErrIPInUse is returned by ReattachPod when the requested address is already
@@ -38,22 +38,41 @@ import (
 // so a corrupt restart manifest cannot silently steal a live pod's address.
 var ErrIPInUse = errors.New("podnet: ip already in use")
 
-// ReattachPod re-adopts a known podID->IP binding after a daemon restart: it
-// validates ip is a usable host address in the node /24 (the reserved network,
-// broadcast, and mesh-egress addresses are rejected with ErrOutOfRange),
-// reserves exactly that address, records the binding, and (re-)ensures the lo0
-// alias — idempotent, since the alias likely survived the crash. A subsequent
-// Setup for the same podID returns the same address, and no other pod can be
-// allocated it.
+// ReattachPod re-adopts a known podID->IP binding of a HOST-PROCESS pod after a
+// daemon restart: it validates ip is a usable host address in the node /24 (the
+// reserved network, broadcast, and mesh-egress addresses are rejected with
+// ErrOutOfRange), reserves exactly that address, records the binding, and
+// (re-)ensures the lo0 alias — idempotent, since the alias likely survived the
+// crash. A subsequent Setup for the same podID returns the same address, and no
+// other pod can be allocated it.
 //
-// It re-adopts the HOST-PROCESS backend (the one with durable lo0 state to
-// re-own); a vm-RuntimeClass guest owns its address inside its own netstack and
-// is re-provisioned via SetupGuest. Reattaching the same podID->ip twice is a
-// no-op success; a conflicting binding fails — ErrIPInUse when the address is
-// held elsewhere, a descriptive error for a same-pod rebind — never a silent
-// overwrite. If the alias plumb fails the reservation is rolled back so a
-// failed reattach leaks nothing.
+// Reattaching the same podID->ip twice is a no-op success that re-ensures the
+// alias, and that holds for a pod already bound as a vm guest too (its alias is
+// owned exactly as a host-process pod's is); a conflicting binding fails —
+// ErrIPInUse when the address is held elsewhere, a descriptive error for a
+// same-pod rebind — never a silent overwrite. If the alias plumb fails the
+// reservation is rolled back so a failed reattach leaks nothing. A vm guest that
+// survived a restart is re-adopted with ReattachGuest.
 func (n *Network) ReattachPod(ctx context.Context, podID string, ip netip.Addr) error {
+	return n.reattach(ctx, podID, ip, BackendHostProcess)
+}
+
+// ReattachGuest is ReattachPod for a vm-RuntimeClass guest that survived a daemon
+// restart: it reserves exactly ip (the pod's published status.podIP), records the
+// binding as BackendVM, and re-ensures the published /32's lo0 alias the node's
+// proxy relays from. The alias is owned by the running pod from here on, so
+// SweepStale keeps it, and Teardown removes it. Every other contract is
+// ReattachPod's; a pod already bound as a host process is refused with
+// ErrBackendMismatch.
+func (n *Network) ReattachGuest(ctx context.Context, podID string, ip netip.Addr) error {
+	return n.reattach(ctx, podID, ip, BackendVM)
+}
+
+// reattach is the shared core of ReattachPod and ReattachGuest. backend is the
+// backend a FRESH binding is recorded under. An existing binding keeps its own
+// backend: ReattachPod of a bound vm guest re-ensures its alias, while
+// ReattachGuest of a bound host-process pod is refused.
+func (n *Network) reattach(ctx context.Context, podID string, ip netip.Addr, backend Backend) error {
 	if podID == "" {
 		return ErrEmptyPodID
 	}
@@ -62,8 +81,11 @@ func (n *Network) ReattachPod(ctx context.Context, podID string, ip netip.Addr) 
 	defer n.mu.Unlock()
 
 	if e, ok := n.byPod[podID]; ok {
-		if e.backend != BackendHostProcess {
-			return fmt.Errorf("%w: pod %s is provisioned as %s, reattach re-adopts host-process pods only", ErrBackendMismatch, podID, e.backend)
+		// A guest re-adopted through ReattachPod keeps its vm binding (the caller
+		// may not know a surviving pod's backend); ReattachGuest of a host-process
+		// pod is a caller error.
+		if backend == BackendVM && e.backend != BackendVM {
+			return fmt.Errorf("%w: pod %s is provisioned as %s, not %s", ErrBackendMismatch, podID, e.backend, backend)
 		}
 		if e.ip != ip {
 			return fmt.Errorf("reattach pod %s: already bound to %s, refusing rebind to %s", podID, e.ip, ip)
@@ -93,14 +115,15 @@ func (n *Network) ReattachPod(ctx context.Context, podID string, ip netip.Addr) 
 		_ = n.alloc.Release(ip)
 		return fmt.Errorf("ensure lo0 alias %s for pod %s: %w", ip, podID, err)
 	}
-	n.byPod[podID] = podEntry{ip: ip, backend: BackendHostProcess}
+	n.byPod[podID] = podEntry{ip: ip, backend: backend}
 	n.inverse[ip] = podID
-	n.log.Debug("pod network reattach", "pod", podID, "ip", ip.String(), "cidr", n.alloc.CIDR().String())
+	n.log.Debug("pod network reattach", "pod", podID, "ip", ip.String(), "backend", backend.String(), "cidr", n.alloc.CIDR().String())
 	return nil
 }
 
 // SweepStale removes every k3sm-owned lo0 alias inside the node podCIDR that is
-// NOT in the known podID->IP set (nor bound in this Network) — the orphans a
+// NOT in the known podID->IP set (nor bound in this Network, under either
+// backend: a running vm guest's published alias is owned) — the orphans a
 // crashed previous daemon left aliased on lo0 with no surviving pod. Callers
 // run it once at startup, after ReattachPod-ing the still-running pods and
 // before serving any Setup; on an empty node with a nil/empty known set it is a
