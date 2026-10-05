@@ -348,7 +348,7 @@ limitations under the License.
 // address is outside the node's vmnet segment (WithVMNetPrefix, defaulting to the
 // policy table's seed), is the segment's network, gateway or broadcast address,
 // equals the published address, or is claimed by two pods in one generation, or
-// when its port set exceeds maxRelayPorts (no truncated subset); a node with no
+// when its port set exceeds MaxRelayPorts (no truncated subset); a node with no
 // vmnet segment relays nothing. A refusal closes an existing relay synchronously,
 // in the same call, even when the pod's own lease did not change.
 //

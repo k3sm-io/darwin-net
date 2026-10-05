@@ -486,7 +486,7 @@ func TestVMNetPrefixFallsBackToPolicySeed(t *testing.T) {
 }
 
 // TestPodRelayPortCap proves the per-pod port cap fails closed: a port set over
-// maxRelayPorts — declared alone, or declared plus Service-targeted — installs no
+// MaxRelayPorts — declared alone, or declared plus Service-targeted — installs no
 // relay at all and logs exactly one Warn naming the pod and the count, while a
 // set exactly at the cap is relayed in full.
 func TestPodRelayPortCap(t *testing.T) {
@@ -505,9 +505,9 @@ func TestPodRelayPortCap(t *testing.T) {
 		service  bool
 		want     int // listeners; 0 = refused
 	}{
-		{"declared set over the cap", maxRelayPorts + 1, false, 0},
-		{"declared at the cap plus one Service port", maxRelayPorts, true, 0},
-		{"declared set exactly at the cap", maxRelayPorts, false, maxRelayPorts},
+		{"declared set over the cap", MaxRelayPorts + 1, false, 0},
+		{"declared at the cap plus one Service port", MaxRelayPorts, true, 0},
+		{"declared set exactly at the cap", MaxRelayPorts, false, MaxRelayPorts},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := &captureHandler{}
@@ -535,7 +535,7 @@ func TestPodRelayPortCap(t *testing.T) {
 				}
 				pod, _ := attr(refusals[0], "pod")
 				reason, _ := attr(refusals[0], "reason")
-				wantCount := strconv.Itoa(maxRelayPorts + 1)
+				wantCount := strconv.Itoa(MaxRelayPorts + 1)
 				if pod != published.String() || !strings.Contains(reason, wantCount+" ports") {
 					t.Fatalf("refusal Warn pod=%q reason=%q; want pod %s and the count %s", pod, reason, published, wantCount)
 				}
