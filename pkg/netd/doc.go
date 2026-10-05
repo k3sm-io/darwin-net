@@ -16,8 +16,10 @@ limitations under the License.
 
 // Package netd is the logic of k3sm's minimal root network daemon (k3sm-netd):
 // the ONLY component that performs the irreducibly-root darwin network operations
-// (lo0 /32 aliases, the wireguard utun + routes, binding privileged ports), so everything else runs as the unprivileged _k3sm user and
-// reaches it over a unix socket.
+// (lo0 /32 aliases, the wireguard utun + routes, binding privileged ports, and the
+// direct-link Thunderbolt ports: their bridge0 membership, /32 address, offload
+// flags, on-link host route and the /25 routes over them), so everything else runs
+// as the unprivileged _k3sm user and reaches it over a unix socket.
 //
 // It ships as a library, not a main: the production entry is the single signed
 // k3sm binary re-exec'd in "netd" mode, which imports Server here. The wire
@@ -40,6 +42,12 @@ limitations under the License.
 //     via pkg/mesh.RouteSet/ValidatePlan, the port policy) and RENDERS the UAPI
 //     itself, reusing the existing pkg/podnet and pkg/mesh logic rather
 //     than trusting or re-implementing it.
+//   - Derived, never trusted, direct-link addresses. ConfigureLink accepts only an
+//     interface the system's own hardware-port mapping names "Thunderbolt N"
+//     (pkg/linkenum.HardwarePorts), derives the port's address itself from the
+//     node identity a ConfigureMesh confirmed, and every direct route's next hop
+//     must be the address derived for the node that owns the routed /24, over a
+//     link the daemon configured toward exactly that address.
 //   - fd-out only. The sole descriptor that ever crosses the socket is the
 //     listening socket BindPort returns to the client via SCM_RIGHTS; no inbound fd
 //     is ever accepted.

@@ -21,3 +21,9 @@ package mesh
 func withDevice(d Device) Option {
 	return func(m *Mesh) { m.dev = d }
 }
+
+// withPinger injects the direct-link probe's I/O, so the liveness logic runs with
+// no ICMP socket.
+func withPinger(p pinger) Option {
+	return func(m *Mesh) { m.prober = newProber(p, m.probeChanged) }
+}

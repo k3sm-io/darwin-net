@@ -57,6 +57,15 @@ func containsPrefix(set []netip.Prefix, want string) bool {
 	return false
 }
 
+// routePrefixes returns the destination of every route in a plan's route set.
+func routePrefixes(rs []RouteSpec) []netip.Prefix {
+	out := make([]netip.Prefix, len(rs))
+	for i, r := range rs {
+		out[i] = r.Prefix
+	}
+	return out
+}
+
 // TestMeshRoutesPerPeerNotAggregate is the M3.1 acceptance for the per-peer kernel
 // routes: the route set is exactly one route per peer podCIDR, and this node's own
 // /24 and the 100.64.0.0/10 cluster aggregate are NEVER in it (routing either to
@@ -217,7 +226,7 @@ func TestMeshPlanUAPIAndKeyHex(t *testing.T) {
 		self := netip.MustParsePrefix("100.64.0.0/24")
 		plan, err := BuildPlan(self, []netv1.MeshPeerSpec{
 			peerSpec("nodeB", "100.64.1.0/24", "192.0.2.10:51820", 0x42),
-		})
+		}, nil)
 		if err != nil {
 			t.Fatalf("BuildPlan: %v", err)
 		}
@@ -253,7 +262,7 @@ func TestBuildPlanSkipsSelfAndInvalid(t *testing.T) {
 	badVersion := peerSpec("nodeD", "100.64.3.0/24", "192.0.2.4:51820", 0x04)
 	badVersion.SchemaVersion = 99 // unsupported (WithDefaults leaves a non-zero value)
 
-	plan, err := BuildPlan(self, []netv1.MeshPeerSpec{selfPeer, good, wrongAllowed, badVersion})
+	plan, err := BuildPlan(self, []netv1.MeshPeerSpec{selfPeer, good, wrongAllowed, badVersion}, nil)
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}

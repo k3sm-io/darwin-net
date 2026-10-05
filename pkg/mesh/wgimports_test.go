@@ -211,7 +211,7 @@ func TestWireguardImportsConfinedAndDeviceFaked(t *testing.T) {
 		if len(base.Peers) != 0 {
 			t.Fatalf("baseline plan has %d peers, want 0 (self is not its own peer): %+v", len(base.Peers), base.Peers)
 		}
-		if containsPrefix(base.Routes, peerCIDR) {
+		if containsPrefix(routePrefixes(base.Routes), peerCIDR) {
 			t.Fatalf("baseline routes already contain %s before the peer was added: %v", peerCIDR, base.Routes)
 		}
 
@@ -229,7 +229,7 @@ func TestWireguardImportsConfinedAndDeviceFaked(t *testing.T) {
 		if got := afterAdd.Peers[0]; got.NodeName != "nodeB" || got.Endpoint != peerEP {
 			t.Fatalf("after ADD, peer = {node %q, endpoint %q}, want {nodeB, %s}", got.NodeName, got.Endpoint, peerEP)
 		}
-		if !containsPrefix(afterAdd.Routes, peerCIDR) {
+		if !containsPrefix(routePrefixes(afterAdd.Routes), peerCIDR) {
 			t.Fatalf("after ADD, routes %v do not contain the new peer's %s (route not installed)", afterAdd.Routes, peerCIDR)
 		}
 
@@ -243,7 +243,7 @@ func TestWireguardImportsConfinedAndDeviceFaked(t *testing.T) {
 		if len(afterRemove.Peers) != 0 {
 			t.Fatalf("after REMOVE, plan still has %d peers, want 0: %+v", len(afterRemove.Peers), afterRemove.Peers)
 		}
-		if containsPrefix(afterRemove.Routes, peerCIDR) {
+		if containsPrefix(routePrefixes(afterRemove.Routes), peerCIDR) {
 			t.Fatalf("after REMOVE, routes %v still contain the departed peer's %s (route not withdrawn)", afterRemove.Routes, peerCIDR)
 		}
 

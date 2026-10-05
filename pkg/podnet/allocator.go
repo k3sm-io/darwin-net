@@ -89,6 +89,35 @@ func NodeCIDR(clusterCIDR netip.Prefix, index int) (netip.Prefix, error) {
 	return netip.PrefixFrom(netip.AddrFrom4(a4), nodeCIDRBits), nil
 }
 
+// NodeIndex is the inverse of NodeCIDR: the zero-based node index whose carve out
+// of clusterCIDR is nodeCIDR. It returns ErrOutOfRange unless nodeCIDR is an IPv4
+// /24 wholly inside clusterCIDR, so a caller deriving an address from the index
+// (a direct-link address, say) never derives one from a /24 the cluster does not
+// own.
+//
+// Example: NodeIndex(100.64.0.0/10, 100.64.7.0/24) == 7.
+func NodeIndex(clusterCIDR, nodeCIDR netip.Prefix) (int, error) {
+	if !clusterCIDR.IsValid() || !nodeCIDR.IsValid() {
+		return 0, fmt.Errorf("%w: invalid cluster or node CIDR", ErrOutOfRange)
+	}
+	clusterCIDR = clusterCIDR.Masked()
+	nodeCIDR = nodeCIDR.Masked()
+	if !clusterCIDR.Addr().Is4() || !nodeCIDR.Addr().Is4() {
+		return 0, fmt.Errorf("%w: only IPv4 CIDRs are supported", ErrOutOfRange)
+	}
+	if nodeCIDR.Bits() != nodeCIDRBits {
+		return 0, fmt.Errorf("%w: node CIDR %s is not a /%d", ErrOutOfRange, nodeCIDR, nodeCIDRBits)
+	}
+	if clusterCIDR.Bits() > nodeCIDRBits || !clusterCIDR.Contains(nodeCIDR.Addr()) {
+		return 0, fmt.Errorf("%w: node CIDR %s is not inside cluster CIDR %s", ErrOutOfRange, nodeCIDR, clusterCIDR)
+	}
+	b := clusterCIDR.Addr().As4()
+	n := nodeCIDR.Addr().As4()
+	base := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+	v := uint32(n[0])<<24 | uint32(n[1])<<16 | uint32(n[2])<<8 | uint32(n[3])
+	return int((v - base) >> (32 - nodeCIDRBits)), nil
+}
+
 // Allocator hands out unique host /32 addresses from a single node's pod CIDR (a
 // /24). It is the pure-logic IPAM core: no interface, no syscalls, no privilege,
 // so its allocate/release behavior is fully table-tested. Three addresses in the

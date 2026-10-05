@@ -59,6 +59,33 @@ type Privileged interface {
 	// BindPort binds a listening socket on the specific addr and returns it; the
 	// caller passes the fd to the client and closes this copy.
 	BindPort(ctx context.Context, network string, addr netip.AddrPort) (*os.File, error)
+	// ConfigureLink configures a validated direct-link port (idempotent): out of
+	// bridge0, its /32 address, offload off, the on-link host route to the peer
+	// when one is given, all read back from the kernel before it returns nil. A
+	// failure leaves no alias or host route of this call behind.
+	ConfigureLink(ctx context.Context, spec LinkSpec) error
+	// RemoveLink tears a direct-link port down (idempotent): the direct routes
+	// over it first, then its host route and address, then bridge membership is
+	// restored.
+	RemoveLink(ctx context.Context, iface string) error
+}
+
+// LinkSpec is a direct-link port the server has validated: the Thunderbolt
+// interface, the address the server derived for it, and the peer's address on
+// the cable (invalid: no host route).
+type LinkSpec struct {
+	Iface      string
+	LinkIP     netip.Addr
+	PeerLinkIP netip.Addr
+}
+
+// linkRouter is the host-route seam the link operations drive
+// (*mesh.HostRoutes in production).
+type linkRouter interface {
+	Ensure(ctx context.Context, peer netip.Addr, iface string) error
+	Remove(ctx context.Context, peer netip.Addr, iface string) error
+	List(ctx context.Context) ([]mesh.Route, error)
+	Delete(ctx context.Context, r mesh.Route) error
 }
 
 // blackholer installs and clears the lo0 blackhole host route that holds a pod
@@ -117,6 +144,22 @@ type darwinApplier struct {
 	// unit tests.
 	command func(ctx context.Context, name string, args ...string) error
 	routes  blackholer
+	// output runs a read-only command and returns its standard output (the
+	// ifconfig read-backs of the link operations); hostRoutes is the link
+	// operations' host-route seam; ifaceAddrs lists every interface's IPv4
+	// addresses for the start-up reconcile. All three are set by
+	// newDarwinApplier and replaced only by unit tests.
+	output     func(ctx context.Context, name string, args ...string) ([]byte, error)
+	hostRoutes linkRouter
+	ifaceAddrs func() (map[string][]netip.Addr, error)
+	// withdraw removes the mesh's direct routes over an interface before its host
+	// route goes (withdrawDirect in production).
+	withdraw func(ctx context.Context, iface string) error
+
+	// linkMu serializes the link operations; links are the ports configured,
+	// guarded by linkMu. Lock order: linkMu, then mu.
+	linkMu sync.Mutex
+	links  map[string]LinkSpec
 
 	aliasMu sync.Mutex
 	aliased map[netip.Addr]aliasState
@@ -139,7 +182,7 @@ func newDarwinApplier(nodePodCIDR netip.Prefix, log *slog.Logger) *darwinApplier
 	}
 	meshIP, _ := podnet.MeshEgressIP(nodePodCIDR)
 	linkIP, _ := podnet.MeshLinkIP(nodePodCIDR)
-	return &darwinApplier{
+	a := &darwinApplier{
 		nodePodCIDR: nodePodCIDR,
 		meshIP:      meshIP,
 		linkIP:      linkIP,
@@ -148,7 +191,13 @@ func newDarwinApplier(nodePodCIDR netip.Prefix, log *slog.Logger) *darwinApplier
 		command:     run,
 		routes:      podnet.BlackholeRoutes{},
 		aliased:     make(map[netip.Addr]aliasState),
+		output:      runOutput,
+		hostRoutes:  mesh.NewHostRoutes(),
+		ifaceAddrs:  interfaceIPv4Addrs,
+		links:       make(map[string]LinkSpec),
 	}
+	a.withdraw = a.withdrawDirect
+	return a
 }
 
 // isPodAddress reports whether ip is a pod address of the node /24 this applier
@@ -405,6 +454,19 @@ func (a *darwinApplier) BindPort(_ context.Context, network string, addr netip.A
 	default:
 		return nil, fmt.Errorf("bind port: unsupported network %q", network)
 	}
+}
+
+// runOutput runs a command and returns its standard output.
+func runOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
+	out, err := exec.CommandContext(ctx, name, args...).Output()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return out, fmt.Errorf("%w: %s", err, bytes.TrimSpace(ee.Stderr))
+		}
+		return out, err
+	}
+	return out, nil
 }
 
 // run invokes a root-gated command, wrapping any failure with its combined output.

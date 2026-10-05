@@ -43,7 +43,7 @@ type Device interface {
 	// update afterwards, so additions, removals, AllowedIPs and key rotations
 	// converge WITHOUT re-stamping an already-configured peer's endpoint over the
 	// one wireguard roamed onto) and reconciles the kernel routes to exactly
-	// plan.Routes, each routed to the utun. An implementation therefore keeps the
+	// plan.Routes (utun routes on the utun, direct routes over their cable). An implementation therefore keeps the
 	// endpoint memory alongside the wireguard state it programs, so a device that
 	// is re-created programs every endpoint again. It is idempotent and safe to
 	// call on every MeshPeer change.
