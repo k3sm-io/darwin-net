@@ -212,9 +212,10 @@ func (n *Network) setup(ctx context.Context, podID string, backend Backend) (net
 
 // Teardown removes podID's lo0 alias and releases its IP, for both backends; the
 // alias manager installs the address's lo0 blackhole as the alias goes (see
-// BlackholeRoutes). For a vm pod the caller drops the pod's relay (its proxy
-// transport override) before calling Teardown, so no relayed connection is still
-// open when the alias goes. It is idempotent and leak-free: a pod with no recorded
+// BlackholeRoutes). For a vm pod the caller MUST first drop the pod's proxy
+// transport override, which closes its relay (listeners and relayed connections)
+// before that call returns, and only then call Teardown, so no relayed
+// connection is still open when the alias goes. It is idempotent and leak-free: a pod with no recorded
 // IP is a no-op success. If the alias removal fails the IP is NOT released (so a
 // retry can complete the teardown rather than orphaning a still-aliased address).
 func (n *Network) Teardown(ctx context.Context, podID string) error {

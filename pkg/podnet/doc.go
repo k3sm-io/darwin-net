@@ -109,7 +109,9 @@ limitations under the License.
 //     needs the Apple-restricted com.apple.vm.networking entitlement (unobtainable).
 //
 // Teardown is shared: for both backends it removes the lo0 alias (installing the
-// address's blackhole, see BlackholeRoutes) and releases the pod IP. ReattachPod
+// address's blackhole, see BlackholeRoutes) and releases the pod IP. For a vm pod
+// the caller must drop the pod's proxy transport override first — that closes
+// the pod's relay synchronously — and only then call Teardown. ReattachPod
 // and ReattachGuest re-adopt a surviving pod of either backend after a daemon
 // restart, re-ensuring its alias, and SweepStale keeps every bound address.
 //
