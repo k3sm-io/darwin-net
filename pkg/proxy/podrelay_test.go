@@ -25,6 +25,8 @@ import (
 	"net/netip"
 	"runtime"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -480,5 +482,99 @@ func TestVMNetPrefixFallsBackToPolicySeed(t *testing.T) {
 	}
 	if p.relays.gateway != netip.MustParseAddr("192.168.65.1") || p.relays.broadcast != netip.MustParseAddr("192.168.65.255") {
 		t.Fatalf("derived gateway/broadcast = %s/%s, want 192.168.65.1/192.168.65.255", p.relays.gateway, p.relays.broadcast)
+	}
+}
+
+// TestPodRelayPortCap proves the per-pod port cap fails closed: a port set over
+// maxRelayPorts — declared alone, or declared plus Service-targeted — installs no
+// relay at all and logs exactly one Warn naming the pod and the count, while a
+// set exactly at the cap is relayed in full.
+func TestPodRelayPortCap(t *testing.T) {
+	published := netip.MustParseAddr("100.64.0.7")
+	live := netip.MustParseAddr("192.168.64.5")
+	portsFrom := func(n int) []uint16 {
+		out := make([]uint16, n)
+		for i := range out {
+			out[i] = uint16(20000 + i)
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name     string
+		declared int
+		service  bool
+		want     int // listeners; 0 = refused
+	}{
+		{"declared set over the cap", maxRelayPorts + 1, false, 0},
+		{"declared at the cap plus one Service port", maxRelayPorts, true, 0},
+		{"declared set exactly at the cap", maxRelayPorts, false, maxRelayPorts},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &captureHandler{}
+			h := newRelayHarness(t, netip.MustParsePrefix("192.168.64.0/24"), newRelayBackends().dial, WithLogger(slog.New(logs)))
+			if tc.service {
+				h.tbl.SetEndpoints(PortKey{ClusterIP: "10.43.0.20", Port: 80, Protocol: netv1.ProtocolTCP},
+					[]netv1.Endpoint{{IP: published.String(), Port: 9090, Ready: true}})
+			}
+			h.tbl.SetTransportOverrides(map[netip.Addr]VMPodTransport{published: {Live: live, Ports: portsFrom(tc.declared)}})
+			h.settle(t)
+			h.settle(t)
+
+			var refusals []slog.Record
+			for _, r := range logs.warns() {
+				if r.Message == "vm pod relay refused: the pod's published address is not relayed" {
+					refusals = append(refusals, r)
+				}
+			}
+			if tc.want == 0 {
+				if n := h.b.count(); n != 0 {
+					t.Fatalf("over-cap set bound %d listener(s); want none (fail closed)", n)
+				}
+				if len(refusals) != 1 {
+					t.Fatalf("got %d refusal Warns, want exactly 1 (throttled)", len(refusals))
+				}
+				pod, _ := attr(refusals[0], "pod")
+				reason, _ := attr(refusals[0], "reason")
+				wantCount := strconv.Itoa(maxRelayPorts + 1)
+				if pod != published.String() || !strings.Contains(reason, wantCount+" ports") {
+					t.Fatalf("refusal Warn pod=%q reason=%q; want pod %s and the count %s", pod, reason, published, wantCount)
+				}
+				return
+			}
+			for _, port := range portsFrom(tc.declared) {
+				h.b.boundAt(t, netip.AddrPortFrom(published, port).String())
+			}
+			if len(refusals) != 0 {
+				t.Fatalf("a set at the cap logged %d refusal Warn(s); want none", len(refusals))
+			}
+		})
+	}
+}
+
+// TestPodRelayRetireClosesNewlyRefused proves a relay whose own lease is unchanged
+// but which the next generation refuses (a second pod reports the same lease) is
+// closed inside SetTransportOverrides, before any reconcile pass runs.
+func TestPodRelayRetireClosesNewlyRefused(t *testing.T) {
+	tbl := NewRoutingTable(netip.Prefix{})
+	b := newRecordingBinder()
+	p := New(tbl, withAliasManager(newNoopAliasManager()), withBinder(b), withDialBackend(newRelayBackends().dial),
+		WithVMNetPrefix(netip.MustParsePrefix("192.168.64.0/24")), WithLogger(slog.New(slog.DiscardHandler)))
+	defer p.relays.shutdown()
+	pubA, pubB := netip.MustParseAddr("100.64.0.7"), netip.MustParseAddr("100.64.0.8")
+	leaseA := netip.MustParseAddr("192.168.64.5")
+	tbl.SetTransportOverrides(map[netip.Addr]VMPodTransport{
+		pubA: {Live: leaseA, Ports: []uint16{8080}},
+		pubB: {Live: netip.MustParseAddr("192.168.64.6"), Ports: []uint16{8080}},
+	})
+	p.relays.reconcile(context.Background(), tbl.load())
+	lnA := b.boundAt(t, "100.64.0.7:8080")
+
+	// B now reports A's lease; A's own override is byte-identical.
+	tbl.SetTransportOverrides(map[netip.Addr]VMPodTransport{
+		pubA: {Live: leaseA, Ports: []uint16{8080}},
+		pubB: {Live: leaseA, Ports: []uint16{8080}},
+	})
+	if !lnA.isClosed() {
+		t.Fatal("pod A's relay was still open when SetTransportOverrides returned; a newly refused relay must close synchronously")
 	}
 }

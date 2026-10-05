@@ -35,6 +35,14 @@ import (
 // endpoint churn must not turn one misreport into a log flood.
 const relayRefusalThrottle = time.Minute
 
+// maxRelayPorts caps one pod's relay port set (declared container ports together
+// with the Service-targeted ports at its published address). Every relayed port is
+// a daemon file descriptor, a bind (a root-helper round-trip below 1024) and a
+// retry log line on failure, and a pod spec may declare tens of thousands of
+// container ports. A pod over the cap gets no relay at all — fail closed, never a
+// silently truncated subset — and a throttled Warn naming the pod and the count.
+const maxRelayPorts = 32
+
 // podRelays is the Proxy's per-pod TCP relay manager: for every vm pod in the
 // routing table's transport overrides it listens on the pod's PUBLISHED address
 // (the lo0 alias pkg/podnet holds for the pod's lifetime) and relays each accepted
@@ -66,8 +74,11 @@ const relayRefusalThrottle = time.Minute
 // arbitrary host on a guest's say-so. An override is refused — no relay, a
 // throttled Warn naming the pod — when its live address is outside the node's
 // vmnet segment, is that segment's gateway or broadcast address, equals the
-// published address, or is claimed by another pod in the same generation. With no
-// vmnet segment configured every override is refused.
+// published address, or is claimed by another pod in the same generation, and when
+// its port set exceeds maxRelayPorts. With no vmnet segment configured every
+// override is refused. retire applies the same admission check, so a relay that
+// becomes refused while its lease is unchanged (a second pod claims the lease)
+// closes synchronously too.
 //
 // Locking discipline: mu guards relays, warned, retryAt and closed. A podRelay has
 // its own leaf lock (podRelay.mu) for its listeners and connections, taken with or
@@ -145,16 +156,22 @@ func (m *podRelays) observe(s *routingSnapshot, transport bool) {
 	}
 }
 
-// retire closes every relay whose pod is absent from s's overrides or whose live
-// address changed.
+// retire closes every relay whose pod is absent from s's overrides, whose live
+// address changed, or whose override s no longer admits. It does not log a
+// refusal; the reconcile pass the same generation kicks does that.
 func (m *podRelays) retire(s *routingSnapshot) {
+	claims := liveClaims(s)
+	svc := s.relayBackendPorts()
 	m.mu.Lock()
 	var gone []*podRelay
 	for pub, r := range m.relays {
-		if tr, ok := s.transport[pub]; !ok || tr.Live != r.live {
-			gone = append(gone, r)
-			delete(m.relays, pub)
+		if tr, ok := s.transport[pub]; ok && tr.Live == r.live {
+			if _, reason := m.admit(pub, tr, svc[pub], claims[tr.Live]); reason == "" {
+				continue
+			}
 		}
+		gone = append(gone, r)
+		delete(m.relays, pub)
 	}
 	m.mu.Unlock()
 	for _, r := range gone {
@@ -249,19 +266,16 @@ func (m *podRelays) reconcile(ctx context.Context, s *routingSnapshot) bool {
 // plan validates s's overrides and returns the relay each admitted pod should
 // have. A refused pod is logged (throttled) and left out.
 func (m *podRelays) plan(s *routingSnapshot) map[netip.Addr]relayPlan {
-	claims := make(map[netip.Addr]int, len(s.transport))
-	for _, tr := range s.transport {
-		claims[tr.Live]++
-	}
+	claims := liveClaims(s)
+	svc := s.relayBackendPorts()
 	want := make(map[netip.Addr]relayPlan, len(s.transport))
 	for pub, tr := range s.transport {
-		if reason := m.refusal(pub, tr.Live, claims[tr.Live]); reason != "" {
+		ports, reason := m.admit(pub, tr, svc[pub], claims[tr.Live])
+		if reason != "" {
 			m.warnRefused(pub, tr.Live, reason)
 			continue
 		}
-		ports := slices.Concat(tr.Ports, s.backendPorts(pub))
-		slices.Sort(ports)
-		want[pub] = relayPlan{live: tr.Live, ports: slices.Compact(ports)}
+		want[pub] = relayPlan{live: tr.Live, ports: ports}
 	}
 	m.mu.Lock()
 	for pub := range m.warned {
@@ -271,6 +285,33 @@ func (m *podRelays) plan(s *routingSnapshot) map[netip.Addr]relayPlan {
 	}
 	m.mu.Unlock()
 	return want
+}
+
+// liveClaims counts, per live address, how many pods in s report it.
+func liveClaims(s *routingSnapshot) map[netip.Addr]int {
+	claims := make(map[netip.Addr]int, len(s.transport))
+	for _, tr := range s.transport {
+		claims[tr.Live]++
+	}
+	return claims
+}
+
+// admit returns the sorted port set the override published→tr is relayed on, or
+// why it must not be relayed at all. svcPorts are the TCP backend ports the
+// generation lists at published (relayBackendPorts) and claims is how many pods in
+// the generation report tr.Live. It reads only its arguments and m's immutable
+// fields, so it is safe under either lock.
+func (m *podRelays) admit(published netip.Addr, tr VMPodTransport, svcPorts []uint16, claims int) ([]uint16, string) {
+	if reason := m.refusal(published, tr.Live, claims); reason != "" {
+		return nil, reason
+	}
+	ports := slices.Concat(tr.Ports, svcPorts)
+	slices.Sort(ports)
+	ports = slices.Compact(ports)
+	if len(ports) > maxRelayPorts {
+		return nil, fmt.Sprintf("port set has %d ports, over the per-pod relay cap of %d", len(ports), maxRelayPorts)
+	}
+	return ports, ""
 }
 
 // refusal returns why the override published→live must not get a relay, or "".

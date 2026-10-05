@@ -633,7 +633,10 @@ func (t *RoutingTable) store(s *routingSnapshot, transport bool) {
 	}
 }
 
-// setObserver installs the generation observer (see the observer field).
+// setObserver installs the generation observer (see the observer field). The
+// observer is single-slot and owned by the one Proxy built over this table: a
+// second call replaces the first observer, which then stops seeing generations
+// (so its relays are no longer retired synchronously). Build one Proxy per table.
 func (t *RoutingTable) setObserver(f func(s *routingSnapshot, transport bool)) {
 	t.mu.Lock()
 	t.observer = f
@@ -658,24 +661,29 @@ func (t *RoutingTable) transportAddr(published netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(tr.Live, published.Port())
 }
 
-// backendPorts returns the ports s lists a Ready TCP backend for at addr, across
-// every Service port, sorted and de-duplicated. It is the Service-targeted half of
-// a vm pod relay's port set (an EndpointSlice may target a port the pod never
-// declared). It scans every state, which is fine off the accept path.
-func (s *routingSnapshot) backendPorts(addr netip.Addr) []uint16 {
-	var out []uint16
+// relayBackendPorts returns, for every published address in s's transport
+// overrides, the ports s lists a Ready TCP backend for at that address across
+// every Service port (unsorted, possibly repeated; the caller normalizes). It is
+// the Service-targeted half of a vm pod relay's port set (an EndpointSlice may
+// target a port the pod never declared), built in one scan of the states, off the
+// accept path.
+func (s *routingSnapshot) relayBackendPorts() map[netip.Addr][]uint16 {
+	if len(s.transport) == 0 {
+		return nil
+	}
+	out := make(map[netip.Addr][]uint16, len(s.transport))
 	for key, st := range s.states {
 		if key.Protocol != netv1.ProtocolTCP {
 			continue
 		}
 		for _, b := range st.all {
-			if b.addr.Addr().Unmap() == addr {
-				out = append(out, b.addr.Port())
+			addr := b.addr.Addr().Unmap()
+			if _, ok := s.transport[addr]; ok {
+				out[addr] = append(out[addr], b.addr.Port())
 			}
 		}
 	}
-	slices.Sort(out)
-	return slices.Compact(out)
+	return out
 }
 
 // classify computes a backend's locality. A zero podCIDR yields LocalityUnknown

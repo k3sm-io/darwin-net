@@ -347,8 +347,19 @@ limitations under the License.
 // refused outright (no relay, a throttled Warn naming the pod) when its live
 // address is outside the node's vmnet segment (WithVMNetPrefix, defaulting to the
 // policy table's seed), is the segment's network, gateway or broadcast address,
-// equals the published address, or is claimed by two pods in one generation; a
-// node with no vmnet segment relays nothing.
+// equals the published address, or is claimed by two pods in one generation, or
+// when its port set exceeds maxRelayPorts (no truncated subset); a node with no
+// vmnet segment relays nothing. A refusal closes an existing relay synchronously,
+// in the same call, even when the pod's own lease did not change.
+//
+// The live lease is the guest agent's own report, not something the host
+// observes. A guest that reports a neighbour's lease therefore makes both pods'
+// overrides claim one address, and both relays are refused: the outcome is fail
+// closed, never a connection delivered to the wrong guest, but it means one
+// guest can deny its neighbour's relay until the false report stops. Guest-to-
+// guest traffic on the vmnet segment itself is not controlled by k3sm; the relay's
+// refusal of a vmnet-segment client only stops a guest reaching a sibling through
+// the host.
 //
 // The ceilings, against a native pod that owns its /32 outright:
 //
