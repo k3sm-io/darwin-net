@@ -324,3 +324,35 @@ func TestHostRouteFlags(t *testing.T) {
 		}
 	}
 }
+
+// TestGuestTeardownBlackholesPublishedAddress proves a vm pod's published /32
+// takes the same lo0 path as a host-process pod's through the production alias
+// manager: SetupGuest clears any stale blackhole and then aliases the address,
+// and Teardown removes the alias and blackholes it in that order, so a relayed
+// connection still open to a departed vm pod cannot re-route onto the mesh utun.
+func TestGuestTeardownBlackholesPublishedAddress(t *testing.T) {
+	ctx := context.Background()
+	node := netip.MustParsePrefix("100.64.3.0/24")
+	m, rec := newRecordedAliasManager(node)
+	n, err := New(node, withAliasManager(m))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gn, err := n.SetupGuest(ctx, "vm-pod")
+	if err != nil {
+		t.Fatalf("SetupGuest: %v", err)
+	}
+	ip := gn.PodIP.String()
+	want := []string{"clear-blackhole " + ip, "ifconfig lo0 alias " + ip + "/32"}
+	if !slices.Equal(rec.ops, want) {
+		t.Fatalf("SetupGuest ops = %q, want %q", rec.ops, want)
+	}
+	rec.ops = nil
+	if err := n.Teardown(ctx, "vm-pod"); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	want = []string{"ifconfig lo0 -alias " + ip, "install-blackhole " + ip}
+	if !slices.Equal(rec.ops, want) {
+		t.Fatalf("Teardown ops = %q, want %q", rec.ops, want)
+	}
+}

@@ -38,6 +38,8 @@ type fakeAliasManager struct {
 	mu      sync.Mutex
 	ensured map[netip.Addr]int
 	removed map[netip.Addr]int
+	// ensureErr, when non-nil, fails every Ensure without recording it.
+	ensureErr error
 }
 
 // newFakeAliasManager returns a rootless aliasManager that performs no syscalls.
@@ -52,8 +54,18 @@ func newFakeAliasManager() *fakeAliasManager {
 func (m *fakeAliasManager) Ensure(_ context.Context, ip netip.Addr) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.ensureErr != nil {
+		return m.ensureErr
+	}
 	m.ensured[ip]++
 	return nil
+}
+
+// failEnsure makes every later Ensure fail with err (nil restores success).
+func (m *fakeAliasManager) failEnsure(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureErr = err
 }
 
 // Remove records the call and succeeds without touching the interface.

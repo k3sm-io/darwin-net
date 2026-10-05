@@ -78,7 +78,7 @@ func TestProxyConcurrentScopedDialsShareNoDialerState(t *testing.T) {
 	// outside the node /24 but inside the aggregate (LocalityRemote).
 	table.SetEndpoints(localKey, []netv1.Endpoint{{IP: published.String(), Port: localPort, Ready: true}})
 	table.SetEndpoints(remoteKey, []netv1.Endpoint{{IP: remoteIP, Port: remotePort, Ready: true}})
-	table.SetTransportOverrides(map[netip.Addr]netip.Addr{published: netip.MustParseAddr("127.0.0.1")})
+	table.SetTransportOverrides(liveOnly(map[netip.Addr]netip.Addr{published: netip.MustParseAddr("127.0.0.1")}))
 
 	p := New(table,
 		WithMeshEgressSource(egressIP),
