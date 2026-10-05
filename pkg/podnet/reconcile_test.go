@@ -248,3 +248,92 @@ func (m *stuckRemoveAliasManager) Remove(ctx context.Context, ip netip.Addr) err
 	}
 	return m.fakeAliasManager.Remove(ctx, ip)
 }
+
+// TestReattachGuestOwnsPublishedAlias proves a vm guest that survived a daemon
+// restart is re-adopted with its published alias owned: ReattachGuest re-ensures
+// the alias and records a vm binding, the startup sweep keeps it while removing
+// an orphan beside it, a repeated reattach (through either verb) re-ensures
+// rather than rebinding, a host-process Setup of the pod is refused, and Teardown
+// removes the alias.
+func TestReattachGuestOwnsPublishedAlias(t *testing.T) {
+	n, fake := newTestNetwork(t)
+	ctx := context.Background()
+	vmIP := netip.MustParseAddr("100.64.0.40")
+	orphan := netip.MustParseAddr("100.64.0.41")
+	for _, ip := range []netip.Addr{vmIP, orphan} {
+		if err := fake.Ensure(ctx, ip); err != nil {
+			t.Fatalf("seed alias %s: %v", ip, err)
+		}
+	}
+
+	if err := n.ReattachGuest(ctx, "vm-pod", vmIP); err != nil {
+		t.Fatalf("ReattachGuest: %v", err)
+	}
+	if got := fake.ensures(vmIP); got != 2 {
+		t.Fatalf("Ensure(%s) = %d calls, want 2 (seed + reattach re-ensure)", vmIP, got)
+	}
+	if err := n.SweepStale(ctx, nil); err != nil {
+		t.Fatalf("SweepStale: %v", err)
+	}
+	if got := fake.removes(vmIP); got != 0 {
+		t.Fatalf("running vm pod's published alias %s swept %d times, want 0", vmIP, got)
+	}
+	if got := fake.removes(orphan); got == 0 {
+		t.Fatalf("orphan alias %s beside the vm pod was not swept", orphan)
+	}
+
+	if err := n.ReattachGuest(ctx, "vm-pod", vmIP); err != nil {
+		t.Fatalf("idempotent ReattachGuest: %v", err)
+	}
+	if err := n.ReattachPod(ctx, "vm-pod", vmIP); err != nil {
+		t.Fatalf("ReattachPod of a bound vm pod: %v", err)
+	}
+	if got := fake.ensures(vmIP); got != 4 {
+		t.Fatalf("Ensure(%s) = %d calls after two re-reattaches, want 4", vmIP, got)
+	}
+	if _, err := n.Setup(ctx, "vm-pod"); !errors.Is(err, ErrBackendMismatch) {
+		t.Fatalf("Setup of a reattached vm pod err = %v, want ErrBackendMismatch (binding must stay vm)", err)
+	}
+	if gn, err := n.SetupGuest(ctx, "vm-pod"); err != nil || gn.PodIP != vmIP {
+		t.Fatalf("SetupGuest after reattach = %s,%v, want %s,nil", gn.PodIP, err, vmIP)
+	}
+
+	if err := n.Teardown(ctx, "vm-pod"); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if got := fake.removes(vmIP); got != 1 {
+		t.Fatalf("Teardown removed the vm alias %d times, want 1", got)
+	}
+	if n.alloc.Allocated(vmIP) {
+		t.Fatalf("vm pod IP %s still allocated after teardown", vmIP)
+	}
+}
+
+// TestReattachGuestRefusesHostProcessPod proves ReattachGuest never re-labels a
+// bound host-process pod as a guest, and that its input validation and rollback
+// are ReattachPod's.
+func TestReattachGuestRefusesHostProcessPod(t *testing.T) {
+	n, fake := newTestNetwork(t)
+	ctx := context.Background()
+	ip, err := n.Setup(ctx, "host-pod")
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if err := n.ReattachGuest(ctx, "host-pod", ip); !errors.Is(err, ErrBackendMismatch) {
+		t.Fatalf("ReattachGuest of a host pod err = %v, want ErrBackendMismatch", err)
+	}
+	if err := n.ReattachGuest(ctx, "vm-pod", ip); !errors.Is(err, ErrIPInUse) {
+		t.Fatalf("ReattachGuest onto a host pod's address err = %v, want ErrIPInUse", err)
+	}
+	if err := n.ReattachGuest(ctx, "vm-pod", n.alloc.MeshEgressIP()); !errors.Is(err, ErrOutOfRange) {
+		t.Fatalf("ReattachGuest of the mesh-egress address err = %v, want ErrOutOfRange", err)
+	}
+	fake.failEnsure(errors.New("netd unavailable"))
+	free := netip.MustParseAddr("100.64.0.50")
+	if err := n.ReattachGuest(ctx, "vm-pod", free); err == nil {
+		t.Fatal("ReattachGuest succeeded despite alias failure")
+	}
+	if n.alloc.Allocated(free) {
+		t.Fatalf("failed ReattachGuest leaked %s", free)
+	}
+}

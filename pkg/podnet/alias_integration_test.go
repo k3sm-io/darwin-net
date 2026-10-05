@@ -197,3 +197,46 @@ func TestPodNetworkSetupTeardownOnRealLo0(t *testing.T) {
 		t.Fatalf("second Teardown (idempotent): %v", err)
 	}
 }
+
+// TestPodNetworkGuestAliasOnRealLo0 is the vm-backend twin of
+// TestPodNetworkSetupTeardownOnRealLo0: SetupGuest aliases the pod's published /32
+// on the live lo0 (so the node's proxy can listen on it and relay to the guest),
+// the address is bindable, and Teardown removes it leak-free.
+func TestPodNetworkGuestAliasOnRealLo0(t *testing.T) {
+	requireRoot(t)
+	ctx := context.Background()
+	n, err := New(netip.MustParsePrefix("127.0.0.0/24"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gn, err := n.SetupGuest(ctx, "vm-int")
+	if err != nil {
+		t.Fatalf("SetupGuest: %v", err)
+	}
+	ip := gn.PodIP
+	t.Cleanup(func() { _ = n.Teardown(context.Background(), "vm-int") })
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !lo0HasAddr(t, ip) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !lo0HasAddr(t, ip) {
+		t.Fatalf("SetupGuest did not alias the published %s on lo0", ip)
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(ip.String(), "0"))
+	if err != nil {
+		t.Fatalf("bind published vm pod IP %s: %v", ip, err)
+	}
+	_ = ln.Close()
+
+	if err := n.Teardown(ctx, "vm-int"); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && lo0HasAddr(t, ip) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if lo0HasAddr(t, ip) {
+		t.Fatalf("%s leaked on lo0 after Teardown", ip)
+	}
+}
