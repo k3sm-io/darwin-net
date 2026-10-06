@@ -128,7 +128,7 @@ func TestPollerReportsStateChangesAndVanishings(t *testing.T) {
 	}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ch := Poller{List: lister.list, Clock: clock}.Events(ctx)
+	ch := Poller{List: lister.list, Carrier: unknownCarrier, Clock: clock}.Events(ctx)
 
 	if got := []Event{recv(t, ch), recv(t, ch)}; !reflect.DeepEqual(got, []Event{{Iface: "en0", Up: true}, {Iface: "en2"}}) {
 		t.Fatalf("first pass = %+v", got)
@@ -159,7 +159,7 @@ func TestPollerSurvivesAListFailure(t *testing.T) {
 	lister := &fakeLister{err: errors.New("boom")}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ch := Poller{List: lister.list, Clock: clock}.Events(ctx)
+	ch := Poller{List: lister.list, Carrier: unknownCarrier, Clock: clock}.Events(ctx)
 	noEvent(t, ch)
 	lister.mu.Lock()
 	lister.err = nil
@@ -288,3 +288,112 @@ func TestRouteReaderDecodesLinkMessages(t *testing.T) {
 		t.Fatalf("a truncated message must be skipped, got %+v", got)
 	}
 }
+
+// carrierState is one scripted SIOCGIFMEDIA answer.
+type carrierState struct {
+	up, known bool
+	err       error
+}
+
+var (
+	carrierUp      = carrierState{up: true, known: true}
+	carrierDown    = carrierState{known: true}
+	carrierUnknown = carrierState{}
+	carrierErr     = carrierState{err: errors.New("media read failed")}
+)
+
+// fakeCarrier serves a scripted sequence of carrier answers per interface, one
+// per call; the last is repeated.
+type fakeCarrier struct {
+	mu     sync.Mutex
+	script map[string][]carrierState
+}
+
+func (c *fakeCarrier) carrier(name string) (bool, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	seq := c.script[name]
+	if len(seq) == 0 {
+		return true, false, nil
+	}
+	cur := seq[0]
+	if len(seq) > 1 {
+		c.script[name] = seq[1:]
+	}
+	return cur.up, cur.known, cur.err
+}
+
+// TestPollReportsCarrierLoss pins that the poll sees a cable pull: an interface
+// that stays IFF_UP|IFF_RUNNING but loses its carrier is reported down within
+// one poll and up again when the carrier returns; an interface whose driver does
+// not report media validity is left as its flags say; and a media-read error on
+// one interface leaves every other interface's events intact.
+func TestPollReportsCarrierLoss(t *testing.T) {
+	cases := []struct {
+		name   string
+		ifaces []net.Interface
+		script map[string][]carrierState
+		first  []Event
+		steps  [][]Event // events expected after each further tick; nil = none
+	}{{
+		name:   "carrier lost then back",
+		ifaces: []net.Interface{iface("en5", true)},
+		script: map[string][]carrierState{"en5": {carrierUp, carrierDown, carrierUp}},
+		first:  []Event{{Iface: "en5", Up: true}},
+		steps:  [][]Event{{{Iface: "en5"}}, {{Iface: "en5", Up: true}}, nil},
+	}, {
+		name:   "carrier unknown changes nothing",
+		ifaces: []net.Interface{iface("en5", true)},
+		script: map[string][]carrierState{"en5": {carrierUp, carrierUnknown}},
+		first:  []Event{{Iface: "en5", Up: true}},
+		steps:  [][]Event{nil, nil},
+	}, {
+		name:   "a media error on one interface spares the other",
+		ifaces: []net.Interface{iface("en5", true), iface("en6", true)},
+		script: map[string][]carrierState{
+			"en5": {carrierErr},
+			"en6": {carrierUp, carrierDown, carrierUp},
+		},
+		first: []Event{{Iface: "en5", Up: true}, {Iface: "en6", Up: true}},
+		steps: [][]Event{{{Iface: "en6"}}, {{Iface: "en6", Up: true}}, nil},
+	}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := newFakeClock()
+			lister := &fakeLister{lists: [][]net.Interface{tc.ifaces}}
+			carrier := &fakeCarrier{script: tc.script}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ch := Poller{List: lister.list, Carrier: carrier.carrier, Clock: clock}.Events(ctx)
+
+			got := make([]Event, 0, len(tc.first))
+			for range tc.first {
+				got = append(got, recv(t, ch))
+			}
+			if !reflect.DeepEqual(got, tc.first) {
+				t.Fatalf("first pass = %+v, want %+v", got, tc.first)
+			}
+			for i, want := range tc.steps {
+				clock.tick <- time.Time{}
+				if want == nil {
+					noEvent(t, ch)
+					continue
+				}
+				got := make([]Event, 0, len(want))
+				for range want {
+					got = append(got, recv(t, ch))
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("poll %d = %+v, want %+v", i+1, got, want)
+				}
+				noEvent(t, ch)
+			}
+			cancel()
+			for range ch {
+			}
+		})
+	}
+}
+
+// unknownCarrier is a driver without media reporting: the flags alone decide.
+func unknownCarrier(string) (bool, bool, error) { return true, false, nil }

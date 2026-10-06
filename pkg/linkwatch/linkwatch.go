@@ -19,15 +19,20 @@ limitations under the License.
 // cable was plugged or pulled without waiting for its periodic resync.
 //
 // Two sources feed one stream. The PRIMARY, and the only mandatory one, is a
-// net.Interfaces() flag poll every 2 s (Poller): pure Go, unprivileged, and
-// independent of any kernel notification path. The OPTIMISATION is a read-only
-// PF_ROUTE socket (RouteReader) that sees RTM_IFINFO, RTM_NEWADDR and RTM_DELADDR
-// as they happen; reading the routing socket needs no privilege, only writing to
-// it does. It is opened best-effort: when it cannot be opened, or a release turns
-// out to send nothing for a Thunderbolt interface, the poll alone carries the
-// stream. Both are merged and debounced (500 ms, trailing), and an event equal to
-// the last one delivered for that interface is dropped, so a change both sources
-// see is delivered once.
+// poll every 2 s (Poller) of net.Interfaces() flags plus each up interface's
+// carrier, read with SIOCGIFMEDIA: pure Go, unprivileged, and independent of any
+// kernel notification path. The poll is the source that sees a cable pull: a
+// pulled Thunderbolt cable leaves the interface IFF_UP and IFF_RUNNING and in
+// the interface list, and changes only its media status (ifconfig's
+// "status: inactive"), which only the carrier read observes. The OPTIMISATION is
+// a read-only PF_ROUTE socket (RouteReader) that sees RTM_IFINFO, RTM_NEWADDR
+// and RTM_DELADDR as they happen; reading the routing socket needs no privilege,
+// only writing to it does. It reports administrative changes (ifconfig up/down,
+// addresses, an interface appearing or vanishing), not a carrier loss, and is
+// opened best-effort: when it cannot be opened the poll alone carries the
+// stream. Both are merged and debounced (500 ms, trailing), and an event equal
+// to the last one delivered for that interface is dropped, so a change both
+// sources see is delivered once.
 //
 // Consumers depend on LinkEvents and nothing else; Watch builds the production
 // stream.
@@ -55,8 +60,9 @@ const (
 type Event struct {
 	// Iface is the interface name (e.g. "en2").
 	Iface string
-	// Up reports that the interface is administratively up AND running (has
-	// link). It is false whenever Gone is true.
+	// Up reports that the interface is administratively up AND running AND,
+	// where the driver reports it, has an active carrier. It is false whenever
+	// Gone is true.
 	Up bool
 	// Gone reports that the interface no longer exists. A consumer treats a
 	// vanished interface as a removal, not as a flag flip.
@@ -111,17 +117,24 @@ func (w watch) Events(ctx context.Context) <-chan Event {
 	return Debounce(ctx, Merge(ctx, sources...), DebounceWindow, RealClock{})
 }
 
-// Poller is the mandatory flag-poll source. Its first pass reports every
-// interface's state; later passes report only changes and vanishings. The zero
-// value polls net.Interfaces every PollInterval on the real clock.
+// Poller is the mandatory poll source. Its first pass reports every interface's
+// state; later passes report only changes and vanishings. An interface is up
+// when its flags say up and running and its carrier is not known to be lost. The
+// zero value polls net.Interfaces and SIOCGIFMEDIA every PollInterval on the
+// real clock.
 type Poller struct {
 	// Interval is the poll period; 0 uses PollInterval.
 	Interval time.Duration
 	// List lists the interfaces; nil uses net.Interfaces.
 	List func() ([]net.Interface, error)
+	// Carrier reads one interface's carrier: up is meaningful only when known
+	// is true, and known false means the driver does not report it. nil uses
+	// MediaCarrier.
+	Carrier func(iface string) (up, known bool, err error)
 	// Clock drives the ticker; nil uses RealClock.
 	Clock Clock
-	// Log receives list failures (Debug); nil uses slog.Default.
+	// Log receives list failures (Debug) and the first carrier-read failure
+	// per interface (Info); nil uses slog.Default.
 	Log *slog.Logger
 }
 
@@ -134,6 +147,10 @@ func (p Poller) Events(ctx context.Context) <-chan Event {
 	list := p.List
 	if list == nil {
 		list = net.Interfaces
+	}
+	carrier := p.Carrier
+	if carrier == nil {
+		carrier = MediaCarrier
 	}
 	clock := p.Clock
 	if clock == nil {
@@ -148,7 +165,8 @@ func (p Poller) Events(ctx context.Context) <-chan Event {
 		defer close(out)
 		ticks, stop := clock.Ticker(interval)
 		defer stop()
-		var last map[string]bool // nil until the first successful list
+		var last map[string]bool             // nil until the first successful list
+		mediaLogged := make(map[string]bool) // interfaces whose carrier error was logged
 		for {
 			ifaces, err := list()
 			if err != nil {
@@ -156,7 +174,22 @@ func (p Poller) Events(ctx context.Context) <-chan Event {
 			} else {
 				next := make(map[string]bool, len(ifaces))
 				for _, ifi := range ifaces {
-					next[ifi.Name] = linkUp(ifi.Flags)
+					up := linkUp(ifi.Flags)
+					if up {
+						cup, known, err := carrier(ifi.Name)
+						switch {
+						case err != nil:
+							// Unknown: the flags decide, and the other
+							// interfaces are unaffected.
+							if !mediaLogged[ifi.Name] {
+								mediaLogged[ifi.Name] = true
+								log.Info("link watch: reading carrier, using the interface flags alone", "iface", ifi.Name, "err", err)
+							}
+						case known:
+							up = cup
+						}
+					}
+					next[ifi.Name] = up
 				}
 				for _, ev := range diff(last, next) {
 					select {
