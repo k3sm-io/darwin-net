@@ -16,165 +16,130 @@ limitations under the License.
 
 package proxy
 
+// The proxy's reconcile and accept paths run here on in-memory fakes: a
+// recordingBinder stands in for the VIP stream bind, a fakeTCPNet for the
+// backend dial, and fakeVIPConn for the datagram bind, with client conns that
+// carry real TCP source addresses (helpers_test.go). The same paths on real
+// loopback sockets are covered by the integration-tier tests, whose helpers are
+// in realsocket_integration_test.go.
+
 import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/netip"
-	"os"
-	"strconv"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
 )
 
-// echoBackend is a tiny TCP server that writes a fixed id then echoes; it stands
-// in for a pod backend so the proxy's data path is exercised without privilege.
-type echoBackend struct {
-	id string
-	ln net.Listener
-	ip string
-	wg sync.WaitGroup
-}
+// testClient is the pod source the proxy tests connect from.
+var testClient = netip.MustParseAddrPort("10.42.0.99:40312")
 
-func newEchoBackend(t *testing.T, id, listenIP string) *echoBackend {
+// readIDVia connects through l from testClient and reads the n-byte id of the
+// backend the proxy spliced to. It closes the client end afterwards, which ends
+// the splice.
+func readIDVia(t *testing.T, l *fakeListener, n int) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", net.JoinHostPort(listenIP, "0"))
-	if err != nil {
-		t.Fatalf("listen echo backend: %v", err)
-	}
-	b := &echoBackend{id: id, ln: ln, ip: listenIP}
-	b.wg.Add(1)
-	go func() {
-		defer b.wg.Done()
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				_, _ = io.WriteString(c, b.id)
-			}(c)
-		}
-	}()
-	return b
-}
-
-func (b *echoBackend) addrPort() (string, int32) {
-	ap := b.ln.Addr().(*net.TCPAddr)
-	return ap.IP.String(), int32(ap.Port)
-}
-
-func (b *echoBackend) close() {
-	_ = b.ln.Close()
-	b.wg.Wait()
-}
-
-// readID dials clusterIP:port and returns the backend id the proxy steered to.
-func readID(t *testing.T, clusterIP string, port int32) string {
-	t.Helper()
-	c, err := net.DialTimeout("tcp", hostPort(clusterIP, port), 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial VIP: %v", err)
-	}
+	c := l.connectFrom(t, testClient)
 	defer c.Close()
-	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf, err := io.ReadAll(c)
-	if err != nil {
-		t.Fatalf("read from VIP: %v", err)
+	_ = c.SetReadDeadline(time.Now().Add(fakeHandledTimeout))
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatalf("read backend id: %v", err)
 	}
 	return string(buf)
 }
 
-// hostPort joins an IP and an int32 port for net.Dial.
-func hostPort(ip string, port int32) string {
-	return net.JoinHostPort(ip, strconv.Itoa(int(port)))
+// startProxy runs p's supervision loop until the test ends.
+func startProxy(t *testing.T, p *Proxy) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); _ = p.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-runDone })
 }
 
 // TestProxyReconcileLoadBalances is the rootless rehearsal for acceptance
 // M1.1-a1: a ClusterIP VIP load-balances accepted TCP connections across two
 // ready backends, with the unready third backend never selected. It runs the
-// full Proxy reconcile path with the noop alias manager.
-//
-// macOS note: only 127.0.0.1 is bindable without a root-created lo0 alias
-// (unlike Linux's whole 127.0.0.0/8). So the rootless tier binds the VIP on
-// 127.0.0.1 and distinguishes the VIP by port; the faithful per-VIP 127.0.0.x
-// source-identity rehearsal (real lo0 alias per VIP) is the root-gated
-// integration test in alias_integration_test.go.
+// full Proxy reconcile path with the noop alias manager: the VIP listener is
+// bound through the binder seam at exactly the VIP address, and every accepted
+// connection is spliced to the backend the routing table picked.
 func TestProxyReconcileLoadBalances(t *testing.T) {
 	t.Parallel()
-	const vip = "127.0.0.1"
+	const vip = "10.43.0.31"
+	const port = 80
 
-	be1 := newEchoBackend(t, "backend-1", "127.0.0.1")
-	be2 := newEchoBackend(t, "backend-2", "127.0.0.1")
-	beUnready := newEchoBackend(t, "backend-unready", "127.0.0.1")
-	defer be1.close()
-	defer be2.close()
-	defer beUnready.close()
-
-	// Pick a free port for the VIP listener.
-	port := freePort(t, vip)
+	backends := newFakeTCPNet()
+	be1 := backends.add(t, "10.42.0.11:8080", "be-1")
+	be2 := backends.add(t, "10.42.0.12:8080", "be-2")
+	beUnready := backends.add(t, "10.42.0.13:8080", "be-u")
 
 	alias := newNoopAliasManager()
+	binder := newRecordingBinder()
 	tbl := NewRoutingTable(netip.Prefix{})
-	p := New(tbl, withAliasManager(alias))
+	p := New(tbl, withAliasManager(alias), withBinder(binder), withDialBackend(backends.dial))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	runDone := make(chan struct{})
 	go func() { defer close(runDone); _ = p.Run(ctx) }()
 
-	ip1, port1 := be1.addrPort()
-	ip2, port2 := be2.addrPort()
-	ipU, portU := beUnready.addrPort()
-
+	unready := beUnready.endpoint()
+	unready.Ready = false
 	sp := &netv1.ServicePort{Port: port, TargetPort: 0, Protocol: netv1.ProtocolTCP}
-	eps := []netv1.Endpoint{
-		{IP: ip1, Port: port1, Ready: true},
-		{IP: ip2, Port: port2, Ready: true},
-		{IP: ipU, Port: portU, Ready: false},
-	}
+	eps := []netv1.Endpoint{be1.endpoint(), be2.endpoint(), unready}
 	if err := p.Reconcile(vip, sp, eps); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	// Wait for the listener to come up.
-	waitListen(t, vip, port)
+	// The listener comes up at exactly the VIP address and port.
+	l := binder.waitBound(t, 1)
+	if want := hostPortAddr(vip, port); l.address != want {
+		t.Fatalf("VIP listener bound at %s, want exactly %s", l.address, want)
+	}
 
-	// The noop alias manager must have been asked to ensure the VIP.
+	// The noop alias manager must have been asked to ensure the VIP: openListener
+	// ensures the alias before it binds, and the bind is ordered before this read.
 	if alias.ensures(netip.MustParseAddr(vip)) == 0 {
 		t.Fatalf("alias.Ensure(%s) was never called", vip)
 	}
 
 	counts := map[string]int{}
 	for i := 0; i < 40; i++ {
-		counts[readID(t, vip, port)]++
+		counts[readIDVia(t, l, 4)]++
 	}
-	if counts["backend-unready"] != 0 {
-		t.Fatalf("unready backend received %d connections, want 0", counts["backend-unready"])
+	if counts["be-u"] != 0 {
+		t.Fatalf("unready backend received %d connections, want 0", counts["be-u"])
 	}
-	if counts["backend-1"] == 0 || counts["backend-2"] == 0 {
+	if counts["be-1"] == 0 || counts["be-2"] == 0 {
 		t.Fatalf("load not balanced: %v", counts)
 	}
-	if counts["backend-1"]+counts["backend-2"] != 40 {
+	if counts["be-1"]+counts["be-2"] != 40 {
 		t.Fatalf("connections lost: %v", counts)
+	}
+	if got := beUnready.accepts.Load(); got != 0 {
+		t.Fatalf("unready backend was dialed %d times, want 0", got)
 	}
 
 	// Tear down: the worker must close the listener and remove the alias.
 	p.ReconcileDelete(PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP})
-	waitClosed(t, vip, port)
-	// listener.Close closes the sockets BEFORE it calls alias.Remove, so the VIP
-	// refusing connections does NOT order the alias removal — waitClosed can win the
-	// race by the width of a deschedule. Wait on the fact being asserted instead.
-	// ctx is still live, so the delete path is the only thing that can remove it.
+	waitListenerClosed(t, l)
+	// listener.Close closes the sockets BEFORE it calls alias.Remove, so the
+	// listener closing does NOT order the alias removal. Wait on the fact being
+	// asserted instead. ctx is still live, so the delete path is the only thing
+	// that can remove it.
 	waitAliasRemoved(t, alias, netip.MustParseAddr(vip))
 
 	cancel()
 	<-runDone
+}
+
+// hostPortAddr formats an IP and port the way a bound listener's address reads.
+func hostPortAddr(ip string, port uint16) string {
+	return netip.AddrPortFrom(netip.MustParseAddr(ip), port).String()
 }
 
 // TestProxyPerVIPSerialization asserts a burst of concurrent reconciles for the
@@ -183,22 +148,22 @@ func TestProxyReconcileLoadBalances(t *testing.T) {
 // and asserts the VIP still serves and tears down cleanly under -race.
 func TestProxyPerVIPSerialization(t *testing.T) {
 	t.Parallel()
-	const vip = "127.0.0.1"
+	const vip = "10.43.0.32"
+	const port = 80
 
-	be := newEchoBackend(t, "be", "127.0.0.1")
-	defer be.close()
-	ip, bport := be.addrPort()
+	backends := newFakeTCPNet()
+	be := backends.add(t, "10.42.0.21:8080", "be")
 
-	port := freePort(t, vip)
 	alias := newNoopAliasManager()
-	p := New(NewRoutingTable(netip.Prefix{}), withAliasManager(alias))
+	binder := newRecordingBinder()
+	p := New(NewRoutingTable(netip.Prefix{}), withAliasManager(alias), withBinder(binder), withDialBackend(backends.dial))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	runDone := make(chan struct{})
 	go func() { defer close(runDone); _ = p.Run(ctx) }()
 
 	sp := &netv1.ServicePort{Port: port, TargetPort: 0, Protocol: netv1.ProtocolTCP}
-	eps := []netv1.Endpoint{{IP: ip, Port: bport, Ready: true}}
+	eps := []netv1.Endpoint{be.endpoint()}
 
 	var wg sync.WaitGroup
 	for i := 0; i < 32; i++ {
@@ -212,17 +177,20 @@ func TestProxyPerVIPSerialization(t *testing.T) {
 	}
 	wg.Wait()
 
-	waitListen(t, vip, port)
-	if got := readID(t, vip, port); got != "be" {
+	l := binder.waitBound(t, 1)
+	if got := readIDVia(t, l, 2); got != "be" {
 		t.Fatalf("VIP served %q, want be", got)
 	}
 
-	// Exactly one worker exists for the key.
+	// Exactly one worker exists for the key, and it bound exactly one listener.
 	p.mu.Lock()
 	nworkers := len(p.workers)
 	p.mu.Unlock()
 	if nworkers != 1 {
 		t.Fatalf("workers for one VIP:port = %d, want 1", nworkers)
+	}
+	if n := binder.count(); n != 1 {
+		t.Fatalf("listeners bound for one VIP:port = %d (%v), want 1", n, binder.addrs())
 	}
 
 	cancel()
@@ -231,7 +199,7 @@ func TestProxyPerVIPSerialization(t *testing.T) {
 	if alias.removes(netip.MustParseAddr(vip)) == 0 {
 		t.Fatalf("alias.Remove(%s) not called on shutdown", vip)
 	}
-	waitClosed(t, vip, port)
+	waitListenerClosed(t, l)
 }
 
 // waitNoWorker polls, bounded, until key has no entry in p.workers — the delete
@@ -288,50 +256,41 @@ func boundedReconcile(t *testing.T, timeout time.Duration, label string, fn func
 // blocks the caller forever.
 func TestWorkerMapCleanedOnDeleteThenRecreate(t *testing.T) {
 	t.Parallel()
-	const vip = "127.0.0.1"
+	const vip = "10.43.0.33"
+	const port = 80
+	key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
+	sp := &netv1.ServicePort{Port: port, TargetPort: 0, Protocol: netv1.ProtocolTCP}
 
 	t.Run("delete then recreate serves again with a fresh worker", func(t *testing.T) {
 		t.Parallel()
 
-		be1 := newEchoBackend(t, "gen-1", "127.0.0.1")
-		defer be1.close()
-		ip1, bport1 := be1.addrPort()
+		backends := newFakeTCPNet()
+		be1 := backends.add(t, "10.42.0.31:8080", "gen-1")
+		be2 := backends.add(t, "10.42.0.32:8080", "gen-2")
 
-		port := freePort(t, vip)
-		key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
-		sp := &netv1.ServicePort{Port: port, TargetPort: 0, Protocol: netv1.ProtocolTCP}
+		binder := newRecordingBinder()
+		p := New(NewRoutingTable(netip.Prefix{}), withAliasManager(newNoopAliasManager()), withBinder(binder), withDialBackend(backends.dial))
+		startProxy(t, p)
 
-		alias := newNoopAliasManager()
-		p := New(NewRoutingTable(netip.Prefix{}), withAliasManager(alias))
-		ctx, cancel := context.WithCancel(context.Background())
-		runDone := make(chan struct{})
-		go func() { defer close(runDone); _ = p.Run(ctx) }()
-		defer func() { cancel(); <-runDone }()
-
-		eps1 := []netv1.Endpoint{{IP: ip1, Port: bport1, Ready: true}}
-		if err := p.Reconcile(vip, sp, eps1); err != nil {
+		if err := p.Reconcile(vip, sp, []netv1.Endpoint{be1.endpoint()}); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
-		waitListen(t, vip, port)
-		if got := readID(t, vip, port); got != "gen-1" {
+		l1 := binder.waitBound(t, 1)
+		if got := readIDVia(t, l1, 5); got != "gen-1" {
 			t.Fatalf("VIP served %q, want gen-1", got)
 		}
 
 		p.ReconcileDelete(key)
-		waitClosed(t, vip, port)
+		waitListenerClosed(t, l1)
 		waitNoWorker(t, p, key)
 
 		// Recreate on the SAME key: worker() must spawn a fresh worker (the map
 		// entry is gone), not reach the exited one.
-		be2 := newEchoBackend(t, "gen-2", "127.0.0.1")
-		defer be2.close()
-		ip2, bport2 := be2.addrPort()
-		eps2 := []netv1.Endpoint{{IP: ip2, Port: bport2, Ready: true}}
-		if err := p.Reconcile(vip, sp, eps2); err != nil {
+		if err := p.Reconcile(vip, sp, []netv1.Endpoint{be2.endpoint()}); err != nil {
 			t.Fatalf("recreate reconcile: %v", err)
 		}
-		waitListen(t, vip, port)
-		if got := readID(t, vip, port); got != "gen-2" {
+		l2 := binder.waitBound(t, 2)
+		if got := readIDVia(t, l2, 5); got != "gen-2" {
 			t.Fatalf("recreated VIP served %q, want gen-2", got)
 		}
 
@@ -350,47 +309,38 @@ func TestWorkerMapCleanedOnDeleteThenRecreate(t *testing.T) {
 	t.Run(">16 reconciles after a delete never block", func(t *testing.T) {
 		t.Parallel()
 
-		be := newEchoBackend(t, "burst", "127.0.0.1")
-		defer be.close()
-		ip, bport := be.addrPort()
+		backends := newFakeTCPNet()
+		be := backends.add(t, "10.42.0.33:8080", "burst")
+		eps := []netv1.Endpoint{be.endpoint()}
 
-		port := freePort(t, vip)
-		key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
-		sp := &netv1.ServicePort{Port: port, TargetPort: 0, Protocol: netv1.ProtocolTCP}
-		eps := []netv1.Endpoint{{IP: ip, Port: bport, Ready: true}}
-
-		alias := newNoopAliasManager()
-		p := New(NewRoutingTable(netip.Prefix{}), withAliasManager(alias))
-		ctx, cancel := context.WithCancel(context.Background())
-		runDone := make(chan struct{})
-		go func() { defer close(runDone); _ = p.Run(ctx) }()
-		defer func() { cancel(); <-runDone }()
+		binder := newRecordingBinder()
+		p := New(NewRoutingTable(netip.Prefix{}), withAliasManager(newNoopAliasManager()), withBinder(binder), withDialBackend(backends.dial))
+		startProxy(t, p)
 
 		if err := p.Reconcile(vip, sp, eps); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
-		waitListen(t, vip, port)
+		l1 := binder.waitBound(t, 1)
 
 		// Delete, and wait for the worker to have fully exited (not merely for
 		// the delete event to have been enqueued) so every reconcile below is
 		// the deterministic post-delete case: at main the stale map entry sends
 		// each one into the dead worker's dead channel.
 		p.ReconcileDelete(key)
-		waitClosed(t, vip, port)
+		waitListenerClosed(t, l1)
 		waitNoWorker(t, p, key)
 
 		// 20 > the worker channel's 16-slot buffer: at main the map entry was
 		// never removed, so all 20 reconciles route to the SAME exited worker
 		// and the 17th blocks forever on its unread channel.
 		for i := 0; i < 20; i++ {
-			i := i
 			boundedReconcile(t, 2*time.Second, fmt.Sprintf("post-delete reconcile %d", i), func() error {
 				return p.Reconcile(vip, sp, eps)
 			})
 		}
 
-		waitListen(t, vip, port)
-		if got := readID(t, vip, port); got != "burst" {
+		l2 := binder.waitBound(t, 2)
+		if got := readIDVia(t, l2, 5); got != "burst" {
 			t.Fatalf("VIP served %q after the reconcile burst, want burst", got)
 		}
 	})
@@ -398,26 +348,18 @@ func TestWorkerMapCleanedOnDeleteThenRecreate(t *testing.T) {
 	t.Run("deliver-vs-dying race under concurrent delete/recreate", func(t *testing.T) {
 		t.Parallel()
 
-		be := newEchoBackend(t, "racer", "127.0.0.1")
-		defer be.close()
-		ip, bport := be.addrPort()
+		backends := newFakeTCPNet()
+		be := backends.add(t, "10.42.0.34:8080", "racer")
+		eps := []netv1.Endpoint{be.endpoint()}
 
-		port := freePort(t, vip)
-		key := PortKey{ClusterIP: vip, Port: port, Protocol: netv1.ProtocolTCP}
-		sp := &netv1.ServicePort{Port: port, TargetPort: 0, Protocol: netv1.ProtocolTCP}
-		eps := []netv1.Endpoint{{IP: ip, Port: bport, Ready: true}}
-
-		alias := newNoopAliasManager()
-		p := New(NewRoutingTable(netip.Prefix{}), withAliasManager(alias))
-		ctx, cancel := context.WithCancel(context.Background())
-		runDone := make(chan struct{})
-		go func() { defer close(runDone); _ = p.Run(ctx) }()
-		defer func() { cancel(); <-runDone }()
+		binder := newRecordingBinder()
+		p := New(NewRoutingTable(netip.Prefix{}), withAliasManager(newNoopAliasManager()), withBinder(binder), withDialBackend(backends.dial))
+		startProxy(t, p)
 
 		if err := p.Reconcile(vip, sp, eps); err != nil {
 			t.Fatalf("seed reconcile: %v", err)
 		}
-		waitListen(t, vip, port)
+		binder.waitBound(t, 1)
 
 		// Hammer ReconcileDelete concurrently with a burst of ReconcilePolicy
 		// calls on the SAME key, round after round, with no synchronization
@@ -466,241 +408,83 @@ func TestWorkerMapCleanedOnDeleteThenRecreate(t *testing.T) {
 		// stayed servable throughout.
 
 		// Settle to a definitively torn-down state before the final check: the
-		// racy loop above may leave a live worker behind whose last open()
-		// attempt failed and is sitting in its retry backoff (a consequence of
-		// hammering ONE real TCP port with concurrent open/close churn — an
-		// orthogonal, expected side effect of this subtest's aggressiveness,
-		// not the workers-map defect under test). Deleting once more and
-		// waiting for the worker to fully exit means the eventual recreate
-		// below spawns a BRAND NEW worker with fresh (unbackoff'd) retry state,
-		// so its first open() attempt is not competing with any of this
-		// subtest's own churn.
+		// racy loop above may leave a live worker behind. Deleting once more and
+		// waiting for the worker to fully exit means the recreate below spawns a
+		// BRAND NEW worker, whose listener is the next one bound.
 		p.ReconcileDelete(key)
 		waitNoWorker(t, p, key)
 
 		// Recreate once more, cleanly, and confirm the VIP still serves — the
 		// race must never leave the key permanently unservable.
+		bound := binder.count()
 		if err := p.Reconcile(vip, sp, eps); err != nil {
 			t.Fatalf("final reconcile: %v", err)
 		}
-		waitListen(t, vip, port)
-		if got := readID(t, vip, port); got != "racer" {
+		l := binder.waitBound(t, bound+1)
+		if got := readIDVia(t, l, 5); got != "racer" {
 			t.Fatalf("VIP served %q after the race, want racer", got)
 		}
 	})
 }
 
-// TestNodePortBindsWildcard is the M3.2 acceptance: a NodePort Service yields a
-// node-wide *:NodePort TCP listener (bound to the wildcard so every interface
-// answers — dialed here via loopback) that load-balances to the same ready
-// backends as the ClusterIP. For UDP (B23) the ClusterIP datagram relay IS built,
-// but the UDP NodePort stays deferred — no datagram socket is bound on the
-// *:NodePort (a wildcard UDP reply would re-select its source on a multi-homed
-// node). The externalTrafficPolicy: Cluster semantics — the userspace L4 splice
-// opens a fresh backend connection and so does NOT preserve the client source IP,
-// hence Local is not honored — are documented in doc.go and the openListener
-// comment; this test pins the wildcard TCP bind, the LB, and the UDP-NodePort
-// deferral.
-func TestNodePortBindsWildcard(t *testing.T) {
-	t.Parallel()
-
-	t.Run("tcp NodePort yields a wildcard listener and load-balances", func(t *testing.T) {
-		t.Parallel()
-		const vip = "127.0.0.1"
-
-		be1 := newEchoBackend(t, "np-1", "127.0.0.1")
-		be2 := newEchoBackend(t, "np-2", "127.0.0.1")
-		defer be1.close()
-		defer be2.close()
-		ip1, p1 := be1.addrPort()
-		ip2, p2 := be2.addrPort()
-
-		clusterPort := freePort(t, vip)
-		nodePort := freePort(t, "0.0.0.0")
-		alias := newNoopAliasManager()
-		p := New(NewRoutingTable(netip.Prefix{}), withAliasManager(alias))
-
-		ctx, cancel := context.WithCancel(context.Background())
-		runDone := make(chan struct{})
-		go func() { defer close(runDone); _ = p.Run(ctx) }()
-
-		sp := &netv1.ServicePort{Port: clusterPort, TargetPort: 0, Protocol: netv1.ProtocolTCP, NodePort: nodePort}
-		eps := []netv1.Endpoint{
-			{IP: ip1, Port: p1, Ready: true},
-			{IP: ip2, Port: p2, Ready: true},
-		}
-		if err := p.Reconcile(vip, sp, eps); err != nil {
-			t.Fatalf("reconcile: %v", err)
-		}
-
-		// The *:NodePort listener answers on the wildcard (dialed via loopback) and
-		// fans out across both ready backends.
-		waitListen(t, "127.0.0.1", nodePort)
-		counts := map[string]int{}
-		for i := 0; i < 20; i++ {
-			counts[readID(t, "127.0.0.1", nodePort)]++
-		}
-		if counts["np-1"] == 0 || counts["np-2"] == 0 {
-			t.Fatalf("NodePort did not load-balance across ready backends: %v", counts)
-		}
-		if counts["np-1"]+counts["np-2"] != 20 {
-			t.Fatalf("NodePort connections lost: %v", counts)
-		}
-
-		// Delete tears the *:NodePort listener down with the ClusterIP.
-		p.ReconcileDelete(PortKey{ClusterIP: vip, Port: clusterPort, Protocol: netv1.ProtocolTCP})
-		waitClosed(t, "127.0.0.1", nodePort)
-
-		cancel()
-		<-runDone
-	})
-
-	t.Run("udp NodePort deferred: clusterIP relay built, NodePort datagram socket not claimed", func(t *testing.T) {
-		t.Parallel()
-		const vip = "127.0.0.1"
-
-		clusterPort := freePort(t, vip)
-		nodePort := freePort(t, "0.0.0.0")
-		alias := newNoopAliasManager()
-		tbl := NewRoutingTable(netip.Prefix{})
-		p := New(tbl, withAliasManager(alias))
-
-		ctx, cancel := context.WithCancel(context.Background())
-		runDone := make(chan struct{})
-		go func() { defer close(runDone); _ = p.Run(ctx) }()
-
-		sp := &netv1.ServicePort{Port: clusterPort, TargetPort: 53, Protocol: netv1.ProtocolUDP, NodePort: nodePort}
-		eps := []netv1.Endpoint{{IP: "10.42.0.9", Port: 53, Ready: true}}
-		if err := p.Reconcile(vip, sp, eps); err != nil {
-			t.Fatalf("reconcile udp nodeport: %v", err)
-		}
-
-		// Let the worker process the event (the UDP key lands in the table; the
-		// ClusterIP relay binds in the same openListener call).
-		key := PortKey{ClusterIP: vip, Port: clusterPort, Protocol: netv1.ProtocolUDP}
-		waitBackends(t, tbl, key, 1)
-
-		// The ClusterIP UDP relay is built, but the NodePort UDP is deferred. No TCP
-		// listener was opened on the NodePort...
-		if c, err := net.DialTimeout("tcp", hostPort("127.0.0.1", nodePort), 200*time.Millisecond); err == nil {
-			_ = c.Close()
-			t.Fatalf("a TCP listener was opened for a UDP NodePort (must be deferred)")
-		}
-		// ...and no UDP datagram socket claimed the NodePort: the wildcard *:NodePort
-		// is still bindable, proving the relay did not open a NodePort datagram socket.
-		if pc, err := net.ListenPacket("udp", net.JoinHostPort("", strconv.Itoa(int(nodePort)))); err != nil {
-			t.Fatalf("UDP NodePort %d was claimed (datagram relay must be deferred): %v", nodePort, err)
-		} else {
-			_ = pc.Close()
-		}
-
-		cancel()
-		<-runDone
-	})
-}
-
-// TestProxyUDPClusterIPRelay asserts a ClusterIP UDP Service now BUILDS the
-// datagram relay (B23): the worker ensures the lo0 alias, records the backend in
-// the routing table, and opens a UDP datagram socket on the VIP — NOT a TCP stream
-// listener (a UDP port must never open a TCP socket). The end-to-end datagram
-// round-trip + per-flow reuse is covered by TestUDPDatagramRelayRoundTrip; this
-// test pins the plumbing and that the relay is UDP-only.
+// TestProxyUDPClusterIPRelay asserts a ClusterIP UDP Service BUILDS the datagram
+// relay: the worker ensures the lo0 alias, records the backend in the routing
+// table, and binds a datagram socket at exactly the VIP address and port — and
+// never a TCP stream listener (a UDP port must never open a TCP socket). The
+// end-to-end datagram round-trip + per-flow reuse is covered by
+// TestUDPDatagramRelayRoundTrip; this test pins the plumbing and that the relay
+// is UDP-only.
 func TestProxyUDPClusterIPRelay(t *testing.T) {
 	t.Parallel()
-	const vip = "127.0.0.1"
+	vip := netip.MustParseAddrPort("10.43.0.34:53")
 
-	udpPort := freePort(t, vip)
+	udpBound := make(chan *fakeVIPConn, 1)
+	listenUDP := func(ap netip.AddrPort) (udpVIPConn, error) {
+		c := newFakeVIPConn(ap)
+		udpBound <- c
+		return c, nil
+	}
 	alias := newNoopAliasManager()
+	binder := newRecordingBinder()
 	tbl := NewRoutingTable(netip.Prefix{})
-	p := New(tbl, withAliasManager(alias))
+	p := New(tbl, withAliasManager(alias), withBinder(binder), withListenUDP(listenUDP))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	runDone := make(chan struct{})
 	go func() { defer close(runDone); _ = p.Run(ctx) }()
 
-	sp := &netv1.ServicePort{Port: udpPort, TargetPort: 53, Protocol: netv1.ProtocolUDP}
+	sp := &netv1.ServicePort{Port: int32(vip.Port()), TargetPort: 53, Protocol: netv1.ProtocolUDP}
 	eps := []netv1.Endpoint{{IP: "10.42.0.7", Port: 53, Ready: true}}
-	if err := p.Reconcile(vip, sp, eps); err != nil {
+	if err := p.Reconcile(vip.Addr().String(), sp, eps); err != nil {
 		t.Fatalf("reconcile udp: %v", err)
 	}
 
 	// Wait for the worker to process the event. runWorker records the backends and
 	// only THEN calls openListener, so a full routing table does not imply the alias
 	// was ensured — the two facts need two waits.
-	key := PortKey{ClusterIP: vip, Port: udpPort, Protocol: netv1.ProtocolUDP}
+	key := PortKey{ClusterIP: vip.Addr().String(), Port: int32(vip.Port()), Protocol: netv1.ProtocolUDP}
 	waitBackends(t, tbl, key, 1)
 
 	// Alias ensured for the UDP VIP (openListener's first act, after the table write).
-	waitAliasEnsured(t, alias, netip.MustParseAddr(vip))
-	// No TCP stream listener was opened on the UDP port — the relay is a datagram
-	// socket, not a stream listener.
-	if c, err := net.DialTimeout("tcp", hostPort(vip, udpPort), 200*time.Millisecond); err == nil {
-		_ = c.Close()
-		t.Fatalf("a TCP listener was opened for a UDP service port (the relay must be UDP-only)")
+	waitAliasEnsured(t, alias, vip.Addr())
+
+	var conn *fakeVIPConn
+	select {
+	case conn = <-udpBound:
+	case <-time.After(fakeHandledTimeout):
+		t.Fatal("the UDP reconcile never bound a VIP datagram socket")
+	}
+	if conn.local != vip {
+		t.Fatalf("VIP datagram socket bound at %v, want exactly %v", conn.local, vip)
+	}
+	// No TCP stream listener was opened for the UDP port: the datagram bind above
+	// is openListener's last act for a UDP port, so the binder count is final.
+	if n := binder.count(); n != 0 {
+		t.Fatalf("a TCP listener was opened for a UDP service port (%v); the relay must be UDP-only", binder.addrs())
 	}
 
 	cancel()
 	<-runDone
-}
-
-// waitBackends blocks until the routing table records exactly want backends for
-// key, or fails the test after a short deadline. It is the readiness signal for
-// the per-VIP worker having applied a reconcile event.
-func waitBackends(t *testing.T, tbl *RoutingTable, key PortKey, want int) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if tbl.Len(key) == want {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("routing table for %s never reached %d backends (have %d)", key, want, tbl.Len(key))
-}
-
-// Port windowing for freePort. Asking the kernel for :0 and immediately closing
-// the listener hands out a port that ANOTHER concurrently running copy of a test
-// binary can be handed too — and `go test ./...` runs one binary per package in
-// parallel, several of which bind loopback ports, while the B207 stress recipe
-// runs several copies of this very binary at once. A collision then surfaces as a
-// listener that never comes up, or as waitClosed finding somebody else's socket on
-// a port this test just released.
-//
-// So ports are drawn from a window derived from the process id and handed out
-// monotonically within it: two concurrent processes cannot be handed the same
-// port unless their pids collide modulo portWindows, and one process never reuses
-// a port while an earlier test still holds it. Each candidate is still verified
-// free by binding it, so an unrelated process squatting the window is skipped
-// rather than fatal.
-const (
-	portWindowBase = 20000
-	portWindowSize = 128
-	portWindows    = 300
-)
-
-// portCursor walks this process's window; it is never reset, so a port is not
-// handed out twice even across sequential tests in one binary.
-var portCursor atomic.Int32
-
-// freePort returns a TCP port currently free on ip, drawn from this process's
-// port window (see above). The bind-and-release TOCTOU against an unrelated
-// process on the box remains — it cannot be closed without holding the socket the
-// caller is about to bind — but the collision this package can actually cause,
-// between its own concurrent test binaries, is gone.
-func freePort(t *testing.T, ip string) int32 {
-	t.Helper()
-	base := int32(portWindowBase + (os.Getpid()%portWindows)*portWindowSize)
-	for i := 0; i < portWindowSize; i++ {
-		port := base + portCursor.Add(1)%portWindowSize
-		ln, err := net.Listen("tcp", net.JoinHostPort(ip, strconv.Itoa(int(port))))
-		if err != nil {
-			continue // squatted by another process; try the next slot
-		}
-		_ = ln.Close()
-		return port
-	}
-	t.Fatalf("no free port in this process's window [%d,%d)", base, base+portWindowSize)
-	return 0
 }
 
 // waitAliasEnsured blocks until the alias manager has been asked to ensure ip.
@@ -733,32 +517,4 @@ func waitAliasRemoved(t *testing.T, m *noopAliasManager, ip netip.Addr) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("alias.Remove(%s) was never called on delete", ip)
-}
-
-func waitListen(t *testing.T, ip string, port int32) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		c, err := net.DialTimeout("tcp", hostPort(ip, port), 200*time.Millisecond)
-		if err == nil {
-			_ = c.Close()
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("listener on %s:%d never came up", ip, port)
-}
-
-func waitClosed(t *testing.T, ip string, port int32) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		c, err := net.DialTimeout("tcp", hostPort(ip, port), 200*time.Millisecond)
-		if err != nil {
-			return
-		}
-		_ = c.Close()
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("listener on %s:%d never closed", ip, port)
 }

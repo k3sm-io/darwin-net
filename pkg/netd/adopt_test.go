@@ -1,3 +1,5 @@
+//go:build integration
+
 /*
 Copyright The k3sm Authors.
 
@@ -13,6 +15,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+// These reach the daemon only over its real unix socket (startServer, rawCall
+// in server_test.go). They need no privilege; run with:
+//
+//	CGO_ENABLED=0 go test -tags integration -run 'NodePodCIDR' ./pkg/netd/
 
 package netd_test
 
@@ -107,7 +114,7 @@ func TestConfigureMeshAdoptsTheNodePodCIDR(t *testing.T) {
 			t.Fatal("a worker pod IP was admitted before adoption, so the test cannot prove the adoption")
 		}
 
-		if err := c.ConfigureMesh(ctx, "ref", 51820, netip.MustParsePrefix(workerCIDR), selfPeer(t)); err != nil {
+		if err := c.ConfigureMesh(ctx, "ref", 51820, netip.MustParsePrefix(workerCIDR), selfPeer(t), nil); err != nil {
 			t.Fatalf("ConfigureMesh carrying the node pod CIDR: %v", err)
 		}
 
@@ -148,10 +155,10 @@ func TestConfigureMeshAdoptsTheNodePodCIDR(t *testing.T) {
 		worker := netip.MustParsePrefix(workerCIDR)
 
 		// Up, then Apply: the real mesh device sends the CIDR on every call.
-		if err := c.ConfigureMesh(ctx, "ref", 51820, worker, nil); err != nil {
+		if err := c.ConfigureMesh(ctx, "ref", 51820, worker, nil, nil); err != nil {
 			t.Fatalf("ConfigureMesh (up): %v", err)
 		}
-		if err := c.ConfigureMesh(ctx, "ref", 51820, worker, selfPeer(t)); err != nil {
+		if err := c.ConfigureMesh(ctx, "ref", 51820, worker, selfPeer(t), nil); err != nil {
 			t.Fatalf("ConfigureMesh (apply, same CIDR): %v", err)
 		}
 
@@ -175,7 +182,7 @@ func TestConfigureMeshAdoptsTheNodePodCIDR(t *testing.T) {
 			t.Fatalf("EnsureAlias: %v", err)
 		}
 
-		err := c.ConfigureMesh(ctx, "ref", 51820, netip.MustParsePrefix(workerCIDR), nil)
+		err := c.ConfigureMesh(ctx, "ref", 51820, netip.MustParsePrefix(workerCIDR), nil, nil)
 		if err == nil {
 			t.Fatal("ConfigureMesh moved the node identity under a live alias, want refusal")
 		}
@@ -207,7 +214,7 @@ func TestConfigureMeshAdoptsTheNodePodCIDR(t *testing.T) {
 		})
 		c := wire.NewClient(sock)
 
-		err := c.ConfigureMesh(ctx, "ref", 51820, netip.MustParsePrefix("192.168.5.0/24"), nil)
+		err := c.ConfigureMesh(ctx, "ref", 51820, netip.MustParsePrefix("192.168.5.0/24"), nil, nil)
 		if err == nil {
 			t.Fatal("ConfigureMesh adopted a CIDR outside the cluster aggregate, want refusal")
 		}
@@ -238,7 +245,7 @@ func TestConfigureMeshAdoptsTheNodePodCIDR(t *testing.T) {
 		if err := c.EnsureAlias(ctx, netip.MustParseAddr("10.43.0.10")); err != nil {
 			t.Fatalf("EnsureAlias(VIP): %v", err)
 		}
-		if err := c.ConfigureMesh(ctx, "ref", 51820, netip.MustParsePrefix(workerCIDR), nil); err != nil {
+		if err := c.ConfigureMesh(ctx, "ref", 51820, netip.MustParsePrefix(workerCIDR), nil, nil); err != nil {
 			t.Fatalf("a live Service VIP alias blocked the adoption: %v", err)
 		}
 		if got := fp.adoptions(); len(got) != 1 || got[0] != netip.MustParsePrefix(workerCIDR) {
@@ -263,7 +270,7 @@ func TestConfigureMeshAdoptsTheNodePodCIDR(t *testing.T) {
 
 		// The daemon the join talked to adopts the worker /24 ...
 		sock, _ := startServer(t, cfg)
-		if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, netip.MustParsePrefix(workerCIDR), nil); err != nil {
+		if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, netip.MustParsePrefix(workerCIDR), nil, nil); err != nil {
 			t.Fatalf("ConfigureMesh: %v", err)
 		}
 

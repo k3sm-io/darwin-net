@@ -54,7 +54,7 @@ func applierDevice(t *testing.T) (*WGDevice, *fakeWG, *fakeRouteTable) {
 func peerPlan(t *testing.T, endpoint string) Plan {
 	t.Helper()
 	self := netip.MustParsePrefix("100.64.0.0/24")
-	plan, err := BuildPlan(self, []netv1.MeshPeerSpec{peerSpec("nodeB", "100.64.1.0/24", endpoint, 0x42)})
+	plan, err := BuildPlan(self, []netv1.MeshPeerSpec{peerSpec("nodeB", "100.64.1.0/24", endpoint, 0x42)}, nil)
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}

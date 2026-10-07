@@ -108,7 +108,7 @@ func serviceToVIP(svc *corev1.Service) (netv1.ServiceVIP, trafficPolicy, affinit
 // Like internalPolicy it is proxy-internal — netv1 carries no SessionAffinity field.
 func sessionAffinity(spec *corev1.ServiceSpec) affinityConfig {
 	if spec.SessionAffinity != corev1.ServiceAffinityClientIP {
-		return affinityConfig{}
+		return affinityConfig{mode: affinityNone}
 	}
 	timeout := affinityDefaultTimeout
 	if c := spec.SessionAffinityConfig; c != nil && c.ClientIP != nil && c.ClientIP.TimeoutSeconds != nil {

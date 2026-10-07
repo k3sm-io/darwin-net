@@ -34,6 +34,7 @@ import (
 	"k3sm.io/darwin-net/pkg/netbind"
 	"k3sm.io/darwin-net/pkg/netd/wire"
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // dialTimeout bounds how long the proxy waits to connect to a chosen backend
@@ -86,13 +87,15 @@ type Proxy struct {
 	// kernel selects the source. It is built once in New and NEVER mutated — the
 	// per-connection handle goroutines share it, so writing LocalAddr on it would
 	// be a data race, and a race that silently applies one connection's source to
-	// another connection's dial (see Proxy.dialerFor).
-	dialer *net.Dialer
+	// another connection's dial (see Proxy.dialerFor). Like meshDialer it is a
+	// tcpseg.Dialer, so every backend connection has its TCP segment size clamped
+	// to the mesh MSS before the splice sends a byte on it.
+	dialer *tcpseg.Dialer
 	// meshDialer is the mesh-source-bound sibling of dialer, built once by
 	// WithMeshEgressSource on a multi-node mesh and nil on a single node. handle
 	// selects between the two per connection via dialerFor; neither is mutated
 	// after construction.
-	meshDialer *net.Dialer
+	meshDialer *tcpseg.Dialer
 	// egress is the destination-scoped mesh-egress source decision — the node's
 	// reserved mesh-egress /32 plus the cluster pod aggregate that scopes the bind
 	// — shared read-only by the TCP dial path and by every per-VIP UDP relay (the
@@ -123,6 +126,35 @@ type Proxy struct {
 	// state under its own lock and never calls back into a relay — no proxy lock
 	// needed.
 	udpBudget *udpBudget
+	// vmnet is the node's vmnet segment (WithVMNetPrefix), the subnet its vm
+	// guests' live lease addresses come from. Read-only after New, which resolves
+	// it (falling back to the policy table's seed) before building relays.
+	vmnet netip.Prefix
+	// relays is the per-pod TCP relay manager on vm pods' published addresses
+	// (podrelay.go). Built by New when there is a routing table to observe, nil
+	// otherwise; Run drives it and shuts it down.
+	relays *podRelays
+
+	// listenUDP, listenNodePort, and dialBackend are the socket-opening calls the
+	// accept and reconcile paths make that do not already go through binder. Each is
+	// defaulted in New to exactly the call it replaces and is read-only thereafter;
+	// only an unexported test option overrides them, so unit tests can run the
+	// reconcile and splice paths without a real socket. They are never exported and
+	// never a runtime-flippable knob.
+	//
+	// listenUDP binds the ClusterIP datagram socket on the specific VIP address (the
+	// default is net.ListenUDP; binder is stream-only).
+	listenUDP func(ap netip.AddrPort) (udpVIPConn, error)
+	// listenNodePort binds the node-wide NodePort stream listener (the default is
+	// net.Listen). It is not binder: a binder binds one specific alias address, while
+	// NodePort binds the wildcard ":port" (both address families) so every node
+	// interface answers.
+	listenNodePort func(network, address string) (net.Listener, error)
+	// dialBackend dials a backend through the dialer dialerFor selected (the default
+	// is d.DialContext with a background context, the dialer's own Timeout bounding
+	// the connect), so the default-vs-mesh-bound dialer choice stays observable. Its
+	// parameter is a *tcpseg.Dialer, so no backend dial can bypass the segment clamp.
+	dialBackend func(d *tcpseg.Dialer, network, address string) (net.Conn, error)
 
 	mu      sync.Mutex
 	workers map[PortKey]*portWorker
@@ -194,7 +226,7 @@ func WithMeshEgressSource(src netip.Addr) Option {
 		// same decision); the zero Addr stays invalid and binds nothing.
 		p.egress.src = src
 		if src.IsValid() {
-			p.meshDialer = &net.Dialer{Timeout: dialTimeout, LocalAddr: &net.TCPAddr{IP: src.AsSlice()}}
+			p.meshDialer = &tcpseg.Dialer{Timeout: dialTimeout, LocalAddr: &net.TCPAddr{IP: src.AsSlice()}}
 		}
 	}
 }
@@ -259,6 +291,20 @@ func WithInfraVIPExemptions(vips ...netip.Addr) Option {
 	}
 }
 
+// WithVMNetPrefix sets the vmnet segment this node's vm-RuntimeClass guests are
+// attached to (the guest NAT subnet, e.g. 192.168.64.0/24). The per-pod relay on a
+// vm pod's published address (podrelay.go) relays only to a live address inside it
+// and refuses a client from inside it. Unset, the proxy uses the segment the policy
+// table was seeded with (NewPolicyTableVMNet), so a node assembles that decision
+// once; with neither, the node relays to no vm pod. An invalid prefix is ignored.
+func WithVMNetPrefix(prefix netip.Prefix) Option {
+	return func(p *Proxy) {
+		if prefix.IsValid() {
+			p.vmnet = prefix.Masked()
+		}
+	}
+}
+
 // WithPolicyTable wires the NetworkPolicy L4-subset verdict table: the
 // accept paths consult it per (source, PICKED backend pod IP, backend port) —
 // TCP in handle after the pick, UDP at relay flow admission — and refuse a denied
@@ -267,11 +313,6 @@ func WithInfraVIPExemptions(vips ...netip.Addr) Option {
 // always-allow seeds) and feeds it from a PolicyWatcher.
 func WithPolicyTable(t *PolicyTable) Option {
 	return func(p *Proxy) { p.policy = t }
-}
-
-// withAliasManager overrides the alias manager (tests inject the rootless fake).
-func withAliasManager(a aliasManager) Option {
-	return func(p *Proxy) { p.alias = a }
 }
 
 // WithNetdHelper routes both privileged proxy operations — the lo0 VIP alias and
@@ -304,12 +345,16 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 		alias:      newLo0AliasManager(),
 		binder:     directBinder{},
 		log:        slog.Default(),
-		dialer:     &net.Dialer{Timeout: dialTimeout},
+		dialer:     &tcpseg.Dialer{Timeout: dialTimeout},
 		egress:     egressScope{clusterCIDR: podnet.ClusterPodCIDR},
 		exemptVIPs: make(map[netip.Addr]struct{}),
 		udpBudget:  newUDPBudget(maxTotal, udpPerSourceGlobalCap(maxTotal)),
 		workers:    make(map[PortKey]*portWorker),
 		done:       make(chan struct{}),
+
+		listenUDP:      listenUDPVIP,
+		listenNodePort: net.Listen,
+		dialBackend:    dialWith,
 	}
 	for _, o := range opts {
 		o(p)
@@ -338,7 +383,28 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 	if p.policy != nil {
 		p.policy.log = p.log
 	}
+	// The vm pod relay observes the routing table's generations. The segment is
+	// the explicit WithVMNetPrefix or, failing that, the policy table's seed —
+	// the same segment, decided once by the assembler.
+	if !p.vmnet.IsValid() && p.policy != nil {
+		p.vmnet = p.policy.vmnet
+	}
+	if p.table != nil {
+		p.relays = newPodRelays(p, p.vmnet)
+		p.table.setObserver(p.relays.observe)
+	}
 	return p
+}
+
+// listenUDPVIP is the production ClusterIP datagram bind: net.ListenUDP on the
+// specific VIP address. A failed bind returns a nil interface, never a typed-nil
+// *net.UDPConn boxed in one.
+func listenUDPVIP(ap netip.AddrPort) (udpVIPConn, error) {
+	c, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(ap))
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // defaultUDPFlowBudget is the relay-global UDP upstream-socket budget when the
@@ -427,11 +493,12 @@ const (
 // reclaims bindings of clients that have gone completely silent (and never redialed).
 const affinitySweepInterval = 60 * time.Second
 
-// Run starts the proxy's worker supervision loop and the ClientIP affinity idle
-// sweeper, and blocks until ctx is cancelled, at which point it stops every worker
-// (closing all listeners and removing every lo0 alias it created), joins the sweeper,
-// and returns. Run is the single owner of the workers map mutation lifecycle and of
-// the affinity sweeper goroutine.
+// Run starts the proxy's worker supervision loop, the ClientIP affinity idle
+// sweeper and the vm pod relay reconciler, and blocks until ctx is cancelled, at
+// which point it stops every worker (closing all listeners and removing every lo0
+// alias it created), joins the sweeper, closes every vm pod relay and joins its
+// goroutines, and returns. Run is the single owner of the workers map mutation
+// lifecycle and of the affinity sweeper and relay goroutines.
 func (p *Proxy) Run(ctx context.Context) error {
 	sweeperDone := make(chan struct{})
 	go func() {
@@ -440,9 +507,20 @@ func (p *Proxy) Run(ctx context.Context) error {
 			p.sweepAffinity(ctx)
 		}
 	}()
+	relaysDone := make(chan struct{})
+	go func() {
+		defer close(relaysDone)
+		if p.relays != nil {
+			p.relays.run(ctx)
+		}
+	}()
 	<-ctx.Done()
 	p.shutdown()
 	<-sweeperDone
+	<-relaysDone
+	if p.relays != nil {
+		p.relays.shutdown()
+	}
 	return ctx.Err()
 }
 
@@ -712,7 +790,7 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 		// wildcard reply re-selects its source on a multi-homed node (wrong src IP,
 		// client drops it), needing IP_RECVDSTADDR/IP_SENDSRCADDR (out of scope).
 		clusterAP := netip.AddrPortFrom(ip, uint16(port.Port))
-		pc, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(clusterAP))
+		pc, err := p.listenUDP(clusterAP)
 		if err != nil {
 			_ = p.alias.Remove(ctx, ip)
 			return nil, fmt.Errorf("listen udp clusterIP %s: %w", clusterAP, err)
@@ -736,11 +814,14 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	// default; under WithNetdHelper a privileged (<1024) VIP port is bound by the
 	// root daemon and the socket is passed back over SCM_RIGHTS.
 	clusterAP := netip.AddrPortFrom(ip, uint16(port.Port))
-	cl, err := p.binder.Listen(ctx, "tcp", clusterAP)
+	rawCL, err := p.binder.Listen(ctx, "tcp", clusterAP)
 	if err != nil {
 		_ = p.alias.Remove(ctx, ip)
 		return nil, fmt.Errorf("listen clusterIP %s: %w", clusterAP, err)
 	}
+	// The proxy's replies to a client pod ride the accepted connection, which was
+	// negotiated over lo0 like the backend side: clamp its segment size too.
+	cl := tcpseg.WrapListener(rawCL)
 	l.clusterIP = cl
 	go p.serve(cl, key, internalListener)
 
@@ -751,12 +832,13 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	// does not preserve client src IP, so eTP:Local is not honored either).
 	if port.NodePort != 0 {
 		nodeAddr := net.JoinHostPort("", strconv.Itoa(int(port.NodePort)))
-		nl, err := net.Listen("tcp", nodeAddr)
+		rawNL, err := p.listenNodePort("tcp", nodeAddr)
 		if err != nil {
 			_ = cl.Close()
 			_ = p.alias.Remove(ctx, ip)
 			return nil, fmt.Errorf("listen nodePort %s: %w", nodeAddr, err)
 		}
+		nl := tcpseg.WrapListener(rawNL)
 		l.nodePort = nl
 		go p.serve(nl, key, externalListener)
 	}
@@ -844,13 +926,19 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 	// admits the reply; every other destination keeps kernel default source
 	// selection. dialerFor picks between two immutable dialers — nothing here
 	// mutates shared state, because handle runs once per accepted connection.
-	backendConn, err := p.dialerFor(be.Locality(), dst.Addr()).Dial("tcp", dst.String())
+	backendConn, err := p.dialBackend(p.dialerFor(be.Locality(), dst.Addr()), "tcp", dst.String())
 	if err != nil {
 		p.logger().Debug("dial backend", "vip", key.String(), "backend", be.Addr().String(), "transport", dst.String(), "err", err)
 		return
 	}
 	defer backendConn.Close()
 	splice(client, backendConn)
+}
+
+// dialWith is the production dialBackend: a background-context dial through d,
+// whose Timeout bounds the connect exactly as the plain net.Dialer it replaced did.
+func dialWith(d *tcpseg.Dialer, network, address string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, address)
 }
 
 // logger returns p.log, or slog.Default() when it is nil. New copies the (possibly nil)

@@ -25,6 +25,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // backendWarnInterval throttles the backend-down (502) Warn to at most one per
@@ -75,6 +77,7 @@ func newHandler(table *RouteTable, log *slog.Logger) *handler {
 		warnLast: make(map[string]time.Time),
 	}
 	h.rp = &httputil.ReverseProxy{
+		Transport: newBackendTransport(),
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			be := pr.In.Context().Value(backendKey{}).(Backend)
 			pr.Out.URL.Scheme = "http"
@@ -100,6 +103,25 @@ func newHandler(table *RouteTable, log *slog.Logger) *handler {
 		},
 	}
 	return h
+}
+
+// backendDialTimeout and backendKeepAlive mirror http.DefaultTransport's own
+// dialer, which the backend transport replaces.
+const (
+	backendDialTimeout = 30 * time.Second
+	backendKeepAlive   = 30 * time.Second
+)
+
+// newBackendTransport returns the transport the reverse proxy dials backends
+// with: http.DefaultTransport's settings, but dialing through a tcpseg.Dialer.
+// The backend is a Service VIP on lo0, so the connection negotiates an lo0-sized
+// TCP segment; the clamp lowers it to the mesh MSS so the connection cannot
+// overrun a skywalk netif's GSO buffer if the VIP's route changes under it.
+func newBackendTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	d := &tcpseg.Dialer{Timeout: backendDialTimeout, KeepAlive: backendKeepAlive}
+	t.DialContext = d.DialContext
+	return t
 }
 
 // ServeHTTP routes the request: RouteTable match (host-specific tier, hostless

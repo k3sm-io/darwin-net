@@ -1,3 +1,5 @@
+//go:build integration
+
 /*
 Copyright The k3sm Authors.
 
@@ -13,6 +15,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+// The daemon contract is the unix socket itself: these tests serve the
+// protocol on a real socket file, check the peer's credentials, and receive
+// bound listeners over SCM_RIGHTS, none of which has a seam. They need no
+// privilege; run with:
+//
+//	CGO_ENABLED=0 go test -tags integration -run '^TestServer|^TestBindPort' ./pkg/netd/
 
 package netd_test
 
@@ -54,9 +63,10 @@ type fakePriv struct {
 	meshKeys    []string
 	meshPlans   []mesh.Plan
 	meshRemoved int
-	pfClamps    []int
 	bound       []netip.AddrPort
 	adopted     []netip.Prefix
+	links       []netd.LinkSpec
+	unlinked    []string
 }
 
 func (f *fakePriv) EnsureAlias(_ context.Context, ip netip.Addr) error {
@@ -90,17 +100,24 @@ func (f *fakePriv) SetNodePodCIDR(_ context.Context, cidr netip.Prefix) error {
 	return nil
 }
 
+func (f *fakePriv) ConfigureLink(_ context.Context, spec netd.LinkSpec) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.links = append(f.links, spec)
+	return nil
+}
+
+func (f *fakePriv) RemoveLink(_ context.Context, iface string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unlinked = append(f.unlinked, iface)
+	return nil
+}
+
 func (f *fakePriv) RemoveMesh(_ context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.meshRemoved++
-	return nil
-}
-
-func (f *fakePriv) LoadPFAnchor(_ context.Context, mssClamp int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.pfClamps = append(f.pfClamps, mssClamp)
 	return nil
 }
 
@@ -326,7 +343,7 @@ func TestServerConfigureMeshRouteOutsideRouteSetRejected(t *testing.T) {
 		Endpoint:   "192.0.2.10:51820",
 		AllowedIPs: []string{"100.64.0.0/16"},
 	}}
-	if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers); err == nil {
+	if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers, nil); err == nil {
 		t.Fatal("ConfigureMesh with non-/24 AllowedIPs succeeded, want rejection")
 	}
 	if got := fp.plans(); len(got) != 0 {
@@ -347,7 +364,7 @@ func TestServerConfigureMeshRouteOutsideAggregateRejected(t *testing.T) {
 		Endpoint:   "192.0.2.10:51820",
 		AllowedIPs: []string{"10.9.9.0/24"}, // valid /24 but outside 100.64.0.0/10
 	}}
-	if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers); err == nil {
+	if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers, nil); err == nil {
 		t.Fatal("ConfigureMesh with out-of-aggregate /24 succeeded, want rejection")
 	}
 	if got := fp.plans(); len(got) != 0 {
@@ -361,7 +378,7 @@ func TestServerConfigureMeshNoResolverFailsFast(t *testing.T) {
 	sock, _ := startServer(t, netd.Config{}) // no MeshKeyResolver
 	ctx := context.Background()
 	peers := []wire.MeshPeerArg{{PubKey: genKeyB64(t), Endpoint: "192.0.2.10:51820", AllowedIPs: []string{"100.64.1.0/24"}}}
-	if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers); err == nil {
+	if err := wire.NewClient(sock).ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers, nil); err == nil {
 		t.Fatal("ConfigureMesh without a key resolver succeeded, want fail-fast rejection")
 	}
 }
@@ -702,11 +719,8 @@ func TestServerHappyPathVerbs(t *testing.T) {
 		t.Fatalf("RemoveAlias: %v", err)
 	}
 	peers := []wire.MeshPeerArg{{PubKey: genKeyB64(t), Endpoint: "192.0.2.10:51820", AllowedIPs: []string{"100.64.1.0/24"}}}
-	if err := c.ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers); err != nil {
+	if err := c.ConfigureMesh(ctx, "ref", 51820, netip.Prefix{}, peers, nil); err != nil {
 		t.Fatalf("ConfigureMesh: %v", err)
-	}
-	if err := c.LoadPFAnchor(ctx, mesh.MSSClamp); err != nil {
-		t.Fatalf("LoadPFAnchor: %v", err)
 	}
 	if err := c.RemoveMesh(ctx); err != nil {
 		t.Fatalf("RemoveMesh: %v", err)

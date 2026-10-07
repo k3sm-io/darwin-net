@@ -2,8 +2,8 @@
 repo: darwin-net
 schema: phases/v1
 current_phase: M7
-updated: 2026-09-01
-updated_by: orchestrator
+updated: 2026-10-05
+updated_by: m17-2-darwin-net-writeback
 
 phases:
   - id: M0
@@ -114,7 +114,7 @@ phases:
         deliverables:
           - id: M3.2-d1
             done: true
-            desc: "NodePort Services in the userspace Service proxy: a non-zero ServicePort.NodePort opens a node-wide `*:nodePort` (wildcard) TCP listener alongside the ClusterIP listener, L4-LB to the SAME ready endpoints, reusing the M1 RoutingTable (already protocol-keyed). The path existed since M1; M3.2 makes it the explicit, documented NodePort path (proxy.openListener + doc.go `# NodePort`). externalTrafficPolicy: Cluster ONLY — the userspace splice opens a fresh backend connection and so does NOT preserve the client source IP, so externalTrafficPolicy: Local is NOT honored (documented). No apis change — `ServicePort.NodePort` already exists (apis:M3.1-d3 pins it unchanged). UDP NodePort is DEFERRED with the UDP datagram relay + idle-flow GC (a UDP port opens NO datagram socket on either the ClusterIP or the NodePort); stockkitty's NodePort surface (VSCode SSH :22, snapshot gRPC range) is all TCP, so UDP NodePort is NOT claimed until the relay lands."
+            desc: "NodePort Services in the userspace Service proxy: a non-zero ServicePort.NodePort opens a node-wide `*:nodePort` (wildcard) TCP listener alongside the ClusterIP listener, L4-LB to the SAME ready endpoints, reusing the M1 RoutingTable (already protocol-keyed). The path existed since M1; M3.2 makes it the explicit, documented NodePort path (proxy.openListener + doc.go `# NodePort`). externalTrafficPolicy: Cluster ONLY — the userspace splice opens a fresh backend connection and so does NOT preserve the client source IP, so externalTrafficPolicy: Local is NOT honored (documented). No apis change — `ServicePort.NodePort` already exists (apis:M3.1-d3 pins it unchanged). UDP NodePort is DEFERRED with the UDP datagram relay + idle-flow GC (a UDP port opens NO datagram socket on either the ClusterIP or the NodePort); a reference workload's NodePort surface (VSCode SSH :22, snapshot gRPC range) is all TCP, so UDP NodePort is NOT claimed until the relay lands."
         acceptance:
           - id: M3.2-a1
             met: true
@@ -157,7 +157,7 @@ phases:
         deliverables:
           - id: M5.1-d1
             done: true  # 2026-09-01 — delivered by M11.3: the NAT guest path is live (M11.3-d1 answered the delivery question with the guest's bare NAT default route; M11.3-d2 landed the two-address identity so the vm pod's podIP reaches EndpointSlices); proven by the M11 lab gate
-            desc: "Guest networking for the `vm` RuntimeClass (Linux micro-VM behind the existing swappable sandbox.Backend seam — runtimed:M5). The lo0-alias + IP_BOUND_IF bind-discipline model is HOST-PROCESS-ONLY: a Virtualization.framework guest has its OWN network stack, so pod connectivity comes from a VZNATNetworkDeviceAttachment (NAT, not bridged — bridged/raw-vmnet needs the Apple-restricted com.apple.vm.networking entitlement, ruled unobtainable; NAT needs only com.apple.security.virtualization), NOT an lo0 alias. LANDED (darwin-net, unit-verifiable): (1) the PATH-SELECTION FORK in pkg/podnet — Network.SetupGuest (BackendVM) allocates the pod IP from the same Allocator but plumbs NO lo0 alias and returns a GuestNetwork (PodIP, NAT gateway/subnet, cluster DNS VIP) for runtimed's VZ backend to apply; Setup (BackendHostProcess) is byte-unchanged; Teardown removes the lo0 alias only for host-process pods. darwin-net provides the config/decision as DATA — the live VZNATNetworkDeviceAttachment wiring is runtimed's (the DAG keeps the VZ backend out of darwin-net). LAB-GATED (scaffold + report, K3SM_LAB=1): the live NAT attach + guest→ClusterIP-VIP reachability (OPEN empirical question: does macOS NAT weak-host-deliver a guest datagram to a host lo0-alias VIP, or only expose the gateway? if not, a host route / a NEW netd route-verb is needed) + cross-node routing. A NAT-private guest IP is NOT yet a cross-node Service backend (same-node scope for M5). Deps apis:M5.1 (the runtime.k3sm.io handler-config mapping runtimeClassName: vm → SANDBOX_BACKEND_VM)."
+            desc: "Guest networking for the `vm` RuntimeClass (Linux micro-VM behind the existing swappable sandbox.Backend seam — runtimed:M5). The IP_BOUND_IF bind discipline is host-process-only: a Virtualization.framework guest has its OWN network stack, so the guest's own connectivity comes from a VZNATNetworkDeviceAttachment (NAT, not bridged — bridged/raw-vmnet needs the Apple-restricted com.apple.vm.networking entitlement, ruled unobtainable; NAT needs only com.apple.security.virtualization). Since B440 the pod's published /32 is still aliased on lo0 for the pod's lifetime, and the node's proxy relays it to the guest's lease, so status.podIP is reachable on the node while the guest keeps its own stack. LANDED (darwin-net, unit-verifiable): (1) the PATH-SELECTION FORK in pkg/podnet — Network.SetupGuest (BackendVM) allocates the pod IP from the same Allocator and returns a GuestNetwork (PodIP, NAT gateway/subnet, cluster DNS VIP) for runtimed's VZ backend to apply; Setup (BackendHostProcess) is byte-unchanged. Since B440 SetupGuest also aliases the pod's published /32 on lo0 for the pod's lifetime and the proxy relays TCP on it to the guest's live lease (TestVMPodSelectsVmnetPathAndAliasesPublished, TestPublishedVMPodAddressRelaysToLive); Teardown removes the alias for both pod kinds behind the blackhole. darwin-net provides the config/decision as DATA — the live VZNATNetworkDeviceAttachment wiring is runtimed's (the DAG keeps the VZ backend out of darwin-net). LAB-GATED (scaffold + report, K3SM_LAB=1): the live NAT attach + guest→ClusterIP-VIP reachability (OPEN empirical question: does macOS NAT weak-host-deliver a guest datagram to a host lo0-alias VIP, or only expose the gateway? if not, a host route / a NEW netd route-verb is needed) + cross-node routing. A NAT-private guest IP is NOT yet a cross-node Service backend (same-node scope for M5). Deps apis:M5.1 (the runtime.k3sm.io handler-config mapping runtimeClassName: vm → SANDBOX_BACKEND_VM)."
         acceptance:
           - id: M5.1-a1
             met: true  # 2026-09-01 — the M11 lab gate on the entitled rig: a vm pod gets its guest IP over NAT, reaches a ClusterIP Service and the cluster DNS VIP from inside the guest, and is reachable through its own ClusterIP (M11-lab 26/0/1, 2026-09-01)
@@ -165,7 +165,7 @@ phases:
             method: integration
           - id: M5.1-a2
             met: true
-            check: "networking config selects the VM (NAT) path — not the lo0-alias path — when the pod's backend is the VM; the host-process path is unaffected. Proven by the named pure-logic/faked unit test (no root) TestVMPodSelectsVmnetPathNotLo0: a vm pod (SetupGuest) ensures NO lo0 alias and returns a GuestNetwork, while a host-process pod (Setup) ensures exactly one lo0 alias and gets no vmnet config — asserting BOTH the taken and not-taken branch and that teardown removes an alias only for the host-process pod."
+            check: "networking config selects the VM (NAT) path when the pod's backend is the VM; the host-process path is unaffected. Proven by the named pure-logic/faked unit test (no root) TestVMPodSelectsVmnetPathAndAliasesPublished: a vm pod (SetupGuest) returns a GuestNetwork with the vmnet config, while a host-process pod (Setup) gets none; both pods' published /32 is aliased on lo0 for the pod's lifetime (since B440 a vm pod's alias is what makes its status.podIP live on its node) and teardown removes either alias behind the blackhole (TestGuestTeardownBlackholesPublishedAddress; TestReattachGuestOwnsPublishedAlias for a restart). The published address is served by the proxy's per-pod TCP relay to the guest's live lease on its declared and Service-targeted ports (darwin-net pkg/proxy TestPublishedVMPodAddressRelaysToLive, TestPodRelayPortSet, TestPodRelayRefusesClients, TestPodRelayRefusesOverrides, TestPodRelayFollowsReplaceAndDrop; real-socket twin TestPublishedVMPodAddressRelaysToLiveSockets). These are unit and loopback proofs only: the alias-bound listener on a real pod /32, the blackhole-on-teardown rebind, and delivery into a real guest are owed to a lab slice (the k3sm e2e twin TestVMPodIPReachableAcrossNodes on the rig)."
             method: unit
       - id: M5.2
         title: Guest-side cluster resolver (the DYLD shim is Darwin-only)
@@ -365,6 +365,45 @@ phases:
             met: true  # 2026-09-09 — ran CGO_ENABLED=0 go test -race ./pkg/proxy/... -run 'TestEgressScope|TestProxyDialerFor|TestUDPRelayAppliesEgressScope|TestWithMeshEgressSourceBuildsSeparateBoundDialer|TestProxyConcurrentScopedDialsShareNoDialerState' here: all pass, incl. TestProxyConcurrentScopedDialsShareNoDialerState (concurrent local+remote-destination dials under -race, meshegress_test.go:411) and the full scopeCases() table (foreign /24 bound; own /24, loopback, node LAN, ClusterIP VIP, upstream, LocalityUnknown all unbound) for both TestProxyDialerForAppliesEgressScope (TCP) and TestUDPRelayAppliesEgressScope (UDP). This closes the method:unit gate this acceptance names. The check text's own cross-node datapath leg (hack/lab/m3.sh, K3SM_LAB=1) is explicitly carved out of this acceptance ("never auto-greened here") and stays unrun — no K3SM_LAB=1 two-Mac session has occurred, so that leg is not claimed here.
             check: "unit tables over the scoping decision for BOTH TCP and UDP (foreign /24 => bound; own /24, loopback, node LAN, ClusterIP VIP, and LocalityUnknown => unbound), run under -race with concurrent local- and remote-destination dials so the per-connection shared-state property is actually exercised rather than assumed; the construction-time bind test is rewritten. The cross-node datapath proof rides the k3sm two-Mac lab (hack/lab/m3.sh, K3SM_LAB=1), never auto-greened here"
             method: unit
+
+  - id: M17
+    title: "Direct links — the darwin-net slice: link enumeration and events, the netd link verbs, the cable as a kernel route"
+    status: in-progress
+    strategy: "phased (named exception: wireguard MeshPeer protocol / AllowedIPs change)"
+    depends_on: [apis:M17]
+    note: "darwin-net's slice of the workspace M17 program (authoritative input: docs/m17-plan.md — Phase C encodes ONLY from that doc; its research findings F1-F7 and its BINDING resolutions R1-R15 are the inputs, and this block re-derives nothing). M17 adds direct links: a point-to-point Thunderbolt cable between two cluster Macs that k3sm discovers, addresses, routes over and prefers; this repo owns the enumeration (pkg/linkenum), the link events (pkg/linkwatch), the root-helper link verbs, and the mesh's choice of the cable as a kernel route. The named exception covers TWO contract surfaces and nothing else: (1) the mesh endpoint/route protocol across nodes — MeshPeerSpec gains the additive Endpoints[] candidate list and a direct peer gets gateway routes over the cable; AllowedIPs is unchanged; (2) the additive k3sm-netd helper IPC minor bump 1.0 -> 1.1, gated by the helper's reported version (the client sends DirectRoutes only to a helper whose reply reports >= 1.1, and only after a successful ConfigureLink on it; a 1.0 helper answers unknown verb to ConfigureLink and the client runs mesh-only with one Info-level line). MeshPeerSchemaVersion STAYS 1 (R12): BuildPlan skips any peer whose stamp differs (pkg/mesh/plan.go:188), so a bump would blackhole every new node from every old reader; Endpoint is still written for every node, so an old reader programs the tunnel exactly as today. The utun route for a peer /24 is NEVER removed (R14): the direct path is two more-specific /25 gateway routes over the Thunderbolt enX plus an on-link host route to the peer's link address, so when the cable goes the kernel deletes the interface-bound routes and pod traffic falls back to the utun /24 with no k3sm code in the path (no RTM_CHANGE; up = host route then /25s, down = /25s then host route). Addresses are derived, never allocated (R4): LinkIP(idx, port) is the one pure function in apis/net/v1alpha1 over the RFC 3927 reserved /24s of 169.254/16, and netd re-validates it root-side for the local address AND every gateway. TunnelMSS stays 1340 for every cross-node path and TSO/LRO are disabled on the Thunderbolt enX (R15). bridge0 ownership is member-only (R10): every Thunderbolt hardware port is removed from bridge0 as a member, re-removed on configd re-add, restored by k3sm link reset/uninstall; the bridge itself and non-Thunderbolt members are never touched. Rollout: any restart order is safe, server first for the feature; io.k3sm.netd restarts first on each node; the mixed-version lab rung (one Mac old, one new, cable live) is green before M17.2 merges."
+    subphases:
+      - id: M17.2
+        title: linkenum + linkwatch + the netd link verbs + the mesh's direct routes
+        status: done
+        completed: 2026-10-05
+        strategy: "phased (named exception: wireguard MeshPeer protocol / AllowedIPs change)"
+        depends_on: [apis:M17.1]
+        deliverables:
+          - id: M17.2-d1
+            done: true  # 2026-10-05 — pkg/linkenum (bc7575f): Exec runs system_profiler/networksetup/ibv_devices by absolute path, Join keys receptacle N to `Thunderbolt N`, HardwarePorts is the single networksetup mapping (ErrNoThunderboltService when none); recorded fixtures for a 6-port desktop and a 2-port laptop, cabled and uncabled, pinned by TestPortsFromRecordedFixtures / TestHardwarePortsMapsOnlyThunderboltNames; no cgo, no verbs.h
+            desc: "pkg/linkenum — exec-only Thunderbolt port enumeration, run unprivileged as _k3sm: /usr/sbin/system_profiler SPThunderboltDataType -json + /usr/sbin/networksetup -listallhardwareports (plain executables by absolute path, no SPI, no cgo) joined exactly as F3 describes, plus ibv_devices (exec, parsed) for the RDMA device, behind a swappable interface with recorded-fixture canaries per macOS build (the symbol-canary idiom for text formats). Yields []Port{Iface, PortOrdinal, DomainUUID, PeerDomainUUID, SpeedGbps, RDMADevice}; RDMADevice = rdma_<iface> iff ibv_devices lists it. A port maps to a Thunderbolt hardware port ONLY by the networksetup `Thunderbolt N` hardware-port name, never by interface name; a deleted Thunderbolt Bridge service yields a NoThunderboltService condition; state is keyed by DomainUUID, never by a cached enX name. This is the SINGLE HardwarePorts implementation netd (root-side validation) and k3sm (pairing trust decision, the DirectLink writer) both call — production is its own networksetup parse, tests inject. No librdma link in any k3sm.io module at v1, and infiniband/verbs.h is barred from this repo."
+          - id: M17.2-d2
+            done: true  # 2026-10-05 — pkg/linkwatch (86d4e76): LinkEvents with the mandatory 2 s Poller and a best-effort read-only PF_ROUTE RouteReader, merged and debounced 500 ms; Gone is its own event; pinned over a fake clock and lister (TestPollerReportsStateChangesAndVanishings, TestDebounceCoalescesABurstAndDropsRepeats); wired into mesh.Watcher.WatchLinks (TestLinkEventsTriggerTheReconcile); B450 — a cable pull leaves enX IFF_UP|IFF_RUNNING and PF_ROUTE silent, so the poll now also reads the carrier with an unprivileged SIOCGIFMEDIA (IFM_AVALID+IFM_ACTIVE; no media report = flags decide; a per-interface read error is logged once and spares the rest) and reports the pull within one poll (TestPollReportsCarrierLoss)
+            desc: "pkg/linkwatch — a consumer-defined LinkEvents interface with two implementations: a MANDATORY 2 s net.Interfaces() flag poll (primary, cheap, pure Go) and an unprivileged PF_ROUTE reader of RTM_IFINFO/RTM_NEWADDR/RTM_DELADDR as the latency optimisation (writes need root; reads do not). Events are debounced 500 ms and call the same Reconcile the MeshPeer informer calls; the 30 s resync stays the backstop. An interface that VANISHES is RemoveLink + re-ConfigureLink on reappearance, never a flag flip. If S1 shows PF_ROUTE silent for a Thunderbolt enX, the poll is the only source (R8)."
+          - id: M17.2-d3
+            done: true  # 2026-10-05 — netd (82d3a5f): VerbConfigureLink/VerbRemoveLink, ConfigureMeshArgs.DirectRoutes validated in full then applied as one plan, minor 1.1 with the daemon version on every reply; root-side derivation of the link address and every gateway (TestGatewayDerivedFromPeerPodCIDR, TestConfigureLinkValidatesRootSide); bridge0 member-only removal, /32 alias, -tso/-lro with a TSO4/TSO6/LRO read-back, host route, rollback, start-up sweep of the reserved halves (TestApplier*); client gate (TestClientNeverSendsDirectRoutesToOldHelper)
+            desc: "netd — two additive verbs and an atomic route set. ConfigureLink{Iface, PortOrdinal, LinkIP (omitempty, a cross-check only), PeerLinkIP (optional, the first-contact host route)}: bridge0 `deletem` of the member (an absent member is success; membership read back), the /32 alias (the utun alias form), TSO/LRO off (-tso4 -tso6 -lro), the on-link host route to the peer's link address (-interface enX), then a kernel read-back of the alias and host route before routeReady is reported; a failed member removal leaves no alias behind (never half-configured). RemoveLink{Iface}: removes the alias and routes and restores bridge membership. ConfigureMeshArgs grows DirectRoutes[]{PeerPodCIDR, Gateway, Iface}, validated in full then applied all-or-nothing in handleConfigureMesh so the route set stays one atomic authority. Protocol minor 1.0 -> 1.1, the daemon's version carried in its reply. Root-side validation through pkg/linkenum's HardwarePorts: the interface must map to a `Thunderbolt N` hardware port; LinkIP is recomputed as LinkIP(idxOf(NodePodCIDR), N-1) from the identity netd adopted at the first ConfigureMesh (the client's value is only a cross-check); every gateway must equal LinkIP(idxOf(PeerPodCIDR), p) for some p, so a compromised _k3sm client cannot redirect a peer's pods to an arbitrary cable; each PeerPodCIDR is a /24 inside the aggregate and not the node's own; at most 8 links. Startup reconcile removes any alias or route in the reserved halves netd does not own (crash-safe, idempotent). Every ConfigureLink/RemoveLink/member change is an os_log line under io.k3sm.netd."
+          - id: M17.2-d4
+            done: true  # 2026-10-05 — pkg/mesh (069ecda): BuildPlan(self, peers, direct) with candidate selection and unknown-Link tolerance, RouteSpec{Prefix, Iface, Gateway} keeping the utun /24 and adding two /25 gateway routes with RTAX_IFA = the .1 mesh-egress address, gateway-and-flags read-back, ValidatePlan reserved-half gateways, EligibleDirectRoutes, the 5 s ICMP probe (3 misses), endpoint re-program on a dead path (TestDirectPathDeathReprogramsEndpoint); TunnelMSS unchanged
+            desc: "pkg/mesh — BuildPlan(self, peers, direct DirectRoutes): per peer, PeerConfig.Endpoint is the `direct` candidate equal to the route's gateway, else the first `underlay` candidate, else Endpoint; unknown Link values are ignored. A peer is direct-eligible only when the local link is up AND the liveness probe is alive AND its DirectLink.status port is up (both ends routeReady) — never from server status alone, since in a cable-only cluster that update would arrive over the path that just died. Plan.Routes becomes []RouteSpec{Prefix, Iface, Gateway} (zero gateway = today's utun link route): the /24 utun route is KEPT and a direct peer adds two /25 gateway routes over enX carrying RTAX_IFA = the node's .1 mesh-egress address (so an unbound host dial falling back to the utun stays inside the peer's AllowedIPs); routes.go gains the gateway form (RTAX_GATEWAY, RTF_GATEWAY) and the read-back is extended to compare gateway and flags, not only interface and RTF_UP; ValidatePlan requires gateways derived as d3 says. Liveness is probed, not inferred: a 5 s ICMP echo to the peer's link address per direct link; three misses delete the /25s and clear routeReady, and the route returns only after the probe answers and the resolver re-asserts up. When the direct path dies the selected candidate changes and UAPIUpdate re-programs the wireguard endpoint to the underlay (wireguard-go roams only on a received packet). TunnelMSS stays 1340, unchanged, for every path. Every up/down transition is a Warn-level slog line naming the interface, the peer and the reason."
+          - id: M17.2-d5
+            done: true  # 2026-10-05 — all five named tests present and passing: TestClientNeverSendsDirectRoutesToOldHelper and TestRouteOverrideNeverBlackholes and TestDirectRouteRequiresPeerRouteReady and TestOldReaderAcceptsEndpointsField (pkg/mesh), TestGatewayDerivedFromPeerPodCIDR (pkg/netd), plus the fixture and fake-routing-socket tables
+            desc: "the named tests, plus table tests over fake enumerations and a fake routing socket: TestClientNeverSendsDirectRoutesToOldHelper (a 1.0 helper is never asked for DirectRoutes); TestRouteOverrideNeverBlackholes (up = host route then /25s, down = /25s then host route, the utun /24 never removed — ordering over a fake routing socket; the kernel property is the lab rung, not this test); TestDirectRouteRequiresPeerRouteReady (no /25s unless the peer's port is up with both ends routeReady and the link is up locally); TestGatewayDerivedFromPeerPodCIDR (netd refuses a gateway that is not LinkIP(idxOf(PeerPodCIDR), p)); TestOldReaderAcceptsEndpointsField (a pre-M17 BuildPlan fixture accepts a reserved-half Endpoint and skips no peer carrying Endpoints)."
+        acceptance:
+          - id: M17.2-a1
+            met: true  # 2026-10-05 — ran in the lane with GOWORK=<lane>/go.work: CGO_ENABLED=0 go vet ./... clean (and -tags integration), CGO_ENABLED=0 go test -race ./... green across every package, the five named tests of M17.2-d5 present and passing, GOWORK=off go mod tidy leaves no diff, staticcheck 2026.2.1 -tests=false clean. The kernel properties stay with M17.2-a2 (lab), not claimed here
+            check: "CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test -race ./... green with the five named tests of M17.2-d5 present and passing, and go mod tidy leaves no diff"
+            method: unit
+          - id: M17.2-a2
+            met: false  # lab-ledger carve-out: the kernel properties are not provable in a unit test; they are proven only by the two-Mac rig ladder in k3sm's hack/lab/m17.sh (K3SM_LAB=1), never auto-greened here
+            check: "the kernel properties behind the unit-proven ordering: on unplug the kernel deletes the interface-bound /25 and host routes and pod traffic falls back to the utun /24; no kernel fault across repeated cable flips under a bulk flow; configd re-adding a Thunderbolt member to bridge0 is re-removed by the watcher — all proven only by the two-Mac rig ladder (k3sm hack/lab/m17.sh, K3SM_LAB=1)"
+            method: lab
 ---
 
 # darwin-net — Phase roadmap
@@ -519,7 +558,7 @@ out of storage `apis:M3.1` into `apis:M3.2`, which darwin-net's mesh depends on)
   backend connection and so does **not** preserve the client source IP, so
   `externalTrafficPolicy: Local` is not honored (documented). **No `apis` change** —
   `ServicePort.NodePort` already exists. **UDP NodePort is DEFERRED** with the UDP datagram relay (a
-  UDP port opens no datagram socket on the ClusterIP **or** the NodePort); stockkitty's NodePort
+  UDP port opens no datagram socket on the ClusterIP **or** the NodePort); a reference workload's NodePort
   surface (VSCode SSH `:22`, snapshot gRPC range) is all TCP, so **UDP NodePort is not claimed until
   the relay lands**.
 
@@ -582,15 +621,17 @@ behind `sandbox.Backend`). The verifiable parts are unit; the live attach + reac
 ### M5.1 — guest networking for the `vm` RuntimeClass 🟡
 **Deliverables**
 - 🟡 `M5.1-d1` Guest networking for the `vm` RuntimeClass guest (a Linux micro-VM behind the existing
-  swappable `sandbox.Backend` seam). The **lo0-alias + `IP_BOUND_IF` bind-discipline model is
-  host-process-only**: a Virtualization.framework guest has its **own network stack**, so pod
-  connectivity comes from a **`VZNATNetworkDeviceAttachment`** (NAT), **not** an lo0 alias (an lo0
-  alias would make the host own the guest's IP and blackhole same-node delivery). **Landed
+  swappable `sandbox.Backend` seam). The **`IP_BOUND_IF` bind discipline is host-process-only**: a
+  Virtualization.framework guest has its **own network stack**, so the guest's own connectivity
+  comes from a **`VZNATNetworkDeviceAttachment`** (NAT). Since B440 the pod's published /32 is still
+  aliased on lo0 for the pod's lifetime and the node's proxy relays it to the guest's lease, so
+  `status.podIP` is reachable on the node while the guest keeps its own stack. **Landed
   (unit-verifiable):** the **path-selection fork** in `pkg/podnet` — `Network.SetupGuest` (`BackendVM`)
-  allocates the pod IP from the same `Allocator` but plumbs **no** lo0 alias and returns a
-  `GuestNetwork` (PodIP, NAT gateway/subnet, cluster DNS VIP) for runtimed's VZ backend to apply;
-  `Setup` (`BackendHostProcess`) is **byte-unchanged**; `Teardown` removes the lo0 alias **only** for
-  host-process pods. darwin-net provides the config/**decision as data** — the live
+  allocates the pod IP from the same `Allocator`, aliases it on lo0, and returns a `GuestNetwork`
+  (PodIP, NAT gateway/subnet, cluster DNS VIP) for runtimed's VZ backend to apply; `Setup`
+  (`BackendHostProcess`) is **byte-unchanged**; `Teardown` removes the alias for both pod kinds
+  behind the blackhole (`TestVMPodSelectsVmnetPathAndAliasesPublished`,
+  `TestPublishedVMPodAddressRelaysToLive`). darwin-net provides the config/**decision as data** — the live
   `VZNATNetworkDeviceAttachment` wiring is runtimed's (the DAG keeps the VZ backend out of darwin-net).
   **Lab-gated remainder (scaffold + report):** the live NAT attach, guest→ClusterIP-VIP reachability
   (**OPEN empirical question** — does macOS NAT weak-host-deliver a guest datagram to a host lo0-alias
@@ -602,12 +643,21 @@ behind `sandbox.Backend`). The verifiable parts are unit; the live attach + reac
 - ⬜ `M5.1-a1` a pod under `runtimeClassName: vm` is assigned a guest IP via the
   `VZNATNetworkDeviceAttachment` and is reachable + can reach a ClusterIP Service and the cluster
   resolver — *method: integration* (lab)
-- ✅ `M5.1-a2` the networking config selects the VM (NAT) path (**not** the lo0-alias path) when the
-  pod's backend is the VM; the host-process path is unaffected — *method: unit* →
-  `TestVMPodSelectsVmnetPathNotLo0` (a vm pod via `SetupGuest` ensures **no** lo0 alias and returns a
-  `GuestNetwork`; a host-process pod via `Setup` ensures exactly one lo0 alias and gets no vmnet
-  config — asserting **both** the taken and not-taken branch, plus that teardown removes an alias only
-  for the host-process pod). Also `TestSetupGuestIdempotentAndBackendMismatch`, `TestBackendString`.
+- ✅ `M5.1-a2` the networking config selects the VM (NAT) path when the pod's backend is the VM; the
+  host-process path is unaffected — *method: unit* → `TestVMPodSelectsVmnetPathAndAliasesPublished`
+  (a vm pod via `SetupGuest` returns a `GuestNetwork`; a host-process pod via `Setup` gets no vmnet
+  config; both pods' published /32 is aliased on lo0 for the pod's lifetime and teardown removes
+  either alias behind the blackhole). Since B440 the vm pod's alias is what makes its `status.podIP`
+  live on its node: the proxy's per-pod relay listens on the published address and relays TCP to the
+  guest's live lease on its declared and Service-targeted ports (`pkg/proxy`
+  `TestPublishedVMPodAddressRelaysToLive`, `TestPodRelayPortSet`, `TestPodRelayRefusesClients`,
+  `TestPodRelayRefusesOverrides`, `TestPodRelayFollowsReplaceAndDrop`; real-socket twin
+  `TestPublishedVMPodAddressRelaysToLiveSockets`). Undeclared non-Service ports are refused and UDP
+  is not relayed. These are unit and loopback proofs only: the alias-bound listener on a real pod
+  /32, the blackhole-on-teardown rebind, and delivery into a real guest are owed to a lab slice (the
+  k3sm e2e twin `TestVMPodIPReachableAcrossNodes` on the rig). Also `TestGuestTeardownBlackholesPublishedAddress`,
+  `TestReattachGuestOwnsPublishedAlias`, `TestSetupGuestIdempotentAndBackendMismatch`,
+  `TestBackendString`.
 
 ### M5.2 — guest-side cluster resolver (the `DYLD` shim is Darwin-only) 🟡
 **Deliverables**
@@ -791,3 +841,39 @@ d3 B113 attribution with a lease-change liveness contract; d4 the network-trust 
 (guest↔guest / guest→LAN segment facts → limitations.md/register, or a pf-filter forward-marker).
 **Acceptance** — frontmatter `M11.3-a1`: seams unit-proven; every live leg rides
 `hack/lab/m11.sh` (`K3SM_LAB=1`), never auto-greened.
+
+## M17 — Direct links (darwin-net slice) 🟡
+A Thunderbolt cable between two cluster Macs becomes a discovered, addressed, preferred data path
+(`docs/m17-plan.md` authoritative; §The shape 1 and 3, §Seams, R4, R8, R10, R12–R15 are the
+inputs). **Phased (named exception: wireguard MeshPeer protocol / AllowedIPs change)**, claimed for
+two surfaces only: the mesh endpoint/route protocol across nodes (the additive `Endpoints[]`
+candidates, the direct gateway routes; AllowedIPs unchanged), and the additive `k3sm-netd` helper
+IPC minor bump 1.0 → 1.1, gated by the helper's reported version. **`MeshPeerSchemaVersion` stays
+1** — `BuildPlan` skips any other stamp, so a bump would blackhole every new node from every old
+reader. **The utun route never leaves**: a direct peer gets two more-specific /25 gateway routes
+over `enX`, so on unplug the kernel deletes them and traffic falls back to the utun /24 with no
+k3sm code in the path. `TunnelMSS` stays 1340 for every path; TSO/LRO off on the Thunderbolt `enX`.
+
+### M17.2 — linkenum, linkwatch, the netd link verbs, the mesh's direct routes ✅
+**Cross-repo dep:** `apis:M17.1` (`EndpointCandidate`/`Endpoints`, the pure `LinkIP(idx, port)`
+over the RFC 3927 reserved /24s).
+**Deliverables** — frontmatter `M17.2-d1…d5`: d1 `pkg/linkenum`, exec-only enumeration
+(`system_profiler SPThunderboltDataType -json`, `networksetup -listallhardwareports`,
+`ibv_devices`) behind a swappable interface with recorded-fixture canaries, the single
+`HardwarePorts` implementation netd and k3sm call, mapping only by the `Thunderbolt N` port name,
+no cgo, `verbs.h` barred; d2 `pkg/linkwatch`, a consumer-defined `LinkEvents` with a mandatory
+2 s flag poll and an unprivileged `PF_ROUTE` reader as the optimisation, debounced 500 ms; d3 netd
+`ConfigureLink`/`RemoveLink` (bridge0 member removal, /32 alias, TSO/LRO off, on-link host route,
+kernel read-back → `routeReady`), `ConfigureMeshArgs.DirectRoutes` applied all-or-nothing, minor
+1.1 in the reply, root-side validation of the link address and every gateway, ≤ 8 links, startup
+reconcile, `os_log` per operation; d4 `pkg/mesh` candidate selection, `RouteSpec{Prefix, Iface,
+Gateway}` with `RTAX_IFA`, the gateway-aware read-back, the 5 s ICMP liveness probe, the endpoint
+re-program on a dead direct path; d5 the named tests.
+**Acceptance** — frontmatter `M17.2-a1`: `CGO_ENABLED=0 go vet ./... && go test -race ./...` with
+`TestClientNeverSendsDirectRoutesToOldHelper`, `TestRouteOverrideNeverBlackholes`,
+`TestDirectRouteRequiresPeerRouteReady`, `TestGatewayDerivedFromPeerPodCIDR`,
+`TestOldReaderAcceptsEndpointsField`, `go mod tidy` clean — *method: unit*. `M17.2-a2`: the kernel
+properties (unplug fallback by kernel deletion, no fault under a bulk flow, configd member re-add)
+ride k3sm's two-Mac `hack/lab/m17.sh` (`K3SM_LAB=1`), never auto-greened here — *method: lab*.
+**Status (2026-10-05):** d1–d5 delivered and `M17.2-a1` met in the unit tier; `M17.2-a2` stays open
+for the lab rung, and the mixed-version rung is still owed before this slice merges.

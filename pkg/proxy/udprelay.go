@@ -202,6 +202,30 @@ func (b *udpBudget) release(srcIP netip.Addr) {
 	}
 }
 
+// udpVIPConn is the relay's view of the VIP datagram socket. *net.UDPConn
+// satisfies it and is the only production implementation; the interface exists so
+// the relay's unit tests can drive it without a real socket. The AddrPort-carrying
+// methods are the ones named here (not ReadFrom/WriteTo) so a datagram's client
+// address stays a netip.AddrPort value — the per-datagram path never boxes a heap
+// net.Addr.
+type udpVIPConn interface {
+	ReadFromUDPAddrPort(b []byte) (int, netip.AddrPort, error)
+	WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error)
+	LocalAddr() net.Addr
+	Close() error
+}
+
+// udpUpstream is the relay's view of one flow's connected upstream socket.
+// *net.UDPConn (from net.DialUDP) satisfies it and is the only production
+// implementation; it is narrowed to the four methods the relay calls so unit tests
+// can substitute an in-memory backend.
+type udpUpstream interface {
+	Read(b []byte) (int, error)
+	Write(b []byte) (int, error)
+	LocalAddr() net.Addr
+	Close() error
+}
+
 // udpFlow is one client→backend datagram flow: a connected upstream socket to the
 // backend picked once for this client 5-tuple, plus the client address (a value,
 // netip.AddrPort, so keying and replying allocate nothing) responses are written
@@ -221,7 +245,7 @@ func (b *udpBudget) release(srcIP netip.Addr) {
 // per-source fair-share bucket key — stored on the flow so a removal path
 // un-counts the exact bucket the insert counted.
 type udpFlow struct {
-	upstream     *net.UDPConn
+	upstream     udpUpstream
 	client       netip.AddrPort
 	srcIP        netip.Addr
 	lastActivity atomic.Int64 // monotonic nanoseconds since udpRelay.epoch
@@ -270,7 +294,12 @@ type udpFlow struct {
 // inverted), and never re-enter the relay. Close joins the dispatcher, the sweeper,
 // and every reader through wg before returning, so teardown strands no goroutine.
 type udpRelay struct {
-	conn  *net.UDPConn // the VIP socket; the concrete type so reads and writes carry netip.AddrPort, not a heap net.Addr
+	// epoch is first so it shares a cache line with conn — the two fields every
+	// reader goroutine reads per datagram — and not with mu, which the dispatcher
+	// writes on every lookup. Placed after the 16-byte conn interface it landed on
+	// mu's 128-byte line and doubled the dispatcher's cost under concurrent readers.
+	epoch time.Time  // zero point of every flow's lastActivity (monotonic)
+	conn  udpVIPConn // the VIP socket (*net.UDPConn in production); its AddrPort methods keep reads and writes free of a heap net.Addr
 	key   PortKey
 	table *RoutingTable
 	// egress is the destination-scoped mesh-egress source decision, shared
@@ -280,7 +309,6 @@ type udpRelay struct {
 	// egressScope.sourceFor verdict rather than carrying a second predicate.
 	egress       egressScope
 	idleTimeout  time.Duration
-	epoch        time.Time // zero point of every flow's lastActivity (monotonic)
 	perSourceCap int
 	budget       *udpBudget
 	log          *slog.Logger
@@ -295,8 +323,9 @@ type udpRelay struct {
 	// dial opens a connected per-flow upstream socket. It defaults to net.DialUDP
 	// (wired once in newUDPRelay) and is an intra-package test seam only — a test
 	// injects a counting dialer to assert a globally-capped source never reaches the
-	// dial. It is never exported and never a runtime-flippable knob.
-	dial func(laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
+	// dial, or an in-memory upstream so the relay runs without a socket. It is never
+	// exported and never a runtime-flippable knob.
+	dial func(laddr, raddr *net.UDPAddr) (udpUpstream, error)
 
 	mu     sync.Mutex
 	closed bool
@@ -323,7 +352,7 @@ type udpRelay struct {
 // via newUDPBudget with a private one sized to the per-VIP cap, so reserve/release
 // never nil-panic and bySource is never nil (no cross-VIP coupling). Call
 // start to run it and Close to tear it down.
-func newUDPRelay(conn *net.UDPConn, key PortKey, table *RoutingTable, egress egressScope, idleTimeout time.Duration, perSourceCap int, budget *udpBudget, log *slog.Logger) *udpRelay {
+func newUDPRelay(conn udpVIPConn, key PortKey, table *RoutingTable, egress egressScope, idleTimeout time.Duration, perSourceCap int, budget *udpBudget, log *slog.Logger) *udpRelay {
 	if budget == nil {
 		budget = newUDPBudget(MaxUDPFlows, udpPerSourceGlobalCap(MaxUDPFlows))
 	}
@@ -337,11 +366,21 @@ func newUDPRelay(conn *net.UDPConn, key PortKey, table *RoutingTable, egress egr
 		perSourceCap: perSourceCap,
 		budget:       budget,
 		log:          log,
-		dial:         func(laddr, raddr *net.UDPAddr) (*net.UDPConn, error) { return net.DialUDP("udp", laddr, raddr) },
+		dial:         dialUDPUpstream,
 		flows:        make(map[netip.AddrPort]*udpFlow),
 		perSource:    make(map[netip.Addr]int),
 		done:         make(chan struct{}),
 	}
+}
+
+// dialUDPUpstream is the production per-flow dial: a connected net.DialUDP socket.
+// A failed dial returns a nil interface, never a typed-nil *net.UDPConn boxed in one.
+func dialUDPUpstream(laddr, raddr *net.UDPAddr) (udpUpstream, error) {
+	c, err := net.DialUDP("udp", laddr, raddr)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // start launches the dispatcher and the idle-flow sweeper. Both are joined by
@@ -406,7 +445,7 @@ func (r *udpRelay) dispatch() {
 //
 // Precondition: client is already canonical (flowKey has unmapped it — see dispatch).
 // upstreamFor keys and counts on it as given.
-func (r *udpRelay) upstreamFor(client netip.AddrPort, lastWarn *time.Time) *net.UDPConn {
+func (r *udpRelay) upstreamFor(client netip.AddrPort, lastWarn *time.Time) udpUpstream {
 	srcIP := client.Addr()
 
 	r.mu.Lock()

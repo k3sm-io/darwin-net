@@ -17,20 +17,17 @@ limitations under the License.
 package proxy
 
 import (
-	"log/slog"
-	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"testing"
-	"time"
-
-	netv1 "k3sm.io/apis/net/v1"
 )
 
 // vmPublished stands in for a vm pod's PUBLISHED identity: a /32 out of the
-// cluster podCIDR that is deliberately live on NO interface (the host must never
-// alias a guest's address). Nothing in this file ever dials it — that is the whole
-// point of the override — so no test here depends on what the network does with it.
+// cluster podCIDR that the pod's node aliases on lo0 and serves through the
+// per-pod relay (podrelay.go), never the address a VIP backend dial targets.
+// Nothing in this file ever dials it — the override is what these tests resolve —
+// so no test here depends on what the network does with it.
 var vmPublished = netip.MustParseAddr("100.64.0.7")
 
 // TestTransportOverrideResolution is the pure table over RoutingTable's
@@ -60,7 +57,7 @@ func TestTransportOverrideResolution(t *testing.T) {
 	t.Run("b: an override redirects the address and PRESERVES the published port", func(t *testing.T) {
 		t.Parallel()
 		tbl := NewRoutingTable(netip.Prefix{})
-		tbl.SetTransportOverrides(map[netip.Addr]netip.Addr{vmPublished: live})
+		tbl.SetTransportOverrides(liveOnly(map[netip.Addr]netip.Addr{vmPublished: live}))
 
 		// The port is the guest's real listening port; a DHCP lease never changes it.
 		for _, port := range []uint16{80, 8080, 65535} {
@@ -81,15 +78,15 @@ func TestTransportOverrideResolution(t *testing.T) {
 		t.Parallel()
 		tbl := NewRoutingTable(netip.Prefix{})
 		otherVM := netip.MustParseAddr("100.64.0.8")
-		tbl.SetTransportOverrides(map[netip.Addr]netip.Addr{
+		tbl.SetTransportOverrides(liveOnly(map[netip.Addr]netip.Addr{
 			vmPublished: live,
 			otherVM:     netip.MustParseAddr("192.168.64.6"),
-		})
+		}))
 
 		// Generation 2 re-leases vmPublished and no longer mentions otherVM (its pod
 		// died). Wholesale replacement must apply BOTH facts.
 		relive := netip.MustParseAddr("192.168.64.9")
-		tbl.SetTransportOverrides(map[netip.Addr]netip.Addr{vmPublished: relive})
+		tbl.SetTransportOverrides(liveOnly(map[netip.Addr]netip.Addr{vmPublished: relive}))
 
 		if got, want := tbl.transportAddr(netip.AddrPortFrom(vmPublished, 80)), netip.AddrPortFrom(relive, 80); got != want {
 			t.Errorf("after re-lease: transportAddr = %s, want %s", got, want)
@@ -111,8 +108,8 @@ func TestTransportOverrideResolution(t *testing.T) {
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				tbl := NewRoutingTable(netip.Prefix{})
-				tbl.SetTransportOverrides(map[netip.Addr]netip.Addr{vmPublished: live})
-				tbl.SetTransportOverrides(tc.clear)
+				tbl.SetTransportOverrides(liveOnly(map[netip.Addr]netip.Addr{vmPublished: live}))
+				tbl.SetTransportOverrides(liveOnly(tc.clear))
 				ap := netip.AddrPortFrom(vmPublished, 80)
 				if got := tbl.transportAddr(ap); got != ap {
 					t.Errorf("transportAddr(%s) = %s, want the published address (the override was cleared)", ap, got)
@@ -126,12 +123,12 @@ func TestTransportOverrideResolution(t *testing.T) {
 		tbl := NewRoutingTable(netip.Prefix{})
 		mappedKey := netip.AddrFrom16(netip.MustParseAddr("100.64.0.9").As16())
 		mappedLive := netip.AddrFrom16(live.As16())
-		tbl.SetTransportOverrides(map[netip.Addr]netip.Addr{
+		tbl.SetTransportOverrides(liveOnly(map[netip.Addr]netip.Addr{
 			vmPublished:                        {},         // invalid value: skipped, not installed as a black hole
 			{}:                                 live,       // invalid key: skipped
 			mappedKey:                          live,       // v4-in-v6 key: normalized to its v4 form
 			netip.MustParseAddr("100.64.0.10"): mappedLive, // v4-in-v6 value: likewise
-		})
+		}))
 		ap := netip.AddrPortFrom(vmPublished, 80)
 		if got := tbl.transportAddr(ap); got != ap {
 			t.Errorf("an invalid override VALUE must be skipped: transportAddr(%s) = %s, want unchanged", ap, got)
@@ -145,15 +142,20 @@ func TestTransportOverrideResolution(t *testing.T) {
 		}
 	})
 
-	t.Run("f: the caller may reuse its map — SetTransportOverrides copies", func(t *testing.T) {
+	t.Run("f: the caller may reuse its map and slices — SetTransportOverrides copies", func(t *testing.T) {
 		t.Parallel()
 		tbl := NewRoutingTable(netip.Prefix{})
-		feed := map[netip.Addr]netip.Addr{vmPublished: live}
+		ports := []uint16{8080, 0, 80, 8080}
+		feed := map[netip.Addr]VMPodTransport{vmPublished: {Live: live, Ports: ports}}
 		tbl.SetTransportOverrides(feed)
-		feed[vmPublished] = netip.MustParseAddr("192.168.64.99") // the feeder reuses its buffer
+		feed[vmPublished] = VMPodTransport{Live: netip.MustParseAddr("192.168.64.99")} // the feeder reuses its buffer
+		ports[0] = 9999
 		want := netip.AddrPortFrom(live, 80)
 		if got := tbl.transportAddr(netip.AddrPortFrom(vmPublished, 80)); got != want {
 			t.Errorf("transportAddr = %s, want %s (a retained caller map must not mutate the table)", got, want)
+		}
+		if got := tbl.load().transport[vmPublished].Ports; !slices.Equal(got, []uint16{80, 8080}) {
+			t.Errorf("installed ports = %v, want [80 8080] (copied, sorted, de-duplicated, zero dropped)", got)
 		}
 	})
 
@@ -165,7 +167,7 @@ func TestTransportOverrideResolution(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
-				tbl.SetTransportOverrides(map[netip.Addr]netip.Addr{vmPublished: live})
+				tbl.SetTransportOverrides(liveOnly(map[netip.Addr]netip.Addr{vmPublished: live}))
 				tbl.SetTransportOverrides(nil)
 			}
 		}()
@@ -184,96 +186,16 @@ func TestTransportOverrideResolution(t *testing.T) {
 	})
 }
 
-// TestTransportOverrideDialTarget proves the seam at the DIAL, on both accept
-// paths: with an override installed the proxy dials the live transport address
-// (reaching a backend that is NOT at the published identity), and with none it is
-// byte-identical to today for a host-process pod. Loopback only — no test here
-// dials an off-loopback address.
-func TestTransportOverrideDialTarget(t *testing.T) {
-	t.Parallel()
-	src := netip.MustParseAddr("10.42.0.10")
-
-	t.Run("a: TCP — the dial follows the override to the live address", func(t *testing.T) {
-		t.Parallel()
-		// The backend LISTENS on loopback; the routing table PUBLISHES it at the vm
-		// /32 with that same port. Only the override can bridge the two, so reaching
-		// the banner is proof the dial used it.
-		be := newTCPBanner(t, "127.0.0.1:0")
-		port := be.addrPort().Port()
-
-		p, table := newPolicyProxy(nil)
-		table.SetTransportOverrides(map[netip.Addr]netip.Addr{vmPublished: be.addrPort().Addr()})
-		key := PortKey{ClusterIP: "10.43.2.1", Port: 80, Protocol: netv1.ProtocolTCP}
-		table.SetEndpoints(key, []netv1.Endpoint{{IP: vmPublished.String(), Port: int32(port), Ready: true}})
-
-		if !handleVIP(t, p, key, src) {
-			t.Fatalf("connection did not reach the backend: the dial must follow the transport override")
-		}
-		if got := be.accepts.Load(); got != 1 {
-			t.Errorf("backend accepts = %d, want 1", got)
-		}
-	})
-
-	t.Run("b: TCP — a host-process backend is unchanged, with an empty AND a populated map", func(t *testing.T) {
-		t.Parallel()
-		be := newTCPBanner(t, "127.0.0.1:0")
-		p, table := newPolicyProxy(nil)
-		key := PortKey{ClusterIP: "10.43.2.2", Port: 80, Protocol: netv1.ProtocolTCP}
-		table.SetEndpoints(key, []netv1.Endpoint{be.endpoint()})
-
-		// No override map has ever been installed: the pre-M11.3 shape exactly.
-		if !handleVIP(t, p, key, src) {
-			t.Errorf("host-process backend must be reached with no overrides installed")
-		}
-		// A populated map that does not name this backend must not disturb it.
-		table.SetTransportOverrides(map[netip.Addr]netip.Addr{vmPublished: netip.MustParseAddr("192.168.64.5")})
-		if !handleVIP(t, p, key, src) {
-			t.Errorf("host-process backend must be reached while OTHER backends carry overrides")
-		}
-		// And an explicitly emptied map is the same thing again.
-		table.SetTransportOverrides(nil)
-		if !handleVIP(t, p, key, src) {
-			t.Errorf("host-process backend must be reached after the override map is cleared")
-		}
-		if got := be.accepts.Load(); got != 3 {
-			t.Errorf("backend accepts = %d, want 3 (every host-process dial unchanged)", got)
-		}
-	})
-
-	t.Run("c: UDP — the relay's per-flow dial follows the same override", func(t *testing.T) {
-		t.Parallel()
-		bp, err := net.ListenPacket("udp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("listen udp backend: %v", err)
-		}
-		defer bp.Close()
-		beAP := bp.LocalAddr().(*net.UDPAddr).AddrPort()
-
-		table := NewRoutingTable(netip.Prefix{})
-		table.SetTransportOverrides(map[netip.Addr]netip.Addr{vmPublished: beAP.Addr()})
-		key := PortKey{ClusterIP: "10.43.2.3", Port: 53, Protocol: netv1.ProtocolUDP}
-		table.SetEndpoints(key, []netv1.Endpoint{{IP: vmPublished.String(), Port: int32(beAP.Port()), Ready: true}})
-
-		vip, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-		if err != nil {
-			t.Fatalf("listen vip socket: %v", err)
-		}
-		r := newUDPRelay(vip, key, table, egressScope{}, time.Minute, maxUDPFlowsPerSource, nil, slog.New(slog.DiscardHandler))
-		defer func() { _ = r.Close() }()
-
-		var lastWarn time.Time
-		up := r.upstreamFor(netip.AddrPortFrom(src, 5001), &lastWarn)
-		if up == nil {
-			t.Fatalf("flow admission failed")
-		}
-		if _, err := up.Write([]byte("ping")); err != nil {
-			t.Fatalf("write via admitted flow: %v", err)
-		}
-		_ = bp.SetReadDeadline(time.Now().Add(policyTestTimeout))
-		buf := make([]byte, 16)
-		n, _, err := bp.ReadFrom(buf)
-		if err != nil || string(buf[:n]) != "ping" {
-			t.Fatalf("backend must receive the datagram at the OVERRIDE address (read %q, err %v)", buf[:n], err)
-		}
-	})
+// liveOnly lifts a published-to-live address map into the override value type,
+// declaring no ports, for the tests that exercise only the dial-site resolution.
+// A nil map stays nil.
+func liveOnly(m map[netip.Addr]netip.Addr) map[netip.Addr]VMPodTransport {
+	if m == nil {
+		return nil
+	}
+	out := make(map[netip.Addr]VMPodTransport, len(m))
+	for k, v := range m {
+		out[k] = VMPodTransport{Live: v}
+	}
+	return out
 }

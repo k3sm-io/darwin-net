@@ -285,3 +285,31 @@ func TestNewAllocatorRejectsNonSlash24(t *testing.T) {
 		}
 	}
 }
+
+// TestNodeIndexInvertsNodeCIDR pins NodeIndex as the exact inverse of NodeCIDR
+// and its refusals: a /24 outside the cluster, a non-/24, and IPv6 never yield an
+// index a caller could derive an address from.
+func TestNodeIndexInvertsNodeCIDR(t *testing.T) {
+	for _, idx := range []int{0, 1, 7, 30, 31, 61, 255, 16383} {
+		cidr, err := NodeCIDR(ClusterPodCIDR, idx)
+		if err != nil {
+			t.Fatalf("NodeCIDR(%d): %v", idx, err)
+		}
+		got, err := NodeIndex(ClusterPodCIDR, cidr)
+		if err != nil || got != idx {
+			t.Errorf("NodeIndex(%s) = (%d, %v), want (%d, nil)", cidr, got, err, idx)
+		}
+	}
+	for _, tc := range []struct{ name, cidr string }{
+		{"outside the aggregate", "10.0.0.0/24"},
+		{"not a /24", "100.64.0.0/25"},
+		{"the aggregate itself", "100.64.0.0/10"},
+		{"IPv6", "fd00::/120"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NodeIndex(ClusterPodCIDR, netip.MustParsePrefix(tc.cidr)); !errors.Is(err, ErrOutOfRange) {
+				t.Errorf("NodeIndex(%s) error = %v, want ErrOutOfRange", tc.cidr, err)
+			}
+		})
+	}
+}

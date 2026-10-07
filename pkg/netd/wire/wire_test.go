@@ -125,3 +125,37 @@ func TestConfigureMeshArgsNodePodCIDRIsAdditive(t *testing.T) {
 		}
 	})
 }
+
+// TestDirectLinksAreMinorOne pins the 1.0 -> 1.1 bump: this build speaks minor 1,
+// a minor-0 daemon does not support direct links, and the DirectRoutes and
+// LinkIP fields are omitted when unset so a frame without direct links is the
+// frame a 1.0 peer has always exchanged.
+func TestDirectLinksAreMinorOne(t *testing.T) {
+	if v := CurrentVersion(); v.Major != 1 || v.Minor != 1 || !v.SupportsDirectLinks() {
+		t.Fatalf("CurrentVersion = %+v, want 1.1 supporting direct links", v)
+	}
+	if (Version{Major: 1, Minor: 0}).SupportsDirectLinks() {
+		t.Fatal("a 1.0 daemon must not be treated as supporting direct links")
+	}
+	if (Version{Major: 2, Minor: 5}).SupportsDirectLinks() {
+		t.Fatal("another major must not be treated as supporting direct links")
+	}
+	b, err := json.Marshal(Request{Version: CurrentVersion(), Verb: VerbConfigureMesh, ConfigureMesh: &ConfigureMeshArgs{LocalPrivKeyRef: "ref"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(b, []byte("directRoutes")) || bytes.Contains(b, []byte("configureLink")) {
+		t.Fatalf("a request without direct links carries minor-1 fields: %s", b)
+	}
+	rb, err := json.Marshal(Response{Version: CurrentVersion(), OK: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(rb, []byte("linkIP")) {
+		t.Fatalf("a reply without a link carries linkIP: %s", rb)
+	}
+	var cl ConfigureLinkArgs
+	if err := json.Unmarshal([]byte(`{"iface":"en5","portOrdinal":3}`), &cl); err != nil || cl.LinkIP != "" || cl.PeerLinkIP != "" {
+		t.Fatalf("a ConfigureLink without the optional addresses decodes as %+v (%v)", cl, err)
+	}
+}

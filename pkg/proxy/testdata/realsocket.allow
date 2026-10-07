@@ -1,0 +1,8 @@
+# Untagged test files that still open a real socket (loopback included), read by
+# TestNoUntaggedRealSocketTests. Format:
+#
+#   <module-relative path> until=YYYY-MM-DD # <why>
+#
+# This list only shrinks. When a file is converted to fakes or moved behind
+# //go:build integration, delete its line (the gate fails on a stale entry). An
+# entry past its date fails, and no entry may be dated more than 183 days out.

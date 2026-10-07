@@ -1,3 +1,5 @@
+//go:build integration
+
 /*
 Copyright The k3sm Authors.
 
@@ -14,12 +16,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// This file tests the stub's own same-port UDP and TCP binding, which is kernel
+// socket behaviour by definition. It needs no privilege; run with:
+//
+//	CGO_ENABLED=0 go test -tags integration -run '^TestStubDNSSurvivesABusyTCPPort$' ./pkg/dns/
+
 package dns
 
 // The shared "same port on UDP and TCP" bind used by both DNS stubs in this
 // package (newStubDNS in stubserver_test.go, newTemplateDNS in
-// differential_integration_test.go — this file carries no build tag so it is in
-// both builds).
+// differential_integration_test.go; all three files are in the integration
+// build).
 //
 // Both stubs need one port that answers on BOTH transports, because the
 // resolver's TC-over-TCP refetch dials the very ip:port the UDP answer came

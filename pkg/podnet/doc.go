@@ -37,6 +37,18 @@ limitations under the License.
 //     `ifconfig lo0 alias <ip>/32` (root-gated, run inside the netd daemon
 //     boundary in deployment). Tests use the rootless fakeAliasManager; the
 //     root-gated integration test drives the real one against a live lo0.
+//   - BlackholeRoutes (blackhole.go) holds a pod address on lo0 while its alias
+//     is torn down: removing the alias installs a `<ip> 127.0.0.1` RTF_BLACKHOLE
+//     host route, and the next alias of that address clears it first. Without it
+//     the address would fall through to the mesh route, and a connection still
+//     open to the departed pod — negotiated with lo0's 16384-byte MTU — would
+//     re-route onto the utun's skywalk netif and overrun its GSO buffer, a
+//     kernel panic. Both alias owners apply it (lo0AliasManager here, and the
+//     netd daemon's executor), to pod addresses of the node /24 only
+//     (IsPodAddress); a Service VIP falls to the default route, never the utun.
+//     Only an address that was actually aliased is blackholed, and the netd
+//     executor sweeps the blackholes of a /24 it stops serving and the stale
+//     ones it finds at start (BlackholeRoutes.List).
 //   - Network (podnet.go) implements PodNetwork, the seam the runtime calls during
 //     pod setup/teardown: Setup allocates an IP, plumbs the lo0 alias, and returns
 //     the bindable address; Teardown removes the alias and releases the IP. Setup
@@ -84,10 +96,11 @@ limitations under the License.
 //     the host owns, and its own wildcard binds are rewritten onto it by the
 //     bind() interpose (see "# Bind discipline" above). This path is unchanged.
 //   - BackendVM (SetupGuest) — a Virtualization.framework micro-VM guest. A VZ guest
-//     has its OWN network stack reached over a VZNATNetworkDeviceAttachment, so it
-//     gets NO lo0 alias: aliasing the guest's IP on the host's lo0 would make the
-//     host answer for it and blackhole same-node delivery. SetupGuest allocates the
-//     pod IP (unified, leak-free IPAM) and returns a GuestNetwork (PodIP + NAT
+//     has its OWN network stack reached over a VZNATNetworkDeviceAttachment at a
+//     macOS-assigned lease address. SetupGuest allocates the pod IP (unified,
+//     leak-free IPAM), aliases it on lo0 for the pod's lifetime — the address the
+//     node's Service proxy listens on to relay into the guest (see "# Pod IP vs
+//     lease address" below) — and returns a GuestNetwork (PodIP + NAT
 //     gateway/subnet + cluster DNS VIP) for runtimed's VZ backend to APPLY. darwin-
 //     net decides and allocates; it does NOT perform the live VZ attach (the DAG
 //     keeps the VZ backend and the guest rootfs in runtimed) — the config flows
@@ -95,8 +108,12 @@ limitations under the License.
 //     only com.apple.security.virtualization, whereas a bridged/raw-vmnet attachment
 //     needs the Apple-restricted com.apple.vm.networking entitlement (unobtainable).
 //
-// Teardown is shared: it releases the pod IP for both backends and removes the lo0
-// alias ONLY for a host-process pod (a guest never had one).
+// Teardown is shared: for both backends it removes the lo0 alias (installing the
+// address's blackhole, see BlackholeRoutes) and releases the pod IP. For a vm pod
+// the caller must drop the pod's proxy transport override first — that closes
+// the pod's relay synchronously — and only then call Teardown. ReattachPod
+// and ReattachGuest re-adopt a surviving pod of either backend after a daemon
+// restart, re-ensuring its alias, and SweepStale keeps every bound address.
 //
 // # Guest VIP reachability — ANSWERED, and it needs nothing (2026-08-31)
 //
@@ -134,20 +151,26 @@ limitations under the License.
 // identity is baked before that. They are kept as two, with a single authority each.
 //
 //   - The podCIDR /32 (GuestNetwork.PodIP) is the PUBLISHED identity: status.podIP,
-//     the EndpointSlice, cluster DNS. For a vm pod it is live on NO interface — the
-//     host must never alias it, or the host would answer for the guest.
+//     the EndpointSlice, cluster DNS. For a vm pod the HOST aliases it on lo0 and
+//     answers for it on the guest's behalf: the Service proxy listens on that
+//     specific address (TCP, on the pod's declared and Service-targeted ports) and
+//     relays each connection to the lease (pkg/proxy podrelay.go). That is what
+//     makes the address reachable from the pod's own host, from another node (the
+//     mesh already routes this node's /24 here) and by a direct dial.
 //   - The guest's DHCP lease is the LIVE TRANSPORT address: it is what host-to-guest
 //     dials (probes, port-forward, the Service-proxy backend dial) must actually
 //     target, and it is never published. The guest agent's Health lease report is its
 //     single authority; darwin-net does not observe it.
 //
 // The Service-proxy seam where the two meet is RoutingTable.SetTransportOverrides in
-// pkg/proxy: a published-to-live map consulted at the dial sites only, so the policy
+// pkg/proxy: a published-to-live map consulted at the dial sites, so the policy
 // verdict and the endpoint identity keep using the published /32 while the packet
-// follows the lease. A vm pod stays SAME-NODE-SCOPED and is not a cross-node Service
-// backend: its lease address is in no peer's mesh AllowedIPs, and vmnet source-NAT is
-// structurally incompatible with the mesh's symmetric AllowedIPs, so cross-node never
-// "just works" and is not claimed.
+// follows the lease, and the same map installs the per-pod relay on the published
+// /32. The lease itself never leaves the node: it is in no peer's mesh AllowedIPs,
+// and vmnet source-NAT is structurally incompatible with the mesh's symmetric
+// AllowedIPs, so cross-node traffic reaches a vm pod only through its node's relay.
+// The relay's ceilings (TCP only, undeclared non-Service ports refused, the guest
+// sees the vmnet gateway as every relayed client) are documented in pkg/proxy.
 //
 // # Guest-to-guest — an observation, not a guarantee, in either direction
 //

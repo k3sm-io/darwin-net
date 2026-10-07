@@ -22,16 +22,27 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"regexp"
 	"sort"
 	"strings"
 
 	netv1 "k3sm.io/apis/net/v1"
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 )
+
+// directHalfBits is the prefix length of each of the two gateway routes a direct
+// peer's /24 gets over the cable: two /25s are more specific than the utun /24, so
+// they win while they exist and the /24 carries the traffic the moment they go.
+const directHalfBits = 25
 
 // nodeCIDRBits is the prefix length of a per-node pod CIDR. The mesh routes and
 // AllowedIPs are per-node /24s; requiring /24 is what excludes the 100.64.0.0/10
 // cluster aggregate (and any supernet) from the kernel route set.
 const nodeCIDRBits = 24
+
+// ethernetIfaceRE is the interface-name shape a direct route may name (en0, en12,
+// ...): the same shape a DirectLink port carries.
+var ethernetIfaceRE = regexp.MustCompile(`^en[0-9]+$`)
 
 // wgKeyBytes is the length of a Curve25519 wireguard key. A MeshPeer carries the
 // PUBLIC key base64-encoded (44 chars); the wireguard UAPI wants it hex-encoded.
@@ -45,7 +56,62 @@ var (
 	// ErrPeerConfig is returned for a MeshPeer that cannot be programmed (bad key,
 	// malformed CIDR, or AllowedIPs that do not equal the peer podCIDR).
 	ErrPeerConfig = errors.New("mesh: invalid mesh peer config")
+	// ErrDirectRoute is returned by ValidatePlan for a direct route the strict
+	// form refuses (a gateway outside the reserved direct-link halves, a malformed
+	// interface, or a route for no programmable peer).
+	ErrDirectRoute = errors.New("mesh: invalid direct route")
 )
+
+// DirectRoute is the cable path to one peer: the local interface the cable is on
+// and the peer's direct-link address on that cable, the next hop for the peer's
+// pods.
+type DirectRoute struct {
+	// Iface is the local interface the cable presents as (e.g. "en5").
+	Iface string
+	// Gateway is the peer's direct-link address (netv1alpha1.LinkIP of the peer's
+	// node index and port).
+	Gateway netip.Addr
+}
+
+// DirectRoutes are the peers to reach over a cable, keyed by peer node name
+// (MeshPeerSpec.NodeName). The caller derives it from local link state ANDed with
+// the resolved DirectLink status and the liveness probe (EligibleDirectRoutes);
+// BuildPlan trusts it and never derives one from a MeshPeer alone.
+type DirectRoutes map[string]DirectRoute
+
+// RouteSpec is one kernel route the plan wants. A zero Gateway is the utun link
+// route of a peer's /24 (Iface is empty: the device knows its own utun); a set
+// Gateway is a direct /25 through the peer's link address on Iface.
+type RouteSpec struct {
+	// Prefix is the destination.
+	Prefix netip.Prefix
+	// Iface is the interface of a direct route; empty for a utun route.
+	Iface string
+	// Gateway is the next hop of a direct route; zero for a utun route.
+	Gateway netip.Addr
+}
+
+// Direct reports whether the route is a direct (gateway) route over a cable.
+func (r RouteSpec) Direct() bool { return r.Gateway.IsValid() }
+
+// String renders a utun route as its prefix and a direct route with its next hop.
+func (r RouteSpec) String() string {
+	if r.Direct() {
+		return fmt.Sprintf("%s via %s on %s", r.Prefix, r.Gateway, r.Iface)
+	}
+	return r.Prefix.String()
+}
+
+// DirectPeer records a peer the plan routes over a cable: the peer, its pod /24,
+// and the route. The netd client sends these to the helper as typed values.
+type DirectPeer struct {
+	// NodeName is the peer node.
+	NodeName string
+	// PodCIDR is the peer's pod /24.
+	PodCIDR netip.Prefix
+	// Route is the cable path.
+	Route DirectRoute
+}
 
 // PeerConfig is the resolved, programmable form of one MeshPeer: the wireguard
 // public key hex-encoded for the UAPI, the reachable endpoint, the AllowedIPs
@@ -82,11 +148,19 @@ type Plan struct {
 	// programmed: a full replacement on the first apply, an incremental update
 	// afterwards so roamed endpoints and live sessions survive a reconcile).
 	Peers []PeerConfig
-	// Routes is the kernel route set: one prefix per peer podCIDR, each routed to
-	// the utun. It NEVER contains this node's own /24 or the cluster aggregate.
-	Routes []netip.Prefix
+	// Routes is the kernel route set: one utun route per peer podCIDR, ALWAYS,
+	// plus, for a direct peer, two /25 gateway routes over its cable. It NEVER
+	// contains this node's own /24 or the cluster aggregate, and a direct peer's
+	// utun /24 is never dropped (the kernel's own deletion of the /25s on unplug
+	// is the fallback to it).
+	Routes []RouteSpec
+	// Direct lists the peers routed over a cable, sorted by pod CIDR.
+	Direct []DirectPeer
 	// Skipped lists MeshPeers omitted from the plan, with reasons, for logging.
 	Skipped []PeerSkip
+	// DirectRejected lists direct routes BuildPlan ignored (the peer still gets
+	// its utun route), with reasons. ValidatePlan refuses a plan with any.
+	DirectRejected []PeerSkip
 }
 
 // EqualCIDR reports whether two prefixes denote the same network (masked equal).
@@ -169,15 +243,26 @@ func AllowedIPsMatchCIDR(spec netv1.MeshPeerSpec) error {
 // resolves the wireguard config. Per-peer problems are recorded in Plan.Skipped
 // (logged by the reconcile loop) rather than failing the whole plan, so one bad
 // MeshPeer cannot wedge the mesh. self must be an IPv4 /24 (ErrSelfCIDR otherwise).
-func BuildPlan(self netip.Prefix, peers []netv1.MeshPeerSpec) (Plan, error) {
+//
+// direct names the peers to route over a cable (nil: none). For each programmable
+// peer it names, the plan adds two /25 gateway routes through the peer's link
+// address on top of — never instead of — the peer's utun /24, and selects the
+// peer's wireguard endpoint from its candidates: the direct candidate whose host
+// is the route's gateway, else the first underlay candidate, else Endpoint. A peer
+// not in direct gets the first underlay candidate, else Endpoint. Candidates with
+// a Link this reader does not know are ignored, never a reason to skip the peer.
+// A direct route that is unusable (no interface, a gateway that is not an IPv4
+// address) is recorded in Plan.DirectRejected and the peer keeps its tunnel.
+func BuildPlan(self netip.Prefix, peers []netv1.MeshPeerSpec, direct DirectRoutes) (Plan, error) {
 	self = self.Masked()
 	if !self.Addr().Is4() || self.Bits() != nodeCIDRBits {
 		return Plan{}, fmt.Errorf("%w: got %s", ErrSelfCIDR, self)
 	}
 	var plan Plan
 	included := make([]netv1.MeshPeerSpec, 0, len(peers))
+	directByCIDR := make(map[netip.Prefix]DirectPeer)
 	for _, raw := range peers {
-		spec := raw.WithDefaults()
+		spec := knownCandidates(raw.WithDefaults())
 		skip := func(reason string) {
 			plan.Skipped = append(plan.Skipped, PeerSkip{NodeName: spec.NodeName, PodCIDR: spec.PodCIDR, Reason: reason})
 		}
@@ -194,6 +279,7 @@ func BuildPlan(self netip.Prefix, peers []netv1.MeshPeerSpec) (Plan, error) {
 			skip(fmt.Sprintf("malformed podCIDR %q: %v", spec.PodCIDR, err))
 			continue
 		}
+		peerCIDR = peerCIDR.Masked()
 		if EqualCIDR(peerCIDR, self) {
 			// The node's own MeshPeer: not a peer of itself; never routed.
 			continue
@@ -207,15 +293,129 @@ func BuildPlan(self netip.Prefix, peers []netv1.MeshPeerSpec) (Plan, error) {
 			skip(err.Error())
 			continue
 		}
+		route, isDirect := direct[spec.NodeName]
+		if isDirect {
+			if reason := directRouteProblem(route); reason != "" {
+				plan.DirectRejected = append(plan.DirectRejected, PeerSkip{NodeName: spec.NodeName, PodCIDR: spec.PodCIDR, Reason: reason})
+				isDirect = false
+			} else if peerCIDR.Bits() == nodeCIDRBits && peerCIDR.Addr().Is4() && !peerCIDR.Overlaps(self) {
+				directByCIDR[peerCIDR] = DirectPeer{NodeName: spec.NodeName, PodCIDR: peerCIDR, Route: route}
+			} else {
+				// RouteSet will not route this peer at all; neither will the cable.
+				isDirect = false
+			}
+		}
+		pc.Endpoint = selectEndpoint(spec, route, isDirect)
 		plan.Peers = append(plan.Peers, pc)
 		included = append(included, spec)
 	}
-	routes, err := RouteSet(self, included)
+	for name := range direct {
+		if !containsNode(included, name) {
+			plan.DirectRejected = append(plan.DirectRejected, PeerSkip{NodeName: name, Reason: "no programmable mesh peer of that name"})
+		}
+	}
+	sort.Slice(plan.DirectRejected, func(i, j int) bool { return plan.DirectRejected[i].NodeName < plan.DirectRejected[j].NodeName })
+	utun, err := RouteSet(self, included)
 	if err != nil {
 		return Plan{}, err
 	}
-	plan.Routes = routes
+	for _, p := range utun {
+		plan.Routes = append(plan.Routes, RouteSpec{Prefix: p})
+		dp, ok := directByCIDR[p]
+		if !ok {
+			continue
+		}
+		lo, hi := halves(p)
+		plan.Routes = append(plan.Routes,
+			RouteSpec{Prefix: lo, Iface: dp.Route.Iface, Gateway: dp.Route.Gateway},
+			RouteSpec{Prefix: hi, Iface: dp.Route.Iface, Gateway: dp.Route.Gateway})
+		plan.Direct = append(plan.Direct, dp)
+	}
 	return plan, nil
+}
+
+// halves splits a /24 into its two /25s.
+func halves(p netip.Prefix) (lo, hi netip.Prefix) {
+	b := p.Masked().Addr().As4()
+	lo = netip.PrefixFrom(netip.AddrFrom4(b), directHalfBits)
+	b[3] = 128
+	hi = netip.PrefixFrom(netip.AddrFrom4(b), directHalfBits)
+	return lo, hi
+}
+
+// directRouteProblem returns why a direct route cannot be used, or "".
+func directRouteProblem(r DirectRoute) string {
+	if r.Iface == "" {
+		return "direct route has no interface"
+	}
+	if !r.Gateway.IsValid() || !r.Gateway.Unmap().Is4() {
+		return fmt.Sprintf("direct route gateway %v is not an IPv4 address", r.Gateway)
+	}
+	return ""
+}
+
+// containsNode reports whether specs holds a peer named name.
+func containsNode(specs []netv1.MeshPeerSpec, name string) bool {
+	for _, s := range specs {
+		if s.NodeName == name {
+			return true
+		}
+	}
+	return false
+}
+
+// knownCandidates returns spec with every Endpoints candidate whose Link this
+// reader does not recognise removed. A reader ignores such a candidate rather than
+// failing the peer, so a future link kind never blackholes a node from an older
+// reader; removing it before Validate is what keeps Validate's writer-side rule
+// (every candidate carries a known Link) from skipping the peer.
+func knownCandidates(spec netv1.MeshPeerSpec) netv1.MeshPeerSpec {
+	if len(spec.Endpoints) == 0 {
+		return spec
+	}
+	kept := make([]netv1.EndpointCandidate, 0, len(spec.Endpoints))
+	for _, c := range spec.Endpoints {
+		switch c.Link {
+		case netv1.EndpointLinkUnderlay, netv1.EndpointLinkDirect:
+			kept = append(kept, c)
+		}
+	}
+	spec.Endpoints = kept
+	return spec
+}
+
+// selectEndpoint chooses the peer's wireguard endpoint: when the peer is routed
+// over a cable, the direct candidate whose host is that cable's gateway; else the
+// first underlay candidate; else Endpoint. The choice is local, so when the direct
+// path dies the selection moves to the underlay and the applier re-programs the
+// endpoint (wireguard-go roams only on a received packet, which a dead cable never
+// delivers).
+func selectEndpoint(spec netv1.MeshPeerSpec, route DirectRoute, direct bool) string {
+	if direct {
+		for _, c := range spec.Endpoints {
+			if c.Link != netv1.EndpointLinkDirect {
+				continue
+			}
+			if host, ok := endpointHost(c.Address); ok && host == route.Gateway.Unmap() {
+				return c.Address
+			}
+		}
+	}
+	for _, c := range spec.Endpoints {
+		if c.Link == netv1.EndpointLinkUnderlay {
+			return c.Address
+		}
+	}
+	return spec.Endpoint
+}
+
+// endpointHost parses the IP host of a host:port endpoint.
+func endpointHost(endpoint string) (netip.Addr, bool) {
+	ap, err := netip.ParseAddrPort(endpoint)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return ap.Addr().Unmap(), true
 }
 
 // ValidatePlan is the strict form of BuildPlan: it returns a Plan only if EVERY
@@ -226,8 +426,15 @@ func BuildPlan(self netip.Prefix, peers []netv1.MeshPeerSpec) (Plan, error) {
 // an attack rather than the benign cluster churn BuildPlan tolerates for the
 // in-process reconcile loop. self must be an IPv4 /24 (ErrSelfCIDR otherwise);
 // per-peer problems wrap ErrPeerConfig.
-func ValidatePlan(self netip.Prefix, peers []netv1.MeshPeerSpec) (Plan, error) {
-	plan, err := BuildPlan(self, peers)
+//
+// Every direct route must be usable, name a programmable peer, sit on an
+// Ethernet-class interface, and have its gateway in one of the two reserved
+// direct-link halves (netv1alpha1.IsLinkAddress); a violation wraps
+// ErrDirectRoute. That the gateway is exactly the address derived for the node
+// that owns the peer's /24 needs the cluster aggregate, so the daemon checks it
+// before calling here.
+func ValidatePlan(self netip.Prefix, peers []netv1.MeshPeerSpec, direct DirectRoutes) (Plan, error) {
+	plan, err := BuildPlan(self, peers, direct)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -245,6 +452,21 @@ func ValidatePlan(self netip.Prefix, peers []netv1.MeshPeerSpec) (Plan, error) {
 			if !a.Addr().Is4() || a.Bits() != nodeCIDRBits {
 				return Plan{}, fmt.Errorf("%w: peer %q AllowedIPs %s is not a per-node /%d", ErrPeerConfig, pc.NodeName, a, nodeCIDRBits)
 			}
+		}
+	}
+	if len(plan.DirectRejected) > 0 {
+		s := plan.DirectRejected[0]
+		return Plan{}, fmt.Errorf("%w: peer %q: %s", ErrDirectRoute, s.NodeName, s.Reason)
+	}
+	for _, r := range plan.Routes {
+		if !r.Direct() {
+			continue
+		}
+		if !ethernetIfaceRE.MatchString(r.Iface) {
+			return Plan{}, fmt.Errorf("%w: route %s: interface %q is not an Ethernet-class interface", ErrDirectRoute, r, r.Iface)
+		}
+		if !netv1alpha1.IsLinkAddress(r.Gateway) {
+			return Plan{}, fmt.Errorf("%w: route %s: gateway %s is outside the reserved direct-link halves 169.254.0.0/24 and 169.254.255.0/24", ErrDirectRoute, r, r.Gateway)
 		}
 	}
 	return plan, nil
