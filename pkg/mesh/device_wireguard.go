@@ -56,6 +56,10 @@ type wgLink struct {
 	linkIP        netip.Addr
 	privateKeyB64 string
 	listenPort    int
+	// nodePodCIDR and allocated drive the SYN refusal (refuser); a nil allocated
+	// leaves the utun unwrapped.
+	nodePodCIDR netip.Prefix
+	allocated   func(netip.Addr) bool
 }
 
 // DeviceConfig is the construction config for the production wireguard Device. It
@@ -82,6 +86,15 @@ type DeviceConfig struct {
 	PrivateKeyB64 string
 	// ListenPort is the UDP port wireguard listens on; 0 uses DefaultListenPort.
 	ListenPort int
+	// NodePodCIDR is the node's pod /24 and Allocated reports whether a pod of this
+	// node holds an address of it. With both set, a TCP SYN a peer sends over the
+	// tunnel to an address of the /24 no pod holds is answered with a RST instead
+	// of being dropped by the kernel (see refuser), so a dial of a deleted pod's
+	// address is refused at once. Allocated is called on the receive path and must
+	// be cheap and safe for concurrent use; it must answer true whenever it is
+	// unsure. A nil Allocated turns the refusal off.
+	NodePodCIDR netip.Prefix
+	Allocated   func(netip.Addr) bool
 }
 
 // WGDevice is the production Device: userspace wireguard (wireguard-go) over a
@@ -180,6 +193,8 @@ func NewDevice(cfg DeviceConfig, log *slog.Logger) *WGDevice {
 		linkIP:        cfg.LinkIP,
 		privateKeyB64: cfg.PrivateKeyB64,
 		listenPort:    port,
+		nodePodCIDR:   cfg.NodePodCIDR,
+		allocated:     cfg.Allocated,
 	}, log)
 }
 
@@ -241,7 +256,7 @@ func (d *WGDevice) Up(ctx context.Context) error {
 	}
 
 	logger := device.NewLogger(device.LogLevelError, fmt.Sprintf("(%s) ", name))
-	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), logger)
+	dev := device.NewDevice(d.wrapTUN(tunDev, name), conn.NewDefaultBind(), logger)
 	if err := dev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n", privHex, d.cfg.listenPort)); err != nil {
 		dev.Close()
 		return fmt.Errorf("configure wireguard private key: %w", err)
@@ -266,6 +281,21 @@ func (d *WGDevice) Up(ctx context.Context) error {
 	d.lastUAPI = ""
 	d.log.Info("mesh device up", "iface", name, "meshIP", d.cfg.meshIP.String(), "linkIP", d.cfg.linkIP.String(), "mtu", d.cfg.mtu, "listenPort", d.cfg.listenPort)
 	return nil
+}
+
+// wrapTUN returns the tun.Device wireguard drives: tunDev itself, or the refuser
+// over it when the config carries an allocation (see DeviceConfig.Allocated).
+func (d *WGDevice) wrapTUN(tunDev tun.Device, name string) tun.Device {
+	if d.cfg.allocated == nil || !d.cfg.nodePodCIDR.IsValid() {
+		return tunDev
+	}
+	node, allocated := d.cfg.nodePodCIDR, d.cfg.allocated
+	wake, rearm := utunWake(tunDev)
+	r := newRefuser(tunDev, func(pkt []byte) bool { return refuseSYN(pkt, node, allocated) }, wake, rearm)
+	r.onWakeErr = func(err error) {
+		d.log.Warn("mesh: cannot wake the utun reader; a refusal waits for the next outbound packet", "iface", name, "err", err)
+	}
+	return r
 }
 
 // plumb performs the host-side bring-up on the created utun name: it assigns the

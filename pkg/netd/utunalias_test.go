@@ -117,9 +117,13 @@ type fakeDevice struct {
 	h    *utunHost
 	link netip.Addr
 	up   bool
+	onUp func()
 }
 
 func (d *fakeDevice) Up(context.Context) error {
+	if d.onUp != nil {
+		d.onUp()
+	}
 	d.h.ops = append(d.h.ops, "device up")
 	d.up, d.h.utunUp = true, true
 	d.h.utun[d.link] = true

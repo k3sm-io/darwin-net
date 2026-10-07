@@ -128,6 +128,66 @@ const (
 	aliasBlackholePending
 )
 
+// localPods is the set of this node's pod addresses that a pod holds — aliased on
+// lo0 — as the mesh device's SYN refusal sees it (mesh.DeviceConfig.Allocated).
+// The device answers a peer's SYN to a pod address OUTSIDE this set with a RST, so
+// the set must never miss a live pod: until it is known (no lo0 read yet, a failed
+// read, a re-pointed /24) every address counts as allocated; an address joins it
+// before its lo0 alias is plumbed and leaves only once that alias is known gone.
+// It is read on the receive path, so it has its own lock, never held across a
+// command. In helper mode every lo0 alias in the node /24 is plumbed through this
+// executor, which is what lets it be the authority.
+type localPods struct {
+	mu    sync.RWMutex
+	known bool
+	set   map[netip.Addr]struct{}
+}
+
+// allocated reports whether a pod holds ip, or the set is not known.
+func (l *localPods) allocated(ip netip.Addr) bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if !l.known {
+		return true
+	}
+	_, ok := l.set[ip]
+	return ok
+}
+
+// reset replaces the set with ips and marks it known.
+func (l *localPods) reset(ips []netip.Addr) {
+	set := make(map[netip.Addr]struct{}, len(ips))
+	for _, ip := range ips {
+		set[ip] = struct{}{}
+	}
+	l.mu.Lock()
+	l.known, l.set = true, set
+	l.mu.Unlock()
+}
+
+// forget marks the set unknown: every address counts as allocated again.
+func (l *localPods) forget() {
+	l.mu.Lock()
+	l.known, l.set = false, nil
+	l.mu.Unlock()
+}
+
+// add puts ip in the set (a no-op while it is unknown).
+func (l *localPods) add(ip netip.Addr) {
+	l.mu.Lock()
+	if l.known {
+		l.set[ip] = struct{}{}
+	}
+	l.mu.Unlock()
+}
+
+// remove takes ip out of the set.
+func (l *localPods) remove(ip netip.Addr) {
+	l.mu.Lock()
+	delete(l.set, ip)
+	l.mu.Unlock()
+}
+
 // darwinApplier is the production Privileged: it shells out to ifconfig and
 // binds sockets directly, and drives the real wireguard mesh device (pkg/mesh).
 // It runs as root inside the daemon; unit tests inject a fake Privileged instead,
@@ -155,6 +215,11 @@ const (
 // drops it when its source is not an address of that interface, so without the
 // utun alias a peer's dial of a closed port on a pod of this node hangs instead
 // of being refused. The alias installs no route and lo0 stays the address's home.
+//
+// The applier also hands the mesh device the set of pod addresses a pod holds
+// (localPods), so the device can answer a peer's SYN to an address of the /24 no
+// pod holds, such as a deleted pod's, with a RST of its own: the kernel cannot,
+// because that address is on no interface.
 //
 // Locking discipline: the lazily-built mesh device, its up/iface state, and the
 // node CIDR the mesh addresses derive from are guarded by mu, so concurrent
@@ -194,6 +259,7 @@ type darwinApplier struct {
 
 	aliasMu sync.Mutex
 	aliased map[netip.Addr]aliasState
+	pods    localPods
 
 	mu          sync.Mutex
 	nodePodCIDR netip.Prefix
@@ -248,6 +314,9 @@ func (a *darwinApplier) EnsureAlias(ctx context.Context, ip netip.Addr) error {
 	a.aliasMu.Lock()
 	defer a.aliasMu.Unlock()
 	if a.isPodAddress(ip) {
+		// Allocated before anything is plumbed: the mesh never refuses a SYN to an
+		// address that may already be live.
+		a.pods.add(ip)
 		if err := a.routes.Clear(ctx, ip); err != nil {
 			return fmt.Errorf("ensure lo0 alias %s: %w", ip, err)
 		}
@@ -330,6 +399,26 @@ func (a *darwinApplier) reconcileUTUNAliases(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// seedPodsLocked replaces the allocation with the pod addresses of the node /24 on
+// lo0, read back from the kernel, plus every address this executor has aliased; a
+// failed read forgets it instead (every address allocated). aliasMu and mu must be
+// held, so no alias change interleaves.
+func (a *darwinApplier) seedPodsLocked() {
+	addrs, err := a.ifaceAddrs()
+	if err != nil {
+		a.pods.forget()
+		a.log.Warn("netd: cannot read lo0; refusing no SYN until it can be read", "err", err)
+		return
+	}
+	ips := podAddresses(a.nodePodCIDR, addrs["lo0"])
+	for ip, st := range a.aliased {
+		if st == aliasLive && podnet.IsPodAddress(a.nodePodCIDR, ip) {
+			ips = append(ips, ip)
+		}
+	}
+	a.pods.reset(ips)
+}
+
 // podAddresses returns the pod addresses of cidr among ips, sorted.
 func podAddresses(cidr netip.Prefix, ips []netip.Addr) []netip.Addr {
 	var out []netip.Addr
@@ -383,6 +472,10 @@ func (a *darwinApplier) RemoveAlias(ctx context.Context, ip netip.Addr) error {
 	if !a.isPodAddress(ip) {
 		delete(a.aliased, ip)
 		return nil
+	}
+	if removed || (tracked && state == aliasBlackholePending) {
+		// The lo0 alias is known gone: a SYN to it is now the mesh's to refuse.
+		a.pods.remove(ip)
 	}
 	if !tracked && !removed {
 		a.log.Debug("lo0 alias was never plumbed; no blackhole installed", "ip", ip.String())
@@ -492,6 +585,7 @@ func (a *darwinApplier) SetNodePodCIDR(ctx context.Context, cidr netip.Prefix) e
 	if old == cidr {
 		return nil
 	}
+	a.pods.forget()
 	for ip := range a.aliased {
 		if podnet.IsPodAddress(old, ip) {
 			delete(a.aliased, ip)
@@ -515,6 +609,9 @@ func (a *darwinApplier) ConfigureMesh(ctx context.Context, privKeyB64 string, li
 	defer a.aliasMu.Unlock()
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// The allocation the device's SYN refusal consults is read from lo0 BEFORE the
+	// device can come up, and again on every resync.
+	a.seedPodsLocked()
 	if a.dev == nil {
 		if !a.meshIP.IsValid() || !a.linkIP.IsValid() {
 			return fmt.Errorf("configure mesh: node podCIDR %s has no mesh-egress source or utun link address", a.nodePodCIDR)
@@ -525,6 +622,8 @@ func (a *darwinApplier) ConfigureMesh(ctx context.Context, privKeyB64 string, li
 			LinkIP:        a.linkIP,
 			PrivateKeyB64: privKeyB64,
 			ListenPort:    listenPort,
+			NodePodCIDR:   a.nodePodCIDR,
+			Allocated:     a.pods.allocated,
 		}, a.log)
 	}
 	if !a.meshUp {
