@@ -56,6 +56,10 @@ type wgLink struct {
 	linkIP        netip.Addr
 	privateKeyB64 string
 	listenPort    int
+	// nodePodCIDR and allocated drive the SYN refusal (refuser); a nil allocated
+	// leaves the utun unwrapped.
+	nodePodCIDR netip.Prefix
+	allocated   func(netip.Addr) bool
 }
 
 // DeviceConfig is the construction config for the production wireguard Device. It
@@ -69,7 +73,8 @@ type DeviceConfig struct {
 	// MTU is the tunnel MTU; 0 uses MTU.
 	MTU int
 	// MeshIP is the node's reserved mesh-egress /32 (podnet.MeshEgressIP), plumbed as
-	// an lo0 alias so the Service proxy can bind it as the backend dialer source.
+	// an lo0 alias so the Service proxy can bind it as the backend dialer source, and
+	// aliased onto the utun too so the kernel can answer for it over the mesh.
 	MeshIP netip.Addr
 	// LinkIP is the node's reserved mesh-link /32 (podnet.MeshLinkIP), assigned as
 	// the utun's own point-to-point interface address. It is REQUIRED: macOS refuses
@@ -81,6 +86,15 @@ type DeviceConfig struct {
 	PrivateKeyB64 string
 	// ListenPort is the UDP port wireguard listens on; 0 uses DefaultListenPort.
 	ListenPort int
+	// NodePodCIDR is the node's pod /24 and Allocated reports whether a pod of this
+	// node holds an address of it. With both set, a TCP SYN a peer sends over the
+	// tunnel to an address of the /24 no pod holds is answered with a RST instead
+	// of being dropped by the kernel (see refuser), so a dial of a deleted pod's
+	// address is refused at once. Allocated is called on the receive path and must
+	// be cheap and safe for concurrent use; it must answer true whenever it is
+	// unsure. A nil Allocated turns the refusal off.
+	NodePodCIDR netip.Prefix
+	Allocated   func(netip.Addr) bool
 }
 
 // WGDevice is the production Device: userspace wireguard (wireguard-go) over a
@@ -102,9 +116,21 @@ type DeviceConfig struct {
 //     routes installable at all (see Up).
 //
 // The two must not be collapsed into one. An address that lives ON the utun is
-// reached OVER the utun: assigning meshIP there installs a host route for it via
-// the tunnel, so a same-node dial of the node's own mesh IP is encrypted and dropped
-// (no peer's AllowedIPs covers this node's own address) instead of looping back.
+// reached OVER the utun: making meshIP the utun's own address installs a host route
+// for it via the tunnel, so a same-node dial of the node's own mesh IP is encrypted
+// and dropped (no peer's AllowedIPs covers this node's own address) instead of
+// looping back.
+//
+// Every node-local address that lives on lo0 (meshIP here, the pod addresses in
+// the netd executor) is ALSO aliased onto the utun, with UTUNAliasArgs. A packet
+// that arrives on the utun is delivered to such an address, but a reply the kernel
+// generates itself (a TCP RST for a closed port, an ICMP echo reply) is scoped to
+// the arrival interface, and ip_output drops it with EADDRNOTAVAIL when its source
+// is not an address of that interface: the peer's dial hangs instead of being
+// refused. The utun alias is point-to-point with the utun's own link address as
+// destination, so it installs no route (the host route to the link address is
+// already there) and lo0 stays the address's home: its lo0 host route still
+// carries every local dial.
 //
 // Locking discipline: all mutable state (the device handle, the actual interface
 // name, and the installed-route set) is guarded by mu, so Up/Apply/Down serialize.
@@ -167,6 +193,8 @@ func NewDevice(cfg DeviceConfig, log *slog.Logger) *WGDevice {
 		linkIP:        cfg.LinkIP,
 		privateKeyB64: cfg.PrivateKeyB64,
 		listenPort:    port,
+		nodePodCIDR:   cfg.NodePodCIDR,
+		allocated:     cfg.Allocated,
 	}, log)
 }
 
@@ -228,7 +256,7 @@ func (d *WGDevice) Up(ctx context.Context) error {
 	}
 
 	logger := device.NewLogger(device.LogLevelError, fmt.Sprintf("(%s) ", name))
-	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), logger)
+	dev := device.NewDevice(d.wrapTUN(tunDev, name), conn.NewDefaultBind(), logger)
 	if err := dev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n", privHex, d.cfg.listenPort)); err != nil {
 		dev.Close()
 		return fmt.Errorf("configure wireguard private key: %w", err)
@@ -255,9 +283,24 @@ func (d *WGDevice) Up(ctx context.Context) error {
 	return nil
 }
 
+// wrapTUN returns the tun.Device wireguard drives: tunDev itself, or the refuser
+// over it when the config carries an allocation (see DeviceConfig.Allocated).
+func (d *WGDevice) wrapTUN(tunDev tun.Device, name string) tun.Device {
+	if d.cfg.allocated == nil || !d.cfg.nodePodCIDR.IsValid() {
+		return tunDev
+	}
+	node, allocated := d.cfg.nodePodCIDR, d.cfg.allocated
+	wake, rearm := utunWake(tunDev)
+	r := newRefuser(tunDev, func(pkt []byte) bool { return refuseSYN(pkt, node, allocated) }, wake, rearm)
+	r.onWakeErr = func(err error) {
+		d.log.Warn("mesh: cannot wake the utun reader; a refusal waits for the next outbound packet", "iface", name, "err", err)
+	}
+	return r
+}
+
 // plumb performs the host-side bring-up on the created utun name: it assigns the
-// utun's own point-to-point mesh-link address and plumbs the mesh-egress source as
-// an lo0 /32 alias. Every command goes through d.command, so it is driven without
+// utun's own point-to-point mesh-link address, plumbs the mesh-egress source as an
+// lo0 /32 alias, and then aliases it onto the utun (UTUNAliasArgs). Every command goes through d.command, so it is driven without
 // privilege in tests. The caller holds mu and closes the device on error.
 func (d *WGDevice) plumb(ctx context.Context, name string) error {
 	// The utun's own point-to-point address. It is what makes the per-peer routes
@@ -273,7 +316,27 @@ func (d *WGDevice) plumb(ctx context.Context, name string) error {
 	if err := d.run(ctx, "ifconfig", "lo0", "alias", fmt.Sprintf("%s/32", d.cfg.meshIP)); err != nil {
 		return fmt.Errorf("plumb mesh-egress alias %s: %w", d.cfg.meshIP, err)
 	}
+	// And onto the utun, after lo0, so the kernel can answer a packet for it that
+	// arrived over the mesh (see WGDevice).
+	if err := d.run(ctx, "ifconfig", UTUNAliasArgs(name, d.cfg.meshIP, d.cfg.linkIP)...); err != nil {
+		return fmt.Errorf("alias mesh-egress address %s onto %s: %w", d.cfg.meshIP, name, err)
+	}
 	return nil
+}
+
+// UTUNAliasArgs is the ifconfig argv that aliases ip onto the mesh utun iface as a
+// point-to-point /32 whose destination is the utun's own link address link. The
+// destination is what keeps the alias route-free: the kernel's host route to link
+// already exists, so the alias adds none, and ip keeps its lo0 host route. It is
+// the one home of that argv; the netd executor uses it for the pod addresses.
+func UTUNAliasArgs(iface string, ip, link netip.Addr) []string {
+	return []string{iface, "inet", ip.String(), link.String(), "netmask", "255.255.255.255", "alias"}
+}
+
+// UTUNUnaliasArgs is the ifconfig argv that removes ip's alias from the mesh utun
+// iface. The alias never owned a route, so its removal deletes none.
+func UTUNUnaliasArgs(iface string, ip netip.Addr) []string {
+	return []string{iface, "inet", ip.String(), "-alias"}
 }
 
 // Apply programs the wireguard peers and reconciles the kernel routes to exactly
@@ -525,7 +588,7 @@ func (d *WGDevice) WithdrawIface(ctx context.Context, iface string) (int, error)
 }
 
 // Down removes every route the device installed, flushes the legacy PFAnchor,
-// removes the mesh-egress alias, and closes the wireguard device. It is leak-free
+// removes the mesh-egress aliases (the utun one, then lo0), and closes the wireguard device. It is leak-free
 // and idempotent.
 func (d *WGDevice) Down(ctx context.Context) error {
 	d.mu.Lock()
@@ -550,6 +613,11 @@ func (d *WGDevice) Down(ctx context.Context) error {
 		d.log.Warn("flush legacy mesh pf anchor", "anchor", PFAnchor, "err", err)
 	}
 	if d.cfg.meshIP.IsValid() {
+		// The utun alias goes before the lo0 one, so the address is never on the
+		// utun alone. Both are best-effort: either may already be gone.
+		if d.iface != "" {
+			_ = d.run(ctx, "ifconfig", UTUNUnaliasArgs(d.iface, d.cfg.meshIP)...)
+		}
 		_ = d.run(ctx, "ifconfig", "lo0", "-alias", d.cfg.meshIP.String())
 	}
 	if d.dev != nil {

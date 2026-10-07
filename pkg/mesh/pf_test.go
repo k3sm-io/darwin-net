@@ -93,6 +93,7 @@ func TestMeshLoadsNoPFAnchor(t *testing.T) {
 	wantUp := [][]string{
 		{"ifconfig", "utun7", "inet", "100.64.3.254", "100.64.3.254", "netmask", "255.255.255.255", "up"},
 		{"ifconfig", "lo0", "alias", "100.64.3.1/32"},
+		{"ifconfig", "utun7", "inet", "100.64.3.1", "100.64.3.254", "netmask", "255.255.255.255", "alias"},
 	}
 	if !slices.EqualFunc(up, wantUp, slices.Equal[[]string]) {
 		t.Fatalf("bring-up commands = %q, want %q", up, wantUp)
