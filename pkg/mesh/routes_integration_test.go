@@ -211,6 +211,12 @@ func TestKernelRouteTableAnswersPresentAndAbsent(t *testing.T) {
 	requireRoot(t)
 	ctx := context.Background()
 	rt := kernelRouteTable{}
+	// A deliberately conservative skip: the fixed test prefixes sit inside the
+	// cluster pod range, and the kernel refuses an add only when a peer owns
+	// exactly the same /24, but a host with any pod-range route on a utun is a
+	// running node, and a result there says more about that node than about this
+	// code. Skip and say so, like the inbound-tunnel test does.
+	requireNoLiveMesh(t, rt)
 
 	_, iface := newTestUTUN(t)
 	linkIP, err := podnet.MeshLinkIP(routeTestSelf)
@@ -257,6 +263,10 @@ func TestKernelRouteTableAnswersPresentAndAbsent(t *testing.T) {
 
 	t.Run("a host route lands as a /32 and deletes", func(t *testing.T) {
 		mustAdd(t, routeTestHost)
+		// A belt-and-braces check: mustAdd already requires the exact /32, so a
+		// read-back that only showed the /24 fails there first. This negative
+		// catches the remaining case, a table that shows both the /32 and its
+		// containing /24 at once.
 		if routeIsOn(t, rt, routeTestPeer, iface) {
 			t.Fatalf("the /32 add reads back as its /24 %s; the read-back lost the prefix length", routeTestPeer)
 		}
@@ -274,6 +284,11 @@ func TestKernelRouteTableAnswersPresentAndAbsent(t *testing.T) {
 // utun, so an echo injected on this test's bare utun is answered by that node's
 // stack, not by the path under test. The test needs a Mac with nothing up; saying
 // so is better than a timeout that reads as a datapath failure.
+//
+// It fires on any host with a mesh utun up, because the utun's own link address
+// sits in the pod range. Once a single-Mac server brings its mesh utun up, the
+// skip becomes the ordinary outcome on a dev host with a running server: run
+// these tests with the node stopped, not against a live cluster.
 func requireNoLiveMesh(t *testing.T, rt kernelRouteTable) {
 	t.Helper()
 	have, err := rt.List(context.Background())
