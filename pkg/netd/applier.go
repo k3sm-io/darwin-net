@@ -26,6 +26,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"slices"
 	"sync"
 
 	"k3sm.io/darwin-net/pkg/mesh"
@@ -99,6 +100,23 @@ type blackholer interface {
 	List(ctx context.Context, nodeCIDR netip.Prefix) ([]netip.Addr, error)
 }
 
+// meshDevice is the slice of the wireguard device (*mesh.WGDevice in production)
+// the applier drives: bring-up, plan apply, teardown, the direct-route withdraw,
+// and the resolved utun name. It exists so the alias plumbing around the device
+// is testable without a utun.
+type meshDevice interface {
+	Up(ctx context.Context) error
+	Apply(ctx context.Context, plan mesh.Plan) error
+	Down(ctx context.Context) error
+	WithdrawIface(ctx context.Context, iface string) (int, error)
+	Interface() string
+}
+
+// newWGDevice builds the production meshDevice.
+func newWGDevice(cfg mesh.DeviceConfig, log *slog.Logger) meshDevice {
+	return mesh.NewDevice(cfg, log)
+}
+
 // aliasState is what the applier knows about a lo0 alias it plumbed.
 type aliasState uint8
 
@@ -128,6 +146,16 @@ const (
 // applier stops serving are swept by SetNodePodCIDR, and stale ones in the
 // current /24 by sweepStaleBlackholes at daemon start.
 //
+// A pod address of the node /24 is also aliased onto the mesh utun, with the
+// utun's own link address as point-to-point destination (mesh.UTUNAliasArgs):
+// after its lo0 alias on EnsureAlias, before it on RemoveAlias, and for the whole
+// lo0 set whenever ConfigureMesh runs (reconcileUTUNAliases), which covers a utun
+// (re)created under live pods. The kernel scopes a reply it generates itself (a
+// RST for a closed port, an echo reply) to the interface the packet arrived on and
+// drops it when its source is not an address of that interface, so without the
+// utun alias a peer's dial of a closed port on a pod of this node hangs instead
+// of being refused. The alias installs no route and lo0 stays the address's home.
+//
 // Locking discipline: the lazily-built mesh device, its up/iface state, and the
 // node CIDR the mesh addresses derive from are guarded by mu, so concurrent
 // ConfigureMesh/RemoveMesh/SetNodePodCIDR calls (from different
@@ -135,7 +163,8 @@ const (
 // change and its blackhole step are one critical section; they read nodePodCIDR
 // under mu briefly and never hold mu across a command (lock order: aliasMu, then
 // mu). aliased is guarded by aliasMu. Port operations are independent (the kernel serializes them) and take no
-// lock here.
+// lock here. ConfigureMesh holds aliasMu (then mu) for its whole run, so the utun
+// reconcile it ends with cannot interleave with an alias change.
 type darwinApplier struct {
 	utunName string
 	log      *slog.Logger
@@ -155,6 +184,8 @@ type darwinApplier struct {
 	// withdraw removes the mesh's direct routes over an interface before its host
 	// route goes (withdrawDirect in production).
 	withdraw func(ctx context.Context, iface string) error
+	// newDevice builds the mesh device (newWGDevice in production).
+	newDevice func(cfg mesh.DeviceConfig, log *slog.Logger) meshDevice
 
 	// linkMu serializes the link operations; links are the ports configured,
 	// guarded by linkMu. Lock order: linkMu, then mu.
@@ -168,7 +199,7 @@ type darwinApplier struct {
 	nodePodCIDR netip.Prefix
 	meshIP      netip.Addr // derived from nodePodCIDR; invalid if the CIDR is bad
 	linkIP      netip.Addr // the mesh utun's own p2p address; same derivation contract
-	dev         *mesh.WGDevice
+	dev         meshDevice
 	meshUp      bool
 }
 
@@ -195,6 +226,7 @@ func newDarwinApplier(nodePodCIDR netip.Prefix, log *slog.Logger) *darwinApplier
 		hostRoutes:  mesh.NewHostRoutes(),
 		ifaceAddrs:  interfaceIPv4Addrs,
 		links:       make(map[string]LinkSpec),
+		newDevice:   newWGDevice,
 	}
 	a.withdraw = a.withdrawDirect
 	return a
@@ -224,7 +256,90 @@ func (a *darwinApplier) EnsureAlias(ctx context.Context, ip netip.Addr) error {
 		return fmt.Errorf("ifconfig lo0 alias %s/32: %w", ip, err)
 	}
 	a.aliased[ip] = aliasLive
+	if !a.isPodAddress(ip) {
+		return nil
+	}
+	// Then onto the mesh utun, if there is one; ConfigureMesh plumbs the set when
+	// the utun comes up later. A refusal is returned, and the lo0 alias stays for
+	// the client's retry (EnsureAlias is idempotent).
+	if iface, link := a.meshUTUN(); iface != "" {
+		if err := a.command(ctx, "ifconfig", mesh.UTUNAliasArgs(iface, ip, link)...); err != nil {
+			return fmt.Errorf("alias %s onto the mesh utun %s: %w", ip, iface, err)
+		}
+	}
 	return nil
+}
+
+// meshUTUN returns the mesh utun's name and its own link address while the mesh
+// is up, or "" when there is no utun.
+func (a *darwinApplier) meshUTUN() (string, netip.Addr) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.meshUTUNLocked()
+}
+
+// meshUTUNLocked is meshUTUN with mu held.
+func (a *darwinApplier) meshUTUNLocked() (string, netip.Addr) {
+	if !a.meshUp || a.dev == nil {
+		return "", netip.Addr{}
+	}
+	return a.dev.Interface(), a.linkIP
+}
+
+// reconcileUTUNAliases converges the mesh utun's pod-address aliases on the pod
+// addresses of the node /24 that are aliased on lo0, read back from the kernel:
+// a utun alias whose lo0 twin is gone is removed first, then a missing one is
+// added. lo0 is the truth because it is the address's home and survives a daemon
+// restart, which the utun (owned by the daemon's wireguard device) does not; so
+// the first ConfigureMesh after a start, or after a utun is re-created, re-plumbs
+// every live pod. The mesh-egress and link addresses are not pod addresses
+// (podnet.IsPodAddress) and are left to the device. It issues alias operations
+// only, never a route operation. aliasMu and mu must be held.
+func (a *darwinApplier) reconcileUTUNAliases(ctx context.Context) error {
+	iface, link := a.meshUTUNLocked()
+	if iface == "" {
+		return nil
+	}
+	// A partial read changes nothing: an lo0 list missing an address would remove a
+	// live pod's utun alias.
+	addrs, err := a.ifaceAddrs()
+	if err != nil {
+		return fmt.Errorf("read interface addresses for the mesh utun aliases: %w", err)
+	}
+	want := podAddresses(a.nodePodCIDR, addrs["lo0"])
+	have := podAddresses(a.nodePodCIDR, addrs[iface])
+	var errs []error
+	for _, ip := range have {
+		if slices.Contains(want, ip) {
+			continue
+		}
+		if err := a.command(ctx, "ifconfig", mesh.UTUNUnaliasArgs(iface, ip)...); err != nil {
+			errs = append(errs, fmt.Errorf("remove stale utun alias %s from %s: %w", ip, iface, err))
+			continue
+		}
+		a.log.Info("netd: removed a utun alias whose lo0 alias is gone", "iface", iface, "ip", ip.String())
+	}
+	for _, ip := range want {
+		if slices.Contains(have, ip) {
+			continue
+		}
+		if err := a.command(ctx, "ifconfig", mesh.UTUNAliasArgs(iface, ip, link)...); err != nil {
+			errs = append(errs, fmt.Errorf("alias %s onto the mesh utun %s: %w", ip, iface, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// podAddresses returns the pod addresses of cidr among ips, sorted.
+func podAddresses(cidr netip.Prefix, ips []netip.Addr) []netip.Addr {
+	var out []netip.Addr
+	for _, ip := range ips {
+		if podnet.IsPodAddress(cidr, ip) && !slices.Contains(out, ip) {
+			out = append(out, ip)
+		}
+	}
+	slices.SortFunc(out, netip.Addr.Compare)
+	return out
 }
 
 // RemoveAlias removes ip's lo0 alias and, for a pod address that was aliased,
@@ -247,6 +362,16 @@ func (a *darwinApplier) RemoveAlias(ctx context.Context, ip netip.Addr) error {
 	a.aliasMu.Lock()
 	defer a.aliasMu.Unlock()
 	state, tracked := a.aliased[ip]
+	// The mesh utun alias goes first, so the address is never on the utun without
+	// its lo0 home. An absent one is tolerated, like the lo0 -alias below; a utun
+	// alias that would not go is left to the next ConfigureMesh's reconcile.
+	if a.isPodAddress(ip) {
+		if iface, _ := a.meshUTUN(); iface != "" {
+			if err := a.command(ctx, "ifconfig", mesh.UTUNUnaliasArgs(iface, ip)...); err != nil {
+				a.log.Debug("utun -alias tolerated (address may be absent)", "iface", iface, "ip", ip.String(), "err", err)
+			}
+		}
+	}
 	removed := false
 	if tracked && state == aliasBlackholePending {
 		a.log.Debug("lo0 alias already removed; retrying its blackhole", "ip", ip.String())
@@ -381,15 +506,20 @@ func (a *darwinApplier) SetNodePodCIDR(ctx context.Context, cidr netip.Prefix) e
 }
 
 // ConfigureMesh builds (once) and brings up the real wireguard device with the
-// resolved private key and listen port, then applies the validated plan.
+// resolved private key and listen port, applies the validated plan, and then
+// reconciles the pod addresses' utun aliases (reconcileUTUNAliases) — on every
+// call, so a freshly created utun gets the live set and any drift is repaired by
+// the next resync. A reconcile failure is returned after the plan is applied.
 func (a *darwinApplier) ConfigureMesh(ctx context.Context, privKeyB64 string, listenPort int, plan mesh.Plan) error {
+	a.aliasMu.Lock()
+	defer a.aliasMu.Unlock()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.dev == nil {
 		if !a.meshIP.IsValid() || !a.linkIP.IsValid() {
 			return fmt.Errorf("configure mesh: node podCIDR %s has no mesh-egress source or utun link address", a.nodePodCIDR)
 		}
-		a.dev = mesh.NewDevice(mesh.DeviceConfig{
+		a.dev = a.newDevice(mesh.DeviceConfig{
 			UTUNName:      a.utunName,
 			MeshIP:        a.meshIP,
 			LinkIP:        a.linkIP,
@@ -403,10 +533,14 @@ func (a *darwinApplier) ConfigureMesh(ctx context.Context, privKeyB64 string, li
 		}
 		a.meshUp = true
 	}
+	var errs []error
 	if err := a.dev.Apply(ctx, plan); err != nil {
-		return fmt.Errorf("apply mesh plan: %w", err)
+		errs = append(errs, fmt.Errorf("apply mesh plan: %w", err))
 	}
-	return nil
+	if err := a.reconcileUTUNAliases(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // RemoveMesh tears the wireguard mesh down.
