@@ -140,7 +140,7 @@ func TestRoutingTableConcurrentPicksAndWriters(t *testing.T) {
 		tbl.SetEndpointsPolicy(churned, eps(20), trafficCluster, clientIPAffinity(time.Hour))
 	})
 	spawn(1, func(int) {
-		tbl.SetTransportOverrides(map[netip.Addr]netip.Addr{netip.AddrFrom4([4]byte{100, 64, 0, 10}): netip.AddrFrom4([4]byte{192, 168, 64, 10})})
+		tbl.SetTransportOverrides(liveOnly(map[netip.Addr]netip.Addr{netip.AddrFrom4([4]byte{100, 64, 0, 10}): netip.AddrFrom4([4]byte{192, 168, 64, 10})}))
 		tbl.SetTransportOverrides(nil)
 	})
 	spawn(1, func(int) { tbl.SweepExpired(time.Now()) })

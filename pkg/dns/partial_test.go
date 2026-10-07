@@ -24,7 +24,7 @@ import "testing"
 // registers a namespace as a host match domain.
 func TestCompletePartialName(t *testing.T) {
 	const domain = "cluster.local"
-	optedIn := func(ns string) bool { return ns == "stockkitty" || ns == "local" }
+	optedIn := func(ns string) bool { return ns == "demo" || ns == "local" }
 
 	tests := []struct {
 		name    string
@@ -35,18 +35,18 @@ func TestCompletePartialName(t *testing.T) {
 	}{
 		{"name.ns.svc is completed", "kubernetes.default.svc", nil, "kubernetes.default.svc.cluster.local", Completed},
 		{"name.ns.svc completion lower-cases", "Kubernetes.Default.SVC", nil, "kubernetes.default.svc.cluster.local", Completed},
-		{"name.ns completed for an opted-in namespace", "postgres.stockkitty", optedIn, "postgres.stockkitty.svc.cluster.local", Completed},
+		{"name.ns completed for an opted-in namespace", "postgres.demo", optedIn, "postgres.demo.svc.cluster.local", Completed},
 		{"name.ns not completed for a namespace that did not opt in", "postgres.default", optedIn, "postgres.default", Forward},
-		{"name.ns not completed with no opt-in source", "postgres.stockkitty", nil, "postgres.stockkitty", Forward},
+		{"name.ns not completed with no opt-in source", "postgres.demo", nil, "postgres.demo", Forward},
 		{"name.ns not completed under a reserved suffix even if opted in", "printer.local", optedIn, "printer.local", Forward},
 		{"name.svc is refused", "kubernetes.svc", optedIn, "kubernetes.svc", Refused},
 		{"bare svc is refused", "svc", optedIn, "svc", Refused},
 		{"deeper name under svc is refused, never forwarded", "a.kubernetes.default.svc", optedIn, "a.kubernetes.default.svc", Refused},
 		{"malformed label under svc is refused", "under_score.default.svc", optedIn, "under_score.default.svc", Refused},
-		{"unknown deeper name under an opted-in namespace is forwarded", "api.foo.stockkitty", optedIn, "api.foo.stockkitty", Forward},
+		{"unknown deeper name under an opted-in namespace is forwarded", "api.foo.demo", optedIn, "api.foo.demo", Forward},
 		{"external name is forwarded", "github.com", optedIn, "github.com", Forward},
 		{"single label is forwarded", "kubernetes", optedIn, "kubernetes", Forward},
-		{"malformed two-label name is forwarded", "bad_name.stockkitty", optedIn, "bad_name.stockkitty", Forward},
+		{"malformed two-label name is forwarded", "bad_name.demo", optedIn, "bad_name.demo", Forward},
 		{"FQDN under the cluster domain passes through", "kubernetes.default.svc.cluster.local", optedIn, "kubernetes.default.svc.cluster.local", Passthrough},
 		{"the cluster domain itself passes through", "cluster.local", optedIn, "cluster.local", Passthrough},
 		{"absolute name with a trailing dot passes through", "kubernetes.default.svc.", optedIn, "kubernetes.default.svc.", Passthrough},
@@ -77,7 +77,7 @@ func TestCompletePartialName(t *testing.T) {
 		{"COM.", true},
 		{"lan", true},
 		{"arpa", true},
-		{"stockkitty", false},
+		{"demo", false},
 		{"default", false},
 	}
 	for _, tt := range reserved {

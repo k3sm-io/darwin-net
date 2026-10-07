@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/netip"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -170,6 +171,13 @@ type RoutingTable struct {
 	// each loads the current snapshot, derives the next, and stores it, and two
 	// writers racing would otherwise lose one's update. No reader takes it.
 	mu sync.Mutex
+	// observer, when set, is told about every generation a writer stores, in store
+	// order, while mu is still held: transport reports whether the generation
+	// replaced the transport overrides. It is the owning Proxy's per-pod relay
+	// manager (podrelay.go), which must retire a dropped or re-leased pod's relay
+	// before SetTransportOverrides returns. Guarded by mu; written once by
+	// proxy.New. The observer never calls back into the table under mu.
+	observer func(s *routingSnapshot, transport bool)
 
 	// affMu guards affinity, affinityCount and affinityWarned. It is a leaf lock:
 	// nothing is acquired while it is held, and writers acquire it after mu (via
@@ -234,7 +242,12 @@ type routingSnapshot struct {
 	// SetTransportOverrides (the same swap lifecycle SetEndpointsPolicy and
 	// PolicyTable.Update use), so a generation of overrides can never leak into the
 	// next one. See SetTransportOverrides for the full contract.
-	transport map[netip.Addr]netip.Addr
+	transport map[netip.Addr]VMPodTransport
+	// transportGen numbers the transport generations: withTransport increments it
+	// and withState carries it, so two snapshots hold the same overrides iff they
+	// carry the same transportGen. The relay manager uses it to tell a stale
+	// generation from the current one.
+	transportGen uint64
 }
 
 // emptySnapshot is what a never-written table reads: nil maps, every lookup a
@@ -264,14 +277,14 @@ func (s *routingSnapshot) withState(key PortKey, st *portState) *routingSnapshot
 	} else {
 		next[key] = st
 	}
-	return &routingSnapshot{states: next, transport: s.transport}
+	return &routingSnapshot{states: next, transport: s.transport, transportGen: s.transportGen}
 }
 
 // withTransport returns the next generation with the transport overrides replaced
 // wholesale by m (already normalized and owned by the snapshot). The states map is
 // shared, so every portState — and its live cursor — carries over untouched.
-func (s *routingSnapshot) withTransport(m map[netip.Addr]netip.Addr) *routingSnapshot {
-	return &routingSnapshot{states: s.states, transport: m}
+func (s *routingSnapshot) withTransport(m map[netip.Addr]VMPodTransport) *routingSnapshot {
+	return &routingSnapshot{states: s.states, transport: m, transportGen: s.transportGen + 1}
 }
 
 // cacheLineSize is the Apple Silicon cache-line size in bytes: `sysctl
@@ -478,11 +491,11 @@ func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, pol
 		// re-validates against the current one under affMu before it records, so
 		// once the new generation is visible no pick can add a binding for key, and
 		// the purge that follows is final (see pickStickyScoped).
-		t.snap.Store(t.load().withState(key, nil))
+		t.store(t.load().withState(key, nil), false)
 		t.purgeAffinity(key) // no backends: any bindings are meaningless
 		return 0
 	}
-	t.snap.Store(t.load().withState(key, &portState{
+	t.store(t.load().withState(key, &portState{
 		all:             ready,
 		locals:          locals,
 		policy:          policy,
@@ -490,7 +503,7 @@ func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, pol
 		affinityTimeout: aff.timeout,
 		allSet:          allSet,
 		localSet:        localSet,
-	}))
+	}), false)
 	if aff.mode != affinityClientIP {
 		// Affinity off for this port: purge bindings so a Service toggled
 		// ClientIP->None (or never sticky) leaves nothing to resurrect on re-enable.
@@ -506,34 +519,57 @@ func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, pol
 func (t *RoutingTable) Delete(key PortKey) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.snap.Store(t.load().withState(key, nil))
+	t.store(t.load().withState(key, nil), false)
 	t.purgeAffinity(key) // after the store, as in SetEndpointsPolicy
 }
 
-// SetTransportOverrides atomically replaces the published-to-live transport
-// address map, the seam the two-address vm-pod identity model needs.
+// VMPodTransport is the live half of one vm-RuntimeClass pod's two-address
+// identity, keyed in SetTransportOverrides by the pod's published address.
+type VMPodTransport struct {
+	// Live is the guest's macOS-assigned vmnet DHCP lease: the address every
+	// host-to-guest dial (the VIP backend dial, the published-address relay)
+	// actually targets. It must lie inside the node's vmnet segment.
+	Live netip.Addr
+	// Ports are the pod's declared TCP container ports. The relay on the published
+	// address listens on these and on every port the routing table lists a backend
+	// for at that address (an EndpointSlice may target an undeclared port); any
+	// other port is refused. Order and duplicates do not matter, and a zero port is
+	// ignored.
+	Ports []uint16
+}
+
+// SetTransportOverrides atomically replaces the published-to-live transport map,
+// the seam the two-address vm-pod identity model needs.
 //
 // # The two addresses
 //
 // A vm-RuntimeClass pod has two addresses and they are never the same one. The /32
 // carved from the node podCIDR is its published identity — what EndpointSlices,
 // cluster DNS and status.podIP carry, and the address every NetworkPolicy names.
-// It is live on no interface for a vm pod: the host must not alias the guest's
-// identity on lo0 or it would answer for it. The address that actually carries
-// bytes is the guest's macOS-assigned vmnet DHCP lease, which is never published.
-// This map is the only place the two meet: keys are published addresses, values
-// are the live lease addresses to dial instead. The port is not overridden — a
-// backend's port is the guest's real listening port, which the lease does not
-// change.
+// The host aliases it on lo0 for the pod's lifetime (pkg/podnet SetupGuest). The
+// address that actually reaches the guest is its macOS-assigned vmnet DHCP lease,
+// which is never published. This map is the only place the two meet: keys are
+// published addresses, values carry the live lease and the pod's declared ports.
+// The port is never rewritten — a backend's port is the guest's real listening
+// port, which the lease does not change.
 //
-// # Who feeds it (nobody yet — stated honestly)
+// # What one generation drives
+//
+// Two consumers read the same generation, so they can never disagree about a pod:
+//
+//   - the dial sites (transportAddr): a VIP connection picked onto a vm pod's
+//     published address is dialed at the live lease instead;
+//   - the owning Proxy's per-pod relay (podrelay.go): it listens on the published
+//     address itself and relays each accepted TCP connection to the lease, which is
+//     what makes the pod reachable by a direct dial, from its own host, and from
+//     another node over the mesh. A relay whose pod is dropped, or whose lease
+//     changed, is closed — its listeners and every connection it relayed — before
+//     this call returns, so a caller that drops the override and then removes the
+//     pod's alias never leaves a relayed connection open on a departing address.
 //
 // The feeder is the k3sm assembler, from the guest agent's Health lease report: it
 // is the only component that may hold both the runtimed-side guest view and this
-// darwin-net table (darwin-net cannot reach for a runtimed type — see the repo DAG),
-// so darwin-net exposes the seam and holds no opinion about the source. That
-// host-side consumer does not exist yet. Until it is built, no override is ever
-// installed and every backend is dialed exactly as it is today.
+// darwin-net table (darwin-net cannot reach for a runtimed type — see the repo DAG).
 //
 // # The liveness contract (the feeder's obligation, not this table's)
 //
@@ -543,33 +579,67 @@ func (t *RoutingTable) Delete(key PortKey) {
 // misdelivery, not a failed dial. This table cannot detect that: it has no lease
 // watch and no liveness signal, and does not invent one. Wholesale replacement is
 // what makes the obligation cheap to discharge: pass the full current map on every
-// lease report and the previous generation is dropped entire.
+// lease report and the previous generation is dropped entire. The relay adds its own
+// fail-closed checks on top (podrelay.go): it refuses a live address outside the
+// node's vmnet segment, and one two pods claim.
 //
 // # No fallback, by design
 //
 // A backend with no override is dialed at its published address — byte-identical to
-// today's behavior, which is what keeps every host-process pod untouched. For a vm
-// pod that is the /32 that is live on no interface, so the dial fails the way any
-// unreachable backend's dial fails today (a refusal or a dialTimeout, logged at
-// Debug). That is the intended outcome: an absent override means undialable. The
-// table never substitutes some other address to paper over a missing override,
-// because the only candidates are wrong — the published /32 XNU will blackhole, or a
-// stale lease pointing at another tenant's guest.
+// the host-process path. For a vm pod with no override that is its own published
+// address, where no relay listens, so the dial is refused the way any unreachable
+// backend's dial is (logged at Debug). That is the intended outcome: an absent
+// override means undialable. The table never substitutes some other address to
+// paper over a missing override, because the only candidate is wrong — a stale lease
+// pointing at another tenant's guest.
 //
 // overrides is defensively copied and normalized (v4-mapped-v6 unmapped on both
-// sides; entries with an invalid key or value skipped, mirroring NewPolicyTable's
-// invalid-seed skip), so the caller may retain and reuse its map. A nil or empty map
-// clears every override.
-func (t *RoutingTable) SetTransportOverrides(overrides map[netip.Addr]netip.Addr) {
-	next := make(map[netip.Addr]netip.Addr, len(overrides))
-	for published, live := range overrides {
-		if !published.IsValid() || !live.IsValid() {
+// addresses; Ports copied, sorted, de-duplicated and stripped of zero; entries with
+// an invalid key or Live skipped, mirroring NewPolicyTable's invalid-seed skip), so
+// the caller may retain and reuse its map and slices. A nil or empty map clears
+// every override.
+func (t *RoutingTable) SetTransportOverrides(overrides map[netip.Addr]VMPodTransport) {
+	next := make(map[netip.Addr]VMPodTransport, len(overrides))
+	for published, tr := range overrides {
+		if !published.IsValid() || !tr.Live.IsValid() {
 			continue
 		}
-		next[published.Unmap()] = live.Unmap()
+		next[published.Unmap()] = VMPodTransport{Live: tr.Live.Unmap(), Ports: normalizePorts(tr.Ports)}
 	}
 	t.mu.Lock()
-	t.snap.Store(t.load().withTransport(next))
+	t.store(t.load().withTransport(next), true)
+	t.mu.Unlock()
+}
+
+// normalizePorts returns a sorted, de-duplicated copy of ports without zero, or nil.
+func normalizePorts(ports []uint16) []uint16 {
+	var out []uint16
+	for _, p := range ports {
+		if p != 0 {
+			out = append(out, p)
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// store publishes s as the current generation and tells the observer, if any. The
+// caller holds mu, so observers see generations in store order. transport reports
+// whether s replaced the transport overrides.
+func (t *RoutingTable) store(s *routingSnapshot, transport bool) {
+	t.snap.Store(s)
+	if t.observer != nil {
+		t.observer(s, transport)
+	}
+}
+
+// setObserver installs the generation observer (see the observer field). The
+// observer is single-slot and owned by the one Proxy built over this table: a
+// second call replaces the first observer, which then stops seeing generations
+// (so its relays are no longer retired synchronously). Build one Proxy per table.
+func (t *RoutingTable) setObserver(f func(s *routingSnapshot, transport bool)) {
+	t.mu.Lock()
+	t.observer = f
 	t.mu.Unlock()
 }
 
@@ -584,11 +654,36 @@ func (t *RoutingTable) SetTransportOverrides(overrides map[netip.Addr]netip.Addr
 // policies and Services name and the one that survives a lease change. Only the
 // packet needs the lease.
 func (t *RoutingTable) transportAddr(published netip.AddrPort) netip.AddrPort {
-	live, ok := t.load().transport[published.Addr().Unmap()]
+	tr, ok := t.load().transport[published.Addr().Unmap()]
 	if !ok {
 		return published
 	}
-	return netip.AddrPortFrom(live, published.Port())
+	return netip.AddrPortFrom(tr.Live, published.Port())
+}
+
+// relayBackendPorts returns, for every published address in s's transport
+// overrides, the ports s lists a Ready TCP backend for at that address across
+// every Service port (unsorted, possibly repeated; the caller normalizes). It is
+// the Service-targeted half of a vm pod relay's port set (an EndpointSlice may
+// target a port the pod never declared), built in one scan of the states, off the
+// accept path.
+func (s *routingSnapshot) relayBackendPorts() map[netip.Addr][]uint16 {
+	if len(s.transport) == 0 {
+		return nil
+	}
+	out := make(map[netip.Addr][]uint16, len(s.transport))
+	for key, st := range s.states {
+		if key.Protocol != netv1.ProtocolTCP {
+			continue
+		}
+		for _, b := range st.all {
+			addr := b.addr.Addr().Unmap()
+			if _, ok := s.transport[addr]; ok {
+				out[addr] = append(out[addr], b.addr.Port())
+			}
+		}
+	}
+	return out
 }
 
 // classify computes a backend's locality. A zero podCIDR yields LocalityUnknown

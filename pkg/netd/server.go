@@ -28,6 +28,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -35,10 +36,20 @@ import (
 	"golang.org/x/sys/unix"
 
 	netv1 "k3sm.io/apis/net/v1"
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
+	"k3sm.io/darwin-net/pkg/linkenum"
 	"k3sm.io/darwin-net/pkg/mesh"
 	"k3sm.io/darwin-net/pkg/netd/wire"
 	"k3sm.io/darwin-net/pkg/podnet"
 )
+
+// MaxLinks is the most direct-link ports the daemon configures at once: one per
+// port ordinal (0..netv1alpha1.MaxPortOrdinal).
+const MaxLinks = netv1alpha1.MaxPortOrdinal + 1
+
+// linkIfaceRE is the shape a direct-link interface name must have before the
+// daemon even asks the system which hardware port it is.
+var linkIfaceRE = regexp.MustCompile(`^en[0-9]+$`)
 
 // DefaultSocketPath is the unix socket the daemon listens on (re-exported from the
 // wire contract so callers can reference it as netd.DefaultSocketPath).
@@ -54,10 +65,9 @@ const DefaultSocketPath = wire.DefaultSocketPath
 // is still alive waits this long between frames.
 const DefaultIdleTimeout = 2 * time.Minute
 
-// minMSSClamp is the smallest TCP MSS the daemon will load into the clamp anchor.
-// A clamp below this is nonsensical (smaller than the headers leave room for) and
-// is rejected; the ceiling is the mesh link's own max MSS.
-const minMSSClamp = 216
+// startupSweepTimeout bounds the production executor's sweep of stale
+// pod-address blackholes when the daemon starts.
+const startupSweepTimeout = 10 * time.Second
 
 // ErrPolicy is the base error a request that violates daemon policy wraps. It is
 // surfaced to the client in the response Error string.
@@ -143,6 +153,10 @@ type Config struct {
 	MeshKeyResolver MeshKeyResolver
 	// Privileged is the root-only executor; nil uses the production darwin executor.
 	Privileged Privileged
+	// HardwarePorts maps the host's Thunderbolt interfaces to their receptacle
+	// numbers, the authority ConfigureLink validates an interface against; nil
+	// uses linkenum.HardwarePorts (networksetup, by absolute path).
+	HardwarePorts func(ctx context.Context) (map[string]int, error)
 	// Logger is the structured logger; nil uses slog.Default.
 	Logger *slog.Logger
 }
@@ -154,32 +168,51 @@ type Config struct {
 // node identity and just enough live-object accounting to decide whether that
 // identity may still be adopted.
 //
-// Locking discipline: mu guards nodePodCIDR, aliases, meshRoutes and meshUp. It is
-// held only around those reads/writes and never across a Privileged call that
-// touches the datapath (ifconfig/pfctl/wireguard can block), so one wedged
-// operation cannot stall every other connection's policy checks. The single
-// exception is adoptNodePodCIDR, which must not let its decision interleave with
-// the executor re-point and the identity write it authorizes; see its comment for
-// why that call is bounded.
+// Locking discipline: mu guards nodePodCIDR, identityConfirmed, aliases, links,
+// meshRoutes and meshUp. It is held only around those reads/writes and never
+// across a Privileged call that touches the datapath (ifconfig/pfctl/wireguard
+// can block), so one wedged operation cannot stall every other connection's
+// policy checks. The single exception is adoptNodePodCIDR, which must not let its
+// decision interleave with the executor re-point and the identity write it
+// authorizes; see its comment for why that call is bounded.
+//
+// linkMu serializes the three verbs that touch direct links — ConfigureLink,
+// RemoveLink, and ConfigureMesh (whose DirectRoutes are validated against the
+// configured links and applied in one step) — across their Privileged calls, so a
+// RemoveLink can never interleave between a ConfigureMesh's validation of a direct
+// route and its installation, which would leave a /25 pointing at a cable whose
+// host route is gone. Lock order: linkMu, then mu.
 type Server struct {
 	cfg  Config
 	log  *slog.Logger
 	peer PeerVerifier
 	priv Privileged
 
-	mu          sync.RWMutex
-	nodePodCIDR netip.Prefix
-	aliases     map[netip.Addr]struct{}
-	meshRoutes  int
-	meshUp      bool
+	linkMu sync.Mutex
+
+	mu                sync.RWMutex
+	nodePodCIDR       netip.Prefix
+	identityConfirmed bool
+	aliases           map[netip.Addr]struct{}
+	links             map[string]linkRecord
+	meshRoutes        int
+	meshUp            bool
+}
+
+// linkRecord is a direct-link port the daemon configured.
+type linkRecord struct {
+	ordinal    int
+	linkIP     netip.Addr
+	peerLinkIP netip.Addr // invalid when no host route was asked for
 }
 
 // NewServer constructs a Server from cfg, filling defaults: the cluster aggregate
 // (podnet.ClusterPodCIDR), the request cap and per-connection cap, the uid
 // PeerVerifier (ServiceUID), and the production darwin Privileged executor. Its
-// only I/O is the identity restore (Config.IdentityPath) and, when a caller
-// supplied its own executor and the restore moved the identity, the one call that
-// re-points that executor; call Serve to start accepting.
+// only I/O is the identity restore (Config.IdentityPath), the production
+// executor's sweep of stale pod-address blackholes in the node /24, and, when a
+// caller supplied its own executor and the restore moved the identity, the one
+// call that re-points that executor; call Serve to start accepting.
 //
 // The CONSTRUCTION ORDER is the production fix, and it is load-bearing. The
 // executor derives the mesh-egress lo0 alias and the utun's own link address from
@@ -219,16 +252,33 @@ func NewServer(cfg Config) *Server {
 	if peer == nil {
 		peer = newUIDVerifier(cfg.ServiceUID)
 	}
+	if cfg.HardwarePorts == nil {
+		cfg.HardwarePorts = linkenum.HardwarePorts
+	}
 	configured := cfg.NodePodCIDR.Masked()
 	node := configured
+	restoredOK := false
 	if restored, ok := restoreIdentity(cfg.IdentityPath, cfg.ClusterAggregate, cfg.Logger); ok {
 		cfg.Logger.Info("netd: restored adopted node pod CIDR", "path", cfg.IdentityPath,
 			"nodePodCIDR", restored.String(), "configured", configured.String())
 		node = restored
+		restoredOK = true
 	}
 	priv := cfg.Privileged
 	if priv == nil {
-		priv = newDarwinApplier(node, cfg.Logger)
+		a := newDarwinApplier(node, cfg.Logger)
+		// Clear the pod-address blackholes a previous daemon left in the node /24
+		// (see sweepStaleBlackholes). It reads the routing table and deletes only
+		// blackhole routes, so it is bounded; the timeout keeps a wedged routing
+		// socket from holding up the start.
+		ctx, cancel := context.WithTimeout(context.Background(), startupSweepTimeout)
+		a.sweepStaleBlackholes(ctx)
+		// A fresh daemon owns no direct link, so every alias and route in the
+		// reserved direct-link halves is a previous daemon's (or nobody's):
+		// remove them before serving (see reconcileLinksAtStart).
+		a.reconcileLinksAtStart(ctx)
+		cancel()
+		priv = a
 	} else if node != configured {
 		// A caller-supplied executor (tests only; see above) was built for the
 		// configured prefix, so it is the one thing the restore cannot fix by
@@ -254,12 +304,14 @@ func NewServer(cfg Config) *Server {
 		}
 	}
 	return &Server{
-		cfg:         cfg,
-		log:         cfg.Logger,
-		peer:        peer,
-		priv:        priv,
-		nodePodCIDR: node,
-		aliases:     make(map[netip.Addr]struct{}),
+		cfg:               cfg,
+		log:               cfg.Logger,
+		peer:              peer,
+		priv:              priv,
+		nodePodCIDR:       node,
+		identityConfirmed: restoredOK,
+		aliases:           make(map[netip.Addr]struct{}),
+		links:             make(map[string]linkRecord),
 	}
 }
 
@@ -527,10 +579,12 @@ func (s *Server) dispatch(ctx context.Context, st *connState, payload []byte) (w
 		return s.handleConfigureMesh(ctx, st, req.ConfigureMesh), nil
 	case wire.VerbRemoveMesh:
 		return s.handleRemoveMesh(ctx), nil
-	case wire.VerbLoadPFAnchor:
-		return s.handleLoadPFAnchor(ctx, req.LoadPFAnchor), nil
 	case wire.VerbBindPort:
 		return s.handleBindPort(ctx, st, req.BindPort)
+	case wire.VerbConfigureLink:
+		return s.handleConfigureLink(ctx, req.ConfigureLink), nil
+	case wire.VerbRemoveLink:
+		return s.handleRemoveLink(ctx, req.RemoveLink), nil
 	default:
 		return s.errResp(fmt.Sprintf("unknown verb %q", req.Verb)), nil
 	}
@@ -587,10 +641,12 @@ func (s *Server) handleRemoveAlias(ctx context.Context, st *connState, args *wir
 
 // handleConfigureMesh adopts the node pod CIDR the client carries (see
 // adoptNodePodCIDR), re-validates the typed peers with the existing mesh logic
-// (RouteSet/ValidatePlan) against the identity then in force, enforces aggregate
-// containment on the routes, resolves the private key root-side, and applies the
-// rendered plan. Adoption runs FIRST so the plan is validated against the node's
-// real self, not the pre-join default.
+// (RouteSet/ValidatePlan) against the identity then in force, validates every
+// direct route (validateDirectRoutes) before anything is applied, enforces
+// aggregate containment on the routes, resolves the private key root-side, and
+// applies the rendered plan — the utun routes and the direct /25s as one plan, or
+// nothing. Adoption runs FIRST so the plan is validated against the node's real
+// self, not the pre-join default.
 func (s *Server) handleConfigureMesh(ctx context.Context, st *connState, args *wire.ConfigureMeshArgs) wire.Response {
 	if args == nil {
 		return s.errResp("configureMesh: missing args")
@@ -598,6 +654,8 @@ func (s *Server) handleConfigureMesh(ctx context.Context, st *connState, args *w
 	if s.cfg.MeshKeyResolver == nil {
 		return s.errResp("configureMesh: no mesh key resolver configured (refusing — there is no embedded key)")
 	}
+	s.linkMu.Lock()
+	defer s.linkMu.Unlock()
 	if err := s.adoptNodePodCIDR(ctx, args.NodePodCIDR); err != nil {
 		s.log.Warn("netd: node pod CIDR adoption rejected", "err", err)
 		return s.errResp(err.Error())
@@ -607,13 +665,18 @@ func (s *Server) handleConfigureMesh(ctx context.Context, st *connState, args *w
 		s.log.Warn("netd: mesh peers rejected", "err", err)
 		return s.errResp(err.Error())
 	}
-	plan, err := mesh.ValidatePlan(s.nodeCIDR(), specs)
+	direct, err := s.validateDirectRoutes(args.DirectRoutes, specs)
+	if err != nil {
+		s.log.Warn("netd: direct routes rejected", "err", err)
+		return s.errResp(fmt.Sprintf("configureMesh: %v", err))
+	}
+	plan, err := mesh.ValidatePlan(s.nodeCIDR(), specs, direct)
 	if err != nil {
 		s.log.Warn("netd: mesh plan rejected", "err", err)
 		return s.errResp(fmt.Sprintf("configureMesh: %v", err))
 	}
 	for _, r := range plan.Routes {
-		if !s.cfg.ClusterAggregate.Contains(r.Addr()) {
+		if !s.cfg.ClusterAggregate.Contains(r.Prefix.Addr()) {
 			return s.errResp(fmt.Sprintf("%v: mesh route %s outside cluster aggregate %s", ErrPolicy, r, s.cfg.ClusterAggregate))
 		}
 	}
@@ -632,7 +695,219 @@ func (s *Server) handleConfigureMesh(ctx context.Context, st *connState, args *w
 		return s.errResp(fmt.Sprintf("configureMesh: %v", err))
 	}
 	s.trackMesh(len(plan.Routes))
-	s.log.Info("netd: mesh configured", "peers", len(plan.Peers), "routes", len(plan.Routes))
+	s.log.Info("netd: mesh configured", "peers", len(plan.Peers), "routes", len(plan.Routes), "direct", len(plan.Direct))
+	return s.okResp()
+}
+
+// validateDirectRoutes checks every DirectRoutes entry before any is applied and
+// returns them keyed the way meshSpecs names the peers (the masked pod /24). The
+// rules, all of which must hold for every entry, or the whole request is refused:
+//
+//   - at most MaxLinks entries, no peer /24 and no interface twice;
+//   - PeerPodCIDR is a /24 inside the cluster aggregate, is not this node's own,
+//     and is the pod /24 of a peer in the same request;
+//   - Gateway is LinkIP(idxOf(PeerPodCIDR), p) for some port ordinal p — the next
+//     hop is tied to the node that owns the prefix, so a compromised client cannot
+//     send a peer's pods to an arbitrary address on an arbitrary cable;
+//   - Iface is a link this daemon configured, and configured with Gateway as its
+//     peer: the on-link host route the /25s depend on is in place.
+//
+// s.linkMu must be held.
+func (s *Server) validateDirectRoutes(args []wire.DirectRouteArg, specs []netv1.MeshPeerSpec) (mesh.DirectRoutes, error) {
+	if len(args) == 0 {
+		return nil, nil
+	}
+	if len(args) > MaxLinks {
+		return nil, fmt.Errorf("%w: %d direct routes exceed the %d-link limit", ErrPolicy, len(args), MaxLinks)
+	}
+	peers := make(map[netip.Prefix]bool, len(specs))
+	for _, sp := range specs {
+		if p, err := netip.ParsePrefix(sp.PodCIDR); err == nil {
+			peers[p.Masked()] = true
+		}
+	}
+	s.mu.RLock()
+	node := s.nodePodCIDR
+	links := make(map[string]linkRecord, len(s.links))
+	for k, v := range s.links {
+		links[k] = v
+	}
+	s.mu.RUnlock()
+
+	out := make(mesh.DirectRoutes, len(args))
+	seenIface := make(map[string]bool, len(args))
+	for i, a := range args {
+		peer, err := netip.ParsePrefix(a.PeerPodCIDR)
+		if err != nil {
+			return nil, fmt.Errorf("%w: direct route %d: parse peerPodCIDR %q: %v", ErrPolicy, i, a.PeerPodCIDR, err)
+		}
+		peer = peer.Masked()
+		idx, err := podnet.NodeIndex(s.cfg.ClusterAggregate, peer)
+		if err != nil {
+			return nil, fmt.Errorf("%w: direct route %d: peer %s is not a node /24 of the cluster: %v", ErrPolicy, i, peer, err)
+		}
+		if peer == node {
+			return nil, fmt.Errorf("%w: direct route %d: peer %s is this node's own /24", ErrPolicy, i, peer)
+		}
+		if !peers[peer] {
+			return nil, fmt.Errorf("%w: direct route %d: peer %s is not a mesh peer of this request", ErrPolicy, i, peer)
+		}
+		if _, dup := out[peer.String()]; dup {
+			return nil, fmt.Errorf("%w: direct route %d: peer %s routed twice", ErrPolicy, i, peer)
+		}
+		gw, err := netip.ParseAddr(a.Gateway)
+		if err != nil {
+			return nil, fmt.Errorf("%w: direct route %d: parse gateway %q: %v", ErrPolicy, i, a.Gateway, err)
+		}
+		gw = gw.Unmap()
+		if !gatewayDerivedFor(idx, gw) {
+			return nil, fmt.Errorf("%w: direct route %d: gateway %s is not a direct-link address of the node owning %s (index %d)", ErrPolicy, i, gw, peer, idx)
+		}
+		if seenIface[a.Iface] {
+			return nil, fmt.Errorf("%w: direct route %d: interface %q carries two peers", ErrPolicy, i, a.Iface)
+		}
+		seenIface[a.Iface] = true
+		rec, ok := links[a.Iface]
+		if !ok {
+			return nil, fmt.Errorf("%w: direct route %d: interface %q is not a configured direct link", ErrPolicy, i, a.Iface)
+		}
+		if rec.peerLinkIP != gw {
+			return nil, fmt.Errorf("%w: direct route %d: link %s is configured toward %v, not %s", ErrPolicy, i, a.Iface, rec.peerLinkIP, gw)
+		}
+		out[peer.String()] = mesh.DirectRoute{Iface: a.Iface, Gateway: gw}
+	}
+	return out, nil
+}
+
+// gatewayDerivedFor reports whether gw is LinkIP(idx, p) for some port ordinal p.
+func gatewayDerivedFor(idx int, gw netip.Addr) bool {
+	for p := 0; p <= netv1alpha1.MaxPortOrdinal; p++ {
+		if a, err := netv1alpha1.LinkIP(idx, p); err == nil && a == gw {
+			return true
+		}
+	}
+	return false
+}
+
+// handleConfigureLink validates a direct-link port against the system and the
+// node identity, then has the executor configure it. The interface must be a
+// Thunderbolt hardware port by the system's own mapping (HardwarePorts), the port
+// ordinal must be that receptacle − 1, and the address is DERIVED here —
+// LinkIP(idxOf(node /24), ordinal) — from the identity a ConfigureMesh confirmed;
+// the client's LinkIP, when sent, must agree. The peer's link address, when sent,
+// must be a reserved-half address that is not this port's own. At most MaxLinks
+// ports are configured at once. Every configuration is an Info line; an idempotent
+// re-assertion is a Debug line.
+func (s *Server) handleConfigureLink(ctx context.Context, args *wire.ConfigureLinkArgs) wire.Response {
+	if args == nil {
+		return s.errResp("configureLink: missing args")
+	}
+	if !linkIfaceRE.MatchString(args.Iface) {
+		return s.errResp(fmt.Sprintf("%v: configureLink: interface %q is not an Ethernet-class interface", ErrPolicy, args.Iface))
+	}
+	s.linkMu.Lock()
+	defer s.linkMu.Unlock()
+
+	s.mu.RLock()
+	node, confirmed := s.nodePodCIDR, s.identityConfirmed
+	prev, had := s.links[args.Iface]
+	count := len(s.links)
+	s.mu.RUnlock()
+	if !confirmed {
+		return s.errResp(fmt.Sprintf("%v: configureLink: the node identity is not confirmed yet (a ConfigureMesh carrying the node pod CIDR must come first)", ErrPolicy))
+	}
+	if !had && count >= MaxLinks {
+		return s.errResp(fmt.Sprintf("%v: configureLink: %d links already configured (limit %d)", ErrPolicy, count, MaxLinks))
+	}
+	hw, err := s.cfg.HardwarePorts(ctx)
+	if err != nil {
+		return s.errResp(fmt.Sprintf("%v: configureLink: read the Thunderbolt hardware ports: %v", ErrPolicy, err))
+	}
+	receptacle, ok := hw[args.Iface]
+	if !ok {
+		s.log.Warn("netd: link refused: not a Thunderbolt hardware port", "iface", args.Iface)
+		return s.errResp(fmt.Sprintf("%v: configureLink: %s is not a Thunderbolt hardware port", ErrPolicy, args.Iface))
+	}
+	ordinal := receptacle - 1
+	if args.PortOrdinal != ordinal {
+		return s.errResp(fmt.Sprintf("%v: configureLink: %s is Thunderbolt %d (port ordinal %d), not ordinal %d", ErrPolicy, args.Iface, receptacle, ordinal, args.PortOrdinal))
+	}
+	idx, err := podnet.NodeIndex(s.cfg.ClusterAggregate, node)
+	if err != nil {
+		return s.errResp(fmt.Sprintf("%v: configureLink: node %s has no index: %v", ErrPolicy, node, err))
+	}
+	linkIP, err := netv1alpha1.LinkIP(idx, ordinal)
+	if err != nil {
+		return s.errResp(fmt.Sprintf("%v: configureLink: %v", ErrPolicy, err))
+	}
+	if args.LinkIP != "" {
+		claimed, err := netip.ParseAddr(args.LinkIP)
+		if err != nil || claimed.Unmap() != linkIP {
+			return s.errResp(fmt.Sprintf("%v: configureLink: linkIP %q disagrees with the derived %s (node index %d, port %d)", ErrPolicy, args.LinkIP, linkIP, idx, ordinal))
+		}
+	}
+	var peer netip.Addr
+	if args.PeerLinkIP != "" {
+		peer, err = netip.ParseAddr(args.PeerLinkIP)
+		if err != nil {
+			return s.errResp(fmt.Sprintf("%v: configureLink: parse peerLinkIP %q: %v", ErrPolicy, args.PeerLinkIP, err))
+		}
+		peer = peer.Unmap()
+		if !netv1alpha1.IsLinkAddress(peer) || peer == linkIP {
+			return s.errResp(fmt.Sprintf("%v: configureLink: peerLinkIP %s is not another node's direct-link address", ErrPolicy, peer))
+		}
+	}
+	if err := s.priv.ConfigureLink(ctx, LinkSpec{Iface: args.Iface, LinkIP: linkIP, PeerLinkIP: peer}); err != nil {
+		s.log.Warn("netd: link configuration failed", "iface", args.Iface, "err", err)
+		return s.errResp(fmt.Sprintf("configureLink: %v", err))
+	}
+	rec := linkRecord{ordinal: ordinal, linkIP: linkIP, peerLinkIP: peer}
+	s.mu.Lock()
+	s.links[args.Iface] = rec
+	s.mu.Unlock()
+	if had && prev == rec {
+		s.log.Debug("netd: link re-asserted", "iface", args.Iface, "linkIP", linkIP.String(), "peer", peer.String())
+	} else {
+		s.log.Info("netd: link configured", "iface", args.Iface, "thunderbolt", receptacle, "linkIP", linkIP.String(), "peer", peer.String())
+	}
+	resp := s.okResp()
+	resp.LinkIP = linkIP.String()
+	return resp
+}
+
+// handleRemoveLink tears a direct-link port down: the executor withdraws the
+// direct routes over it, then its host route and address, and restores its bridge
+// membership. The interface must be one this daemon configured or a Thunderbolt
+// hardware port (an idempotent remove of a port the daemon no longer tracks).
+func (s *Server) handleRemoveLink(ctx context.Context, args *wire.RemoveLinkArgs) wire.Response {
+	if args == nil {
+		return s.errResp("removeLink: missing args")
+	}
+	if !linkIfaceRE.MatchString(args.Iface) {
+		return s.errResp(fmt.Sprintf("%v: removeLink: interface %q is not an Ethernet-class interface", ErrPolicy, args.Iface))
+	}
+	s.linkMu.Lock()
+	defer s.linkMu.Unlock()
+	s.mu.RLock()
+	_, had := s.links[args.Iface]
+	s.mu.RUnlock()
+	if !had {
+		hw, err := s.cfg.HardwarePorts(ctx)
+		if err != nil {
+			return s.errResp(fmt.Sprintf("%v: removeLink: read the Thunderbolt hardware ports: %v", ErrPolicy, err))
+		}
+		if _, ok := hw[args.Iface]; !ok {
+			return s.errResp(fmt.Sprintf("%v: removeLink: %s is neither a configured link nor a Thunderbolt hardware port", ErrPolicy, args.Iface))
+		}
+	}
+	if err := s.priv.RemoveLink(ctx, args.Iface); err != nil {
+		s.log.Warn("netd: link removal failed", "iface", args.Iface, "err", err)
+		return s.errResp(fmt.Sprintf("removeLink: %v", err))
+	}
+	s.mu.Lock()
+	delete(s.links, args.Iface)
+	s.mu.Unlock()
+	s.log.Info("netd: link removed", "iface", args.Iface)
 	return s.okResp()
 }
 
@@ -680,17 +955,19 @@ func (s *Server) adoptNodePodCIDR(ctx context.Context, arg string) error {
 	defer s.mu.Unlock()
 	if s.nodePodCIDR == want {
 		s.log.Debug("netd: configureMesh node pod CIDR unchanged", "nodePodCIDR", want.String())
+		s.identityConfirmed = true
 		return nil
 	}
-	if pods := s.livePodAliasesLocked(); pods > 0 || s.meshRoutes > 0 || s.meshUp {
-		return fmt.Errorf("%w: configureMesh: node identity already pinned to %s; refusing %s (live: %d pod alias(es), %d mesh route(s), mesh up=%t)",
-			ErrPolicy, s.nodePodCIDR, want, pods, s.meshRoutes, s.meshUp)
+	if pods := s.livePodAliasesLocked(); pods > 0 || s.meshRoutes > 0 || s.meshUp || len(s.links) > 0 {
+		return fmt.Errorf("%w: configureMesh: node identity already pinned to %s; refusing %s (live: %d pod alias(es), %d mesh route(s), mesh up=%t, %d direct link(s))",
+			ErrPolicy, s.nodePodCIDR, want, pods, s.meshRoutes, s.meshUp, len(s.links))
 	}
 	if err := s.priv.SetNodePodCIDR(ctx, want); err != nil {
 		return fmt.Errorf("%w: configureMesh: adopt node pod CIDR %s: %v", ErrPolicy, want, err)
 	}
 	old := s.nodePodCIDR
 	s.nodePodCIDR = want
+	s.identityConfirmed = true
 	s.persistIdentity(want)
 	s.log.Info("netd: adopted node pod CIDR from ConfigureMesh", "old", old.String(), "new", want.String())
 	return nil
@@ -754,23 +1031,6 @@ func (s *Server) handleRemoveMesh(ctx context.Context) wire.Response {
 	}
 	s.untrackMesh()
 	s.log.Info("netd: mesh removed")
-	return s.okResp()
-}
-
-// handleLoadPFAnchor validates the clamp against the mesh link MSS bounds and loads
-// the anchor (the rule text is rendered daemon-side from the clamp).
-func (s *Server) handleLoadPFAnchor(ctx context.Context, args *wire.LoadPFAnchorArgs) wire.Response {
-	if args == nil {
-		return s.errResp("loadPFAnchor: missing args")
-	}
-	if err := validateMSSClamp(args.MSSClamp); err != nil {
-		s.log.Warn("netd: pf clamp rejected", "mss", args.MSSClamp, "err", err)
-		return s.errResp(err.Error())
-	}
-	if err := s.priv.LoadPFAnchor(ctx, args.MSSClamp); err != nil {
-		return s.errResp(fmt.Sprintf("loadPFAnchor: %v", err))
-	}
-	s.log.Info("netd: pf clamp anchor loaded", "mss", args.MSSClamp)
 	return s.okResp()
 }
 
@@ -880,22 +1140,12 @@ func (s *Server) authorizePort(ctx context.Context, port int, nodeAddr string) e
 	return nil
 }
 
-// validateMSSClamp bounds the clamp to a sane TCP MSS window: at least minMSSClamp
-// and no larger than the mesh link's own max MSS (a larger clamp would be a no-op
-// that defeats the anchor's purpose).
-func validateMSSClamp(mss int) error {
-	max := mesh.MaxMSS(mesh.MTU)
-	if mss < minMSSClamp || mss > max {
-		return fmt.Errorf("%w: mss clamp %d outside [%d,%d]", ErrPolicy, mss, minMSSClamp, max)
-	}
-	return nil
-}
-
 // meshSpecs converts the typed wire peers into netv1.MeshPeerSpec for the mesh
 // validation/rendering logic. Each peer's AllowedIPs are its pod /24; the first
 // entry is taken as the podCIDR (mesh.AllowedIPsMatchCIDR, invoked by ValidatePlan,
 // then asserts every AllowedIPs entry equals it). The NodeName is set to the
-// podCIDR so logs and skip reasons identify the peer.
+// masked podCIDR so logs and skip reasons identify the peer, and so a direct route
+// (keyed the same way) finds its peer.
 func meshSpecs(peers []wire.MeshPeerArg) ([]netv1.MeshPeerSpec, error) {
 	specs := make([]netv1.MeshPeerSpec, 0, len(peers))
 	for i, p := range peers {
@@ -903,9 +1153,13 @@ func meshSpecs(peers []wire.MeshPeerArg) ([]netv1.MeshPeerSpec, error) {
 			return nil, fmt.Errorf("%w: mesh peer %d has no allowedIPs", ErrPolicy, i)
 		}
 		podCIDR := p.AllowedIPs[0]
+		name := podCIDR
+		if pc, err := netip.ParsePrefix(podCIDR); err == nil {
+			name = pc.Masked().String() // the key validateDirectRoutes uses
+		}
 		specs = append(specs, netv1.MeshPeerSpec{
 			SchemaVersion: netv1.MeshPeerSchemaVersion,
-			NodeName:      podCIDR,
+			NodeName:      name,
 			PublicKey:     p.PubKey,
 			Endpoint:      p.Endpoint,
 			PodCIDR:       podCIDR,

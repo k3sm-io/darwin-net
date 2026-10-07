@@ -32,8 +32,9 @@ var ErrBackendMismatch = errors.New("podnet: pod already set up under a differen
 // Backend selects how a pod's network is provisioned — the path-selection fork. A
 // host-process pod lives in the host's network and binds a /32 lo0 alias
 // (IP_BOUND_IF); a vm-RuntimeClass guest runs under Virtualization.framework with
-// its OWN network stack and is reached over a VZNATNetworkDeviceAttachment, so it
-// gets no lo0 alias. The caller (runtimed) chooses the backend from the pod's
+// its OWN network stack and is reached over a VZNATNetworkDeviceAttachment at its
+// live lease address, while its published /32 is aliased on lo0 for the node's
+// proxy to relay from (see GuestNetwork.PodIP). The caller (runtimed) chooses the backend from the pod's
 // RuntimeClass: the empty/default handler is a host process; the "vm" handler
 // (apis runtimev1.HandlerVM => SANDBOX_BACKEND_VM) is the guest.
 type Backend int
@@ -42,8 +43,9 @@ const (
 	// BackendHostProcess is a pod that runs as a native Darwin process and binds a
 	// /32 lo0 alias. It is the zero value (the default backend).
 	BackendHostProcess Backend = iota
-	// BackendVM is a pod that runs as a Virtualization.framework micro-VM guest and
-	// gets a GuestNetwork (NAT-attachment config), never an lo0 alias.
+	// BackendVM is a pod that runs as a Virtualization.framework micro-VM guest. It
+	// gets a GuestNetwork (NAT-attachment config), and its published /32 is aliased
+	// on lo0 as the relay's listen address.
 	BackendVM
 )
 
@@ -98,19 +100,20 @@ func WithVMNetwork(cfg VMNetworkConfig) Option {
 // vm-RuntimeClass guest. darwin-net decides and allocates (the pod's cluster IP and
 // the NAT/DNS parameters) but does not attach: the live VZNATNetworkDeviceAttachment
 // wiring is runtimed's (the DAG forbids darwin-net touching the VZ backend or the
-// guest rootfs), so this flows guest-ward as data. It carries no lo0 alias — the
-// host must never own the guest's address.
+// guest rootfs), so this flows guest-ward as data. The guest never configures
+// PodIP on its own interface; the host aliases it on lo0 instead (SetupGuest).
 type GuestNetwork struct {
 	// PodIP is the pod's cluster identity, allocated from the node podCIDR by the
 	// same Allocator host-process pods use (unified, leak-free IPAM). It is the
 	// published half of the two-address model (doc.go): status.podIP, the
-	// EndpointSlice and cluster DNS carry it, and for a vm pod it is live on no
-	// interface — the host must never alias it. The guest's macOS-assigned vmnet
-	// lease is the other half, the live transport address that host-to-guest dials
-	// target; it is never published, and the two are not reconciled into
-	// one address (the lease exists only after boot, the identity is baked before).
-	// A guest pod stays same-node-scoped and is not a cross-node Service backend: its
-	// lease address is in no peer's mesh AllowedIPs.
+	// EndpointSlice and cluster DNS carry it. The host aliases it on lo0 for the
+	// pod's lifetime, and the node's Service proxy listens on it and relays each
+	// accepted TCP connection to the guest's macOS-assigned vmnet lease — the other
+	// half, the live transport address, which is never published. The two are not
+	// reconciled into one address (the lease exists only after boot, the identity is
+	// baked before). Because the published /32 lies in the node /24 the mesh already
+	// routes here, a remote node reaches the pod through this relay; the lease itself
+	// stays in no peer's mesh AllowedIPs.
 	PodIP netip.Addr
 	// Gateway is the NAT gateway the guest routes through (from VMNetworkConfig).
 	Gateway netip.Addr
@@ -123,11 +126,13 @@ type GuestNetwork struct {
 }
 
 // SetupGuest provisions the vm-RuntimeClass (guest) backend for podID: it allocates
-// a pod IP from the node /24 and returns the GuestNetwork config WITHOUT plumbing a
-// lo0 alias (the not-taken branch of the path-selection fork). It is idempotent per
-// podID and returns ErrBackendMismatch if podID was already set up as a host
-// process. The returned GuestNetwork is for runtimed's VZ backend to apply; the live
-// NAT attach stays lab-gated, while guest VIP reachability is answered and needs
+// a pod IP from the node /24, ensures its /32 lo0 alias (the address the node's
+// proxy relays from — see GuestNetwork.PodIP), and returns the GuestNetwork config.
+// The alias lives as long as the pod (SetupGuest to Teardown), never as long as the
+// guest's lease. It is idempotent per podID and returns ErrBackendMismatch if podID
+// was already set up as a host process; a failed alias plumb releases the address.
+// The returned GuestNetwork is for runtimed's VZ backend to apply; the live NAT
+// attach stays lab-gated, while guest VIP reachability is answered and needs
 // nothing added (see doc.go).
 func (n *Network) SetupGuest(ctx context.Context, podID string) (GuestNetwork, error) {
 	ip, err := n.setup(ctx, podID, BackendVM)

@@ -67,7 +67,7 @@ func TestKernelRoutesLandOnlyWithAUTUNAddress(t *testing.T) {
 
 	// (1) Addressless: the routing socket reports the refusal synchronously, and
 	// the kernel table is the verdict regardless: it must NOT hold the route.
-	report, err := rt.Add(ctx, routeTestPeer, iface)
+	report, err := rt.Add(ctx, Route{Prefix: routeTestPeer, Interface: iface})
 	t.Logf("addressless add reported: %q", report)
 	if !errors.Is(err, unix.ENETUNREACH) {
 		t.Errorf("addressless add err = %v, want the kernel's ENETUNREACH from the routing-socket write", err)
@@ -82,10 +82,10 @@ func TestKernelRoutesLandOnlyWithAUTUNAddress(t *testing.T) {
 		t.Fatalf("MeshLinkIP: %v", err)
 	}
 	mustRun(t, "ifconfig", iface, "inet", linkIP.String(), linkIP.String(), "netmask", "255.255.255.255", "up")
-	if report, err := rt.Add(ctx, routeTestPeer, iface); err != nil {
+	if report, err := rt.Add(ctx, Route{Prefix: routeTestPeer, Interface: iface}); err != nil {
 		t.Fatalf("add %s -> %s: %v (%s)", routeTestPeer, iface, err, report)
 	}
-	t.Cleanup(func() { _, _ = rt.Delete(context.Background(), routeTestPeer, iface) })
+	t.Cleanup(func() { _, _ = rt.Delete(context.Background(), Route{Prefix: routeTestPeer, Interface: iface}) })
 	if !routeIsOn(t, rt, routeTestPeer, iface) {
 		t.Fatalf("route %s is absent from the kernel table on %s even with the link address %s assigned", routeTestPeer, iface, linkIP)
 	}
@@ -97,7 +97,7 @@ func TestKernelRoutesLandOnlyWithAUTUNAddress(t *testing.T) {
 	}
 
 	// (4) Deleting it removes it from the table, so teardown is leak-free.
-	if _, err := rt.Delete(ctx, routeTestPeer, iface); err != nil {
+	if _, err := rt.Delete(ctx, Route{Prefix: routeTestPeer, Interface: iface}); err != nil {
 		t.Fatalf("delete %s -> %s: %v", routeTestPeer, iface, err)
 	}
 	if routeIsOn(t, rt, routeTestPeer, iface) {
@@ -139,10 +139,10 @@ func TestInboundTunnelTrafficToTheMeshIPIsAnswered(t *testing.T) {
 	mustRun(t, "ifconfig", "lo0", "alias", meshIP.String()+"/32")
 	t.Cleanup(func() { _ = exec.Command("ifconfig", "lo0", "-alias", meshIP.String()).Run() })
 
-	if _, err := rt.Add(ctx, routeTestPeer, iface); err != nil {
+	if _, err := rt.Add(ctx, Route{Prefix: routeTestPeer, Interface: iface}); err != nil {
 		t.Fatalf("add peer route: %v", err)
 	}
-	t.Cleanup(func() { _, _ = rt.Delete(context.Background(), routeTestPeer, iface) })
+	t.Cleanup(func() { _, _ = rt.Delete(context.Background(), Route{Prefix: routeTestPeer, Interface: iface}) })
 	if !routeIsOn(t, rt, routeTestPeer, iface) {
 		t.Fatalf("peer route %s did not land on %s", routeTestPeer, iface)
 	}
@@ -228,10 +228,10 @@ func TestKernelRouteTableAnswersPresentAndAbsent(t *testing.T) {
 	// assertion in one case cannot leak a route into the next.
 	mustAdd := func(t *testing.T, prefix netip.Prefix) {
 		t.Helper()
-		if report, err := rt.Add(ctx, prefix, iface); err != nil {
+		if report, err := rt.Add(ctx, Route{Prefix: prefix, Interface: iface}); err != nil {
 			t.Fatalf("add %s: %v (%s)", prefix, err, report)
 		}
-		t.Cleanup(func() { _, _ = rt.Delete(context.Background(), prefix, iface) })
+		t.Cleanup(func() { _, _ = rt.Delete(context.Background(), Route{Prefix: prefix, Interface: iface}) })
 		if !routeIsOn(t, rt, prefix, iface) {
 			t.Fatalf("route %s is absent from the table on %s after its add", prefix, iface)
 		}
@@ -239,7 +239,7 @@ func TestKernelRouteTableAnswersPresentAndAbsent(t *testing.T) {
 
 	t.Run("a second add of a present route is refused with EEXIST and the route stays", func(t *testing.T) {
 		mustAdd(t, routeTestPeer)
-		report, err := rt.Add(ctx, routeTestPeer, iface)
+		report, err := rt.Add(ctx, Route{Prefix: routeTestPeer, Interface: iface})
 		if !errors.Is(err, unix.EEXIST) {
 			t.Fatalf("second add err = %v (report %q), want EEXIST", err, report)
 		}
@@ -252,7 +252,7 @@ func TestKernelRouteTableAnswersPresentAndAbsent(t *testing.T) {
 		if routeIsOn(t, rt, routeTestPeer, iface) {
 			t.Fatalf("route %s is on %s before the case starts", routeTestPeer, iface)
 		}
-		if report, err := rt.Delete(ctx, routeTestPeer, iface); err != nil {
+		if report, err := rt.Delete(ctx, Route{Prefix: routeTestPeer, Interface: iface}); err != nil {
 			t.Fatalf("delete of an absent route err = %v (report %q), want nil: ESRCH is the idempotent case", err, report)
 		}
 		if routeIsOn(t, rt, routeTestPeer, iface) {
@@ -269,7 +269,7 @@ func TestKernelRouteTableAnswersPresentAndAbsent(t *testing.T) {
 		if routeIsOn(t, rt, routeTestPeer, iface) {
 			t.Fatalf("the /32 add reads back as its /24 %s; the read-back lost the prefix length", routeTestPeer)
 		}
-		if _, err := rt.Delete(ctx, routeTestHost, iface); err != nil {
+		if _, err := rt.Delete(ctx, Route{Prefix: routeTestHost, Interface: iface}); err != nil {
 			t.Fatalf("delete %s: %v", routeTestHost, err)
 		}
 		if routeIsOn(t, rt, routeTestHost, iface) {
@@ -335,8 +335,12 @@ func routeIsOn(t *testing.T, rt kernelRouteTable, prefix netip.Prefix, iface str
 	if err != nil {
 		t.Fatalf("list kernel routes: %v", err)
 	}
-	_, ok := prefixesOn(have, iface)[prefix.Masked()]
-	return ok
+	for _, r := range have {
+		if r.Prefix == prefix.Masked() && r.Interface == iface {
+			return true
+		}
+	}
+	return false
 }
 
 // mustRun runs a privileged setup command, failing the test with its output.

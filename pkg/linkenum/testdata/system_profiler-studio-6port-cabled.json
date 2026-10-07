@@ -1,0 +1,126 @@
+{
+  "SPThunderboltDataType" : [
+    {
+      "_name" : "thunderboltusb4_bus_5",
+      "device_name_key" : "Mac Studio",
+      "domain_uuid_key" : "00000000-0000-4000-8000-000000000006",
+      "receptacle_1_tag" : {
+        "current_speed_key" : "Up to 40 Gb/s",
+        "link_status_key" : "0x100",
+        "receptacle_id_key" : "6",
+        "receptacle_status_key" : "receptacle_no_devices_connected"
+      },
+      "route_string_key" : "0",
+      "switch_uid_key" : "0x05AC000000000005",
+      "vendor_name_key" : "Apple Inc."
+    },
+    {
+      "_name" : "thunderboltusb4_bus_4",
+      "device_name_key" : "Mac Studio",
+      "domain_uuid_key" : "00000000-0000-4000-8000-000000000005",
+      "receptacle_1_tag" : {
+        "current_speed_key" : "Up to 40 Gb/s",
+        "link_status_key" : "0x100",
+        "receptacle_id_key" : "5",
+        "receptacle_status_key" : "receptacle_no_devices_connected"
+      },
+      "route_string_key" : "0",
+      "switch_uid_key" : "0x05AC000000000004",
+      "vendor_name_key" : "Apple Inc."
+    },
+    {
+      "_items" : [
+        {
+          "_name" : "Studio Display",
+          "device_id_key" : "0x801F",
+          "device_name_key" : "Studio Display",
+          "device_revision_key" : "0x1",
+          "mode_key" : "thunderbolt_three",
+          "receptacle_upstream_ambiguous_tag" : {
+            "current_speed_key" : "40 Gb/s",
+            "lc_version_key" : "1.45.0",
+            "link_status_key" : "0x2",
+            "receptacle_status_key" : "receptacle_connected"
+          },
+          "route_string_key" : "1",
+          "switch_uid_key" : "0x0001E0C800000000",
+          "switch_version_key" : "67.1",
+          "vendor_id_key" : "0x0001",
+          "vendor_name_key" : "Apple Inc."
+        }
+      ],
+      "_name" : "thunderboltusb4_bus_3",
+      "device_name_key" : "Mac Studio",
+      "domain_uuid_key" : "00000000-0000-4000-8000-000000000004",
+      "receptacle_1_tag" : {
+        "current_speed_key" : "40 Gb/s",
+        "link_status_key" : "0x2",
+        "micro_version_key" : "0.0.0",
+        "receptacle_id_key" : "4",
+        "receptacle_status_key" : "receptacle_connected"
+      },
+      "route_string_key" : "0",
+      "switch_uid_key" : "0x05AC000000000003",
+      "vendor_name_key" : "Apple Inc."
+    },
+    {
+      "_items" : [
+        {
+          "_name" : "MacBook Air",
+          "device_name_key" : "MacBook Air",
+          "domain_uuid_key" : "00000000-0000-4000-8000-000000000011",
+          "mode_key" : "thunderbolt_mode",
+          "receptacle_upstream_ambiguous_tag" : {
+            "current_speed_key" : "40 Gb/s",
+            "link_status_key" : "0x2",
+            "receptacle_status_key" : "receptacle_connected"
+          },
+          "route_string_key" : "1",
+          "switch_uid_key" : "0x05AC0000000000AA",
+          "vendor_name_key" : "Apple Inc."
+        }
+      ],
+      "_name" : "thunderboltusb4_bus_2",
+      "device_name_key" : "Mac Studio",
+      "domain_uuid_key" : "00000000-0000-4000-8000-000000000003",
+      "receptacle_1_tag" : {
+        "current_speed_key" : "40 Gb/s",
+        "link_status_key" : "0x2",
+        "micro_version_key" : "0.0.0",
+        "receptacle_id_key" : "3",
+        "receptacle_status_key" : "receptacle_connected"
+      },
+      "route_string_key" : "0",
+      "switch_uid_key" : "0x05AC000000000002",
+      "vendor_name_key" : "Apple Inc."
+    },
+    {
+      "_name" : "thunderboltusb4_bus_1",
+      "device_name_key" : "Mac Studio",
+      "domain_uuid_key" : "00000000-0000-4000-8000-000000000002",
+      "receptacle_1_tag" : {
+        "current_speed_key" : "Up to 40 Gb/s",
+        "link_status_key" : "0x100",
+        "receptacle_id_key" : "2",
+        "receptacle_status_key" : "receptacle_no_devices_connected"
+      },
+      "route_string_key" : "0",
+      "switch_uid_key" : "0x05AC000000000001",
+      "vendor_name_key" : "Apple Inc."
+    },
+    {
+      "_name" : "thunderboltusb4_bus_0",
+      "device_name_key" : "Mac Studio",
+      "domain_uuid_key" : "00000000-0000-4000-8000-000000000001",
+      "receptacle_1_tag" : {
+        "current_speed_key" : "Up to 40 Gb/s",
+        "link_status_key" : "0x100",
+        "receptacle_id_key" : "1",
+        "receptacle_status_key" : "receptacle_no_devices_connected"
+      },
+      "route_string_key" : "0",
+      "switch_uid_key" : "0x05AC000000000000",
+      "vendor_name_key" : "Apple Inc."
+    }
+  ]
+}

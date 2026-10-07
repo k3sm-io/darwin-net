@@ -24,15 +24,15 @@ limitations under the License.
 // # Why the pure logic is separated from the privileged device
 //
 // Bringing the mesh up touches root-only state (creating a utun, installing
-// kernel routes, loading a pf anchor), so those operations live behind the Device
+// kernel routes, plumbing lo0 aliases), so those operations live behind the Device
 // seam and run inside the netd daemon boundary in deployment. Everything that
 // decides WHAT to program is pure and table-tested without privilege: the route
 // set (RouteSet), the AllowedIPs==podCIDR equality check (AllowedIPsMatchCIDR),
 // the wireguard UAPI config (Plan.UAPI), the public-key encoding (publicKeyHex),
-// and the MTU/MSS constants. BuildPlan turns a MeshPeer snapshot into a Plan; the
+// and the MTU constants. BuildPlan turns a MeshPeer snapshot into a Plan; the
 // Device applies it.
 //
-// # Four load-bearing mechanics (each blackholes traffic if dropped)
+// # Three load-bearing mechanics (each blackholes traffic if dropped)
 //
 //   - Per-peer kernel routes, distinct from wireguard AllowedIPs. wireguard-go is
 //     the library over a raw utun; unlike wg-quick it installs NO kernel routes,
@@ -56,10 +56,31 @@ limitations under the License.
 //   - The node /24 as a single source of truth. AllowedIPs == the podnet IPAM CIDR
 //     == node.spec.podCIDR; the mesh asserts equality, not merely symmetry, because
 //     a symmetric-but-wrong AllowedIPs still blackholes.
-//   - An MSS clamp scoped to the utun egress. A pod socket bound to an lo0 alias
-//     sees the loopback MTU (16384) and can advertise an MSS too large for the 1380
-//     utun, blackholing large-payload cross-node TCP; a minimal pf scrub anchor
-//     (built ahead of the full pf sub-anchor) clamps max-mss on the utun only, never lo0.
+//
+// TCP segment size across the tunnel needs no pf rule: the mesh relies on the
+// tunnel MTU (1380). XNU takes a connection's TCP MSS from the route to the
+// destination, not from the source address's interface, so a pod socket bound to
+// an lo0 alias (MTU 16384) still advertises the tunnel's MSS (TunnelMSS, 1340)
+// toward a peer's pod CIDR, because that route resolves to the utun. Nothing in
+// this package loads a pf rule; teardown only flushes the PFAnchor an older
+// release may have loaded.
+//
+// # Direct links
+//
+// A Thunderbolt cable between two nodes becomes a preferred kernel route, never a
+// replacement for the tunnel. A peer routed over a cable keeps its utun /24 and
+// gains two more-specific /25 gateway routes through the peer's direct-link
+// address on the cable interface, sourced (RTAX_IFA) from the mesh-egress address;
+// the on-link host route to that address is the root helper's, installed before
+// the /25s and removed after them. When the cable goes the kernel deletes the
+// interface-bound routes and the /24 carries the traffic with no code in the path.
+// The choice is local and re-derived on every reconcile (EligibleDirectRoutes): the
+// resolved DirectLink status must say the port is up, the link must be up here
+// (link events), and the liveness probe must hear the peer. The peer's wireguard
+// endpoint follows the choice (the direct candidate while routed over the cable,
+// the underlay otherwise), so a dead cable re-programs the endpoint rather than
+// waiting for a packet wireguard will never receive. TunnelMSS is unchanged for
+// every path.
 //
 // # The endpoint-roaming contract
 //

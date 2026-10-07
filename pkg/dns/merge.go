@@ -71,8 +71,18 @@ const MaxSearchDomains = 8
 //
 // base is not mutated: out starts as a copy of base and is given a FRESH
 // SearchDomains slice that never aliases the caller's. dnsConfig.nameservers and
-// non-ndots dnsConfig.options are NOT honored here (the single-server shim ABI).
+// non-ndots dnsConfig.options are NOT honored here: a ClusterFirst pod always
+// queries the cluster resolver.
+//
+// MergeDNSConfig is ClusterFirst-only. For a base whose Policy is not
+// DNSPolicyClusterFirst it returns base unchanged and 0 dropped: a
+// DNSPolicyNone pod's search list and ndots are its own, carried in its own
+// config, never an augmentation of cluster defaults. That returned value shares
+// base's slices, which is safe because nothing is merged into them.
 func MergeDNSConfig(base netv1.DNSConfig, searches []string, ndots int32) (netv1.DNSConfig, int) {
+	if base.Policy != netv1.DNSPolicyClusterFirst {
+		return base, 0
+	}
 	out := base
 
 	// Cluster searches first, then the pod's; dedupe first-seen so the cluster wins

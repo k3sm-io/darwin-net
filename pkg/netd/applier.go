@@ -19,6 +19,7 @@ package netd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -55,26 +56,113 @@ type Privileged interface {
 	// live; an executor that cannot serve the new CIDR returns an error and the
 	// adoption is refused.
 	SetNodePodCIDR(ctx context.Context, cidr netip.Prefix) error
-	// LoadPFAnchor loads the utun-scoped MSS-clamp rule (mssClamp already validated).
-	LoadPFAnchor(ctx context.Context, mssClamp int) error
 	// BindPort binds a listening socket on the specific addr and returns it; the
 	// caller passes the fd to the client and closes this copy.
 	BindPort(ctx context.Context, network string, addr netip.AddrPort) (*os.File, error)
+	// ConfigureLink configures a validated direct-link port (idempotent): out of
+	// bridge0, its /32 address, offload off, the on-link host route to the peer
+	// when one is given, all read back from the kernel before it returns nil. A
+	// failure leaves no alias or host route of this call behind.
+	ConfigureLink(ctx context.Context, spec LinkSpec) error
+	// RemoveLink tears a direct-link port down (idempotent): the direct routes
+	// over it first, then its host route and address, then bridge membership is
+	// restored.
+	RemoveLink(ctx context.Context, iface string) error
 }
 
-// darwinApplier is the production Privileged: it shells out to ifconfig/pfctl and
+// LinkSpec is a direct-link port the server has validated: the Thunderbolt
+// interface, the address the server derived for it, and the peer's address on
+// the cable (invalid: no host route).
+type LinkSpec struct {
+	Iface      string
+	LinkIP     netip.Addr
+	PeerLinkIP netip.Addr
+}
+
+// linkRouter is the host-route seam the link operations drive
+// (*mesh.HostRoutes in production).
+type linkRouter interface {
+	Ensure(ctx context.Context, peer netip.Addr, iface string) error
+	Remove(ctx context.Context, peer netip.Addr, iface string) error
+	List(ctx context.Context) ([]mesh.Route, error)
+	Delete(ctx context.Context, r mesh.Route) error
+}
+
+// blackholer installs and clears the lo0 blackhole host route that holds a pod
+// address while its alias is torn down (podnet.BlackholeRoutes in production).
+type blackholer interface {
+	// Install adds the blackhole host route for ip (idempotent).
+	Install(ctx context.Context, ip netip.Addr) error
+	// Clear removes ip's blackhole host route if there is one, and nothing else.
+	Clear(ctx context.Context, ip netip.Addr) error
+	// List returns the pod addresses of nodeCIDR that hold a blackhole host route.
+	List(ctx context.Context, nodeCIDR netip.Prefix) ([]netip.Addr, error)
+}
+
+// aliasState is what the applier knows about a lo0 alias it plumbed.
+type aliasState uint8
+
+const (
+	// aliasLive: the alias is plumbed on lo0.
+	aliasLive aliasState = iota
+	// aliasBlackholePending: the alias is gone but its blackhole install failed,
+	// so the address stays tracked until a retried RemoveAlias installs it.
+	aliasBlackholePending
+)
+
+// darwinApplier is the production Privileged: it shells out to ifconfig and
 // binds sockets directly, and drives the real wireguard mesh device (pkg/mesh).
 // It runs as root inside the daemon; unit tests inject a fake Privileged instead,
-// so this code path is exercised only in the root-gated integration tier.
+// so this code path is exercised only in the root-gated integration tier, apart
+// from the alias path, whose command runner and route seam a unit test replaces.
+//
+// A pod address of the node /24 (podnet.IsPodAddress) is blackholed on lo0 when
+// its alias is removed and un-blackholed just before it is aliased again, so a
+// connection still open to a departed pod cannot re-route onto the mesh utun (see
+// podnet.BlackholeRoutes). A Service VIP is aliased and removed plainly: with no
+// alias it falls to the default route, never the utun. The blackhole is installed
+// only for an address that was actually aliased — one this applier tracks, or one
+// whose -alias found an alias on lo0 (left by a previous daemon; a lo0 alias in
+// the pod /24 is plumbed by nothing but this root executor) — so a RemoveAlias
+// request cannot durably blackhole an unused address. The blackholes of a /24 the
+// applier stops serving are swept by SetNodePodCIDR, and stale ones in the
+// current /24 by sweepStaleBlackholes at daemon start.
 //
 // Locking discipline: the lazily-built mesh device, its up/iface state, and the
 // node CIDR the mesh addresses derive from are guarded by mu, so concurrent
-// ConfigureMesh/RemoveMesh/LoadPFAnchor/SetNodePodCIDR calls (from different
-// connections) serialize. Alias and port operations are independent (the kernel
-// serializes them) and take no lock here.
+// ConfigureMesh/RemoveMesh/SetNodePodCIDR calls (from different
+// connections) serialize. Alias operations serialize on aliasMu, so an alias
+// change and its blackhole step are one critical section; they read nodePodCIDR
+// under mu briefly and never hold mu across a command (lock order: aliasMu, then
+// mu). aliased is guarded by aliasMu. Port operations are independent (the kernel serializes them) and take no
+// lock here.
 type darwinApplier struct {
 	utunName string
 	log      *slog.Logger
+	// command runs a root-gated command and routes installs and clears the
+	// pod-address blackhole. Both are set by newDarwinApplier and replaced only by
+	// unit tests.
+	command func(ctx context.Context, name string, args ...string) error
+	routes  blackholer
+	// output runs a read-only command and returns its standard output (the
+	// ifconfig read-backs of the link operations); hostRoutes is the link
+	// operations' host-route seam; ifaceAddrs lists every interface's IPv4
+	// addresses for the start-up reconcile. All three are set by
+	// newDarwinApplier and replaced only by unit tests.
+	output     func(ctx context.Context, name string, args ...string) ([]byte, error)
+	hostRoutes linkRouter
+	ifaceAddrs func() (map[string][]netip.Addr, error)
+	// withdraw removes the mesh's direct routes over an interface before its host
+	// route goes (withdrawDirect in production).
+	withdraw func(ctx context.Context, iface string) error
+
+	// linkMu serializes the link operations; links are the ports configured,
+	// guarded by linkMu. Lock order: linkMu, then mu.
+	linkMu sync.Mutex
+	links  map[string]LinkSpec
+
+	aliasMu sync.Mutex
+	aliased map[netip.Addr]aliasState
 
 	mu          sync.Mutex
 	nodePodCIDR netip.Prefix
@@ -94,30 +182,140 @@ func newDarwinApplier(nodePodCIDR netip.Prefix, log *slog.Logger) *darwinApplier
 	}
 	meshIP, _ := podnet.MeshEgressIP(nodePodCIDR)
 	linkIP, _ := podnet.MeshLinkIP(nodePodCIDR)
-	return &darwinApplier{
+	a := &darwinApplier{
 		nodePodCIDR: nodePodCIDR,
 		meshIP:      meshIP,
 		linkIP:      linkIP,
 		utunName:    "utun",
 		log:         log,
+		command:     run,
+		routes:      podnet.BlackholeRoutes{},
+		aliased:     make(map[netip.Addr]aliasState),
+		output:      runOutput,
+		hostRoutes:  mesh.NewHostRoutes(),
+		ifaceAddrs:  interfaceIPv4Addrs,
+		links:       make(map[string]LinkSpec),
 	}
+	a.withdraw = a.withdrawDirect
+	return a
 }
 
-// EnsureAlias adds ip as a /32 alias on lo0.
+// isPodAddress reports whether ip is a pod address of the node /24 this applier
+// currently serves, reading nodePodCIDR under mu.
+func (a *darwinApplier) isPodAddress(ip netip.Addr) bool {
+	a.mu.Lock()
+	cidr := a.nodePodCIDR
+	a.mu.Unlock()
+	return podnet.IsPodAddress(cidr, ip)
+}
+
+// EnsureAlias adds ip as a /32 alias on lo0. For a pod address it first clears
+// any blackhole left by the address's previous teardown — a stale blackhole must
+// never shadow a new pod — and fails if that clear fails.
 func (a *darwinApplier) EnsureAlias(ctx context.Context, ip netip.Addr) error {
-	if err := run(ctx, "ifconfig", "lo0", "alias", fmt.Sprintf("%s/32", ip)); err != nil {
+	a.aliasMu.Lock()
+	defer a.aliasMu.Unlock()
+	if a.isPodAddress(ip) {
+		if err := a.routes.Clear(ctx, ip); err != nil {
+			return fmt.Errorf("ensure lo0 alias %s: %w", ip, err)
+		}
+	}
+	if err := a.command(ctx, "ifconfig", "lo0", "alias", fmt.Sprintf("%s/32", ip)); err != nil {
 		return fmt.Errorf("ifconfig lo0 alias %s/32: %w", ip, err)
 	}
+	a.aliased[ip] = aliasLive
 	return nil
 }
 
-// RemoveAlias removes ip's lo0 alias. An absent alias is tolerated (leak-free
-// teardown), so the error is logged, not returned.
+// RemoveAlias removes ip's lo0 alias and, for a pod address that was aliased,
+// installs its blackhole host route right after. An absent alias is tolerated
+// (leak-free teardown), so the ifconfig error is logged, not returned.
+//
+// The blackhole is skipped, with a Debug line, for a pod address this applier
+// does not track whose -alias found nothing on lo0: there is no alias, so no
+// departed pod whose connections could re-route, and installing it would let any
+// authorized peer blackhole an unused address of the /24 until it is next aliased.
+// A tracked address is blackholed even when its -alias fails, and the install
+// fails closed on a live non-blackhole host route, so an alias that would not go
+// is reported rather than hidden.
+//
+// A failed blackhole install IS returned, and the address stays tracked as
+// pending: the client keeps the address allocated and retries the teardown, the
+// retry skips the -alias and re-runs the install, so the address is never reused
+// while a departed pod's connections could re-route.
 func (a *darwinApplier) RemoveAlias(ctx context.Context, ip netip.Addr) error {
-	if err := run(ctx, "ifconfig", "lo0", "-alias", ip.String()); err != nil {
+	a.aliasMu.Lock()
+	defer a.aliasMu.Unlock()
+	state, tracked := a.aliased[ip]
+	removed := false
+	if tracked && state == aliasBlackholePending {
+		a.log.Debug("lo0 alias already removed; retrying its blackhole", "ip", ip.String())
+	} else if err := a.command(ctx, "ifconfig", "lo0", "-alias", ip.String()); err != nil {
 		a.log.Debug("ifconfig lo0 -alias tolerated (address may be absent)", "ip", ip.String(), "err", err)
+	} else {
+		removed = true
 	}
+	if !a.isPodAddress(ip) {
+		delete(a.aliased, ip)
+		return nil
+	}
+	if !tracked && !removed {
+		a.log.Debug("lo0 alias was never plumbed; no blackhole installed", "ip", ip.String())
+		return nil
+	}
+	if err := a.routes.Install(ctx, ip); err != nil {
+		a.aliased[ip] = aliasBlackholePending
+		return fmt.Errorf("remove lo0 alias %s: %w", ip, err)
+	}
+	delete(a.aliased, ip)
 	return nil
+}
+
+// sweepBlackholes clears every blackhole host route held for a pod address of
+// cidr and returns how many it cleared. Clear deletes a host route only when it
+// carries RTF_BLACKHOLE, and an address's alias and its blackhole are the same
+// /32 key, so no live alias's route can be touched. aliasMu must be held.
+func (a *darwinApplier) sweepBlackholes(ctx context.Context, cidr netip.Prefix) (int, error) {
+	ips, err := a.routes.List(ctx, cidr)
+	if err != nil {
+		return 0, err
+	}
+	var errs []error
+	n := 0
+	for _, ip := range ips {
+		if err := a.routes.Clear(ctx, ip); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		n++
+	}
+	return n, errors.Join(errs...)
+}
+
+// sweepStaleBlackholes clears, at daemon start, the blackholes left inside the
+// node pod /24 the applier serves. A teardown can leave one behind for good: the
+// daemon crashing between a -alias and the blackhole's later clear, or a pod that
+// never came back to its address. A fresh daemon has no alias tracked and no pod
+// teardown in flight, so nothing it holds is protected by those routes — a pod
+// re-plumbed afterwards clears its own anyway — and they would otherwise sit in
+// the table until the address is next aliased. The residual: a connection another
+// process still holds to a pod torn down just before a daemon restart loses its
+// blackhole here. A failure is logged, never fatal:
+// a leftover blackhole is harmless, and the daemon must start.
+func (a *darwinApplier) sweepStaleBlackholes(ctx context.Context) {
+	a.aliasMu.Lock()
+	defer a.aliasMu.Unlock()
+	a.mu.Lock()
+	cidr := a.nodePodCIDR
+	a.mu.Unlock()
+	n, err := a.sweepBlackholes(ctx, cidr)
+	if err != nil {
+		a.log.Warn("netd: sweeping stale pod-address blackholes at start", "nodePodCIDR", cidr.String(), "swept", n, "err", err)
+		return
+	}
+	if n > 0 {
+		a.log.Info("netd: swept stale pod-address blackholes at start", "nodePodCIDR", cidr.String(), "swept", n)
+	}
 }
 
 // SetNodePodCIDR re-points the applier at cidr and re-derives the two addresses the
@@ -133,6 +331,13 @@ func (a *darwinApplier) RemoveAlias(ctx context.Context, ip netip.Addr) error {
 // on a never-upped or already-downed device is safe; its error is only logged,
 // because a stale device's teardown must not fail an adoption that is otherwise
 // admissible.
+//
+// A changed CIDR also sweeps the blackhole host routes of the OLD /24 and drops
+// the applier's alias tracking for it. Those routes stood in for departed pods of
+// a /24 this node no longer serves; left behind, they would blackhole another
+// node's pods on this host once the old /24 is routed over the mesh. Only routes
+// flagged RTF_BLACKHOLE are deleted, and a sweep failure is logged, not returned,
+// for the same reason as the device teardown.
 func (a *darwinApplier) SetNodePodCIDR(ctx context.Context, cidr netip.Prefix) error {
 	meshIP, err := podnet.MeshEgressIP(cidr)
 	if err != nil {
@@ -142,10 +347,13 @@ func (a *darwinApplier) SetNodePodCIDR(ctx context.Context, cidr netip.Prefix) e
 	if err != nil {
 		return fmt.Errorf("derive mesh link address for %s: %w", cidr, err)
 	}
+	a.aliasMu.Lock()
+	defer a.aliasMu.Unlock()
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.meshUp {
-		return fmt.Errorf("mesh is up on node podCIDR %s: refusing to re-derive its addresses", a.nodePodCIDR)
+		old := a.nodePodCIDR
+		a.mu.Unlock()
+		return fmt.Errorf("mesh is up on node podCIDR %s: refusing to re-derive its addresses", old)
 	}
 	if a.dev != nil {
 		if err := a.dev.Down(ctx); err != nil {
@@ -153,7 +361,22 @@ func (a *darwinApplier) SetNodePodCIDR(ctx context.Context, cidr netip.Prefix) e
 		}
 		a.dev = nil
 	}
+	old := a.nodePodCIDR
 	a.nodePodCIDR, a.meshIP, a.linkIP = cidr, meshIP, linkIP
+	a.mu.Unlock()
+	if old == cidr {
+		return nil
+	}
+	for ip := range a.aliased {
+		if podnet.IsPodAddress(old, ip) {
+			delete(a.aliased, ip)
+		}
+	}
+	if n, err := a.sweepBlackholes(ctx, old); err != nil {
+		a.log.Warn("netd: sweeping the previous node podCIDR's blackholes", "nodePodCIDR", old.String(), "swept", n, "err", err)
+	} else if n > 0 {
+		a.log.Info("netd: swept the previous node podCIDR's blackholes", "nodePodCIDR", old.String(), "swept", n)
+	}
 	return nil
 }
 
@@ -200,27 +423,6 @@ func (a *darwinApplier) RemoveMesh(ctx context.Context) error {
 	return nil
 }
 
-// LoadPFAnchor loads the MSS-clamp rule scoped to the live mesh utun. It requires
-// the mesh to be up (the clamp is meaningless without a utun to scope it to); the
-// rule text is rendered here from the validated clamp, never accepted over the wire.
-func (a *darwinApplier) LoadPFAnchor(ctx context.Context, mssClamp int) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.dev == nil || !a.meshUp {
-		return fmt.Errorf("load pf anchor: mesh not configured (no utun to scope the MSS clamp)")
-	}
-	iface := a.dev.Interface()
-	if iface == "" {
-		return fmt.Errorf("load pf anchor: mesh utun not resolved")
-	}
-	cmd := exec.CommandContext(ctx, "pfctl", "-a", mesh.PFAnchor, "-f", "-")
-	cmd.Stdin = bytes.NewBufferString(mesh.PFMSSClampRule(iface, mssClamp))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("pfctl load %s: %w: %s", mesh.PFAnchor, err, bytes.TrimSpace(out))
-	}
-	return nil
-}
-
 // BindPort binds a listening socket on addr and returns it as an *os.File so the
 // server can pass the descriptor to the client over SCM_RIGHTS. The original
 // listener is closed after the descriptor is duplicated; the kernel keeps the
@@ -252,6 +454,19 @@ func (a *darwinApplier) BindPort(_ context.Context, network string, addr netip.A
 	default:
 		return nil, fmt.Errorf("bind port: unsupported network %q", network)
 	}
+}
+
+// runOutput runs a command and returns its standard output.
+func runOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
+	out, err := exec.CommandContext(ctx, name, args...).Output()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return out, fmt.Errorf("%w: %s", err, bytes.TrimSpace(ee.Stderr))
+		}
+		return out, err
+	}
+	return out, nil
 }
 
 // run invokes a root-gated command, wrapping any failure with its combined output.

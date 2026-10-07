@@ -30,6 +30,7 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // defaultQueryTimeout bounds a single CoreDNS query attempt.
@@ -38,8 +39,18 @@ const defaultQueryTimeout = 2 * time.Second
 // queryAttempts is how many times one candidate FQDN is queried when the
 // attempt fails transiently (timeout, network error, SERVFAIL). It mirrors the
 // resolv.conf "attempts" default; a definitive answer (NOERROR/NXDOMAIN) never
-// retries. The C shim mirrors this as K3SM_DNS_ATTEMPTS.
+// retries. With several nameservers it is the number of passes over the server
+// list (attempt loop outer, server loop inner, as glibc does). The C shim
+// mirrors this as K3SM_DNS_ATTEMPTS.
 const queryAttempts = 2
+
+// errTransport marks a query that failed at the transport level: the dial, the
+// send, or the receive (a timeout or an error such as ECONNREFUSED), on UDP or
+// on the TCP refetch. With more than one nameserver a server that fails this
+// way is dead for the rest of the lookup. A reply that arrived but could not be
+// used (SERVFAIL, malformed) is not a transport failure; it only advances to
+// the next server. The C shim draws the same line.
+var errTransport = errors.New("dns: transport failure")
 
 // EDNSUDPPayloadSize is the EDNS0 (RFC 6891) UDP payload size the resolver
 // advertises in an OPT pseudo-RR on every query, telling CoreDNS it may return
@@ -65,21 +76,45 @@ var ErrNotFound = errors.New("dns: no address found for name")
 var ErrTempFail = errors.New("dns: cluster resolver temporarily unavailable")
 
 // Resolver turns a hostname into addresses by applying ndots/search expansion
-// (the pure candidateNames logic) and querying CoreDNS over the cluster DNS VIP.
+// (the pure candidateNames logic) and querying the config's nameservers: the
+// cluster DNS VIP for ClusterFirst, or the pod's own IPv4 nameservers for
+// DNSPolicyNone.
 // It is the Go reference implementation of the resolution the getaddrinfo DYLD
 // shim performs inside a pod; the shim's C code mirrors this algorithm. The
 // transport is plain UDP DNS (the codec is golang.org/x/net/dns/dnsmessage), so
 // it stays pure Go.
 //
-// A Resolver is safe for concurrent use; it holds no mutable state. The cluster
-// DNS server address is taken from the DNSConfig, so a Resolver is cheap to
-// construct per-config.
+// Server walk (mirrors the C shim). With one nameserver a candidate is retried
+// queryAttempts times. With several, each attempt walks the servers in order: a
+// HIT or a definitive miss (NXDOMAIN/NODATA) from any server ends the candidate,
+// a SERVFAIL or malformed reply moves to the next server, and a server that
+// fails at the transport level (errTransport) is dead for the rest of the
+// LookupHost call, so a lookup costs at most one timeout per server however many
+// candidates it expands to.
+//
+// Exclusive mode (DNSPolicyNone) classifies every candidate as fail-closed, so a
+// transient failure is ErrTempFail and never the ErrNotFound a ClusterFirst
+// external candidate reports to let its caller fall through to the host.
+//
+// A Resolver is safe for concurrent use; it holds no mutable state. The server
+// addresses are taken from the DNSConfig, so a Resolver is cheap to construct
+// per-config.
 type Resolver struct {
-	cfg     netv1.DNSConfig
-	timeout time.Duration
-	// dial is the UDP dial seam; tests point it at a stub DNS server. It defaults
-	// to net.Dialer.DialContext.
+	cfg netv1.DNSConfig
+	// servers are the nameserver addresses ("ip:port") in query order.
+	servers []string
+	// exclusive is set for DNSPolicyNone: every candidate fails closed.
+	exclusive bool
+	timeout   time.Duration
+	// dial is the UDP and TCP dial seam; tests point it at a stub DNS server. It
+	// defaults to tcpseg.Dialer.DialContext, so the TCP refetch toward the DNS VIP
+	// (an lo0 alias) has its segment size clamped like every other connection the
+	// node opens to a VIP; a UDP socket passes through the clamp untouched.
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// onCandidate, when set, is called once for every candidate LookupHost
+	// queries (not for one it skips), with that candidate's outcome. It is a test
+	// seam that mirrors the shim's per-candidate debug trace line.
+	onCandidate func(cand string, addrs []netip.Addr, err error)
 }
 
 // Option configures a Resolver.
@@ -90,22 +125,34 @@ func WithTimeout(d time.Duration) Option {
 	return func(r *Resolver) { r.timeout = d }
 }
 
-// withDialer overrides the UDP dialer; tests use it to reach a stub server.
-func withDialer(d func(ctx context.Context, network, addr string) (net.Conn, error)) Option {
-	return func(r *Resolver) { r.dial = d }
-}
-
 // NewResolver builds a Resolver for cfg. It returns an error if cfg is not usable
-// (missing cluster DNS IP or domain). The DNS server port defaults to 53.
+// (cfg.Validate fails), or one wrapping ErrNoUsableNameserver for a
+// DNSPolicyNone config with no IPv4 nameserver (the same IPv4 subset the shim
+// is given). The DNS server port is 53.
 func NewResolver(cfg netv1.DNSConfig, opts ...Option) (*Resolver, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("dns resolver config: %w", err)
 	}
-	d := &net.Dialer{}
+	servers := cfg.Servers()
+	exclusive := cfg.Policy == netv1.DNSPolicyNone
+	if exclusive {
+		kept, dropped := ipv4Servers(cfg)
+		if len(kept) == 0 {
+			return nil, fmt.Errorf("dns resolver config: nameservers %v: %w", dropped, ErrNoUsableNameserver)
+		}
+		servers = kept
+	}
+	addrs := make([]string, len(servers))
+	for i, s := range servers {
+		addrs[i] = net.JoinHostPort(s, "53")
+	}
+	d := &tcpseg.Dialer{}
 	r := &Resolver{
-		cfg:     cfg.WithDefaults(),
-		timeout: defaultQueryTimeout,
-		dial:    d.DialContext,
+		cfg:       cfg.WithDefaults(),
+		servers:   addrs,
+		exclusive: exclusive,
+		timeout:   defaultQueryTimeout,
+		dial:      d.DialContext,
 	}
 	for _, o := range opts {
 		o(r)
@@ -117,11 +164,6 @@ func NewResolver(cfg netv1.DNSConfig, opts ...Option) (*Resolver, error) {
 // exposing the pure ndots/search expansion for inspection and tests.
 func (r *Resolver) Candidates(name string) []string {
 	return candidateNames(r.cfg, name)
-}
-
-// serverAddr returns the cluster DNS server's ip:port (port 53).
-func (r *Resolver) serverAddr() string {
-	return net.JoinHostPort(r.cfg.ClusterDNSIP, "53")
 }
 
 // LookupHost resolves name to one or more IP addresses, trying each ndots/search
@@ -137,12 +179,17 @@ func (r *Resolver) serverAddr() string {
 // yields ErrNotFound so the caller may fall through to the host resolver,
 // keeping external DNS alive across a resolver bounce. The walk continues past a
 // cluster transient (a later external candidate may still resolve) and reports
-// the remembered ErrTempFail only if nothing else resolves.
+// the remembered ErrTempFail only if nothing else resolves. In exclusive mode
+// (DNSPolicyNone) every candidate is cluster-scoped in that sense, so any
+// transient failure ends as ErrTempFail.
+//
+// The dead-server memo (see Resolver) lives for exactly one LookupHost call.
 func (r *Resolver) LookupHost(ctx context.Context, name string) ([]netip.Addr, error) {
 	cands := r.Candidates(name)
 	if len(cands) == 0 {
 		return nil, fmt.Errorf("dns: empty query name")
 	}
+	dead := make([]bool, len(r.servers))
 	// clusterTempErr records that a CLUSTER-scoped candidate failed transiently.
 	// We keep walking past it (a later external candidate may still resolve), and
 	// only fail closed with ErrTempFail at the end if nothing else resolves —
@@ -157,11 +204,14 @@ func (r *Resolver) LookupHost(ctx context.Context, name string) ([]netip.Addr, e
 		if clusterTempErr != nil && r.isClusterCandidate(fqdn) {
 			continue
 		}
-		addrs, err := r.lookupCandidate(ctx, fqdn)
+		addrs, err := r.queryCandidate(ctx, fqdn, dead)
+		if r.onCandidate != nil {
+			r.onCandidate(fqdn, addrs, err)
+		}
 		if err != nil {
 			if !errors.Is(err, ErrTempFail) {
 				// A non-transient hard error (should not normally happen —
-				// lookupCandidate converts query failures to ErrTempFail).
+				// queryCandidate converts query failures to ErrTempFail).
 				return nil, fmt.Errorf("dns: lookup %q: %w", name, err)
 			}
 			if r.isClusterCandidate(fqdn) {
@@ -205,7 +255,14 @@ func (r *Resolver) LookupHost(ctx context.Context, name string) ([]netip.Addr, e
 // turns a TRANSIENT outage into a definitive not-found for exactly those
 // forms. Suffix-based scoping cannot tell "db.prod" from "github.com"; the
 // bare-label and fully-qualified cluster forms keep the ErrTempFail guarantee.
+//
+// In exclusive mode (DNSPolicyNone) every candidate is fail-closed: there is no
+// host resolver to fall through to. An empty ClusterDomain is skipped, so it
+// never makes every name look cluster-scoped.
 func (r *Resolver) isClusterCandidate(fqdn string) bool {
+	if r.exclusive {
+		return true
+	}
 	name := strings.TrimSuffix(fqdn, ".")
 	if !strings.Contains(name, ".") {
 		return true // bare label: a cluster short name, never external
@@ -223,31 +280,73 @@ func (r *Resolver) isClusterCandidate(fqdn string) bool {
 	return false
 }
 
-// lookupCandidate resolves one FQDN, retrying transient failures up to
-// queryAttempts. A nil error with empty addrs is a DEFINITIVE miss (NXDOMAIN or
-// NODATA — the server answered, the name has nothing); a non-nil error wraps
-// ErrTempFail and means the outcome is unknown.
-func (r *Resolver) lookupCandidate(ctx context.Context, fqdn string) ([]netip.Addr, error) {
+// queryCandidate resolves one FQDN through the server walk (see Resolver),
+// reading and updating dead, the per-lookup dead-server memo. With a single
+// server the memo is not consulted: the candidate is retried queryAttempts
+// times exactly as a one-server resolv.conf would. A nil error with empty addrs
+// is a DEFINITIVE miss (NXDOMAIN or NODATA — the server answered, the name has
+// nothing); a non-nil error wraps ErrTempFail and means the outcome is unknown.
+func (r *Resolver) queryCandidate(ctx context.Context, fqdn string, dead []bool) ([]netip.Addr, error) {
 	var lastErr error
-	for range queryAttempts {
-		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrTempFail, err)
-		}
-		res, err := r.queryA(ctx, fqdn)
-		if err != nil {
+	if len(r.servers) == 1 {
+		for range queryAttempts {
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("%w: %w", ErrTempFail, err)
+			}
+			addrs, done, err := r.askServer(ctx, 0, fqdn)
+			if done {
+				return addrs, nil
+			}
 			lastErr = err
-			continue
 		}
-		switch res.rcode {
-		case dnsmessage.RCodeSuccess, dnsmessage.RCodeNameError:
-			return res.addrs, nil
-		default:
-			// SERVFAIL and friends are transient upstream trouble; retrying is
-			// right and treating them as "no such host" is not.
-			lastErr = fmt.Errorf("server returned %v", res.rcode)
+		return nil, fmt.Errorf("%w after %d attempts: %w", ErrTempFail, queryAttempts, lastErr)
+	}
+	for range queryAttempts {
+		live := false
+		for i := range r.servers {
+			if dead[i] {
+				continue
+			}
+			live = true
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("%w: %w", ErrTempFail, err)
+			}
+			addrs, done, err := r.askServer(ctx, i, fqdn)
+			if done {
+				return addrs, nil
+			}
+			lastErr = err
+			if errors.Is(err, errTransport) {
+				dead[i] = true
+			}
+		}
+		if !live {
+			break
 		}
 	}
+	if lastErr == nil {
+		lastErr = errors.New("every nameserver is unreachable")
+	}
 	return nil, fmt.Errorf("%w after %d attempts: %w", ErrTempFail, queryAttempts, lastErr)
+}
+
+// askServer sends one query for fqdn to server i. done reports a definitive
+// outcome (a HIT, or NXDOMAIN/NODATA with no addresses); otherwise err says why
+// the outcome is unknown, wrapping errTransport for a transport failure.
+func (r *Resolver) askServer(ctx context.Context, i int, fqdn string) (addrs []netip.Addr, done bool, err error) {
+	res, err := r.queryA(ctx, i, fqdn)
+	if err != nil {
+		return nil, false, err
+	}
+	switch res.rcode {
+	case dnsmessage.RCodeSuccess, dnsmessage.RCodeNameError:
+		return res.addrs, true, nil
+	default:
+		// SERVFAIL and friends are transient upstream trouble; retrying (or
+		// asking the next server) is right and treating them as "no such host"
+		// is not.
+		return nil, false, fmt.Errorf("server returned %v", res.rcode)
+	}
 }
 
 // aResult is one candidate query's decoded outcome: the rcode distinguishes a
@@ -257,10 +356,10 @@ type aResult struct {
 	rcode dnsmessage.RCode
 }
 
-// queryA sends a single A-record query for fqdn to CoreDNS over UDP, re-fetching
+// queryA sends a single A-record query for fqdn to server i over UDP, re-fetching
 // over TCP when the response has TC set (RFC 1035 §4.2.2 — the answer set did
 // not fit a plain-UDP response).
-func (r *Resolver) queryA(ctx context.Context, fqdn string) (aResult, error) {
+func (r *Resolver) queryA(ctx context.Context, i int, fqdn string) (aResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
@@ -304,7 +403,7 @@ func (r *Resolver) queryA(ctx context.Context, fqdn string) (aResult, error) {
 		// TOTAL length, so a name whose defect is a single LABEL sails past it
 		// and is rejected here instead. An unencodable name can never resolve at
 		// CoreDNS, so retrying it is pointless; returning an error would make
-		// lookupCandidate retry it like a lost datagram and report ErrTempFail,
+		// queryCandidate retry it like a lost datagram and report ErrTempFail,
 		// diverging from the C shim, which reaches the same verdict with zero
 		// wire I/O.
 		//
@@ -339,7 +438,7 @@ func (r *Resolver) queryA(ctx context.Context, fqdn string) (aResult, error) {
 		return aResult{rcode: dnsmessage.RCodeNameError}, nil
 	}
 
-	resp, err := r.exchange(ctx, "udp", packed)
+	resp, err := r.exchange(ctx, "udp", r.servers[i], packed)
 	if err != nil {
 		return aResult{}, err
 	}
@@ -348,7 +447,7 @@ func (r *Resolver) queryA(ctx context.Context, fqdn string) (aResult, error) {
 		return aResult{}, err
 	}
 	if truncated {
-		resp, err = r.exchange(ctx, "tcp", packed)
+		resp, err = r.exchange(ctx, "tcp", r.servers[i], packed)
 		if err != nil {
 			return aResult{}, fmt.Errorf("tcp refetch: %w", err)
 		}
@@ -360,7 +459,7 @@ func (r *Resolver) queryA(ctx context.Context, fqdn string) (aResult, error) {
 		if stillTruncated {
 			// TC still set on the TCP response is malformed — the answer must
 			// fit a length-prefixed TCP message. Treat it as a transient error
-			// (it lands in the ErrTempFail bucket via lookupCandidate), never a
+			// (it lands in the ErrTempFail bucket via queryCandidate), never a
 			// definitive result. Mirrors the C shim's TEMPFAIL on TC-over-TCP.
 			return aResult{}, fmt.Errorf("tcp refetch: response still truncated")
 		}
@@ -368,12 +467,22 @@ func (r *Resolver) queryA(ctx context.Context, fqdn string) (aResult, error) {
 	return res, nil
 }
 
-// exchange performs one DNS message round-trip: a single datagram on "udp", a
-// length-prefixed message on "tcp" (RFC 1035 §4.2.2 framing).
-func (r *Resolver) exchange(ctx context.Context, network string, packed []byte) ([]byte, error) {
-	conn, err := r.dial(ctx, network, r.serverAddr())
+// exchange performs one DNS message round-trip with server (an "ip:port"): a
+// single datagram on "udp", a length-prefixed message on "tcp" (RFC 1035 §4.2.2
+// framing). Every error it returns wraps errTransport.
+func (r *Resolver) exchange(ctx context.Context, network, server string, packed []byte) ([]byte, error) {
+	resp, err := r.roundTrip(ctx, network, server, packed)
 	if err != nil {
-		return nil, fmt.Errorf("dial coredns %s %s: %w", network, r.serverAddr(), err)
+		return nil, fmt.Errorf("%w: %w", errTransport, err)
+	}
+	return resp, nil
+}
+
+// roundTrip is exchange without the errTransport wrap.
+func (r *Resolver) roundTrip(ctx context.Context, network, server string, packed []byte) ([]byte, error) {
+	conn, err := r.dial(ctx, network, server)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s %s: %w", network, server, err)
 	}
 	defer conn.Close()
 	if dl, ok := ctx.Deadline(); ok {

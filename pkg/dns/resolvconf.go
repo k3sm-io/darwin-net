@@ -50,8 +50,18 @@ type ResolvConfFields struct {
 // text and performs no independent normalization of its own, so the two views can
 // never diverge.
 //
-// It returns an error if cfg is not usable (missing cluster DNS VIP or domain) —
-// the same validity check GuestResolvConf applies.
+// The nameservers follow cfg's Policy: the cluster DNS VIP for ClusterFirst, and
+// for DNSPolicyNone the IPv4 subset of cfg.Nameservers in pod order, with each
+// cfg.Options entry appended verbatim after ndots ("name", or "name:value").
+//
+// IPv6 nameservers are dropped SILENTLY here as long as one IPv4 nameserver
+// remains: the resolv.conf simply omits them and no error is returned.
+// ConfigToEnvChecked, run on the same config, is where a caller learns of the
+// drop (ErrNameserversDropped).
+//
+// It returns an error if cfg is not usable (cfg.Validate fails) — the same
+// validity check GuestResolvConf applies — and an error wrapping
+// ErrNoUsableNameserver for a DNSPolicyNone config with no IPv4 nameserver.
 func GuestResolvConfFields(cfg netv1.DNSConfig) (ResolvConfFields, error) {
 	if err := cfg.Validate(); err != nil {
 		return ResolvConfFields{}, fmt.Errorf("guest resolv.conf: %w", err)
@@ -75,10 +85,34 @@ func GuestResolvConfFields(cfg netv1.DNSConfig) (ResolvConfFields, error) {
 		ndots = MaxNDots
 	}
 
+	options := []string{fmt.Sprintf("ndots:%d", ndots)}
+	nameservers := []string{cfg.ClusterDNSIP}
+	if cfg.Policy == netv1.DNSPolicyNone {
+		// The SAME IPv4 subset the native shim gets (ipv4Servers): the guest's NAT
+		// segment is IPv4, and an IPv6-first resolv.conf would stall each query on
+		// a server the guest cannot reach. IPv6 entries are dropped silently here;
+		// ConfigToEnvChecked is where a caller learns of the drop.
+		kept, dropped := ipv4Servers(cfg)
+		if len(kept) == 0 {
+			return ResolvConfFields{}, fmt.Errorf("guest resolv.conf: nameservers %v: %w", dropped, ErrNoUsableNameserver)
+		}
+		nameservers = kept
+		// Each option verbatim, "name" or "name:value". Validate above already
+		// refused whitespace and control characters in both, so neither can break
+		// out of its "options" line.
+		for _, o := range cfg.Options {
+			if o.Value == "" {
+				options = append(options, o.Name)
+				continue
+			}
+			options = append(options, o.Name+":"+o.Value)
+		}
+	}
+
 	return ResolvConfFields{
-		Nameservers: []string{cfg.ClusterDNSIP},
+		Nameservers: nameservers,
 		Search:      search,
-		Options:     []string{fmt.Sprintf("ndots:%d", ndots)},
+		Options:     options,
 	}, nil
 }
 
@@ -86,9 +120,9 @@ func GuestResolvConfFields(cfg netv1.DNSConfig) (ResolvConfFields, error) {
 // guest from cfg — the SAME netv1.DNSConfig the Darwin getaddrinfo shim consumes for
 // a host-process pod. Only the injection mechanism differs: the Darwin
 // DYLD_INSERT_LIBRARIES shim is meaningless in a Linux guest (no dyld; glibc/musl
-// NSS instead), so the guest is pointed at the cluster resolver the standard Linux
-// way — nameserver = the cluster DNS VIP (cfg.ClusterDNSIP), with search + ndots
-// from cfg.
+// NSS instead), so the guest is pointed at its resolver the standard Linux way:
+// nameserver = the cluster DNS VIP (cfg.ClusterDNSIP) for ClusterFirst, or the
+// pod's own IPv4 nameservers for DNSPolicyNone, with search + options from cfg.
 //
 // It returns the file CONTENT as data; darwin-net does NOT write it. The cross-repo
 // DAG forbids darwin-net touching runtimed's guest rootfs, so runtimed (or the k3sm
@@ -109,7 +143,7 @@ func GuestResolvConfFields(cfg netv1.DNSConfig) (ResolvConfFields, error) {
 //     short-name expansion may resolve differently under musl than glibc — prefer
 //     FQDNs in the guest where the distinction matters.
 //
-// It returns an error if cfg is not usable (missing cluster DNS VIP or domain).
+// It returns an error if cfg is not usable (see GuestResolvConfFields).
 //
 // GuestResolvConf performs NO normalization of its own — it renders exactly the
 // ResolvConfFields GuestResolvConfFields derives, so the two can never diverge.

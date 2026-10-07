@@ -57,6 +57,15 @@ func containsPrefix(set []netip.Prefix, want string) bool {
 	return false
 }
 
+// routePrefixes returns the destination of every route in a plan's route set.
+func routePrefixes(rs []RouteSpec) []netip.Prefix {
+	out := make([]netip.Prefix, len(rs))
+	for i, r := range rs {
+		out[i] = r.Prefix
+	}
+	return out
+}
+
 // TestMeshRoutesPerPeerNotAggregate is the M3.1 acceptance for the per-peer kernel
 // routes: the route set is exactly one route per peer podCIDR, and this node's own
 // /24 and the 100.64.0.0/10 cluster aggregate are NEVER in it (routing either to
@@ -170,11 +179,10 @@ func TestMeshAllowedIPsEqualsCIDR(t *testing.T) {
 	}
 }
 
-// TestMeshConstantsAndMSSClamp pins the link constants and the MSS-clamp
-// derivation: the clamp must be the mesh MTU minus the IPv4+TCP headers, the value
-// a pf scrub uses so a pod socket on the lo0 MTU (16384) cannot advertise an MSS
-// too large for the 1380 utun (a large-payload cross-node TCP blackhole).
-func TestMeshConstantsAndMSSClamp(t *testing.T) {
+// TestMeshConstantsAndTunnelMSS pins the link constants and the documented
+// expected TCP MSS across the mesh: the tunnel MTU minus the IPv4+TCP headers,
+// which is what XNU derives from the route to a peer pod CIDR (the utun).
+func TestMeshConstantsAndTunnelMSS(t *testing.T) {
 	if MTU != 1380 {
 		t.Fatalf("MTU = %d, want 1380", MTU)
 	}
@@ -187,23 +195,11 @@ func TestMeshConstantsAndMSSClamp(t *testing.T) {
 	if got := MaxMSS(1500); got != 1460 {
 		t.Fatalf("MaxMSS(1500) = %d, want 1460", got)
 	}
-	if MSSClamp != 1340 {
-		t.Fatalf("MSSClamp = %d, want 1340 (MTU-40)", MSSClamp)
+	if got := MaxMSS(MTU); got != 1340 {
+		t.Fatalf("MaxMSS(MTU) = %d, want 1340 (MTU-40)", got)
 	}
-}
-
-// TestMeshPFClampScopedToUTUN proves the pf scrub rule is scoped to the utun
-// egress and clamps the MSS, and is NOT applied to lo0 (clamping loopback would
-// needlessly shrink same-node segments).
-func TestMeshPFClampScopedToUTUN(t *testing.T) {
-	rule := PFMSSClampRule("utun4", MSSClamp)
-	for _, want := range []string{"scrub out", "on utun4", "proto tcp", "max-mss 1340"} {
-		if !strings.Contains(rule, want) {
-			t.Fatalf("pf rule %q missing %q", rule, want)
-		}
-	}
-	if strings.Contains(rule, "lo0") {
-		t.Fatalf("pf rule clamps lo0 (must be utun-only): %q", rule)
+	if TunnelMSS != MaxMSS(MTU) {
+		t.Fatalf("TunnelMSS = %d, want MaxMSS(MTU) = %d", TunnelMSS, MaxMSS(MTU))
 	}
 }
 
@@ -230,7 +226,7 @@ func TestMeshPlanUAPIAndKeyHex(t *testing.T) {
 		self := netip.MustParsePrefix("100.64.0.0/24")
 		plan, err := BuildPlan(self, []netv1.MeshPeerSpec{
 			peerSpec("nodeB", "100.64.1.0/24", "192.0.2.10:51820", 0x42),
-		})
+		}, nil)
 		if err != nil {
 			t.Fatalf("BuildPlan: %v", err)
 		}
@@ -266,7 +262,7 @@ func TestBuildPlanSkipsSelfAndInvalid(t *testing.T) {
 	badVersion := peerSpec("nodeD", "100.64.3.0/24", "192.0.2.4:51820", 0x04)
 	badVersion.SchemaVersion = 99 // unsupported (WithDefaults leaves a non-zero value)
 
-	plan, err := BuildPlan(self, []netv1.MeshPeerSpec{selfPeer, good, wrongAllowed, badVersion})
+	plan, err := BuildPlan(self, []netv1.MeshPeerSpec{selfPeer, good, wrongAllowed, badVersion}, nil)
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}
@@ -287,5 +283,65 @@ func TestBuildPlanSkipsSelfAndInvalid(t *testing.T) {
 	}
 	if !skipped["nodeC"] || !skipped["nodeD"] {
 		t.Fatalf("Skipped = %+v, want nodeC (wrong allowedIPs) and nodeD (bad version)", plan.Skipped)
+	}
+}
+
+// TestBuildPlanWithSelfAtANonZeroIndex pins the plan an HA server joined at a
+// non-zero node index builds, from both ends. Every control-plane server's pod
+// /24 is the one its own --mesh-ip names, so the second server of a pair sits at
+// index 1 (100.64.1.0/24) while the first holds index 0. BuildPlan is
+// index-agnostic: it excludes self by CIDR equality and routes every other peer
+// — the first server at index 0 included — and an index-0 node routes the
+// index-1 server like any other peer.
+func TestBuildPlanWithSelfAtANonZeroIndex(t *testing.T) {
+	first := peerSpec("server-a", "100.64.0.0/24", "192.0.2.10:51820", 0x0a)
+	second := peerSpec("server-b", "100.64.1.0/24", "192.0.2.11:51820", 0x0b)
+	worker := peerSpec("worker-1", "100.64.2.0/24", "192.0.2.12:51820", 0x0c)
+	peers := []netv1.MeshPeerSpec{first, second, worker}
+
+	cases := []struct {
+		name       string
+		self       string
+		wantPeers  []string
+		wantRoutes []string
+	}{
+		{"the joined server at index 1", "100.64.1.0/24", []string{"server-a", "worker-1"}, []string{"100.64.0.0/24", "100.64.2.0/24"}},
+		{"the first server at index 0", "100.64.0.0/24", []string{"server-b", "worker-1"}, []string{"100.64.1.0/24", "100.64.2.0/24"}},
+		{"a worker at index 2", "100.64.2.0/24", []string{"server-a", "server-b"}, []string{"100.64.0.0/24", "100.64.1.0/24"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// ValidatePlan is BuildPlan plus the refusals ConfigureMesh applies, so
+			// a pass here is the plan a reconcile would program.
+			plan, err := ValidatePlan(netip.MustParsePrefix(tc.self), peers, nil)
+			if err != nil {
+				t.Fatalf("ValidatePlan: %v", err)
+			}
+			var names []string
+			for _, p := range plan.Peers {
+				names = append(names, p.NodeName)
+				if len(p.AllowedIPs) != 1 {
+					t.Errorf("peer %s AllowedIPs = %v, want exactly its /24", p.NodeName, p.AllowedIPs)
+				}
+			}
+			if strings.Join(names, ",") != strings.Join(tc.wantPeers, ",") {
+				t.Errorf("peers = %v, want %v (self excluded by CIDR, never by index)", names, tc.wantPeers)
+			}
+			if len(plan.Skipped) != 0 {
+				t.Errorf("Skipped = %+v, want none", plan.Skipped)
+			}
+			routes := routePrefixes(plan.Routes)
+			if len(routes) != len(tc.wantRoutes) {
+				t.Fatalf("routes = %v, want %v", routes, tc.wantRoutes)
+			}
+			for _, w := range tc.wantRoutes {
+				if !containsPrefix(routes, w) {
+					t.Errorf("routes = %v, missing %s", routes, w)
+				}
+			}
+			if containsPrefix(routes, tc.self) {
+				t.Errorf("routes = %v include this node's own %s", routes, tc.self)
+			}
+		})
 	}
 }

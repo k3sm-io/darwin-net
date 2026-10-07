@@ -23,7 +23,7 @@ import (
 // Device is the privileged, root-only mesh datapath the Mesh controller drives.
 // It is defined here, at the consumer, per the standards: the production
 // WGDevice creates a utun, runs userspace wireguard over it, installs the
-// per-peer kernel routes, and loads the utun-scoped MSS-clamp pf anchor — all
+// per-peer kernel routes, and plumbs the mesh-egress lo0 alias, all
 // root-only operations that run inside the netd daemon boundary in deployment.
 // Unit tests substitute a fake so the controller's reconcile logic is exercised
 // without privilege; the root-gated integration test drives the real device.
@@ -34,8 +34,8 @@ import (
 type Device interface {
 	// Up brings the mesh interface up: it creates/opens the utun at the mesh MTU,
 	// starts wireguard with the node's private key and listen port, assigns the
-	// mesh-egress source address so it is locally bindable, and loads the
-	// utun-scoped MSS-clamp pf anchor. It is idempotent. Root-only — it returns an
+	// mesh-egress source address so it is locally bindable. It loads no pf
+	// rule. It is idempotent. Root-only — it returns an
 	// error without privilege.
 	Up(ctx context.Context) error
 	// Apply programs the desired state: it sets the wireguard peers from the plan
@@ -43,13 +43,13 @@ type Device interface {
 	// update afterwards, so additions, removals, AllowedIPs and key rotations
 	// converge WITHOUT re-stamping an already-configured peer's endpoint over the
 	// one wireguard roamed onto) and reconciles the kernel routes to exactly
-	// plan.Routes, each routed to the utun. An implementation therefore keeps the
+	// plan.Routes (utun routes on the utun, direct routes over their cable). An implementation therefore keeps the
 	// endpoint memory alongside the wireguard state it programs, so a device that
 	// is re-created programs every endpoint again. It is idempotent and safe to
 	// call on every MeshPeer change.
 	Apply(ctx context.Context, plan Plan) error
 	// Down tears the mesh down leak-free: it removes every route it installed,
-	// unloads the pf anchor, removes the mesh-egress alias, and closes the
+	// flushes the legacy pf anchor, removes the mesh-egress alias, and closes the
 	// wireguard device.
 	Down(ctx context.Context) error
 }

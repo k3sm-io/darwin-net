@@ -103,7 +103,7 @@ limitations under the License.
 // NodePort is TCP only: the ClusterIP UDP datagram relay (below) is built, but the
 // UDP NodePort is deferred, because a wildcard *:NodePort UDP reply re-selects its
 // source by route lookup on a multi-homed node (the client would see the wrong
-// source IP and drop it). stockkitty's NodePort surface (VSCode SSH :22, the
+// source IP and drop it). A reference workload's NodePort surface (VSCode SSH :22, the
 // snapshot gRPC range) is all TCP, so UDP NodePort is not claimed.
 //
 // # Locality (load-bearing only for internalTrafficPolicy: Local)
@@ -217,7 +217,7 @@ limitations under the License.
 // predicate (egressScope.sourceFor), so a same-node, node-LAN, loopback or
 // unclassifiable destination keeps kernel default source selection on the datagram
 // path exactly as it does on the stream path. The UDP path cannot reuse the mesh
-// *net.Dialer because a *net.TCPAddr LocalAddr fails to dial "udp", so it builds a
+// TCP dialer because a *net.TCPAddr LocalAddr fails to dial "udp", so it builds a
 // *net.UDPAddr from that same verdict. The relay has no conntrack-style flush, so a flow
 // stays pinned to its picked backend until idle GC reaps it, even if that endpoint
 // is removed mid-flow.
@@ -232,6 +232,18 @@ limitations under the License.
 // infra-VIP exemption (WithInfraVIPExemptions) steps the proxy aside before any
 // worker is created, so a legitimate user UDP Service on a non-exempt VIP is relayed
 // while kube-dns stays node-local on its own resolver.
+//
+// # TCP segment clamp
+//
+// Every backend dial goes through a tcpseg.Dialer and both stream listeners (the
+// ClusterIP listener and the *:NodePort listener) are wrapped with
+// tcpseg.WrapListener, so both legs of a splice have their TCP segment size lowered
+// to the mesh MSS right after connect. A connection to a pod or VIP negotiates over
+// lo0 (MTU 16384); if the destination's alias disappears mid-connection the flow
+// re-routes onto the mesh utun, and an lo0-sized segment there overruns the
+// skywalk netif's GSO buffer. TestBackendDialsClampTCPMaxSeg pins that no dial in
+// this package bypasses the clamp; the UDP relay is exempt (datagrams carry no
+// MSS).
 //
 // # ClientIP session affinity (TCP)
 //
@@ -278,10 +290,12 @@ limitations under the License.
 // A backend's address in the routing table is its published identity: what the
 // EndpointSlice carries, what cluster DNS answers, what status.podIP reports, and
 // what a NetworkPolicy names. For a host-process pod that address is also where the
-// bytes go — it is a /32 alias the host owns on lo0. For a vm-RuntimeClass pod it is
-// not: the guest owns its address inside its own netstack behind a NAT attachment,
-// the host never aliases the pod /32, and the address that actually carries bytes is
-// the guest's macOS-assigned vmnet DHCP lease, which is never published.
+// bytes go — it is a /32 alias the host owns on lo0 and the pod's own sockets bind.
+// For a vm-RuntimeClass pod it is not: the guest sits behind a NAT attachment, and
+// the address that actually reaches it is the guest's macOS-assigned vmnet DHCP
+// lease, which is never published. The pod's node still aliases the published /32
+// on lo0 for the pod's lifetime (pkg/podnet SetupGuest), so the address is live on
+// that node and the mesh's route for the node's /24 delivers to it.
 //
 // RoutingTable.SetTransportOverrides is the one seam where those two meet — a
 // published-to-live address map, replaced wholesale, consulted only at the dial
@@ -308,6 +322,58 @@ limitations under the License.
 // backend, not the RuntimeClass it asked for. A host-process pod carries no
 // override and no such lag: its dial is exactly as before.
 //
+// # The published-address relay (podrelay.go)
+//
+// The override map drives a second consumer: for every vm pod it names, the
+// owning Proxy listens on the pod's published address itself — that specific
+// address, never a wildcard, through the same binder as every other proxy
+// listener — and relays each accepted TCP connection to live:port, dialed through
+// the segment-clamped default-source dialer (tcpseg). That is what makes a vm pod's
+// status.podIP answer a direct dial: from its own host, from a pod on the same
+// node, and from another node, whose traffic to this node's /24 arrives over the
+// mesh at the alias. The port set is the pod's declared TCP container ports
+// (VMPodTransport.Ports) together with every port this node's routing table lists
+// a TCP backend for at the published address, so a Service whose EndpointSlice
+// targets an undeclared port is still reachable through it. Per connection the
+// relay refuses a client inside the vmnet segment (a guest must not reach a
+// sibling, or itself, through the host) and applies the NetworkPolicy verdict
+// against the published address and port, as the VIP path does after its pick.
+//
+// The relay's lifetime is the override's: a generation that drops a pod or
+// changes its lease closes that pod's listeners and every connection it was
+// relaying before SetTransportOverrides returns, so the caller can drop the
+// override and then remove the alias without leaving a relayed connection on a
+// departing address. The node acts on a guest-reported lease, so an override is
+// refused outright (no relay, a throttled Warn naming the pod) when its live
+// address is outside the node's vmnet segment (WithVMNetPrefix, defaulting to the
+// policy table's seed), is the segment's network, gateway or broadcast address,
+// equals the published address, or is claimed by two pods in one generation, or
+// when its port set exceeds MaxRelayPorts (no truncated subset); a node with no
+// vmnet segment relays nothing. A refusal closes an existing relay synchronously,
+// in the same call, even when the pod's own lease did not change.
+//
+// The live lease is the guest agent's own report, not something the host
+// observes. A guest that reports a neighbour's lease therefore makes both pods'
+// overrides claim one address, and both relays are refused: the outcome is fail
+// closed, never a connection delivered to the wrong guest, but it means one
+// guest can deny its neighbour's relay until the false report stops. Guest-to-
+// guest traffic on the vmnet segment itself is not controlled by k3sm; the relay's
+// refusal of a vmnet-segment client only stops a guest reaching a sibling through
+// the host.
+//
+// The ceilings, against a native pod that owns its /32 outright:
+//
+//   - A port that is neither declared nor targeted by a Service has no listener,
+//     so a dial to it is refused (RST). A native pod answers on any port it binds.
+//   - UDP is not relayed. A vm pod's UDP is reachable only through a Service VIP
+//     (the UDP relay's override-aware upstream), never at its published address.
+//   - Source loss: the relay re-originates the connection, so the guest sees the
+//     vmnet gateway as every client's address, not the caller's pod IP.
+//   - NetworkPolicy stays the VIP-mediated hint described below. The relay applies
+//     the verdict at its accept, but a dial of the live lease from the host itself
+//     never transits it, the same bypass a direct pod-IP dial is for a native pod;
+//     the hint is not isolation for either class.
+//
 // # NetworkPolicy L4 subset — VIP-mediated ingress hint, NOT isolation
 //
 // PolicyTable (policy.go) + PolicyWatcher (policywatch.go) add an
@@ -327,6 +393,22 @@ limitations under the License.
 // atomically via PolicyTable.Update. Convergence after an API change is bounded
 // by informer latency plus the debounce window; the table is empty (allow
 // everything) until WaitForCacheSync — fail-open, never a partial-cache deny.
+// An informer that cannot list or watch keeps the table in that state; the
+// watcher reports it with its own handler (one Warn naming the resource and the
+// fail-open consequence, a re-warn at most every ten minutes while it persists,
+// one Info on recovery) instead of client-go's per-retry log line.
+//
+// Node-scoped mode and the worker ceiling: a worker's own identity may list and
+// watch only the pods bound to it, so a worker's watcher is built with
+// WithPodNodeScope and its Pods informer carries the spec.nodeName field selector
+// (Namespaces and NetworkPolicies stay cluster-wide). The worker's table then
+// resolves both selected backends and peer sources against its local pods only.
+// That is widen-only at this enforcement point, whose clients are local pods and
+// whose cross-node traffic arrives from a peer's always-allowed mesh-egress /32:
+// a policy selecting a pod on another node is unseen here, and a remote pod IP as
+// a source is unknown and fails open. Policies on local backends are enforced as
+// on the server; nothing moves from allow to deny relative to the cluster-wide
+// view.
 //
 // The honest ceiling (the per-pod-/32 causal link): once each pod has its own
 // /32, direct pod-IP→pod-IP traffic bypasses the userspace proxy entirely — the

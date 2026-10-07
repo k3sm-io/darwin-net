@@ -27,13 +27,13 @@ import (
 )
 
 // podResolver builds a Resolver for a pod in namespace ns whose CoreDNS queries
-// are redirected to the in-process stub (regardless of the configured VIP). It
-// uses the production PodDNSConfig so the search list and ndots are exactly what
-// a real pod receives.
-func podResolver(t *testing.T, ns string, stub *stubDNS) *Resolver {
+// reach the in-memory fake (fakedns_test.go) through the dial seam. It uses the
+// production PodDNSConfig so the search list and ndots are exactly what a real
+// pod receives.
+func podResolver(t *testing.T, ns string, stub *fakeDNS) *Resolver {
 	t.Helper()
 	cfg := PodDNSConfig("10.43.0.10", "cluster.local", ns)
-	r, err := NewResolver(cfg, dialToStub(stub), WithTimeout(time.Second))
+	r, err := NewResolver(cfg, dialFakes(stub), WithTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("NewResolver(ns=%s): %v", ns, err)
 	}
@@ -126,8 +126,7 @@ func TestInPodKubernetesAndCrossNamespaceResolution(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			stub := newStubDNS(t, tc.zone)
-			defer stub.close()
+			stub := newFakeDNS("10.43.0.10:53", tc.zone)
 
 			r := podResolver(t, tc.podNS, stub)
 			addrs, err := r.LookupHost(context.Background(), tc.query)

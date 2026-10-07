@@ -17,6 +17,8 @@ limitations under the License.
 package dns
 
 import (
+	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -291,4 +293,97 @@ func slicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestGuestResolvConfPolicyNone pins the vm-guest rendering of a DNSPolicyNone
+// config: the pod's own IPv4 nameservers (the same subset the native shim gets,
+// since the guest's NAT segment is IPv4), its search list, and options =
+// ndots:N followed by each Options entry verbatim. ClusterFirst output is
+// unchanged, and an injection-shaped option is refused.
+func TestGuestResolvConfPolicyNone(t *testing.T) {
+	t.Parallel()
+
+	t.Run("None renders IPv4 nameservers, search, ndots and verbatim options", func(t *testing.T) {
+		t.Parallel()
+		cfg := netv1.DNSConfig{
+			Policy:        netv1.DNSPolicyNone,
+			Nameservers:   []string{"1.1.1.1", "2606:4700:4700::1111", "::ffff:9.9.9.9"},
+			SearchDomains: []string{"a.example", "b.example"},
+			NDots:         2,
+			Options:       []netv1.DNSOption{{Name: "edns0"}, {Name: "timeout", Value: "3"}},
+		}
+		fields, err := GuestResolvConfFields(cfg)
+		if err != nil {
+			t.Fatalf("GuestResolvConfFields: %v", err)
+		}
+		if got, want := fields.Nameservers, []string{"1.1.1.1", "9.9.9.9"}; !slicesEqual(got, want) {
+			t.Fatalf("Nameservers = %v, want the IPv4 subset %v in pod order", got, want)
+		}
+		if got, want := fields.Search, []string{"a.example", "b.example"}; !slicesEqual(got, want) {
+			t.Fatalf("Search = %v, want %v", got, want)
+		}
+		if got, want := fields.Options, []string{"ndots:2", "edns0", "timeout:3"}; !slicesEqual(got, want) {
+			t.Fatalf("Options = %v, want %v", got, want)
+		}
+		got, err := GuestResolvConf(cfg)
+		if err != nil {
+			t.Fatalf("GuestResolvConf: %v", err)
+		}
+		want := "nameserver 1.1.1.1\nnameserver 9.9.9.9\nsearch a.example b.example\n" +
+			"options ndots:2\noptions edns0\noptions timeout:3\n"
+		if got != want {
+			t.Fatalf("GuestResolvConf(None) =\n%s\nwant\n%s", got, want)
+		}
+	})
+
+	t.Run("None with no IPv4 nameserver is refused", func(t *testing.T) {
+		t.Parallel()
+		cfg := netv1.DNSConfig{Policy: netv1.DNSPolicyNone, Nameservers: []string{"2620:fe::fe"}}
+		if _, err := GuestResolvConfFields(cfg); !errors.Is(err, ErrNoUsableNameserver) {
+			t.Fatalf("GuestResolvConfFields(all-IPv6) err = %v, want ErrNoUsableNameserver", err)
+		}
+	})
+
+	t.Run("None takes no cluster default: no search line without searches", func(t *testing.T) {
+		t.Parallel()
+		cfg := netv1.DNSConfig{Policy: netv1.DNSPolicyNone, Nameservers: []string{"1.1.1.1"}, ClusterDomain: "cluster.local"}
+		got, err := GuestResolvConf(cfg)
+		if err != nil {
+			t.Fatalf("GuestResolvConf: %v", err)
+		}
+		if want := "nameserver 1.1.1.1\noptions ndots:5\n"; got != want {
+			t.Fatalf("GuestResolvConf = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("ClusterFirst render is unchanged", func(t *testing.T) {
+		t.Parallel()
+		got, err := GuestResolvConf(PodDNSConfig(DefaultDNSVIP, "cluster.local", "default"))
+		if err != nil {
+			t.Fatalf("GuestResolvConf: %v", err)
+		}
+		want := "nameserver 10.43.0.10\nsearch default.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n"
+		if got != want {
+			t.Fatalf("GuestResolvConf(ClusterFirst) = %q, want %q", got, want)
+		}
+	})
+
+	for _, opt := range []netv1.DNSOption{
+		{Name: "edns0\nnameserver", Value: ""},
+		{Name: "timeout", Value: "3\nnameserver 6.6.6.6"},
+		{Name: "rotate x"},
+	} {
+		t.Run("an injection-shaped option is refused: "+strconv.Quote(opt.Name+":"+opt.Value), func(t *testing.T) {
+			t.Parallel()
+			cfg := netv1.DNSConfig{
+				Policy:      netv1.DNSPolicyNone,
+				Nameservers: []string{"1.1.1.1"},
+				Options:     []netv1.DNSOption{opt},
+			}
+			got, err := GuestResolvConf(cfg)
+			if !errors.Is(err, netv1.ErrInvalid) {
+				t.Fatalf("GuestResolvConf(%q) = %q, %v; want ErrInvalid", opt, got, err)
+			}
+		})
+	}
 }

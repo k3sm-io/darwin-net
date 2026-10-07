@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"k3sm.io/darwin-net/pkg/netbind"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // ErrBind is the NAMED bind failure returned by Server.Run before any serving
@@ -192,12 +193,15 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
-// bind opens one listener on cfg.Addr:port through the binder seam.
+// bind opens one listener on cfg.Addr:port through the binder seam and wraps it
+// with the TCP segment clamp, so responses to a client pod (connected over lo0)
+// are sent in mesh-sized segments. The https listener wraps TLS around this one,
+// leaving the clamp on the raw socket where it can reach the descriptor.
 func (s *Server) bind(ctx context.Context, port uint16) (net.Listener, error) {
 	ap := netip.AddrPortFrom(s.cfg.Addr, port)
 	ln, err := s.binder.Listen(ctx, "tcp", ap)
 	if err != nil {
 		return nil, fmt.Errorf("%w %s: %w", ErrBind, ap, err)
 	}
-	return ln, nil
+	return tcpseg.WrapListener(ln), nil
 }

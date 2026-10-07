@@ -42,27 +42,35 @@ type fakeRouteTable struct {
 	addOut   string
 	addErr   error
 	listErr  error
+	ops      []string // every add and delete, in order, as "add <route>"/"delete <route>"
 }
 
-func (f *fakeRouteTable) Add(_ context.Context, prefix netip.Prefix, iface string) (string, error) {
-	f.adds = append(f.adds, Route{Prefix: prefix, Interface: iface})
+func (f *fakeRouteTable) Add(_ context.Context, r Route) (string, error) {
+	f.adds = append(f.adds, r)
+	f.ops = append(f.ops, "add "+r.String())
 	if !f.dropAdds {
-		f.table = append(f.table, Route{Prefix: prefix, Interface: iface})
+		k := r
+		k.Flags = unix.RTF_UP | unix.RTF_STATIC
+		if r.Gateway.IsValid() {
+			k.Flags |= unix.RTF_GATEWAY
+		}
+		f.table = append(f.table, k)
 	}
 	return f.addOut, f.addErr
 }
 
-func (f *fakeRouteTable) Delete(_ context.Context, prefix netip.Prefix, iface string) (string, error) {
-	f.deletes = append(f.deletes, Route{Prefix: prefix, Interface: iface})
+func (f *fakeRouteTable) Delete(_ context.Context, r Route) (string, error) {
+	f.deletes = append(f.deletes, r)
+	f.ops = append(f.ops, "delete "+r.String())
 	if f.dropDels {
 		return "", nil
 	}
 	kept := f.table[:0]
-	for _, r := range f.table {
-		if r.Prefix == prefix && r.Interface == iface {
+	for _, k := range f.table {
+		if holds(k, r) {
 			continue
 		}
-		kept = append(kept, r)
+		kept = append(kept, k)
 	}
 	f.table = kept
 	return "", nil
@@ -81,10 +89,19 @@ func (f *fakeRouteTable) List(context.Context) ([]Route, error) {
 // resolved, so the route reconcile can be driven without privilege (no utun, no
 // wireguard: reconcileRoutes touches neither).
 func routeDevice(fake *fakeRouteTable) *WGDevice {
-	d := newWGDevice(wgLink{name: "utun", mtu: MTU, mss: MSSClamp, listenPort: DefaultListenPort}, discardLogger())
+	d := newWGDevice(wgLink{name: "utun", mtu: MTU, listenPort: DefaultListenPort}, discardLogger())
 	d.rt = fake
 	d.iface = "utun9"
 	return d
+}
+
+// utunSpecs turns prefixes into the utun route specs a plan carries for them.
+func utunSpecs(ps []netip.Prefix) []RouteSpec {
+	out := make([]RouteSpec, len(ps))
+	for i, p := range ps {
+		out[i] = RouteSpec{Prefix: p}
+	}
+	return out
 }
 
 func mustPrefixes(t *testing.T, ss ...string) []netip.Prefix {
@@ -117,7 +134,7 @@ func TestReconcileRoutesFailsLoudlyWhenTheKernelDropsTheAdd(t *testing.T) {
 	}
 	d := routeDevice(fake)
 
-	n, err := d.reconcileRoutes(context.Background(), mustPrefixes(t, "100.64.1.0/24"))
+	n, err := d.reconcileRoutes(context.Background(), utunSpecs(mustPrefixes(t, "100.64.1.0/24")))
 	if err == nil {
 		t.Fatalf("reconcileRoutes reported %d installed routes and no error, but the kernel table is empty (the exact lie this test pins)", n)
 	}
@@ -144,7 +161,7 @@ func TestReconcileRoutesRecordsOnlyVerifiedRoutes(t *testing.T) {
 	d := routeDevice(fake)
 	want := mustPrefixes(t, "100.64.1.0/24", "100.64.2.0/24")
 
-	n, err := d.reconcileRoutes(context.Background(), want)
+	n, err := d.reconcileRoutes(context.Background(), utunSpecs(want))
 	if err != nil {
 		t.Fatalf("reconcileRoutes: %v", err)
 	}
@@ -158,7 +175,7 @@ func TestReconcileRoutesRecordsOnlyVerifiedRoutes(t *testing.T) {
 	}
 
 	adds := len(fake.adds)
-	if n, err := d.reconcileRoutes(context.Background(), want); err != nil || n != 2 {
+	if n, err := d.reconcileRoutes(context.Background(), utunSpecs(want)); err != nil || n != 2 {
 		t.Fatalf("second reconcileRoutes = (%d, %v), want (2, nil)", n, err)
 	}
 	if len(fake.adds) != adds {
@@ -178,7 +195,7 @@ func TestReconcileRoutesRejectsARouteOnAnotherInterface(t *testing.T) {
 	}
 	d := routeDevice(fake)
 
-	if _, err := d.reconcileRoutes(context.Background(), want); !errors.Is(err, ErrRouteNotInstalled) {
+	if _, err := d.reconcileRoutes(context.Background(), utunSpecs(want)); !errors.Is(err, ErrRouteNotInstalled) {
 		t.Fatalf("error = %v, want ErrRouteNotInstalled for a route bound to en0 instead of the utun", err)
 	}
 }
@@ -190,11 +207,11 @@ func TestReconcileRoutesWithdrawsDepartedPeerRoutes(t *testing.T) {
 	fake := &fakeRouteTable{}
 	d := routeDevice(fake)
 	two := mustPrefixes(t, "100.64.1.0/24", "100.64.2.0/24")
-	if _, err := d.reconcileRoutes(context.Background(), two); err != nil {
+	if _, err := d.reconcileRoutes(context.Background(), utunSpecs(two)); err != nil {
 		t.Fatalf("reconcileRoutes: %v", err)
 	}
 
-	n, err := d.reconcileRoutes(context.Background(), two[:1])
+	n, err := d.reconcileRoutes(context.Background(), utunSpecs(two[:1]))
 	if err != nil {
 		t.Fatalf("reconcileRoutes after departure: %v", err)
 	}
@@ -218,12 +235,12 @@ func TestReconcileRoutesKeepsRetryingALingeringStaleRoute(t *testing.T) {
 	fake := &fakeRouteTable{}
 	d := routeDevice(fake)
 	two := mustPrefixes(t, "100.64.1.0/24", "100.64.2.0/24")
-	if _, err := d.reconcileRoutes(context.Background(), two); err != nil {
+	if _, err := d.reconcileRoutes(context.Background(), utunSpecs(two)); err != nil {
 		t.Fatalf("reconcileRoutes: %v", err)
 	}
 
 	fake.dropDels = true
-	n, err := d.reconcileRoutes(context.Background(), two[:1])
+	n, err := d.reconcileRoutes(context.Background(), utunSpecs(two[:1]))
 	if err != nil {
 		t.Fatalf("a lingering stale route must not fail the apply: %v", err)
 	}
@@ -235,7 +252,7 @@ func TestReconcileRoutesKeepsRetryingALingeringStaleRoute(t *testing.T) {
 	}
 
 	deletes := len(fake.deletes)
-	if _, err := d.reconcileRoutes(context.Background(), two[:1]); err != nil {
+	if _, err := d.reconcileRoutes(context.Background(), utunSpecs(two[:1])); err != nil {
 		t.Fatalf("reconcileRoutes: %v", err)
 	}
 	if len(fake.deletes) != deletes+1 {
@@ -250,25 +267,8 @@ func TestReconcileRoutesFailsWhenTheTableCannotBeRead(t *testing.T) {
 	fake := &fakeRouteTable{listErr: errors.New("sysctl: operation not permitted")}
 	d := routeDevice(fake)
 
-	if _, err := d.reconcileRoutes(context.Background(), mustPrefixes(t, "100.64.1.0/24")); err == nil {
+	if _, err := d.reconcileRoutes(context.Background(), utunSpecs(mustPrefixes(t, "100.64.1.0/24"))); err == nil {
 		t.Fatal("reconcileRoutes reported success without being able to read the routing table")
-	}
-}
-
-// TestPrefixesOn pins the interface-scoping helper the read-back is built on.
-func TestPrefixesOn(t *testing.T) {
-	p := mustPrefixes(t, "100.64.1.0/24", "100.64.2.0/24", "0.0.0.0/0")
-	have := []Route{
-		{Prefix: p[0], Interface: "utun9"},
-		{Prefix: p[1], Interface: "en0"},
-		{Prefix: p[2], Interface: "en0"},
-	}
-	on := prefixesOn(have, "utun9")
-	if len(on) != 1 {
-		t.Fatalf("prefixesOn(utun9) = %v, want exactly the one utun9 route", on)
-	}
-	if _, ok := on[p[0]]; !ok {
-		t.Errorf("prefixesOn(utun9) = %v, want %s", on, p[0])
 	}
 }
 
@@ -304,12 +304,12 @@ func TestRouteMessageEncodesAnInterfaceRoute(t *testing.T) {
 	}{
 		{"add /24", unix.RTM_ADD, "100.64.1.7/24", 24, [4]byte{255, 255, 255, 0}},
 		{"delete /24", unix.RTM_DELETE, "100.64.2.0/24", 24, [4]byte{255, 255, 255, 0}},
-		{"add /32", unix.RTM_ADD, "100.64.3.9/32", 32, [4]byte{255, 255, 255, 255}},
+		{"add /25", unix.RTM_ADD, "100.64.3.128/25", 25, [4]byte{255, 255, 255, 128}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			prefix := netip.MustParsePrefix(tc.prefix)
-			b, err := routeMessage(tc.typ, prefix, "utun9", 21).Marshal()
+			b, err := routeMessage(tc.typ, Route{Prefix: prefix, Interface: "utun9"}, 21).Marshal()
 			if err != nil {
 				t.Fatalf("marshal: %v", err)
 			}
@@ -395,9 +395,9 @@ func TestKernelRouteTableReportsTheKernelsVerdict(t *testing.T) {
 				err    error
 			)
 			if tc.del {
-				report, err = rt.Delete(context.Background(), prefix, lo.Name)
+				report, err = rt.Delete(context.Background(), Route{Prefix: prefix, Interface: lo.Name})
 			} else {
-				report, err = rt.Add(context.Background(), prefix, lo.Name)
+				report, err = rt.Add(context.Background(), Route{Prefix: prefix, Interface: lo.Name})
 			}
 			if tc.wantErr == nil && err != nil {
 				t.Fatalf("err = %v, want nil (report %q)", err, report)
@@ -439,7 +439,7 @@ func TestKernelRouteTableRefusesAnUnknownInterface(t *testing.T) {
 		t.Fatal("a routing message was written for an interface that does not exist")
 		return nil
 	}}
-	if _, err := rt.Add(context.Background(), netip.MustParsePrefix("100.64.1.0/24"), "utun999"); err == nil {
+	if _, err := rt.Add(context.Background(), Route{Prefix: netip.MustParsePrefix("100.64.1.0/24"), Interface: "utun999"}); err == nil {
 		t.Fatal("Add on a nonexistent interface returned no error")
 	}
 }

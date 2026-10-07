@@ -56,6 +56,10 @@ func (p *recordingPriv) ConfigureMesh(context.Context, string, int, mesh.Plan) e
 
 func (p *recordingPriv) RemoveMesh(context.Context) error { p.served = true; return nil }
 
+func (p *recordingPriv) ConfigureLink(context.Context, LinkSpec) error { p.served = true; return nil }
+
+func (p *recordingPriv) RemoveLink(context.Context, string) error { p.served = true; return nil }
+
 func (p *recordingPriv) SetNodePodCIDR(_ context.Context, cidr netip.Prefix) error {
 	if p.adoptedErr != nil {
 		return p.adoptedErr
@@ -63,8 +67,6 @@ func (p *recordingPriv) SetNodePodCIDR(_ context.Context, cidr netip.Prefix) err
 	p.adopted = append(p.adopted, cidr)
 	return nil
 }
-
-func (p *recordingPriv) LoadPFAnchor(context.Context, int) error { p.served = true; return nil }
 
 func (p *recordingPriv) BindPort(context.Context, string, netip.AddrPort) (*os.File, error) {
 	p.served = true

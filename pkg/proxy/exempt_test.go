@@ -19,6 +19,7 @@ package proxy
 import (
 	"context"
 	"net/netip"
+	"slices"
 	"testing"
 
 	netv1 "k3sm.io/apis/net/v1"
@@ -30,17 +31,25 @@ import (
 // routing entry — so per-node CoreDNS (which binds 10.43.0.10:53 directly) never
 // hits EADDRINUSE. A normal ClusterIP Service on a different address is still
 // claimed, proving the exemption is specific to the kube-dns VIP and not a blanket
-// opt-out.
+// opt-out. The binds are observed at the binder and datagram seams, so "never
+// bound" is asserted directly rather than inferred from a refused dial.
 func TestKubeDNSVIPExemptFromProxy(t *testing.T) {
 	t.Parallel()
 
 	const kubeDNS = "10.43.0.10"
 	kubeDNSAddr := netip.MustParseAddr(kubeDNS)
-	const normalVIP = "127.0.0.1"
+	const normalVIP = "10.43.0.40"
+	const normalPort = 80
 
 	alias := newNoopAliasManager()
+	binder := newRecordingBinder()
+	udpBound := make(chan netip.AddrPort, 4)
+	listenUDP := func(ap netip.AddrPort) (udpVIPConn, error) {
+		udpBound <- ap
+		return newFakeVIPConn(ap), nil
+	}
 	tbl := NewRoutingTable(netip.Prefix{})
-	p := New(tbl, withAliasManager(alias), WithInfraVIPExemptions(kubeDNSAddr))
+	p := New(tbl, withAliasManager(alias), withBinder(binder), withListenUDP(listenUDP), WithInfraVIPExemptions(kubeDNSAddr))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	runDone := make(chan struct{})
@@ -62,7 +71,6 @@ func TestKubeDNSVIPExemptFromProxy(t *testing.T) {
 	}
 
 	// A normal ClusterIP Service IS still claimed.
-	normalPort := freePort(t, normalVIP)
 	normalSP := &netv1.ServicePort{Port: normalPort, TargetPort: 8080, Protocol: netv1.ProtocolTCP}
 	if err := p.Reconcile(normalVIP, normalSP, eps); err != nil {
 		t.Fatalf("reconcile normal vip: %v", err)
@@ -93,9 +101,25 @@ func TestKubeDNSVIPExemptFromProxy(t *testing.T) {
 		t.Fatalf("worker count = %d, want 1 (only the normal VIP)", nworkers)
 	}
 
-	// The normal VIP's worker brings its listener up; wait so its reconcile
-	// (alias ensure + routing) has completed before the assertions below.
-	waitListen(t, normalVIP, normalPort)
+	// The normal VIP's worker brings its listener up at exactly its address; wait
+	// so its reconcile (alias ensure + routing) has completed before the
+	// assertions below.
+	if l := binder.waitBound(t, 1); l.address != hostPortAddr(normalVIP, normalPort) {
+		t.Fatalf("normal VIP listener bound at %s, want %s", l.address, hostPortAddr(normalVIP, normalPort))
+	}
+
+	// The proxy NEVER binds the kube-dns VIP, on either protocol: the only stream
+	// listener is the normal VIP's, and no datagram socket was opened at all. The
+	// exemption is synchronous in Reconcile, so by now any kube-dns bind would
+	// have had its worker created above.
+	if got := binder.addrs(); slices.ContainsFunc(got, func(a string) bool { return netip.MustParseAddrPort(a).Addr() == kubeDNSAddr }) || len(got) != 1 {
+		t.Fatalf("stream listeners bound = %v, want only the normal VIP (CoreDNS owns the kube-dns socket)", got)
+	}
+	select {
+	case ap := <-udpBound:
+		t.Fatalf("proxy bound a datagram socket at %v, want none (CoreDNS owns 53/UDP)", ap)
+	default:
+	}
 
 	// The proxy NEVER aliases the kube-dns VIP — CoreDNS owns the alias + socket.
 	if got := alias.ensures(kubeDNSAddr); got != 0 {

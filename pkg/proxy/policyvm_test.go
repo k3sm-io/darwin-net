@@ -262,9 +262,10 @@ func TestPolicyVMNetUnknownSourceFailsClosed(t *testing.T) {
 		}
 	})
 
-	t.Run("h: through the real TCP accept path — the connection is refused, the backend never dialed", func(t *testing.T) {
+	t.Run("h: through the TCP accept path — the connection is refused, the backend never dialed", func(t *testing.T) {
 		t.Parallel()
-		be := newTCPBanner(t, "127.0.0.1:0")
+		backends := newFakeTCPNet()
+		be := backends.add(t, "10.42.0.27:8080", "ok")
 
 		h := &captureHandler{}
 		pt := NewPolicyTableVMNet(vmnet)
@@ -274,7 +275,7 @@ func TestPolicyVMNetUnknownSourceFailsClosed(t *testing.T) {
 			be.addrPort().Addr(): {{Sources: podIPSet(knownPod)}},
 		}, podIPSet(knownPod))
 
-		p, table := newPolicyProxy(pt)
+		p, table := newPolicyProxy(pt, withDialBackend(backends.dial))
 		p.policy.log = slog.New(h) // newPolicyProxy re-points the table's logger
 		key := PortKey{ClusterIP: "10.43.3.1", Port: 80, Protocol: netv1.ProtocolTCP}
 		table.SetEndpoints(key, []netv1.Endpoint{be.endpoint()})
