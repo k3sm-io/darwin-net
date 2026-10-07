@@ -644,6 +644,10 @@ func (a *darwinApplier) ConfigureMesh(ctx context.Context, privKeyB64 string, li
 
 // RemoveMesh tears the wireguard mesh down.
 func (a *darwinApplier) RemoveMesh(ctx context.Context) error {
+	// Take aliasMu first, as ConfigureMesh does (lock order aliasMu, then mu), so an
+	// alias operation never reads the utun name just before Down destroys it.
+	a.aliasMu.Lock()
+	defer a.aliasMu.Unlock()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.dev == nil || !a.meshUp {

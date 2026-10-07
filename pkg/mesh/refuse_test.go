@@ -111,6 +111,8 @@ func TestRefuseSYNDecision(t *testing.T) {
 	udp[9] = 17
 	badLen := syn("100.64.1.9")
 	binary.BigEndian.PutUint16(badLen[2:], 200)
+	bigOff := syn("100.64.1.9")
+	bigOff[20+12] = 0xf0 // a 60-byte TCP header claimed in a 20-byte segment
 
 	cases := []struct {
 		name      string
@@ -135,6 +137,7 @@ func TestRefuseSYNDecision(t *testing.T) {
 		{"a truncated packet is not answered", short, allocated, false},
 		{"UDP is not answered", udp, allocated, false},
 		{"a length beyond the buffer is not answered", badLen, allocated, false},
+		{"a TCP header offset beyond the segment is not answered", bigOff, allocated, false},
 		{"IPv6 is not answered", append([]byte{0x60}, make([]byte, 59)...), allocated, false},
 		{"an empty packet is not answered", nil, allocated, false},
 	}

@@ -74,7 +74,7 @@ func refuseSYN(pkt []byte, node netip.Prefix, allocated func(netip.Addr) bool) b
 		return false
 	}
 	tcp := pkt[ihl:total]
-	if int(tcp[12]>>4)*4 < 20 || tcp[13]&(tcpSYN|tcpACK|tcpRST|tcpFIN) != tcpSYN {
+	if doff := int(tcp[12]>>4) * 4; doff < 20 || doff > len(tcp) || tcp[13]&(tcpSYN|tcpACK|tcpRST|tcpFIN) != tcpSYN {
 		return false
 	}
 	src := netip.AddrFrom4([4]byte(pkt[12:16]))
