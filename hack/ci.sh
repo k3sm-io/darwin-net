@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."   # repo root
 
 CGO=0   # darwin-net is pure Go (utun/pf/lo0 via golang.org/x/sys/unix)
 STATICCHECK_VERSION=2026.2.1   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
+GOVULNCHECK_VERSION=v1.8.0   # the govulncheck the gate requires; keep equal across the k3sm repos and hack/etcd-wrapper.sh
 
 echo "==> [darwin-net] gofmt"
 fmt=$(gofmt -l .) || true
@@ -80,6 +81,45 @@ echo "==> [darwin-net] go mod tidy (no-diff)"
 go mod tidy
 if [ -n "$(git status --porcelain -- go.mod go.sum 2>/dev/null)" ]; then
 	echo "go.mod/go.sum not tidy after 'go mod tidy':"; git --no-pager diff -- go.mod go.sum; exit 1
+fi
+
+# The dependency supply-chain check (hack/verify-deps.sh): the go environment
+# cannot weaken verification, go mod verify, the hack/deps.lock module graph,
+# the 14-day cooldown on new versions, the OSV malicious-package query, go.mod
+# replace discipline, and exact pins on every remote go install / go run. It
+# needs proxy.golang.org and api.osv.dev; there is no offline skip, because a
+# network failure there is RED by design. It runs only in the real module: the
+# k3sm repo's hack/acceptance/ci_guard_test.go runs this script in a throwaway
+# module whose graph the lock could never describe.
+if grep -qx "module k3sm.io/darwin-net" go.mod 2>/dev/null; then
+	echo "==> [darwin-net] verify-deps (self-test)"
+	hack/verify-deps.sh --self-test
+	echo "==> [darwin-net] verify-deps"
+	hack/verify-deps.sh
+
+	# govulncheck, pinned to an exact version like staticcheck: a different release
+	# can report different findings. Each candidate (PATH first, then
+	# $(go env GOPATH)/bin) is probed and the first reporting exactly the pin is
+	# used. A missing or mismatched tool is RED, never a skip, and so is a finding
+	# or a failure to reach the vulnerability database.
+	gv=""; gv_seen=""
+	for c in "$(command -v govulncheck 2>/dev/null || true)" "$(go env GOPATH)/bin/govulncheck"; do
+		[ -n "$c" ] && [ -x "$c" ] || continue
+		gv_ver="$("$c" -version 2>/dev/null | sed -n 's/^Scanner: govulncheck@//p' | head -1)" || gv_ver=""
+		gv_seen="${gv_seen}    $c reports ${gv_ver:-no version}"$'\n'
+		if [ "$gv_ver" = "$GOVULNCHECK_VERSION" ]; then gv="$c"; break; fi
+	done
+	if [ -z "$gv" ]; then
+		if [ -z "$gv_seen" ]; then
+			echo "==> [darwin-net] govulncheck: not installed; the gate needs ${GOVULNCHECK_VERSION} (go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION})" >&2
+		else
+			echo "==> [darwin-net] govulncheck: wrong version; the gate needs ${GOVULNCHECK_VERSION} (go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}). Found:" >&2
+			printf '%s' "$gv_seen" >&2
+		fi
+		exit 1
+	fi
+	echo "==> [darwin-net] govulncheck ${GOVULNCHECK_VERSION} ./..."
+	GOWORK=off CGO_ENABLED=$CGO "$gv" ./...
 fi
 
 echo "OK: darwin-net ci green"
