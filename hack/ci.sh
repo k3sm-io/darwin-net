@@ -82,4 +82,36 @@ if [ -n "$(git status --porcelain -- go.mod go.sum 2>/dev/null)" ]; then
 	echo "go.mod/go.sum not tidy after 'go mod tidy':"; git --no-pager diff -- go.mod go.sum; exit 1
 fi
 
+# The dependency supply-chain check (hack/verify-deps.sh): the go environment
+# cannot weaken verification, go mod verify, the hack/deps.lock module graph,
+# the 14-day cooldown on new versions, the OSV malicious-package query, go.mod
+# replace discipline, and exact pins on every remote go install / go run. It
+# needs proxy.golang.org and api.osv.dev; there is no offline skip, because a
+# network failure there is RED by design. It runs only in the real module: the
+# k3sm repo's hack/acceptance/ci_guard_test.go runs this script in a throwaway
+# module whose graph the lock could never describe.
+if grep -qx "module k3sm.io/darwin-net" go.mod 2>/dev/null; then
+	echo "==> [darwin-net] verify-deps (self-test)"
+	hack/verify-deps.sh --self-test
+	echo "==> [darwin-net] verify-deps"
+	hack/verify-deps.sh
+
+	# govulncheck over this module, the posture of the k3sm repo's etcd-wrapper
+	# stage: a missing govulncheck prints a SKIP line; a finding, or a failure to
+	# reach the vulnerability database, is RED (there is no offline skip).
+	vc=""
+	for c in "$(command -v govulncheck || true)" "$(go env GOPATH)/bin/govulncheck"; do
+		if [ -n "$c" ] && [ -x "$c" ]; then
+			vc="$c"
+			break
+		fi
+	done
+	if [ -z "$vc" ]; then
+		echo "==> [darwin-net] SKIP govulncheck: not installed (go install golang.org/x/vuln/cmd/govulncheck@v1.8.0)"
+	else
+		echo "==> [darwin-net] govulncheck ./..."
+		GOWORK=off CGO_ENABLED=$CGO "$vc" ./...
+	fi
+fi
+
 echo "OK: darwin-net ci green"
