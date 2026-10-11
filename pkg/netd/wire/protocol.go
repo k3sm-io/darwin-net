@@ -43,17 +43,24 @@ const DefaultMaxPerConn = 253
 // Protocol version. A peer with a different MAJOR cannot interoperate (the daemon
 // rejects it); a higher MINOR is additive/compatible and is accepted. Minor 1 adds
 // the direct-link verbs (ConfigureLink, RemoveLink) and ConfigureMeshArgs.
-// DirectRoutes. Every reply carries the daemon's own version, and a client sends
-// minor-1 fields only to a daemon that reported minor >= 1: a minor-0 daemon does
-// not decode strictly, so it would silently drop a field it does not know.
+// DirectRoutes. Minor 2 adds Hello and the interconnect verbs
+// (EnsureInterconnectAlias, RemoveInterconnectAlias) with Response.Reason and
+// Response.InterconnectIP. Every reply carries the daemon's own version, and a
+// client sends minor-1 fields only to a daemon that reported minor >= 1: a minor-0
+// daemon does not decode strictly, so it would silently drop a field it does not
+// know.
 const (
 	ProtocolVersionMajor = 1
-	ProtocolVersionMinor = 1
+	ProtocolVersionMinor = 2
 )
 
 // MinorDirectLinks is the first minor version that understands the direct-link
 // verbs and DirectRoutes.
 const MinorDirectLinks = 1
+
+// MinorInterconnect is the first minor version that understands Hello and the
+// interconnect alias verbs.
+const MinorInterconnect = 2
 
 // Sentinel errors. Compare with errors.Is, never by string match.
 var (
@@ -66,7 +73,76 @@ var (
 	// ErrNoFD is returned by the fd-receiving client path when the daemon's response
 	// carried no file descriptor.
 	ErrNoFD = errors.New("netd/wire: response carried no file descriptor")
+	// ErrHelperTooOld is returned, without anything sent, by a client method whose
+	// verb the daemon on the current connection does not understand (it reported a
+	// minor below the verb's).
+	ErrHelperTooOld = errors.New("netd/wire: the netd helper is too old for this verb")
 )
+
+// The named interconnect refusals. The daemon wraps the matching one in every
+// interconnect rejection and names it in Response.Reason; the client maps the
+// reason back, so a caller compares with errors.Is across the socket.
+var (
+	// ErrInterconnectSlotOutOfRange: the slot is outside
+	// 0..netv1alpha1.MaxInterconnectSlot.
+	ErrInterconnectSlotOutOfRange = errors.New("netd: interconnect slot out of range")
+	// ErrInterconnectIndexOutOfRange: the node's cluster index, derived from the
+	// daemon's adopted node pod CIDR, is beyond
+	// netv1alpha1.MaxInterconnectNodeIndex, so the node has no interconnect
+	// address. The k3sm side reports it as InterconnectIndexOutOfRange.
+	ErrInterconnectIndexOutOfRange = errors.New("netd: node cluster index out of the interconnect range")
+	// ErrInterconnectIdentityUnadopted: the daemon has no adopted node pod CIDR
+	// yet (no ConfigureMesh confirmed one and none was restored), so it has no
+	// index to derive an address from.
+	ErrInterconnectIdentityUnadopted = errors.New("netd: node identity not adopted yet")
+	// ErrInterconnectNoBridge: the host has no bridge0 interface.
+	ErrInterconnectNoBridge = errors.New("netd: bridge0 does not exist")
+	// ErrInterconnectTeardownOrder: slot 0 (the connected /24) cannot be removed
+	// while the daemon owns a slot 1..7 /32 alias that rides it.
+	ErrInterconnectTeardownOrder = errors.New("netd: slot 0 is removed only after every slot 1..7 alias")
+)
+
+// Response.Reason values for the named interconnect refusals.
+const (
+	ReasonInterconnectSlotOutOfRange    = "InterconnectSlotOutOfRange"
+	ReasonInterconnectIndexOutOfRange   = "InterconnectIndexOutOfRange"
+	ReasonInterconnectIdentityUnadopted = "InterconnectIdentityUnadopted"
+	ReasonInterconnectNoBridge          = "InterconnectNoBridge"
+	ReasonInterconnectTeardownOrder     = "InterconnectTeardownOrder"
+)
+
+// reasons is the one table pairing each Reason with its sentinel.
+var reasons = []struct {
+	reason string
+	err    error
+}{
+	{ReasonInterconnectSlotOutOfRange, ErrInterconnectSlotOutOfRange},
+	{ReasonInterconnectIndexOutOfRange, ErrInterconnectIndexOutOfRange},
+	{ReasonInterconnectIdentityUnadopted, ErrInterconnectIdentityUnadopted},
+	{ReasonInterconnectNoBridge, ErrInterconnectNoBridge},
+	{ReasonInterconnectTeardownOrder, ErrInterconnectTeardownOrder},
+}
+
+// ReasonOf returns the Response.Reason naming the first sentinel err wraps, or ""
+// when it wraps none.
+func ReasonOf(err error) string {
+	for _, r := range reasons {
+		if errors.Is(err, r.err) {
+			return r.reason
+		}
+	}
+	return ""
+}
+
+// errorOfReason returns the sentinel a Response.Reason names, or nil.
+func errorOfReason(reason string) error {
+	for _, r := range reasons {
+		if r.reason == reason {
+			return r.err
+		}
+	}
+	return nil
+}
 
 // Version is the protocol version a Request advertises.
 type Version struct {
@@ -83,6 +159,12 @@ func CurrentVersion() Version {
 // direct-link verbs and DirectRoutes.
 func (v Version) SupportsDirectLinks() bool {
 	return v.Major == ProtocolVersionMajor && v.Minor >= MinorDirectLinks
+}
+
+// SupportsInterconnect reports whether a daemon reporting v understands Hello
+// and the interconnect alias verbs.
+func (v Version) SupportsInterconnect() bool {
+	return v.Major == ProtocolVersionMajor && v.Minor >= MinorInterconnect
 }
 
 // Compatible reports whether a peer speaking v can interoperate with this build:
@@ -115,6 +197,23 @@ const (
 	// VerbRemoveLink tears a direct-link port down and restores its bridge
 	// membership. Minor 1.
 	VerbRemoveLink Verb = "RemoveLink"
+	// VerbHello carries no arguments and changes nothing; the reply reports the
+	// daemon's version. A client sends it first on a connection to learn what that
+	// daemon understands before it sends a newer verb. A daemon older than minor 2
+	// answers it "unknown verb", and that reply still carries its version. Minor 2.
+	VerbHello Verb = "Hello"
+	// VerbEnsureInterconnectAlias asks the daemon to put the interconnect address
+	// of one slot on bridge0. The client sends only the slot; the daemon derives
+	// the address itself, InterconnectSlotAddress(index of its adopted node pod
+	// CIDR, slot), with a /24 netmask for slot 0 (the node's connected interconnect
+	// subnet) and /32 for slots 1..7, and adds no route. The slot bound (0..7)
+	// bounds bridge0 at 8 interconnect aliases per node. Minor 2.
+	VerbEnsureInterconnectAlias Verb = "EnsureInterconnectAlias"
+	// VerbRemoveInterconnectAlias removes one slot's interconnect alias from
+	// bridge0, only when the daemon created or adopted it, and slot 0 only after
+	// every slot 1..7 alias. The slot bound (0..7) bounds bridge0 at 8
+	// interconnect aliases per node. Minor 2.
+	VerbRemoveInterconnectAlias Verb = "RemoveInterconnectAlias"
 )
 
 // EnsureAliasArgs carries the host IP to alias on lo0 as a /32 (no prefix text —
@@ -184,6 +283,13 @@ type RemoveLinkArgs struct {
 	Iface string `json:"iface"`
 }
 
+// InterconnectAliasArgs names one interconnect slot. It is the only argument
+// the interconnect verbs carry: never an address, prefix, netmask, interface or
+// route.
+type InterconnectAliasArgs struct {
+	Slot int `json:"slot"`
+}
+
 // BindPortArgs requests a listening socket on a node address and port. A specific
 // address is the norm. A wildcard address is accepted only for a privileged
 // (<1024) port and only when the daemon's port authorizer grants it; a wildcard on
@@ -205,20 +311,27 @@ type Request struct {
 	BindPort      *BindPortArgs      `json:"bindPort,omitempty"`
 	ConfigureLink *ConfigureLinkArgs `json:"configureLink,omitempty"`
 	RemoveLink    *RemoveLinkArgs    `json:"removeLink,omitempty"`
+
+	EnsureInterconnectAlias *InterconnectAliasArgs `json:"ensureInterconnectAlias,omitempty"`
+	RemoveInterconnectAlias *InterconnectAliasArgs `json:"removeInterconnectAlias,omitempty"`
 }
 
 // Response is the daemon's reply. Version is the DAEMON's protocol version, on
 // every reply, success or not, so a client learns what the daemon understands
 // from any exchange. For VerbBindPort an fd accompanies the response out-of-band
 // via SCM_RIGHTS when FDPassed is true. For VerbConfigureLink, LinkIP is the
-// address the daemon derived and configured.
+// address the daemon derived and configured. For the interconnect verbs,
+// InterconnectIP is the address the daemon derived, and Reason names the refusal
+// (one of the Reason* constants) when the rejection is a named one.
 type Response struct {
-	Version   Version `json:"version"`
-	OK        bool    `json:"ok"`
-	Error     string  `json:"error,omitempty"`
-	FDPassed  bool    `json:"fdPassed,omitempty"`
-	BoundAddr string  `json:"boundAddr,omitempty"`
-	LinkIP    string  `json:"linkIP,omitempty"`
+	Version        Version `json:"version"`
+	OK             bool    `json:"ok"`
+	Error          string  `json:"error,omitempty"`
+	Reason         string  `json:"reason,omitempty"`
+	FDPassed       bool    `json:"fdPassed,omitempty"`
+	BoundAddr      string  `json:"boundAddr,omitempty"`
+	LinkIP         string  `json:"linkIP,omitempty"`
+	InterconnectIP string  `json:"interconnectIP,omitempty"`
 }
 
 // Frame returns payload prefixed with its 4-byte big-endian length. It is the

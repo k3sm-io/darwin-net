@@ -69,6 +69,15 @@ type Privileged interface {
 	// over it first, then its host route and address, then bridge membership is
 	// restored.
 	RemoveLink(ctx context.Context, iface string) error
+	// InterconnectAddrs reads bridge0's IPv4 addresses; a host without bridge0
+	// yields an error wrapping wire.ErrInterconnectNoBridge.
+	InterconnectAddrs(ctx context.Context) (map[netip.Addr]bool, error)
+	// AddInterconnectAlias puts a validated interconnect address on bridge0 with
+	// a bits-long netmask (24 for slot 0, 32 otherwise). It adds no route.
+	AddInterconnectAlias(ctx context.Context, addr netip.Addr, bits int) error
+	// RemoveInterconnectAlias removes a validated interconnect address from
+	// bridge0, and nothing else.
+	RemoveInterconnectAlias(ctx context.Context, addr netip.Addr) error
 }
 
 // LinkSpec is a direct-link port the server has validated: the Thunderbolt

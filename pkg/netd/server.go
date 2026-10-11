@@ -27,7 +27,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -123,6 +122,13 @@ type Config struct {
 	// its mesh key dir). Optional: empty disables persistence, and an unreadable or
 	// malformed file is logged and ignored (the daemon falls back to NodePodCIDR).
 	IdentityPath string
+	// InterconnectStatePath, when non-empty, is the file the daemon persists the
+	// interconnect aliases it owns on bridge0 to (temp-and-rename, 0600), so a
+	// restarted daemon removes only aliases it did not create. Same directory
+	// contract as IdentityPath. Optional: empty keeps ownership in memory only, so
+	// a restart's reconcile removes every one of this node's derived interconnect
+	// aliases (k3sm ensures them again).
+	InterconnectStatePath string
 	// ServiceCIDR, when valid, additionally admits an EnsureAlias for a Service VIP
 	// (the proxy's ClusterIPs live here, outside the pod aggregate). Optional.
 	ServiceCIDR netip.Prefix
@@ -181,7 +187,13 @@ type Config struct {
 // configured links and applied in one step) — across their Privileged calls, so a
 // RemoveLink can never interleave between a ConfigureMesh's validation of a direct
 // route and its installation, which would leave a /25 pointing at a cable whose
-// host route is gone. Lock order: linkMu, then mu.
+// host route is gone.
+//
+// icMu serializes the interconnect verbs, the start-up interconnect reconcile and
+// an identity adoption across their Privileged calls, so an alias is never derived
+// from one identity and recorded under another. icOwned (the interconnect aliases
+// the daemon owns, by slot) is guarded by mu, so the adoption's liveness check
+// can read it. Lock order: linkMu, then icMu, then mu.
 type Server struct {
 	cfg  Config
 	log  *slog.Logger
@@ -189,12 +201,14 @@ type Server struct {
 	priv Privileged
 
 	linkMu sync.Mutex
+	icMu   sync.Mutex
 
 	mu                sync.RWMutex
 	nodePodCIDR       netip.Prefix
 	identityConfirmed bool
 	aliases           map[netip.Addr]struct{}
 	links             map[string]linkRecord
+	icOwned           map[int]netip.Addr
 	meshRoutes        int
 	meshUp            bool
 }
@@ -303,7 +317,7 @@ func NewServer(cfg Config) *Server {
 				"nodePodCIDR", node.String(), "configured", configured.String(), "err", err)
 		}
 	}
-	return &Server{
+	s := &Server{
 		cfg:               cfg,
 		log:               cfg.Logger,
 		peer:              peer,
@@ -312,7 +326,14 @@ func NewServer(cfg Config) *Server {
 		identityConfirmed: restoredOK,
 		aliases:           make(map[netip.Addr]struct{}),
 		links:             make(map[string]linkRecord),
+		icOwned:           make(map[int]netip.Addr),
 	}
+	// Remove this node's derived interconnect aliases that the daemon does not
+	// own (see reconcileInterconnectAtStart); bounded like the sweeps above.
+	ctx, cancel := context.WithTimeout(context.Background(), startupSweepTimeout)
+	s.reconcileInterconnectAtStart(ctx)
+	cancel()
+	return s
 }
 
 // restoreIdentity reads a previously adopted node pod CIDR from path. It is
@@ -374,26 +395,7 @@ func (s *Server) persistIdentity(cidr netip.Prefix) {
 // and ignored, which is safe but silently loses the identity — the rename makes the
 // file either the old content or the new one.
 func writeIdentityFile(path string, cidr netip.Prefix) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".nodepodcidr-*")
-	if err != nil {
-		return fmt.Errorf("create temp beside %s: %w", path, err)
-	}
-	tmp := f.Name()
-	defer func() {
-		// A no-op once the rename succeeded (the name is gone by then).
-		_ = os.Remove(tmp)
-	}()
-	if _, err := f.WriteString(cidr.String() + "\n"); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("write %s: %w", tmp, err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("rename %s to %s: %w", tmp, path, err)
-	}
-	return nil
+	return writeFileAtomic(path, ".nodepodcidr-*", []byte(cidr.String()+"\n"))
 }
 
 // nodeCIDR returns the node identity in force: the configured pre-adoption /24
@@ -585,6 +587,12 @@ func (s *Server) dispatch(ctx context.Context, st *connState, payload []byte) (w
 		return s.handleConfigureLink(ctx, req.ConfigureLink), nil
 	case wire.VerbRemoveLink:
 		return s.handleRemoveLink(ctx, req.RemoveLink), nil
+	case wire.VerbHello:
+		return s.okResp(), nil
+	case wire.VerbEnsureInterconnectAlias:
+		return s.handleEnsureInterconnectAlias(ctx, req.EnsureInterconnectAlias), nil
+	case wire.VerbRemoveInterconnectAlias:
+		return s.handleRemoveInterconnectAlias(ctx, req.RemoveInterconnectAlias), nil
 	default:
 		return s.errResp(fmt.Sprintf("unknown verb %q", req.Verb)), nil
 	}
@@ -931,6 +939,10 @@ func (s *Server) handleRemoveLink(ctx context.Context, args *wire.RemoveLinkArgs
 // Otherwise the daemon adopts it, re-points the executor (whose mesh-egress and
 // utun link addresses derive from it), and persists it for a restart.
 //
+// An owned interconnect alias counts as live too: it was derived from the
+// current identity's cluster index. s.icMu is taken before s.mu so the decision
+// cannot interleave with an interconnect verb deriving from the old identity.
+//
 // It is called with s.mu unheld and takes it for the whole decision, including the
 // executor's SetNodePodCIDR and the identity write — so the decision and the
 // re-pointing cannot interleave with a concurrent adoption. That is the one place
@@ -951,6 +963,8 @@ func (s *Server) adoptNodePodCIDR(ctx context.Context, arg string) error {
 			ErrPolicy, want, s.cfg.ClusterAggregate)
 	}
 
+	s.icMu.Lock()
+	defer s.icMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.nodePodCIDR == want {
@@ -958,9 +972,9 @@ func (s *Server) adoptNodePodCIDR(ctx context.Context, arg string) error {
 		s.identityConfirmed = true
 		return nil
 	}
-	if pods := s.livePodAliasesLocked(); pods > 0 || s.meshRoutes > 0 || s.meshUp || len(s.links) > 0 {
-		return fmt.Errorf("%w: configureMesh: node identity already pinned to %s; refusing %s (live: %d pod alias(es), %d mesh route(s), mesh up=%t, %d direct link(s))",
-			ErrPolicy, s.nodePodCIDR, want, pods, s.meshRoutes, s.meshUp, len(s.links))
+	if pods := s.livePodAliasesLocked(); pods > 0 || s.meshRoutes > 0 || s.meshUp || len(s.links) > 0 || len(s.icOwned) > 0 {
+		return fmt.Errorf("%w: configureMesh: node identity already pinned to %s; refusing %s (live: %d pod alias(es), %d mesh route(s), mesh up=%t, %d direct link(s), %d interconnect alias(es))",
+			ErrPolicy, s.nodePodCIDR, want, pods, s.meshRoutes, s.meshUp, len(s.links), len(s.icOwned))
 	}
 	if err := s.priv.SetNodePodCIDR(ctx, want); err != nil {
 		return fmt.Errorf("%w: configureMesh: adopt node pod CIDR %s: %v", ErrPolicy, want, err)

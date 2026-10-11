@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -44,6 +45,9 @@ const defaultRPCTimeout = 10 * time.Second
 type Client struct {
 	socketPath string
 	maxResp    int
+	// open dials one framed (non-fd) connection: c.dial in production, an
+	// in-memory pipe in the unit tests.
+	open func(ctx context.Context) (io.ReadWriteCloser, error)
 
 	mu         sync.Mutex
 	helper     Version
@@ -72,7 +76,9 @@ func NewClient(socketPath string) *Client {
 	if socketPath == "" {
 		socketPath = DefaultSocketPath
 	}
-	return &Client{socketPath: socketPath, maxResp: DefaultMaxRequestBytes}
+	c := &Client{socketPath: socketPath, maxResp: DefaultMaxRequestBytes}
+	c.open = func(ctx context.Context) (io.ReadWriteCloser, error) { return c.dial(ctx) }
+	return c
 }
 
 // dial opens a connection to the daemon and arms it with a deadline derived from
@@ -98,12 +104,18 @@ func (c *Client) dial(ctx context.Context) (*net.UnixConn, error) {
 
 // roundTrip performs a framed request/response exchange with no fd transfer.
 func (c *Client) roundTrip(ctx context.Context, req Request) (Response, error) {
-	conn, err := c.dial(ctx)
+	conn, err := c.open(ctx)
 	if err != nil {
 		return Response{}, err
 	}
 	defer conn.Close()
+	return c.exchange(conn, req)
+}
 
+// exchange writes one request frame on conn and reads and decodes its reply,
+// recording the daemon version it carries. A rejection is an error; a named one
+// (Response.Reason) wraps its sentinel.
+func (c *Client) exchange(conn io.ReadWriter, req Request) (Response, error) {
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return Response{}, fmt.Errorf("encode %s request: %w", req.Verb, err)
@@ -121,9 +133,77 @@ func (c *Client) roundTrip(ctx context.Context, req Request) (Response, error) {
 	}
 	c.observe(resp.Version)
 	if !resp.OK {
+		if named := errorOfReason(resp.Reason); named != nil {
+			return resp, fmt.Errorf("netd %s rejected: %s: %w", req.Verb, resp.Error, named)
+		}
 		return resp, fmt.Errorf("netd %s rejected: %s", req.Verb, resp.Error)
 	}
 	return resp, nil
+}
+
+// interconnectRoundTrip sends verb only to a daemon that, on this very
+// connection, reported a minor that understands it: Hello first, then the verb
+// on the same connection. A version learned on an earlier connection is never
+// trusted, because the helper may have been replaced (downgraded) since. A daemon
+// older than minor 2 answers Hello "unknown verb" with its version; that is the
+// expected probe result, so the client returns ErrHelperTooOld and writes
+// nothing more.
+func (c *Client) interconnectRoundTrip(ctx context.Context, verb Verb, args InterconnectAliasArgs) (netip.Addr, error) {
+	conn, err := c.open(ctx)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	defer conn.Close()
+	hello, err := c.exchange(conn, Request{Version: CurrentVersion(), Verb: VerbHello})
+	if !hello.Version.SupportsInterconnect() {
+		if err != nil && hello.Version == (Version{}) {
+			// No decodable reply at all: the probe itself failed.
+			return netip.Addr{}, err
+		}
+		return netip.Addr{}, fmt.Errorf("%w: %s needs minor %d, the helper speaks %d.%d",
+			ErrHelperTooOld, verb, MinorInterconnect, hello.Version.Major, hello.Version.Minor)
+	}
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	req := Request{Version: CurrentVersion(), Verb: verb}
+	switch verb {
+	case VerbEnsureInterconnectAlias:
+		req.EnsureInterconnectAlias = &args
+	case VerbRemoveInterconnectAlias:
+		req.RemoveInterconnectAlias = &args
+	default:
+		return netip.Addr{}, fmt.Errorf("netd: %s is not an interconnect verb", verb)
+	}
+	resp, err := c.exchange(conn, req)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	if resp.InterconnectIP == "" {
+		return netip.Addr{}, nil
+	}
+	addr, err := netip.ParseAddr(resp.InterconnectIP)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("netd %s: reply carries no usable interconnect address %q: %w", verb, resp.InterconnectIP, err)
+	}
+	return addr, nil
+}
+
+// EnsureInterconnectAlias asks the daemon to put slot's interconnect address on
+// bridge0 and returns the address the daemon derived. It sends only the slot.
+// Against a helper older than minor 2 (as reported on this call's own connection)
+// it sends nothing and returns ErrHelperTooOld. A named refusal wraps its
+// sentinel (ErrInterconnectIndexOutOfRange and the rest).
+func (c *Client) EnsureInterconnectAlias(ctx context.Context, slot int) (netip.Addr, error) {
+	return c.interconnectRoundTrip(ctx, VerbEnsureInterconnectAlias, InterconnectAliasArgs{Slot: slot})
+}
+
+// RemoveInterconnectAlias asks the daemon to remove slot's interconnect alias
+// from bridge0. It sends only the slot, and, like EnsureInterconnectAlias, nothing
+// at all to a helper older than minor 2 (ErrHelperTooOld).
+func (c *Client) RemoveInterconnectAlias(ctx context.Context, slot int) error {
+	_, err := c.interconnectRoundTrip(ctx, VerbRemoveInterconnectAlias, InterconnectAliasArgs{Slot: slot})
+	return err
 }
 
 // roundTripFD performs a framed request and receives a response that carries a
