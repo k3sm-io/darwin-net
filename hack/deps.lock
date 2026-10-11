@@ -1,7 +1,8 @@
 # Module graph lock for hack/verify-deps.sh: one line per module in
-# `go list -m all` (main module excluded), each with the publish time the
-# module proxy reports for the version that is built (`local` for a
-# filesystem replacement). Regenerate with: hack/verify-deps.sh --update
+# `go list -m all` (main module excluded), each with the commit time the
+# module proxy records for the version that is built (not its first
+# publication; `local` for a filesystem replacement).
+# Regenerate with: hack/verify-deps.sh --update
 cloud.google.com/go/compute/metadata v0.3.0 # 2024-04-15T20:50:16Z
 github.com/Masterminds/semver/v3 v3.4.0 # 2025-06-27T14:48:33Z
 github.com/NYTimes/gziphandler v1.1.1 # 2019-02-21T23:16:47Z
