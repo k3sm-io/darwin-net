@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."   # repo root
 
 CGO=0   # darwin-net is pure Go (utun/pf/lo0 via golang.org/x/sys/unix)
 STATICCHECK_VERSION=2026.2.1   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
+GOVULNCHECK_VERSION=v1.8.0   # the govulncheck the gate requires; keep equal across the k3sm repos and hack/etcd-wrapper.sh
 
 echo "==> [darwin-net] gofmt"
 fmt=$(gofmt -l .) || true
@@ -96,22 +97,29 @@ if grep -qx "module k3sm.io/darwin-net" go.mod 2>/dev/null; then
 	echo "==> [darwin-net] verify-deps"
 	hack/verify-deps.sh
 
-	# govulncheck over this module, the posture of the k3sm repo's etcd-wrapper
-	# stage: a missing govulncheck prints a SKIP line; a finding, or a failure to
-	# reach the vulnerability database, is RED (there is no offline skip).
-	vc=""
-	for c in "$(command -v govulncheck || true)" "$(go env GOPATH)/bin/govulncheck"; do
-		if [ -n "$c" ] && [ -x "$c" ]; then
-			vc="$c"
-			break
-		fi
+	# govulncheck, pinned to an exact version like staticcheck: a different release
+	# can report different findings. Each candidate (PATH first, then
+	# $(go env GOPATH)/bin) is probed and the first reporting exactly the pin is
+	# used. A missing or mismatched tool is RED, never a skip, and so is a finding
+	# or a failure to reach the vulnerability database.
+	gv=""; gv_seen=""
+	for c in "$(command -v govulncheck 2>/dev/null || true)" "$(go env GOPATH)/bin/govulncheck"; do
+		[ -n "$c" ] && [ -x "$c" ] || continue
+		gv_ver="$("$c" -version 2>/dev/null | sed -n 's/^Scanner: govulncheck@//p' | head -1)" || gv_ver=""
+		gv_seen="${gv_seen}    $c reports ${gv_ver:-no version}"$'\n'
+		if [ "$gv_ver" = "$GOVULNCHECK_VERSION" ]; then gv="$c"; break; fi
 	done
-	if [ -z "$vc" ]; then
-		echo "==> [darwin-net] SKIP govulncheck: not installed (go install golang.org/x/vuln/cmd/govulncheck@v1.8.0)"
-	else
-		echo "==> [darwin-net] govulncheck ./..."
-		GOWORK=off CGO_ENABLED=$CGO "$vc" ./...
+	if [ -z "$gv" ]; then
+		if [ -z "$gv_seen" ]; then
+			echo "==> [darwin-net] govulncheck: not installed; the gate needs ${GOVULNCHECK_VERSION} (go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION})" >&2
+		else
+			echo "==> [darwin-net] govulncheck: wrong version; the gate needs ${GOVULNCHECK_VERSION} (go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}). Found:" >&2
+			printf '%s' "$gv_seen" >&2
+		fi
+		exit 1
 	fi
+	echo "==> [darwin-net] govulncheck ${GOVULNCHECK_VERSION} ./..."
+	GOWORK=off CGO_ENABLED=$CGO "$gv" ./...
 fi
 
 echo "OK: darwin-net ci green"
