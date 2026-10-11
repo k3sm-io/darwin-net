@@ -69,9 +69,10 @@ type Privileged interface {
 	// over it first, then its host route and address, then bridge membership is
 	// restored.
 	RemoveLink(ctx context.Context, iface string) error
-	// InterconnectAddrs reads bridge0's IPv4 addresses; a host without bridge0
-	// yields an error wrapping wire.ErrInterconnectNoBridge.
-	InterconnectAddrs(ctx context.Context) (map[netip.Addr]bool, error)
+	// InterconnectAddrs reads bridge0's IPv4 addresses with each one's prefix
+	// length (-1 when unknown). A host without bridge0 yields an error wrapping
+	// wire.ErrInterconnectNoBridge; any other read failure is a different error.
+	InterconnectAddrs(ctx context.Context) (map[netip.Addr]int, error)
 	// AddInterconnectAlias puts a validated interconnect address on bridge0 with
 	// a bits-long netmask (24 for slot 0, 32 otherwise). It adds no route.
 	AddInterconnectAlias(ctx context.Context, addr netip.Addr, bits int) error

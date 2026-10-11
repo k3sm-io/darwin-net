@@ -37,11 +37,15 @@ import (
 // Thunderbolt member, behind the applier's command and output seams, and records
 // every command in order. noBridge is a host whose Thunderbolt Bridge was
 // deleted; failRemove makes a -alias fail and leave the address in place (the
-// macOS 27 "not in table" case).
+// macOS 27 "not in table" case); readErrs fails the next reads in order (a nil
+// entry is a good read), and garbage makes every read print something that is
+// not a bridge0 report.
 type bridgeHost struct {
 	addrs      map[netip.Addr]string
 	ops        []string
 	noBridge   bool
+	garbage    bool
+	readErrs   []error
 	failRemove map[netip.Addr]bool
 }
 
@@ -57,13 +61,24 @@ func (h *bridgeHost) output(_ context.Context, name string, args ...string) ([]b
 	if name != "ifconfig" || len(args) != 1 || args[0] != bridgeIface {
 		return nil, fmt.Errorf("unexpected read %s %v", name, args)
 	}
+	if len(h.readErrs) > 0 {
+		err := h.readErrs[0]
+		h.readErrs = h.readErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if h.noBridge {
-		return nil, errors.New("ifconfig: interface bridge0 does not exist")
+		return nil, errors.New("exit status 1: ifconfig: interface bridge0 does not exist")
+	}
+	if h.garbage {
+		return []byte("signal: killed\n"), nil
 	}
 	var b strings.Builder
 	b.WriteString("bridge0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n")
 	for _, a := range slices.SortedFunc(maps.Keys(h.addrs), netip.Addr.Compare) {
-		fmt.Fprintf(&b, "\tinet %s netmask %s\n", a, h.addrs[a])
+		m := netip.MustParseAddr(h.addrs[a]).As4()
+		fmt.Fprintf(&b, "\tinet %s netmask 0x%02x%02x%02x%02x\n", a, m[0], m[1], m[2], m[3])
 	}
 	b.WriteString("\tmember: en1 flags=3<LEARNING,DISCOVER>\n")
 	return []byte(b.String()), nil
@@ -340,6 +355,75 @@ func TestInterconnectAliasPolicy(t *testing.T) {
 		}
 		if h.has("169.254.0.3") {
 			t.Fatal("the reconcile stopped at the failed removal")
+		}
+	})
+
+	t.Run("a bridge0 read failure is reported as itself, never as no bridge", func(t *testing.T) {
+		for name, fail := range map[string]func(*bridgeHost){
+			"timeout":         func(h *bridgeHost) { h.readErrs = []error{context.DeadlineExceeded} },
+			"killed ifconfig": func(h *bridgeHost) { h.readErrs = []error{errors.New("signal: killed")} },
+			"unparsable":      func(h *bridgeHost) { h.garbage = true },
+		} {
+			h := newBridgeHost(nil)
+			s, _ := icServer(t, "100.64.0.0/24", h, "")
+			fail(h)
+			resp := ensureIC(t, s, 0)
+			if resp.OK || resp.Reason != "" || !strings.Contains(resp.Error, "reading bridge0 failed") {
+				t.Errorf("%s: ensure = %+v, want an unnamed read failure", name, resp)
+			}
+			if len(h.ops) != 0 {
+				t.Errorf("%s: issued %q", name, h.ops)
+			}
+		}
+	})
+
+	t.Run("remove keeps ownership on a read failure and drops it only on a verified absence", func(t *testing.T) {
+		h := newBridgeHost(nil)
+		s, statePath := icServer(t, "100.64.0.0/24", h, "")
+		a3 := slotAddr(t, 0, 3)
+		wantOK(t, ensureIC(t, s, 3))
+		h.readErrs = []error{context.DeadlineExceeded}
+		if resp := removeIC(t, s, 3); resp.OK {
+			t.Fatal("a remove whose bridge0 read failed reported success")
+		}
+		if raw, _ := os.ReadFile(statePath); !strings.Contains(string(raw), a3) {
+			t.Fatalf("a read failure dropped ownership: ledger %s", raw)
+		}
+		// The -alias fails and the read-back fails too: still nothing proven.
+		h.failRemove[netip.MustParseAddr(a3)] = true
+		h.readErrs = []error{nil, errors.New("signal: killed")}
+		if resp := removeIC(t, s, 3); resp.OK {
+			t.Fatal("a failed -alias with an unreadable read-back reported success")
+		}
+		delete(h.failRemove, netip.MustParseAddr(a3))
+		wantOK(t, removeIC(t, s, 3)) // still owned, so it goes now
+		if h.has(a3) || h.ops[len(h.ops)-1] != "ifconfig bridge0 -alias "+a3 {
+			t.Fatalf("the kept ownership did not remove the alias: ops %q", h.ops)
+		}
+		// A deleted bridge0 is a verified absence: ownership goes, no command.
+		wantOK(t, ensureIC(t, s, 4))
+		h.noBridge = true
+		n := len(h.ops)
+		wantOK(t, removeIC(t, s, 4))
+		if raw, _ := os.ReadFile(statePath); strings.Contains(string(raw), slotAddr(t, 0, 4)) || len(h.ops) != n {
+			t.Fatalf("no-bridge removal: ledger %s, ops %q", raw, h.ops[n:])
+		}
+		h.checkOps(t)
+	})
+
+	t.Run("a slot-0 address with the wrong netmask is repaired to the /24", func(t *testing.T) {
+		h := newBridgeHost(nil)
+		s, _ := icServer(t, "100.64.0.0/24", h, "")
+		a0 := slotAddr(t, 0, 0)
+		h.addrs[netip.MustParseAddr(a0)] = "255.255.255.255" // present, but a /32
+		wantOK(t, ensureIC(t, s, 0))
+		want := []string{"ifconfig bridge0 -alias " + a0, "ifconfig bridge0 inet " + a0 + " netmask 255.255.255.0 alias"}
+		if !slices.Equal(h.ops, want) || h.addrs[netip.MustParseAddr(a0)] != "255.255.255.0" {
+			t.Fatalf("ops %q, mask %s; want %q", h.ops, h.addrs[netip.MustParseAddr(a0)], want)
+		}
+		wantOK(t, ensureIC(t, s, 0)) // now right: no command
+		if len(h.ops) != 2 {
+			t.Fatalf("a correct /24 issued %q", h.ops[2:])
 		}
 	})
 

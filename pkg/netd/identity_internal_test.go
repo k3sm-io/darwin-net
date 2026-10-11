@@ -60,7 +60,7 @@ func (p *recordingPriv) ConfigureLink(context.Context, LinkSpec) error { p.serve
 
 func (p *recordingPriv) RemoveLink(context.Context, string) error { p.served = true; return nil }
 
-func (p *recordingPriv) InterconnectAddrs(context.Context) (map[netip.Addr]bool, error) {
+func (p *recordingPriv) InterconnectAddrs(context.Context) (map[netip.Addr]int, error) {
 	return nil, nil
 }
 

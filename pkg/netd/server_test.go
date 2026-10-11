@@ -70,12 +70,12 @@ type fakePriv struct {
 	bridge      map[netip.Addr]int // bridge0's interconnect aliases and their prefix lengths
 }
 
-func (f *fakePriv) InterconnectAddrs(context.Context) (map[netip.Addr]bool, error) {
+func (f *fakePriv) InterconnectAddrs(context.Context) (map[netip.Addr]int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make(map[netip.Addr]bool, len(f.bridge))
-	for a := range f.bridge {
-		out[a] = true
+	out := make(map[netip.Addr]int, len(f.bridge))
+	for a, b := range f.bridge {
+		out[a] = b
 	}
 	return out, nil
 }

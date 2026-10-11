@@ -17,6 +17,7 @@ limitations under the License.
 package netd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+
+	"golang.org/x/sys/unix"
 
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	"k3sm.io/darwin-net/pkg/netd/wire"
@@ -52,16 +56,43 @@ func netmaskOf(bits int) string {
 	return netip.AddrFrom4([4]byte{byte(m >> 24), byte(m >> 16), byte(m >> 8), byte(m)}).String()
 }
 
-// InterconnectAddrs reads bridge0's IPv4 addresses. A host without bridge0 (the
-// Thunderbolt Bridge was deleted) yields an error wrapping
-// wire.ErrInterconnectNoBridge.
-func (a *darwinApplier) InterconnectAddrs(ctx context.Context) (map[netip.Addr]bool, error) {
+// errBridgeUnreadable reports a bridge0 read that failed for any reason other than
+// the interface not existing: a timeout, a killed ifconfig, output that is not
+// bridge0's. It never proves an address absent.
+var errBridgeUnreadable = errors.New("netd: reading bridge0 failed")
+
+// InterconnectAddrs reads bridge0's IPv4 addresses and the prefix length of each
+// (-1 when ifconfig printed no usable netmask). ifconfig reporting that bridge0
+// does not exist (the Thunderbolt Bridge was deleted) yields an error wrapping
+// wire.ErrInterconnectNoBridge; every other failure, including output that is not
+// a bridge0 report, wraps errBridgeUnreadable.
+func (a *darwinApplier) InterconnectAddrs(ctx context.Context) (map[netip.Addr]int, error) {
 	out, err := a.output(ctx, "ifconfig", bridgeIface)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", wire.ErrInterconnectNoBridge, err)
+		if strings.Contains(err.Error(), "does not exist") {
+			return nil, fmt.Errorf("%w: %v", wire.ErrInterconnectNoBridge, err)
+		}
+		return nil, fmt.Errorf("%w: %v", errBridgeUnreadable, err)
 	}
-	addrs, _ := parseIfconfig(out)
-	return addrs, nil
+	if !bytes.HasPrefix(out, []byte(bridgeIface+":")) {
+		return nil, fmt.Errorf("%w: ifconfig printed no %s report", errBridgeUnreadable, bridgeIface)
+	}
+	_, _, masks := parseIfconfig(out)
+	return masks, nil
+}
+
+// bridgeHas reports whether addr is on bridge0. A missing bridge0 is a verified
+// absence (false, nil); any other read failure is returned and proves nothing.
+func (s *Server) bridgeHas(ctx context.Context, addr netip.Addr) (bool, error) {
+	present, err := s.priv.InterconnectAddrs(ctx)
+	if errors.Is(err, wire.ErrInterconnectNoBridge) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	_, ok := present[addr]
+	return ok, nil
 }
 
 // AddInterconnectAlias puts addr on bridge0 with a bits-long netmask:
@@ -142,8 +173,10 @@ func (s *Server) interconnectIndex() (int, error) {
 // handleEnsureInterconnectAlias puts one slot's derived address on bridge0. It is
 // idempotent against the kernel, not only the ledger: an address already on
 // bridge0 is recorded as owned with no command, and an owned address that has
-// gone missing is added again. The slot bound (0..7) bounds bridge0 at 8
-// interconnect aliases.
+// gone missing is added again. A slot-0 address present with any netmask but
+// the /24 is repaired: removed, then added again as the /24 (safe, because it is
+// this node's own derived address). A read failure is reported as itself. The
+// slot bound (0..7) bounds bridge0 at 8 interconnect aliases.
 func (s *Server) handleEnsureInterconnectAlias(ctx context.Context, args *wire.InterconnectAliasArgs) wire.Response {
 	if args == nil {
 		return s.errResp("ensureInterconnectAlias: missing args")
@@ -161,7 +194,16 @@ func (s *Server) handleEnsureInterconnectAlias(ctx context.Context, args *wire.I
 		return s.interconnectErr(fmt.Errorf("ensureInterconnectAlias: %w", err))
 	}
 	bits := interconnectBits(args.Slot)
-	if present[addr] {
+	have, ok := present[addr]
+	if ok && args.Slot == 0 && have != bits {
+		if err := s.priv.RemoveInterconnectAlias(ctx, addr); err != nil {
+			s.log.Warn("netd: repairing a slot-0 interconnect alias with the wrong netmask failed", "ip", addr.String(), "bits", have, "err", err)
+			return s.errResp(fmt.Sprintf("ensureInterconnectAlias: repair %s/%d: %v", addr, have, err))
+		}
+		s.log.Info("netd: removed a slot-0 interconnect alias with the wrong netmask", "ip", addr.String(), "bits", have)
+		ok = false
+	}
+	if ok {
 		s.log.Debug("netd: interconnect alias already on bridge0", "slot", args.Slot, "ip", addr.String())
 	} else {
 		if err := s.priv.AddInterconnectAlias(ctx, addr, bits); err != nil {
@@ -212,17 +254,18 @@ func (s *Server) handleRemoveInterconnectAlias(ctx context.Context, args *wire.I
 		s.log.Warn("netd: interconnect alias removal refused", "slot", 0, "err", err)
 		return s.interconnectErr(err)
 	}
-	present, err := s.priv.InterconnectAddrs(ctx)
+	// Ownership is dropped only on a verified absence: a read that failed keeps
+	// the ledger, so the alias stays removable once bridge0 reads again.
+	here, err := s.bridgeHas(ctx, addr)
 	if err != nil {
-		// No bridge0, no alias on it.
-		s.log.Warn("netd: bridge0 is unreadable; an owned interconnect alias is taken as gone", "slot", args.Slot, "ip", addr.String(), "err", err)
-		present = nil
+		s.log.Warn("netd: interconnect alias removal failed; ownership kept", "slot", args.Slot, "ip", addr.String(), "err", err)
+		return s.errResp(fmt.Sprintf("removeInterconnectAlias: %v", err))
 	}
-	if present[addr] {
+	if here {
 		if err := s.priv.RemoveInterconnectAlias(ctx, addr); err != nil {
-			again, rerr := s.priv.InterconnectAddrs(ctx)
-			if rerr == nil && again[addr] {
-				s.log.Warn("netd: interconnect alias removal failed", "slot", args.Slot, "ip", addr.String(), "err", err)
+			still, rerr := s.bridgeHas(ctx, addr)
+			if rerr != nil || still {
+				s.log.Warn("netd: interconnect alias removal failed; ownership kept", "slot", args.Slot, "ip", addr.String(), "err", err, "readErr", rerr)
 				return s.errResp(fmt.Sprintf("removeInterconnectAlias: %v", err))
 			}
 			s.log.Warn("netd: interconnect alias removal reported an error but the alias is gone", "slot", args.Slot, "ip", addr.String(), "err", err)
@@ -372,7 +415,7 @@ func (s *Server) reconcileInterconnectAtStart(ctx context.Context) {
 	}
 	for slot := netv1alpha1.MaxInterconnectSlot; slot >= 0; slot-- {
 		addr := derived[slot]
-		if !present[addr] {
+		if _, ok := present[addr]; !ok {
 			continue
 		}
 		if _, mine := owned[slot]; mine {
@@ -391,9 +434,9 @@ func (s *Server) reconcileInterconnectAtStart(ctx context.Context) {
 }
 
 // ownsRider reports whether an owned slot 1..7 alias is present on bridge0.
-func ownsRider(owned map[int]netip.Addr, present map[netip.Addr]bool) bool {
+func ownsRider(owned map[int]netip.Addr, present map[netip.Addr]int) bool {
 	for slot, addr := range owned {
-		if slot != 0 && present[addr] {
+		if _, ok := present[addr]; slot != 0 && ok {
 			return true
 		}
 	}
@@ -403,7 +446,8 @@ func ownsRider(owned map[int]netip.Addr, present map[netip.Addr]bool) bool {
 // writeFileAtomic writes data to path through a 0600 temp file (pattern) in the
 // same directory and a rename, the identity file's discipline.
 func writeFileAtomic(path, pattern string, data []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(path), pattern)
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		return fmt.Errorf("create temp beside %s: %w", path, err)
 	}
@@ -412,15 +456,35 @@ func writeFileAtomic(path, pattern string, data []byte) error {
 		// A no-op once the rename succeeded (the name is gone by then).
 		_ = os.Remove(tmp)
 	}()
+	// CreateTemp already creates 0600; the explicit chmod keeps the mode out of
+	// the umask's and the implementation's hands.
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("chmod %s: %w", tmp, err)
+	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	// The content is durable before the rename makes it the file.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync %s: %w", tmp, err)
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("rename %s to %s: %w", tmp, path, err)
+	}
+	// And the rename itself is durable: fsync the directory entry.
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open %s to sync it: %w", dir, err)
+	}
+	defer d.Close()
+	if err := unix.Fsync(int(d.Fd())); err != nil {
+		return fmt.Errorf("sync directory %s: %w", dir, err)
 	}
 	return nil
 }

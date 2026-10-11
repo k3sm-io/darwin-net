@@ -22,9 +22,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/bits"
 	"net"
 	"net/netip"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
@@ -241,7 +244,7 @@ func (a *darwinApplier) readIface(ctx context.Context, iface string) (map[netip.
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %s: %v", errNoSuchInterface, iface, err)
 	}
-	addrs, opts := parseIfconfig(out)
+	addrs, opts, _ := parseIfconfig(out)
 	return addrs, opts, nil
 }
 
@@ -302,10 +305,13 @@ func staleLinkRoute(r mesh.Route) bool {
 }
 
 // parseIfconfig reads `ifconfig <iface>` output: the IPv4 addresses ("inet A
-// netmask ...") and the option flags ("options=460<TSO4,TSO6,CHANNEL_IO>").
-func parseIfconfig(out []byte) (map[netip.Addr]bool, map[string]bool) {
+// netmask ..."), each address's netmask as a prefix length (masks; -1 when the
+// line carries no netmask ifconfig's way or a non-contiguous one), and the option
+// flags ("options=460<TSO4,TSO6,CHANNEL_IO>").
+func parseIfconfig(out []byte) (map[netip.Addr]bool, map[string]bool, map[netip.Addr]int) {
 	addrs := make(map[netip.Addr]bool)
 	opts := make(map[string]bool)
+	masks := make(map[netip.Addr]int)
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
 		f := strings.Fields(sc.Text())
@@ -316,6 +322,10 @@ func parseIfconfig(out []byte) (map[netip.Addr]bool, map[string]bool) {
 		case f[0] == "inet" && len(f) > 1:
 			if ip, err := netip.ParseAddr(f[1]); err == nil {
 				addrs[ip] = true
+				masks[ip] = -1
+				if i := slices.Index(f, "netmask"); i > 0 && i+1 < len(f) {
+					masks[ip] = netmaskBits(f[i+1])
+				}
 			}
 		case strings.HasPrefix(f[0], "options="):
 			lt, gt := strings.IndexByte(f[0], '<'), strings.LastIndexByte(f[0], '>')
@@ -329,7 +339,33 @@ func parseIfconfig(out []byte) (map[netip.Addr]bool, map[string]bool) {
 			}
 		}
 	}
-	return addrs, opts
+	return addrs, opts, masks
+}
+
+// netmaskBits converts an ifconfig netmask, hex ("0xffffff00") or dotted
+// ("255.255.255.0"), to its prefix length, or -1 when it is unparsable or not
+// contiguous.
+func netmaskBits(s string) int {
+	var m uint32
+	if hex, ok := strings.CutPrefix(s, "0x"); ok {
+		v, err := strconv.ParseUint(hex, 16, 32)
+		if err != nil {
+			return -1
+		}
+		m = uint32(v)
+	} else {
+		a, err := netip.ParseAddr(s)
+		if err != nil || !a.Is4() {
+			return -1
+		}
+		b := a.As4()
+		m = uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+	}
+	n := bits.LeadingZeros32(^m)
+	if n < 32 && m<<n != 0 {
+		return -1
+	}
+	return n
 }
 
 // parseBridgeMembers reads the "member: enX flags=..." lines of `ifconfig
