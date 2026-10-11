@@ -33,6 +33,7 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/mesh"
 	"k3sm.io/darwin-net/pkg/netd"
+	"k3sm.io/darwin-net/pkg/netd/wire"
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/darwin-net/pkg/proxy"
 )
@@ -175,5 +176,36 @@ func TestMeshClientRoundTrip(t *testing.T) {
 	}
 	if got := fp.removedMesh(); got != 1 {
 		t.Fatalf("RemoveMesh called %d times, want 1", got)
+	}
+}
+
+// TestInterconnectClientRoundTrip proves the wire client's interconnect verbs
+// round-trip to an in-process daemon over its real socket: after a ConfigureMesh
+// confirms the node identity, EnsureInterconnectAlias(0) puts the derived slot-0
+// address on bridge0 as a /24 and returns it, and RemoveInterconnectAlias(0)
+// takes it off again.
+func TestInterconnectClientRoundTrip(t *testing.T) {
+	sock, fp := startServer(t, netd.Config{
+		NodePodCIDR:     netip.MustParsePrefix("100.64.0.0/24"),
+		MeshKeyResolver: fakeResolver{key: genKeyB64(t)},
+	})
+	c := wire.NewClient(sock)
+	ctx := context.Background()
+	if err := c.ConfigureMesh(ctx, "node-key-ref", 0, netip.MustParsePrefix("100.64.0.0/24"), nil, nil); err != nil {
+		t.Fatalf("ConfigureMesh: %v", err)
+	}
+	addr, err := c.EnsureInterconnectAlias(ctx, 0)
+	if err != nil {
+		t.Fatalf("EnsureInterconnectAlias: %v", err)
+	}
+	want := netip.MustParseAddr("169.254.0.1")
+	if got := fp.bridgeAliases(); addr != want || got[want] != 24 || len(got) != 1 {
+		t.Fatalf("ensured %s, bridge0 = %v; want %s as a /24", addr, got, want)
+	}
+	if err := c.RemoveInterconnectAlias(ctx, 0); err != nil {
+		t.Fatalf("RemoveInterconnectAlias: %v", err)
+	}
+	if got := fp.bridgeAliases(); len(got) != 0 {
+		t.Fatalf("bridge0 after removal = %v", got)
 	}
 }

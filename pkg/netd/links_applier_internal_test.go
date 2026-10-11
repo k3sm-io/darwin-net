@@ -346,7 +346,7 @@ func TestApplierStartupSweepsReservedHalves(t *testing.T) {
 
 // TestParseIfconfigAndBridge pins the two ifconfig parsers on the real format.
 func TestParseIfconfigAndBridge(t *testing.T) {
-	addrs, opts := parseIfconfig([]byte("en2: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500\n\toptions=460<TSO4,TSO6,CHANNEL_IO>\n\tether 02:00:00:00:00:40\n\tinet 169.254.0.4 netmask 0xffffffff\n\tmedia: autoselect <full-duplex>\n\tstatus: inactive\n"))
+	addrs, opts, _ := parseIfconfig([]byte("en2: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500\n\toptions=460<TSO4,TSO6,CHANNEL_IO>\n\tether 02:00:00:00:00:40\n\tinet 169.254.0.4 netmask 0xffffffff\n\tmedia: autoselect <full-duplex>\n\tstatus: inactive\n"))
 	if !addrs[netip.MustParseAddr("169.254.0.4")] || len(addrs) != 1 {
 		t.Errorf("addrs = %v", addrs)
 	}

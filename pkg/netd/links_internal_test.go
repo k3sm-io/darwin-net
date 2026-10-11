@@ -49,6 +49,11 @@ type linkPriv struct {
 func (p *linkPriv) EnsureAlias(context.Context, netip.Addr) error { return nil }
 func (p *linkPriv) RemoveAlias(context.Context, netip.Addr) error { return nil }
 func (p *linkPriv) RemoveMesh(context.Context) error              { return nil }
+func (p *linkPriv) InterconnectAddrs(context.Context) (map[netip.Addr]int, error) {
+	return nil, nil
+}
+func (p *linkPriv) AddInterconnectAlias(context.Context, netip.Addr, int) error { return nil }
+func (p *linkPriv) RemoveInterconnectAlias(context.Context, netip.Addr) error   { return nil }
 func (p *linkPriv) SetNodePodCIDR(context.Context, netip.Prefix) error {
 	return nil
 }

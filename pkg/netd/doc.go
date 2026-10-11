@@ -48,6 +48,13 @@ limitations under the License.
 //     node identity a ConfigureMesh confirmed, and every direct route's next hop
 //     must be the address derived for the node that owns the routed /24, over a
 //     link the daemon configured toward exactly that address.
+//   - Derived, never trusted, interconnect addresses. The interconnect verbs carry
+//     only a slot (0..7, so at most 8 aliases on bridge0). The daemon derives the
+//     address from its own adopted node identity (netv1alpha1.
+//     InterconnectSlotAddress), refuses before adoption and beyond the cable's
+//     node-index ceiling, applies it to bridge0 only with no route, removes only
+//     aliases it owns (slot 0 last), and at start removes only this node's
+//     derived aliases that it does not own.
 //   - fd-out only. The sole descriptor that ever crosses the socket is the
 //     listening socket BindPort returns to the client via SCM_RIGHTS; no inbound fd
 //     is ever accepted.

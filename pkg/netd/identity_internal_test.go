@@ -60,6 +60,20 @@ func (p *recordingPriv) ConfigureLink(context.Context, LinkSpec) error { p.serve
 
 func (p *recordingPriv) RemoveLink(context.Context, string) error { p.served = true; return nil }
 
+func (p *recordingPriv) InterconnectAddrs(context.Context) (map[netip.Addr]int, error) {
+	return nil, nil
+}
+
+func (p *recordingPriv) AddInterconnectAlias(context.Context, netip.Addr, int) error {
+	p.served = true
+	return nil
+}
+
+func (p *recordingPriv) RemoveInterconnectAlias(context.Context, netip.Addr) error {
+	p.served = true
+	return nil
+}
+
 func (p *recordingPriv) SetNodePodCIDR(_ context.Context, cidr netip.Prefix) error {
 	if p.adoptedErr != nil {
 		return p.adoptedErr

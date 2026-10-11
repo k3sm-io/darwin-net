@@ -67,6 +67,45 @@ type fakePriv struct {
 	adopted     []netip.Prefix
 	links       []netd.LinkSpec
 	unlinked    []string
+	bridge      map[netip.Addr]int // bridge0's interconnect aliases and their prefix lengths
+}
+
+func (f *fakePriv) InterconnectAddrs(context.Context) (map[netip.Addr]int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[netip.Addr]int, len(f.bridge))
+	for a, b := range f.bridge {
+		out[a] = b
+	}
+	return out, nil
+}
+
+func (f *fakePriv) AddInterconnectAlias(_ context.Context, addr netip.Addr, bits int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.bridge == nil {
+		f.bridge = make(map[netip.Addr]int)
+	}
+	f.bridge[addr] = bits
+	return nil
+}
+
+func (f *fakePriv) RemoveInterconnectAlias(_ context.Context, addr netip.Addr) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.bridge, addr)
+	return nil
+}
+
+// bridgeAliases returns a copy of bridge0's interconnect aliases.
+func (f *fakePriv) bridgeAliases() map[netip.Addr]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[netip.Addr]int, len(f.bridge))
+	for a, b := range f.bridge {
+		out[a] = b
+	}
+	return out
 }
 
 func (f *fakePriv) EnsureAlias(_ context.Context, ip netip.Addr) error {

@@ -126,13 +126,13 @@ func TestConfigureMeshArgsNodePodCIDRIsAdditive(t *testing.T) {
 	})
 }
 
-// TestDirectLinksAreMinorOne pins the 1.0 -> 1.1 bump: this build speaks minor 1,
-// a minor-0 daemon does not support direct links, and the DirectRoutes and
+// TestDirectLinksAreMinorOne pins the 1.0 -> 1.1 bump: this build speaks minor 1
+// or later, a minor-0 daemon does not support direct links, and the DirectRoutes and
 // LinkIP fields are omitted when unset so a frame without direct links is the
 // frame a 1.0 peer has always exchanged.
 func TestDirectLinksAreMinorOne(t *testing.T) {
-	if v := CurrentVersion(); v.Major != 1 || v.Minor != 1 || !v.SupportsDirectLinks() {
-		t.Fatalf("CurrentVersion = %+v, want 1.1 supporting direct links", v)
+	if v := CurrentVersion(); v.Major != 1 || v.Minor < 1 || !v.SupportsDirectLinks() {
+		t.Fatalf("CurrentVersion = %+v, want at least 1.1 supporting direct links", v)
 	}
 	if (Version{Major: 1, Minor: 0}).SupportsDirectLinks() {
 		t.Fatal("a 1.0 daemon must not be treated as supporting direct links")
