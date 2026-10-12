@@ -1622,6 +1622,14 @@ typedef struct {
      * rung existed. */
     int ncidrs;
     k3sm_cidr_t cidrs[K3SM_MAX_CLUSTER_CIDRS];
+    /* The interconnect scope (see k3sm_interconnect_cfg_init). nic == 0 means
+     * it is OFF — K3SM_INTERCONNECT_IP or K3SM_INTERCONNECT_CIDRS was unset,
+     * empty or unparseable, a CIDR lay outside 169.254.0.0/16, or the address
+     * lay outside every CIDR — and no dial is ever pinned to icip. */
+    int nic;
+    struct in_addr icip;            /* network byte order, ready to memcpy */
+    char icip_s[INET_ADDRSTRLEN];   /* presentation form, for the trace only */
+    k3sm_cidr_t iccidrs[K3SM_MAX_CLUSTER_CIDRS];
 } k3sm_bind_cfg_t;
 
 /*
@@ -1662,10 +1670,13 @@ static void k3sm_bind_trace(const char *fmt, ...) {
 }
 
 /*
- * Parse K3SM_CLUSTER_CIDRS — a comma-separated list of IPv4 CIDRs ("10.42.0.0/16,
- * 10.43.0.0/16") naming the destinations the connect() rung may source-pin. On
- * success it fills k3sm_bind_cfg.cidrs and returns the count; on ANY defect it
- * returns -1 and the caller leaves ncidrs at 0, which disables the rung entirely.
+ * Parse a destination-scope list — a comma-separated list of IPv4 CIDRs
+ * ("10.42.0.0/16,10.43.0.0/16") naming the destinations the connect() rung may
+ * source-pin. It is the ONE parser for both scopes: K3SM_CLUSTER_CIDRS (into
+ * k3sm_bind_cfg.cidrs) and K3SM_INTERCONNECT_CIDRS (into k3sm_bind_cfg.iccidrs).
+ * out must hold K3SM_MAX_CLUSTER_CIDRS entries. On success it fills out and
+ * returns the count; on ANY defect it returns -1 and the caller leaves its count
+ * at 0, which disables that scope entirely.
  *
  * STRICT AND FAIL-SAFE, in that order. Every rejection below collapses to the
  * same outcome as an unset value — no dial is pinned, which is exactly the
@@ -1680,7 +1691,7 @@ static void k3sm_bind_trace(const char *fmt, ...) {
  * pkg/podnet's encoder, which never emits one. A hand-set /0 is far more likely
  * to be a mistake than an intent, and this is the fail-safe reading of it.
  */
-static int k3sm_parse_cluster_cidrs(const char *spec) {
+static int k3sm_parse_cidrs(const char *spec, k3sm_cidr_t *out) {
     char buf[K3SM_MAX_CLUSTER_CIDRS * (INET_ADDRSTRLEN + 4) + 8];
     size_t n = spec == NULL ? 0 : strlen(spec);
     if (n == 0 || n >= sizeof buf) {
@@ -1733,16 +1744,15 @@ static int k3sm_parse_cluster_cidrs(const char *spec) {
 
         uint32_t mask = bits == 32 ? 0xffffffffu : ~((1u << (32 - (unsigned)bits)) - 1u);
         uint32_t net = ntohl(addr.s_addr) & mask;
-        k3sm_bind_cfg.cidrs[count].net = net;
-        k3sm_bind_cfg.cidrs[count].mask = mask;
+        out[count].net = net;
+        out[count].mask = mask;
         struct in_addr masked;
         masked.s_addr = htonl(net);
         char abuf[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &masked, abuf, sizeof abuf);
         /* Store the MASKED form: the trace must show what is actually matched
          * against, not the possibly-unmasked spelling the operator supplied. */
-        snprintf(k3sm_bind_cfg.cidrs[count].s, sizeof k3sm_bind_cfg.cidrs[count].s, "%s/%u", abuf,
-                 (unsigned)bits);
+        snprintf(out[count].s, sizeof out[count].s, "%s/%u", abuf, (unsigned)bits);
         count++;
 
         if (comma == NULL) {
@@ -1753,14 +1763,97 @@ static int k3sm_parse_cluster_cidrs(const char *spec) {
     return count;
 }
 
-/* Containment test for a destination address in HOST byte order. */
-static int k3sm_dst_in_cluster(uint32_t dst_h) {
-    for (int i = 0; i < k3sm_bind_cfg.ncidrs; i++) {
-        if ((dst_h & k3sm_bind_cfg.cidrs[i].mask) == k3sm_bind_cfg.cidrs[i].net) {
+/* Containment test for an address in HOST byte order against a parsed scope. */
+static int k3sm_addr_in(const k3sm_cidr_t *tab, int n, uint32_t a_h) {
+    for (int i = 0; i < n; i++) {
+        if ((a_h & tab[i].mask) == tab[i].net) {
             return 1;
         }
     }
     return 0;
+}
+
+/* Render a parsed scope as "a/n,b/m" for the trace. */
+static void k3sm_join_cidrs(const k3sm_cidr_t *tab, int n, char *joined, size_t cap) {
+    size_t off = 0;
+    joined[0] = '\0';
+    for (int i = 0; i < n && off < cap; i++) {
+        int w = snprintf(joined + off, cap - off, "%s%s", i == 0 ? "" : ",", tab[i].s);
+        if (w < 0 || (size_t)w >= cap - off) {
+            break;
+        }
+        off += (size_t)w;
+    }
+}
+
+/*
+ * K3SM_INTERCONNECT_RANGE_NET / _BITS bound every interconnect CIDR to the IPv4
+ * link-local range 169.254.0.0/16. pkg/podnet's interconnectRange holds the
+ * Go-side copy and TestShimInterconnectRangeMatchesC binds the two mechanically.
+ * Pinning a link-local source onto a dial that leaves the link means its replies
+ * can never come back, so a CIDR outside this range turns the whole interconnect
+ * scope off, the same reading the cluster scope gives a /0.
+ */
+#define K3SM_INTERCONNECT_RANGE_NET 0xa9fe0000u /* 169.254.0.0 */
+#define K3SM_INTERCONNECT_RANGE_BITS 16
+
+/*
+ * The interconnect scope: K3SM_INTERCONNECT_IP (the pod's interconnect address)
+ * and K3SM_INTERCONNECT_CIDRS (the interconnect range, today exactly
+ * 169.254.0.0/24). An unbound AF_INET dial whose DESTINATION is inside the range
+ * is source-pinned to the interconnect address instead of the pod IP: macOS has
+ * no source policy routing, so the destination alone puts the packet on the
+ * cable, and without the pin XNU would pick some bridge0 address the peer
+ * cannot attribute to this pod.
+ *
+ * Nothing else changes. A wildcard bind still rewrites to K3SM_POD_IP, so an
+ * application listener is never reachable over the interconnect; a pod is
+ * reachable there only through an explicit bind to its interconnect address,
+ * which the bind rung passes through like any specific bind.
+ *
+ * FAIL-SAFE, every way. Both values must be set and valid, every CIDR must lie
+ * inside K3SM_INTERCONNECT_RANGE, and the address must lie inside one of the
+ * CIDRs; any defect leaves nic at 0, so no dial is pinned to an interconnect
+ * address and the cluster scope behaves exactly as it does without these
+ * variables. pkg/podnet's InterconnectEnv is the encoder that never produces a
+ * defective pair.
+ */
+static void k3sm_interconnect_cfg_init(void) {
+    const char *ip = getenv("K3SM_INTERCONNECT_IP");
+    const char *cidrs = getenv("K3SM_INTERCONNECT_CIDRS");
+    if (ip == NULL || ip[0] == '\0' || cidrs == NULL || cidrs[0] == '\0') {
+        k3sm_bind_trace("interconnect: K3SM_INTERCONNECT_IP/K3SM_INTERCONNECT_CIDRS unset -> "
+                        "no dial is pinned to an interconnect address");
+        return;
+    }
+    if (inet_pton(AF_INET, ip, &k3sm_bind_cfg.icip) != 1) {
+        k3sm_bind_trace("interconnect: K3SM_INTERCONNECT_IP=%s unparseable -> off", ip);
+        return;
+    }
+    int n = k3sm_parse_cidrs(cidrs, k3sm_bind_cfg.iccidrs);
+    if (n <= 0) {
+        k3sm_bind_trace("interconnect: K3SM_INTERCONNECT_CIDRS=%s unparseable -> off", cidrs);
+        return;
+    }
+    const uint32_t rmask = ~((1u << (32 - K3SM_INTERCONNECT_RANGE_BITS)) - 1u);
+    for (int i = 0; i < n; i++) {
+        if ((k3sm_bind_cfg.iccidrs[i].mask & rmask) != rmask ||
+            (k3sm_bind_cfg.iccidrs[i].net & rmask) != K3SM_INTERCONNECT_RANGE_NET) {
+            k3sm_bind_trace("interconnect: %s is outside 169.254.0.0/%d -> off",
+                            k3sm_bind_cfg.iccidrs[i].s, K3SM_INTERCONNECT_RANGE_BITS);
+            return;
+        }
+    }
+    if (!k3sm_addr_in(k3sm_bind_cfg.iccidrs, n, ntohl(k3sm_bind_cfg.icip.s_addr))) {
+        k3sm_bind_trace("interconnect: K3SM_INTERCONNECT_IP=%s is outside %s -> off", ip, cidrs);
+        return;
+    }
+    snprintf(k3sm_bind_cfg.icip_s, sizeof k3sm_bind_cfg.icip_s, "%s", ip);
+    k3sm_bind_cfg.nic = n;
+    char joined[(INET_ADDRSTRLEN + 5) * K3SM_MAX_CLUSTER_CIDRS + 8];
+    k3sm_join_cidrs(k3sm_bind_cfg.iccidrs, n, joined, sizeof joined);
+    k3sm_bind_trace("interconnect: source-pin scope %s (unbound AF_INET dials into it get source %s)",
+                    joined, k3sm_bind_cfg.icip_s);
 }
 
 static void k3sm_bind_cfg_init(void) {
@@ -1790,6 +1883,11 @@ static void k3sm_bind_cfg_init(void) {
     k3sm_bind_trace("enabled: pod ip %s (wildcard binds >= %d rewritten)",
                     k3sm_bind_cfg.podip_s, K3SM_BIND_MIN_PORT);
 
+    /* The interconnect scope needs the pod identity too: a process with no
+     * K3SM_POD_IP is fully passthrough, whatever else is set. It is read before
+     * the cluster scope because that block returns early on its own defects. */
+    k3sm_interconnect_cfg_init();
+
     /*
      * The connect() rung's destination scope, read in the SAME once-initializer:
      * it is per-process configuration with nothing per-call to vary, and folding
@@ -1803,7 +1901,7 @@ static void k3sm_bind_cfg_init(void) {
         k3sm_bind_trace("connect: K3SM_CLUSTER_CIDRS unset -> no dial is source-pinned");
         return;
     }
-    int ncidrs = k3sm_parse_cluster_cidrs(cidrs);
+    int ncidrs = k3sm_parse_cidrs(cidrs, k3sm_bind_cfg.cidrs);
     if (ncidrs <= 0) {
         k3sm_bind_cfg.ncidrs = 0;
         k3sm_bind_trace("connect: K3SM_CLUSTER_CIDRS=%s unparseable -> no dial is source-pinned",
@@ -1812,16 +1910,7 @@ static void k3sm_bind_cfg_init(void) {
     }
     k3sm_bind_cfg.ncidrs = ncidrs;
     char joined[(INET_ADDRSTRLEN + 5) * K3SM_MAX_CLUSTER_CIDRS + 8];
-    size_t off = 0;
-    joined[0] = '\0';
-    for (int i = 0; i < ncidrs && off < sizeof joined; i++) {
-        int w = snprintf(joined + off, sizeof joined - off, "%s%s", i == 0 ? "" : ",",
-                         k3sm_bind_cfg.cidrs[i].s);
-        if (w < 0 || (size_t)w >= sizeof joined - off) {
-            break;
-        }
-        off += (size_t)w;
-    }
+    k3sm_join_cidrs(k3sm_bind_cfg.cidrs, ncidrs, joined, sizeof joined);
     k3sm_bind_trace("connect: source-pin scope %s (unbound AF_INET dials into it get source %s)",
                     joined, k3sm_bind_cfg.podip_s);
 }
@@ -2058,7 +2147,7 @@ int k3sm_connect(int fd, const struct sockaddr *addr, socklen_t len) {
         k3sm_bind_trace("connect fd=%d -> passthrough (shim disabled)", fd);
         return connect(fd, addr, len);
     }
-    if (k3sm_bind_cfg.ncidrs == 0) {
+    if (k3sm_bind_cfg.ncidrs == 0 && k3sm_bind_cfg.nic == 0) {
         k3sm_bind_trace("connect fd=%d -> PASSTHROUGH-NOSCOPE (no cluster CIDRs configured)", fd);
         return connect(fd, addr, len);
     }
@@ -2093,8 +2182,28 @@ int k3sm_connect(int fd, const struct sockaddr *addr, socklen_t len) {
     }
 
     /* STEP 4 — destination scope. An out-of-cluster dial is en0-routed and must
-     * NEVER be pinned to a lo0 /32; that is the entire point of the scoping. */
-    if (!k3sm_dst_in_cluster(ntohl(dst.sin_addr.s_addr))) {
+     * NEVER be pinned to a lo0 /32; that is the entire point of the scoping.
+     *
+     * PRECEDENCE: the interconnect scope is tested FIRST, so a destination
+     * inside K3SM_INTERCONNECT_CIDRS gets the interconnect address even if a
+     * cluster CIDR also covers it; every other destination is decided by the
+     * cluster scope alone. The two ranges cannot overlap today (the cluster
+     * CIDRs are never link-local), so the order only fixes what a hand-set
+     * overlap would mean: a dial into the cable's range never carries a lo0
+     * pod source the peer across the cable cannot route back to. */
+    uint32_t dst_h = ntohl(dst.sin_addr.s_addr);
+    const struct in_addr *pin = NULL;
+    const char *pin_s = NULL;
+    const char *verdict = NULL;
+    if (k3sm_bind_cfg.nic > 0 && k3sm_addr_in(k3sm_bind_cfg.iccidrs, k3sm_bind_cfg.nic, dst_h)) {
+        pin = &k3sm_bind_cfg.icip;
+        pin_s = k3sm_bind_cfg.icip_s;
+        verdict = "PIN-INTERCONNECT";
+    } else if (k3sm_addr_in(k3sm_bind_cfg.cidrs, k3sm_bind_cfg.ncidrs, dst_h)) {
+        pin = &k3sm_bind_cfg.podip;
+        pin_s = k3sm_bind_cfg.podip_s;
+        verdict = "PIN";
+    } else {
         k3sm_bind_trace("connect fd=%d dst %s:%u -> PASSTHROUGH-NOTCLUSTER", fd, dbuf, dport);
         return connect(fd, addr, len);
     }
@@ -2104,7 +2213,7 @@ int k3sm_connect(int fd, const struct sockaddr *addr, socklen_t len) {
     src.sin_family = AF_INET;
     src.sin_len = (unsigned char)sizeof src;
     src.sin_port = 0;
-    src.sin_addr = k3sm_bind_cfg.podip;
+    src.sin_addr = *pin;
     if (bind(fd, (const struct sockaddr *)&src, (socklen_t)sizeof src) != 0) {
         /*
          * The alias raced away (EADDRNOTAVAIL after a pod teardown), or the
@@ -2118,7 +2227,6 @@ int k3sm_connect(int fd, const struct sockaddr *addr, socklen_t len) {
                         dbuf, dport, errno);
         return connect(fd, addr, len);
     }
-    k3sm_bind_trace("connect fd=%d dst %s:%u -> PIN source %s", fd, dbuf, dport,
-                    k3sm_bind_cfg.podip_s);
+    k3sm_bind_trace("connect fd=%d dst %s:%u -> %s source %s", fd, dbuf, dport, verdict, pin_s);
     return connect(fd, addr, len);
 }

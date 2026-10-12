@@ -63,7 +63,29 @@ const (
 	// carry a loopback source and never see a reply. Unset or unparseable therefore
 	// means "pin nothing", the same fail-safe polarity EnvPodIP has.
 	EnvClusterCIDRs = "K3SM_CLUSTER_CIDRS"
+	// EnvInterconnectIP names the pod's interconnect slot address (an IPv4
+	// literal inside EnvInterconnectCIDRs, e.g. "169.254.0.11"). An unbound
+	// AF_INET dial whose DESTINATION is inside EnvInterconnectCIDRs is
+	// bind()-pinned to it, so the peer across the cable sees this pod's own
+	// interconnect address. It never changes a bind: a wildcard bind still lands
+	// on EnvPodIP, so a listener is reachable over the interconnect only through
+	// an explicit bind to this address.
+	EnvInterconnectIP = "K3SM_INTERCONNECT_IP"
+	// EnvInterconnectCIDRs names the interconnect range, comma-separated in the
+	// EnvClusterCIDRs format; today exactly "169.254.0.0/24". The shim reads it
+	// only together with EnvInterconnectIP and EnvPodIP: a missing or
+	// unparseable member, a CIDR outside 169.254.0.0/16, or an address outside
+	// every CIDR turns the interconnect pin off and leaves every other behaviour
+	// as it is without these variables.
+	EnvInterconnectCIDRs = "K3SM_INTERCONNECT_CIDRS"
 )
+
+// interconnectRange is the ceiling every interconnect CIDR must lie inside: the
+// IPv4 link-local range. It is held in the C shim as
+// `#define K3SM_INTERCONNECT_RANGE_NET` and `K3SM_INTERCONNECT_RANGE_BITS` and
+// bound to them by TestShimInterconnectRangeMatchesC. A link-local source pinned
+// onto a dial that leaves the link would never see a reply.
+var interconnectRange = netip.MustParsePrefix("169.254.0.0/16")
 
 // MinRewritablePort is the port floor of the bind discipline: a WILDCARD bind
 // below it is passed through unrewritten. It is the Go-side single source of the
@@ -178,4 +200,62 @@ func BindDisciplineEnvWithCIDRs(podIP netip.Addr, cidrs []netip.Prefix) map[stri
 	}
 	env[EnvClusterCIDRs] = strings.Join(out, ",")
 	return env
+}
+
+// InterconnectEnv serializes a pod's interconnect slot address and the
+// interconnect range into the environment map the shim's connect() rung reads:
+// EnvInterconnectIP and EnvInterconnectCIDRs. It is ADDITIVE to
+// BindDisciplineEnvWithCIDRs, whose output it never changes; a caller merges
+// the two maps. The shim honours the pair only when K3SM_POD_IP is also set.
+//
+// It returns nil, meaning "inject nothing", unless ip can serve as an
+// interconnect source: ip must be a valid, specified IPv4 address (a 4-in-6
+// spelling is unmapped first) inside one of the usable cidrs.
+//
+// CIDR handling mirrors BindDisciplineEnvWithCIDRs:
+//   - each prefix is Unmap()ed and Masked(); caller order is kept and exact
+//     duplicates are dropped.
+//   - an invalid or non-IPv4 prefix, or one not inside 169.254.0.0/16 (which
+//     includes /0 and every prefix shorter than /16), is SKIPPED, so the scope
+//     can only narrow, never reach a destination off the link.
+//   - more than MaxClusterCIDRs usable prefixes => nil. The shim parses this
+//     list into a table of the same fixed size as the cluster list and treats
+//     an over-long value as unparseable, so the encoder refuses it outright.
+//   - no usable prefix, or ip inside none of them => nil.
+func InterconnectEnv(ip netip.Addr, cidrs []netip.Prefix) map[string]string {
+	ip = ip.Unmap()
+	if !ip.IsValid() || !ip.Is4() || ip.IsUnspecified() {
+		return nil
+	}
+	out := make([]string, 0, len(cidrs))
+	seen := make(map[netip.Prefix]struct{}, len(cidrs))
+	inScope := false
+	for _, p := range cidrs {
+		if !p.IsValid() {
+			continue
+		}
+		p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits())
+		if !p.IsValid() || !p.Addr().Is4() {
+			continue
+		}
+		p = p.Masked()
+		if p.Bits() < interconnectRange.Bits() || !interconnectRange.Contains(p.Addr()) {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p.String())
+		if p.Contains(ip) {
+			inScope = true
+		}
+	}
+	if len(out) == 0 || len(out) > MaxClusterCIDRs || !inScope {
+		return nil
+	}
+	return map[string]string{
+		EnvInterconnectIP:    ip.String(),
+		EnvInterconnectCIDRs: strings.Join(out, ","),
+	}
 }
