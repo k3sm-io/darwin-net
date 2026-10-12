@@ -17,16 +17,19 @@ limitations under the License.
 package netd
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"math/bits"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -35,6 +38,10 @@ import (
 	"k3sm.io/darwin-net/pkg/netd/wire"
 	"k3sm.io/darwin-net/pkg/podnet"
 )
+
+// bridgeIface is the Thunderbolt Bridge interface macOS puts every Thunderbolt
+// port into, and the interface every interconnect alias lives on.
+const bridgeIface = "bridge0"
 
 // interconnectCIDR is the one connected subnet every interconnect address lives
 // in (netv1alpha1.InterconnectCIDR).
@@ -77,8 +84,7 @@ func (a *darwinApplier) InterconnectAddrs(ctx context.Context) (map[netip.Addr]i
 	if !bytes.HasPrefix(out, []byte(bridgeIface+":")) {
 		return nil, fmt.Errorf("%w: ifconfig printed no %s report", errBridgeUnreadable, bridgeIface)
 	}
-	_, _, masks := parseIfconfig(out)
-	return masks, nil
+	return parseIfconfig(out), nil
 }
 
 // bridgeHas reports whether addr is on bridge0. A missing bridge0 is a verified
@@ -487,4 +493,51 @@ func writeFileAtomic(path, pattern string, data []byte) error {
 		return fmt.Errorf("sync directory %s: %w", dir, err)
 	}
 	return nil
+}
+
+// parseIfconfig reads the IPv4 addresses of `ifconfig <iface>` output ("inet A
+// netmask ...") with each address's netmask as a prefix length (-1 when the line
+// carries no netmask ifconfig's way or a non-contiguous one).
+func parseIfconfig(out []byte) map[netip.Addr]int {
+	masks := make(map[netip.Addr]int)
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) < 2 || f[0] != "inet" {
+			continue
+		}
+		if ip, err := netip.ParseAddr(f[1]); err == nil {
+			masks[ip] = -1
+			if i := slices.Index(f, "netmask"); i > 0 && i+1 < len(f) {
+				masks[ip] = netmaskBits(f[i+1])
+			}
+		}
+	}
+	return masks
+}
+
+// netmaskBits converts an ifconfig netmask, hex ("0xffffff00") or dotted
+// ("255.255.255.0"), to its prefix length, or -1 when it is unparsable or not
+// contiguous.
+func netmaskBits(s string) int {
+	var m uint32
+	if hex, ok := strings.CutPrefix(s, "0x"); ok {
+		v, err := strconv.ParseUint(hex, 16, 32)
+		if err != nil {
+			return -1
+		}
+		m = uint32(v)
+	} else {
+		a, err := netip.ParseAddr(s)
+		if err != nil || !a.Is4() {
+			return -1
+		}
+		b := a.As4()
+		m = uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+	}
+	n := bits.LeadingZeros32(^m)
+	if n < 32 && m<<n != 0 {
+		return -1
+	}
+	return n
 }

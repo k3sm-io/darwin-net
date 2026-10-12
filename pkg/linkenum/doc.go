@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package linkenum enumerates a Mac's direct-link ports: the Thunderbolt
-// receptacles, the network interface each one presents as, the domain at each
-// end of a cable, and the RDMA device a port carries.
+// Package linkenum enumerates a Mac's Thunderbolt ports for k3sm's interconnect
+// reporter: the Thunderbolt receptacles, the network interface each one presents
+// as, the domain at each end of a cable, and the RDMA device a port carries.
 //
 // # Exec only
 //
@@ -26,9 +26,7 @@ limitations under the License.
 // for the receptacle-to-interface mapping, and /usr/bin/ibv_devices for the RDMA
 // devices. There is no SPI, no cgo, and no RDMA library link: the package builds
 // CGO_ENABLED=0 and never includes a verbs header. The commands need no privilege,
-// so the unprivileged service user runs the enumeration; the root network helper
-// runs only the networksetup half (HardwarePorts) to validate what it is asked to
-// configure.
+// so the unprivileged service user runs the enumeration.
 //
 // # The join
 //

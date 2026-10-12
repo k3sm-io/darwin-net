@@ -56,10 +56,6 @@ func (p *recordingPriv) ConfigureMesh(context.Context, string, int, mesh.Plan) e
 
 func (p *recordingPriv) RemoveMesh(context.Context) error { p.served = true; return nil }
 
-func (p *recordingPriv) ConfigureLink(context.Context, LinkSpec) error { p.served = true; return nil }
-
-func (p *recordingPriv) RemoveLink(context.Context, string) error { p.served = true; return nil }
-
 func (p *recordingPriv) InterconnectAddrs(context.Context) (map[netip.Addr]int, error) {
 	return nil, nil
 }

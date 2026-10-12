@@ -31,17 +31,17 @@ import (
 )
 
 const (
-	// ProbeInterval is how often each direct peer is probed.
+	// ProbeInterval is how often each interconnect peer is probed.
 	ProbeInterval = 5 * time.Second
-	// ProbeMisses is how many consecutive unanswered probes declare a direct
-	// peer dead (15 s at ProbeInterval).
+	// ProbeMisses is how many consecutive unanswered probes declare an
+	// interconnect peer dead (15 s at ProbeInterval).
 	ProbeMisses = 3
 	// probeTimeout bounds one echo's wait for its reply.
 	probeTimeout = 2 * time.Second
 )
 
-// ProbeTarget is one direct peer to probe: the local cable interface and the
-// peer's link address on it.
+// ProbeTarget is one interconnect peer to probe: the local interface the cable is
+// on and the peer's interconnect address on it.
 type ProbeTarget struct {
 	Iface string
 	Peer  netip.Addr
@@ -52,15 +52,15 @@ type pinger interface {
 	Ping(ctx context.Context, dst netip.Addr, timeout time.Duration) error
 }
 
-// Prober is the direct-link liveness probe. A cable whose peer sleeps or hangs
-// raises no link event (Thunderbolt has no wake-on-LAN, and the local link stays
-// up), so liveness is probed, not inferred: every ProbeInterval each target gets
+// Prober is the interconnect peer liveness probe, used by k3sm's interconnect
+// reporter. A cable whose peer sleeps or hangs raises no link event (Thunderbolt
+// has no wake-on-LAN, and the local link stays up), so liveness is probed, not inferred: every ProbeInterval each target gets
 // one ICMP echo; a target is alive from its first answered echo and dead after
 // ProbeMisses unanswered ones in a row, and it comes back only when an echo is
 // answered again. Every transition calls the onChange callback (outside any lock).
 //
-// A new target starts dead: the cable carries pods only after the peer has
-// answered over it.
+// A new target starts dead: a peer counts as reachable over the cable only after
+// it has answered over it.
 //
 // Locking discipline: mu guards targets and state; Ping runs without it, so a slow
 // echo never blocks Alive.
@@ -76,6 +76,11 @@ type probeState struct {
 	alive  bool
 	misses int
 }
+
+// NewProber returns a Prober over the unprivileged ICMP pinger that calls
+// onChange (outside any lock) on every liveness transition. Run drives it. Its
+// intended consumer is k3sm's interconnect reporter, which probes slot-0 peers.
+func NewProber(onChange func(ProbeTarget, bool)) *Prober { return newProber(nil, onChange) }
 
 // newProber returns a Prober using p (nil: the unprivileged ICMP pinger).
 func newProber(p pinger, onChange func(ProbeTarget, bool)) *Prober {
@@ -203,7 +208,7 @@ func (icmpPinger) Ping(ctx context.Context, dst netip.Addr, timeout time.Duratio
 	}
 	id := os.Getpid() & 0xffff
 	seq := int(time.Now().UnixNano() & 0xffff)
-	msg := icmp.Message{Type: ipv4.ICMPTypeEcho, Body: &icmp.Echo{ID: id, Seq: seq, Data: []byte("k3sm-direct-link")}}
+	msg := icmp.Message{Type: ipv4.ICMPTypeEcho, Body: &icmp.Echo{ID: id, Seq: seq, Data: []byte("k3sm-interconnect")}}
 	b, err := msg.Marshal(nil)
 	if err != nil {
 		return fmt.Errorf("marshal icmp echo: %w", err)

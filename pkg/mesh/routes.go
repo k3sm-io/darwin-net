@@ -45,10 +45,10 @@ var ErrRouteNotInstalled = errors.New("mesh: kernel route not installed")
 // a command claimed to have done — and it is what the applier verifies against.
 //
 // A route is one of two forms. A LINK route (Gateway zero) sends the prefix out of
-// Interface with the link itself as the next hop: the per-peer utun routes, and an
-// on-link /32 host route to a direct-link peer (which is how ARP comes to resolve
-// that peer on the cable). A GATEWAY route (Gateway set) sends the prefix to
-// Gateway, bound to Interface: the direct /25s through a peer's link address.
+// Interface with the link itself as the next hop: the per-peer utun routes. A
+// GATEWAY route (Gateway set) sends the prefix to Gateway, bound to Interface; the
+// mesh requests none, but the kernel reports them, and the read-back must tell one
+// from a link route for the same prefix.
 type Route struct {
 	// Prefix is the masked destination prefix (a host route is a /32).
 	Prefix netip.Prefix
@@ -294,12 +294,10 @@ func requestString(r Route) string {
 //     routes): RTF_UP|RTF_STATIC, the gateway is the interface's own AF_LINK
 //     address carrying its index (the next hop is the link itself), and the
 //     netmask says how wide the route is.
-//   - `-host <addr> -interface <iface>` (a /32 link route, the on-link host route
-//     to a direct-link peer): RTF_UP|RTF_STATIC|RTF_HOST, the AF_LINK gateway, no
-//     netmask. A host route bound to the link is what makes the kernel resolve the
-//     peer by ARP on that cable.
-//   - `-net <prefix> <gateway> -ifp <iface> [-ifa <source>]` (a gateway route, the
-//     direct /25s): RTF_UP|RTF_STATIC|RTF_GATEWAY, RTAX_GATEWAY the next hop as an
+//   - `-host <addr> -interface <iface>` (a /32 link route): RTF_UP|RTF_STATIC|
+//     RTF_HOST, the AF_LINK gateway, no netmask.
+//   - `-net <prefix> <gateway> -ifp <iface> [-ifa <source>]` (a gateway route):
+//     RTF_UP|RTF_STATIC|RTF_GATEWAY, RTAX_GATEWAY the next hop as an
 //     IPv4 address, RTAX_IFP the interface's AF_LINK address (which binds the route
 //     to that interface), and RTAX_IFA the source address when one is set.
 func routeMessage(typ int, r Route, ifindex int) *xroute.RouteMessage {
