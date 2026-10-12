@@ -67,6 +67,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <os/log.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -1844,9 +1845,26 @@ static void k3sm_interconnect_cfg_init(void) {
             return;
         }
     }
-    if (!k3sm_addr_in(k3sm_bind_cfg.iccidrs, n, ntohl(k3sm_bind_cfg.icip.s_addr))) {
+    uint32_t icip_h = ntohl(k3sm_bind_cfg.icip.s_addr);
+    if (!k3sm_addr_in(k3sm_bind_cfg.iccidrs, n, icip_h)) {
         k3sm_bind_trace("interconnect: K3SM_INTERCONNECT_IP=%s is outside %s -> off", ip, cidrs);
         return;
+    }
+    /* The network and broadcast addresses of any CIDR that contains the
+     * address are not host addresses (169.254.0.0 and 169.254.0.255 for the
+     * /24), so they are refused as a source. A /31 or /32 has neither, the
+     * RFC 3021 reading, so it is exempt. pkg/podnet's InterconnectEnv applies
+     * the same rule. */
+    for (int i = 0; i < n; i++) {
+        const k3sm_cidr_t *c = &k3sm_bind_cfg.iccidrs[i];
+        if ((icip_h & c->mask) != c->net || c->mask == 0xffffffffu || c->mask == 0xfffffffeu) {
+            continue;
+        }
+        if (icip_h == c->net || icip_h == (c->net | ~c->mask)) {
+            k3sm_bind_trace("interconnect: K3SM_INTERCONNECT_IP=%s is the network or broadcast "
+                            "address of %s -> off", ip, c->s);
+            return;
+        }
     }
     snprintf(k3sm_bind_cfg.icip_s, sizeof k3sm_bind_cfg.icip_s, "%s", ip);
     k3sm_bind_cfg.nic = n;
@@ -2122,6 +2140,31 @@ int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len) {
  */
 
 /*
+ * k3sm_interconnect_pin_failed reports, ONCE per process and above trace level,
+ * that a dial into the interconnect range went out unpinned because binding
+ * the interconnect address failed (typically EADDRNOTAVAIL: the bridge0 alias
+ * is missing or was removed). The dial still proceeds unpinned, the fail-safe
+ * polarity, but the peer across the cable then cannot attribute the
+ * connection to this pod, which is worth one line in the unified log
+ * (subsystem io.k3sm.shim). Later failures are left to the K3SM_BIND_DEBUG
+ * trace, so nothing logs per dial. The caller passes the bind's errno, and the
+ * real connect() that follows sets its own, so logging here cannot clobber
+ * what the workload sees.
+ */
+static int k3sm_ic_pin_failed_logged;
+
+static void k3sm_interconnect_pin_failed(int err) {
+    if (__atomic_exchange_n(&k3sm_ic_pin_failed_logged, 1, __ATOMIC_RELAXED) != 0) {
+        return;
+    }
+    os_log_t lg = os_log_create("io.k3sm.shim", "interconnect");
+    os_log_error(lg,
+                 "interconnect source pin to %{public}s failed (errno=%d); dials into the "
+                 "interconnect range go out unpinned (logged once per process)",
+                 k3sm_bind_cfg.icip_s, err);
+}
+
+/*
  * The interposed connect(). Every path returns the REAL connect()'s result, and
  * every trace is emitted BEFORE that call, so the caller sees the kernel's errno
  * untouched (a trace after the call would clobber it).
@@ -2215,6 +2258,7 @@ int k3sm_connect(int fd, const struct sockaddr *addr, socklen_t len) {
     src.sin_port = 0;
     src.sin_addr = *pin;
     if (bind(fd, (const struct sockaddr *)&src, (socklen_t)sizeof src) != 0) {
+        int perr = errno;
         /*
          * The alias raced away (EADDRNOTAVAIL after a pod teardown), or the
          * ephemeral range is exhausted. A WORKING DIAL BEATS A PINNED FAILURE:
@@ -2224,7 +2268,10 @@ int k3sm_connect(int fd, const struct sockaddr *addr, socklen_t len) {
          * trace names, not an outage.
          */
         k3sm_bind_trace("connect fd=%d dst %s:%u -> PIN-FAILED errno=%d, dialling UNPINNED", fd,
-                        dbuf, dport, errno);
+                        dbuf, dport, perr);
+        if (pin == &k3sm_bind_cfg.icip) {
+            k3sm_interconnect_pin_failed(perr);
+        }
         return connect(fd, addr, len);
     }
     k3sm_bind_trace("connect fd=%d dst %s:%u -> %s source %s", fd, dbuf, dport, verdict, pin_s);

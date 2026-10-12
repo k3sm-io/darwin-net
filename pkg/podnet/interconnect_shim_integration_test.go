@@ -45,6 +45,10 @@ const (
 	icTestDst        = "169.254.0.250"
 	icTestOutDst     = "198.51.100.7" // RFC 5737 TEST-NET-2
 	icTestBasePort   = "18522"
+
+	// icScopeAccepted is the trace line the shim prints when it accepts the
+	// interconnect scope.
+	icScopeAccepted = "interconnect: source-pin scope"
 )
 
 // icRepoRoot returns the darwin-net repo root from this file's location.
@@ -234,6 +238,8 @@ func TestInterconnectEnvPinsSourceInScope(t *testing.T) {
 		{"ip outside the cidrs", []string{EnvInterconnectIP + "=" + icTestPodIP, EnvInterconnectCIDRs + "=" + icRange}},
 		{"cidr outside link-local", []string{EnvInterconnectIP + "=" + icTestIP, EnvInterconnectCIDRs + "=" + icRange + ",198.51.100.0/24"}},
 		{"/0", []string{EnvInterconnectIP + "=" + icTestIP, EnvInterconnectCIDRs + "=0.0.0.0/0"}},
+		{"network address", []string{EnvInterconnectIP + "=169.254.0.0", EnvInterconnectCIDRs + "=" + icRange}},
+		{"broadcast address", []string{EnvInterconnectIP + "=169.254.0.255", EnvInterconnectCIDRs + "=" + icRange}},
 	}
 	for _, tc := range inert {
 		t.Run("inert/"+tc.name, func(t *testing.T) {
@@ -243,11 +249,62 @@ func TestInterconnectEnvPinsSourceInScope(t *testing.T) {
 					t.Errorf("case %s sourced %s, want the cluster-only %s", c, got, want)
 				}
 			}
-			if strings.Contains(arm.trace, "PIN-INTERCONNECT") {
-				t.Errorf("an interconnect pin fired:\n%s", arm.trace)
+			if strings.Contains(arm.trace, "PIN-INTERCONNECT") || strings.Contains(arm.trace, icScopeAccepted) {
+				t.Errorf("the shim accepted the interconnect scope or pinned a dial:\n%s", arm.trace)
 			}
 		})
 	}
+	// A valid interconnect address that is not on the host: the pin's bind
+	// fails, the dial still goes out (unpinned, with the kernel's own source),
+	// and the failure is traced. The one-shot unified-log line is not read
+	// here; reading the log store is slow and needs no extra coverage beyond
+	// the trace, which proves the branch ran.
+	t.Run("a failed pin falls through unpinned", func(t *testing.T) {
+		missing := "169.254.0.252"
+		arm := run(t, true, append(cloneEnv(podEnv), EnvInterconnectIP+"="+missing, EnvInterconnectCIDRs+"="+icRange)...)
+		c := arm.cases["ic_dial_interconnect"]
+		if c["RC"] != "0" {
+			t.Fatalf("dial failed after a failed pin: %v", c)
+		}
+		if got, want := arm.local("ic_dial_interconnect"), clusterOnly.local("ic_dial_interconnect"); got != want {
+			t.Errorf("dial sourced %s, want the unpinned %s", got, want)
+		}
+		if want := "dst " + icTestDst + ":9999 -> PIN-FAILED errno=49"; !strings.Contains(arm.trace, want) {
+			t.Errorf("trace lacks %q (EADDRNOTAVAIL):\n%s", want, arm.trace)
+		}
+	})
+
+	// The C and Go sides must agree on which (address, range) pairs are
+	// usable. Every input here is canonical (masked, inside 169.254.0.0/16),
+	// the only shape InterconnectEnv emits, so Go's verdict on it and the
+	// shim's verdict on the same strings must match exactly.
+	t.Run("the shim and InterconnectEnv agree", func(t *testing.T) {
+		pairs := []struct{ ip, cidrs string }{
+			{icTestIP, icRange},
+			{"169.254.0.1", icRange},
+			{"169.254.0.254", icRange},
+			{"169.254.0.0", icRange},
+			{"169.254.0.255", icRange},
+			{"169.254.0.255", "169.254.0.0/16,169.254.0.0/24"},
+			{"169.254.0.11", "169.254.0.8/29,169.254.0.0/24"},
+			{"169.254.0.11", "169.254.0.11/32"},
+			{"169.254.0.10", "169.254.0.10/31"},
+			{"169.254.9.209", icRange},
+		}
+		for _, pr := range pairs {
+			var cidrs []netip.Prefix
+			for _, c := range strings.Split(pr.cidrs, ",") {
+				cidrs = append(cidrs, netip.MustParsePrefix(c))
+			}
+			goOK := InterconnectEnv(netip.MustParseAddr(pr.ip), cidrs) != nil
+			arm := run(t, true, append(cloneEnv(podEnv), EnvInterconnectIP+"="+pr.ip, EnvInterconnectCIDRs+"="+pr.cidrs)...)
+			cOK := strings.Contains(arm.trace, icScopeAccepted)
+			if goOK != cOK {
+				t.Errorf("%s in %s: InterconnectEnv accepts=%v, shim accepts=%v\n%s", pr.ip, pr.cidrs, goOK, cOK, arm.trace)
+			}
+		}
+	})
+
 	t.Run("inert/no pod IP", func(t *testing.T) {
 		arm := run(t, true, append([]string{"K3SM_CLUSTER_CIDRS=" + icTestClusterNet}, icEnv...)...)
 		for c := range control.cases {
