@@ -67,7 +67,7 @@ golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 # 2023-01-26T15:27:24
 golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446 # 2026-05-22T21:04:24Z
 google.golang.org/genproto/googleapis/rpc v0.0.0-20260618152121-87f3d3e198d3 # 2026-06-18T15:21:21Z
 google.golang.org/grpc v1.83.2 # 2026-08-25T15:47:16Z
-google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af # 2026-01-20T15:10:49Z
+google.golang.org/protobuf v1.36.12 # 2026-08-10T13:29:45Z
 gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c # 2020-11-30T13:44:42Z
 gopkg.in/evanphx/json-patch.v4 v4.13.0 # 2025-01-28T17:43:52Z
 gopkg.in/inf.v0 v0.9.1 # 2018-03-26T17:23:32Z
