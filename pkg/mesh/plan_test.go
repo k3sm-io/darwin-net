@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	netv1 "k3sm.io/apis/net/v1"
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 )
 
 // wgKeyB64 builds a deterministic, valid 32-byte wireguard key base64-encoded, so
@@ -226,7 +227,7 @@ func TestMeshPlanUAPIAndKeyHex(t *testing.T) {
 		self := netip.MustParsePrefix("100.64.0.0/24")
 		plan, err := BuildPlan(self, []netv1.MeshPeerSpec{
 			peerSpec("nodeB", "100.64.1.0/24", "192.0.2.10:51820", 0x42),
-		}, nil)
+		})
 		if err != nil {
 			t.Fatalf("BuildPlan: %v", err)
 		}
@@ -262,7 +263,7 @@ func TestBuildPlanSkipsSelfAndInvalid(t *testing.T) {
 	badVersion := peerSpec("nodeD", "100.64.3.0/24", "192.0.2.4:51820", 0x04)
 	badVersion.SchemaVersion = 99 // unsupported (WithDefaults leaves a non-zero value)
 
-	plan, err := BuildPlan(self, []netv1.MeshPeerSpec{selfPeer, good, wrongAllowed, badVersion}, nil)
+	plan, err := BuildPlan(self, []netv1.MeshPeerSpec{selfPeer, good, wrongAllowed, badVersion})
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}
@@ -313,7 +314,7 @@ func TestBuildPlanWithSelfAtANonZeroIndex(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// ValidatePlan is BuildPlan plus the refusals ConfigureMesh applies, so
 			// a pass here is the plan a reconcile would program.
-			plan, err := ValidatePlan(netip.MustParsePrefix(tc.self), peers, nil)
+			plan, err := ValidatePlan(netip.MustParsePrefix(tc.self), peers)
 			if err != nil {
 				t.Fatalf("ValidatePlan: %v", err)
 			}
@@ -341,6 +342,87 @@ func TestBuildPlanWithSelfAtANonZeroIndex(t *testing.T) {
 			}
 			if containsPrefix(routes, tc.self) {
 				t.Errorf("routes = %v include this node's own %s", routes, tc.self)
+			}
+		})
+	}
+}
+
+// directCandidate is a peer's wireguard endpoint on a Thunderbolt cable: the
+// peer's direct-link address (netv1alpha1.LinkIP of its node index and port).
+// MeshPeerSpec still carries the direct link value, with no writer.
+func directCandidate(t *testing.T, idx, port int) netv1.EndpointCandidate {
+	t.Helper()
+	ip, err := netv1alpha1.LinkIP(idx, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return netv1.EndpointCandidate{Address: netip.AddrPortFrom(ip, DefaultListenPort).String(), Link: netv1.EndpointLinkDirect}
+}
+
+// TestBuildPlanUtunRoutesOnly pins the mesh as tunnel-only: whatever direct link
+// endpoints the peers carry, BuildPlan (and its strict form) emits exactly one
+// utun route per peer pod /24, never a /25 gateway half or an on-link host route,
+// and never selects a direct candidate as a peer's endpoint. A candidate with an
+// unknown Link is ignored, never a reason to skip the peer.
+func TestBuildPlanUtunRoutesOnly(t *testing.T) {
+	self := netip.MustParsePrefix("100.64.0.0/24")
+	const underlay = "192.0.2.10:51820"
+
+	both := peerSpec("nodeB", "100.64.1.0/24", underlay, 0x42)
+	both.Endpoints = []netv1.EndpointCandidate{
+		directCandidate(t, 1, 0),
+		{Address: "203.0.113.9:51820", Link: "satellite"}, // a Link this reader does not know
+		{Address: underlay, Link: netv1.EndpointLinkUnderlay},
+	}
+	cableOnly := directCandidate(t, 2, 1)
+	onlyDirect := peerSpec("nodeC", "100.64.2.0/24", cableOnly.Address, 0x43)
+	onlyDirect.Endpoints = []netv1.EndpointCandidate{cableOnly}
+	plain := peerSpec("nodeD", "100.64.3.0/24", "192.0.2.12:51820", 0x44)
+	peers := []netv1.MeshPeerSpec{both, onlyDirect, plain}
+
+	wantRoutes := []RouteSpec{
+		{Prefix: netip.MustParsePrefix("100.64.1.0/24")},
+		{Prefix: netip.MustParsePrefix("100.64.2.0/24")},
+		{Prefix: netip.MustParsePrefix("100.64.3.0/24")},
+	}
+	wantEndpoints := map[string]string{"nodeB": underlay, "nodeC": cableOnly.Address, "nodeD": "192.0.2.12:51820"}
+
+	build := map[string]func() (Plan, error){
+		"BuildPlan":    func() (Plan, error) { return BuildPlan(self, peers) },
+		"ValidatePlan": func() (Plan, error) { return ValidatePlan(self, peers) },
+	}
+	for name, fn := range build {
+		t.Run(name, func(t *testing.T) {
+			plan, err := fn()
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if len(plan.Skipped) != 0 {
+				t.Fatalf("peers skipped: %+v", plan.Skipped)
+			}
+			for _, r := range plan.Routes {
+				if r.Prefix.Bits() != nodeCIDRBits {
+					t.Errorf("route %s is not a utun /%d (a /25 half or a host route leaked into the plan)", r, nodeCIDRBits)
+				}
+				if netv1alpha1.IsLinkAddress(r.Prefix.Addr()) {
+					t.Errorf("route %s targets a direct-link address", r)
+				}
+			}
+			if len(plan.Routes) != len(wantRoutes) {
+				t.Fatalf("routes = %v, want exactly the utun routes %v", plan.Routes, wantRoutes)
+			}
+			for i, r := range plan.Routes {
+				if r != wantRoutes[i] {
+					t.Fatalf("routes = %v, want exactly the utun routes %v", plan.Routes, wantRoutes)
+				}
+			}
+			if len(plan.Peers) != len(wantEndpoints) {
+				t.Fatalf("peers = %+v, want %d", plan.Peers, len(wantEndpoints))
+			}
+			for _, pc := range plan.Peers {
+				if pc.Endpoint != wantEndpoints[pc.NodeName] {
+					t.Errorf("peer %s endpoint = %q, want %q (the underlay candidate, else Endpoint)", pc.NodeName, pc.Endpoint, wantEndpoints[pc.NodeName])
+				}
 			}
 		})
 	}

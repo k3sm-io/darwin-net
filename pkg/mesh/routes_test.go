@@ -443,3 +443,74 @@ func TestKernelRouteTableRefusesAnUnknownInterface(t *testing.T) {
 		t.Fatal("Add on a nonexistent interface returned no error")
 	}
 }
+
+// TestReconcileRoutesRefusesAGatewayRouteForTheUtun pins that the read-back
+// compares the route's form: a gateway route for a peer's /24 does not satisfy
+// the utun link route the plan wants.
+func TestReconcileRoutesRefusesAGatewayRouteForTheUtun(t *testing.T) {
+	peer := netip.MustParsePrefix("100.64.1.0/24")
+	fake := &fakeRouteTable{dropAdds: true, table: []Route{{Prefix: peer, Interface: "utun9", Gateway: netip.MustParseAddr("169.254.1.0"), Flags: unix.RTF_UP | unix.RTF_GATEWAY}}}
+	if _, err := routeDevice(fake).reconcileRoutes(context.Background(), []RouteSpec{{Prefix: peer}}); !errors.Is(err, ErrRouteNotInstalled) {
+		t.Fatalf("a gateway route satisfied the utun link route: %v", err)
+	}
+}
+
+// TestRouteMessageEncodesGatewayAndHostRoutes pins the gateway and host request
+// forms against the parser the read-back uses.
+func TestRouteMessageEncodesGatewayAndHostRoutes(t *testing.T) {
+	src := netip.MustParseAddr("100.64.0.1")
+	gwAddr := netip.MustParseAddr("169.254.1.0")
+	half := netip.MustParsePrefix("100.64.1.128/25")
+	parse := func(t *testing.T, m *xroute.RouteMessage) *xroute.RouteMessage {
+		t.Helper()
+		b, err := m.Marshal()
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		msgs, err := xroute.ParseRIB(xroute.RIBTypeRoute, b)
+		if err != nil || len(msgs) != 1 {
+			t.Fatalf("parse: %v (%d)", err, len(msgs))
+		}
+		rm := msgs[0].(*xroute.RouteMessage)
+		// A request carries no rtm_index; the kernel's dump of the installed route
+		// does. Stamp it as the dump would, so decodeRoute names the interface.
+		rm.Index = 12
+		return rm
+	}
+	t.Run("gateway route with source", func(t *testing.T) {
+		rm := parse(t, routeMessage(unix.RTM_ADD, Route{Prefix: half, Interface: "en5", Gateway: gwAddr, Source: src}, 12))
+		if rm.Flags != unix.RTF_UP|unix.RTF_STATIC|unix.RTF_GATEWAY {
+			t.Errorf("flags = %#x, want RTF_UP|RTF_STATIC|RTF_GATEWAY", rm.Flags)
+		}
+		gw, ok := rm.Addrs[unix.RTAX_GATEWAY].(*xroute.Inet4Addr)
+		if !ok || netip.AddrFrom4(gw.IP) != gwAddr {
+			t.Errorf("gateway = %+v, want %s", rm.Addrs[unix.RTAX_GATEWAY], gwAddr)
+		}
+		ifp, ok := rm.Addrs[unix.RTAX_IFP].(*xroute.LinkAddr)
+		if !ok || ifp.Index != 12 {
+			t.Errorf("ifp = %+v, want the AF_LINK address of index 12", rm.Addrs[unix.RTAX_IFP])
+		}
+		ifa, ok := rm.Addrs[unix.RTAX_IFA].(*xroute.Inet4Addr)
+		if !ok || netip.AddrFrom4(ifa.IP) != src {
+			t.Errorf("ifa = %+v, want %s", rm.Addrs[unix.RTAX_IFA], src)
+		}
+		r, ok := decodeRoute(rm, map[int]string{12: "en5"})
+		if !ok || !holds(r, Route{Prefix: half, Interface: "en5", Gateway: gwAddr}) {
+			t.Errorf("read-back decodes %+v (%v), which does not hold the route it was built from", r, ok)
+		}
+	})
+	t.Run("host link route", func(t *testing.T) {
+		host := Route{Prefix: netip.PrefixFrom(gwAddr, 32), Interface: "en5"}
+		rm := parse(t, routeMessage(unix.RTM_ADD, host, 12))
+		if rm.Flags != unix.RTF_UP|unix.RTF_STATIC|unix.RTF_HOST {
+			t.Errorf("flags = %#x, want RTF_UP|RTF_STATIC|RTF_HOST", rm.Flags)
+		}
+		if gw, ok := rm.Addrs[unix.RTAX_GATEWAY].(*xroute.LinkAddr); !ok || gw.Index != 12 {
+			t.Errorf("gateway = %+v, want the AF_LINK address of index 12", rm.Addrs[unix.RTAX_GATEWAY])
+		}
+		r, ok := decodeRoute(rm, map[int]string{12: "en5"})
+		if !ok || !holds(r, host) {
+			t.Errorf("read-back decodes %+v (%v)", r, ok)
+		}
+	})
+}

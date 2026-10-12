@@ -18,6 +18,7 @@ package netd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -117,6 +118,22 @@ func (h *bridgeHost) has(a string) bool { return h.addrs[netip.MustParseAddr(a)]
 // icServer builds a daemon whose executor is the production applier over h. A
 // non-empty cidr is seeded as the adopted identity; ledger, when non-empty, is
 // the persisted owned-alias file's content.
+type keyResolver struct{}
+
+func (keyResolver) Resolve(context.Context, string) (string, error) { return "key", nil }
+
+// call dispatches one request through the server's own decode-and-route path.
+func call(t *testing.T, s *Server, req wire.Request) wire.Response {
+	t.Helper()
+	req.Version = wire.CurrentVersion()
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, _ := s.dispatch(context.Background(), newConnState(wire.DefaultMaxPerConn), b)
+	return resp
+}
+
 func icServer(t *testing.T, cidr string, h *bridgeHost, ledger string) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -453,4 +470,25 @@ func TestInterconnectAliasPolicy(t *testing.T) {
 			t.Fatalf("a restart removed owned aliases: ops %q", h.ops)
 		}
 	})
+}
+
+// TestWithdrawnLinkVerbsAreUnknown pins the withdrawal of minor 1's direct-link
+// verbs: a client that still sends ConfigureLink or RemoveLink gets "unknown verb"
+// (which such a client treats as a mesh-only helper), nothing reaches bridge0,
+// and the reply still carries the daemon's version.
+func TestWithdrawnLinkVerbsAreUnknown(t *testing.T) {
+	h := newBridgeHost(nil)
+	s, _ := icServer(t, "", h, "")
+	for _, verb := range []wire.Verb{"ConfigureLink", "RemoveLink"} {
+		resp := call(t, s, wire.Request{Verb: verb})
+		if resp.OK || !strings.Contains(resp.Error, "unknown verb") {
+			t.Errorf("%s reply = %+v, want an unknown-verb refusal", verb, resp)
+		}
+		if resp.Version != wire.CurrentVersion() {
+			t.Errorf("%s reply version = %+v, want %+v", verb, resp.Version, wire.CurrentVersion())
+		}
+	}
+	if len(h.ops) != 0 {
+		t.Fatalf("a withdrawn verb touched the host: %v", h.ops)
+	}
 }

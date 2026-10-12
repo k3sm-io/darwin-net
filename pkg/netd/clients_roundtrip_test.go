@@ -191,7 +191,7 @@ func TestInterconnectClientRoundTrip(t *testing.T) {
 	})
 	c := wire.NewClient(sock)
 	ctx := context.Background()
-	if err := c.ConfigureMesh(ctx, "node-key-ref", 0, netip.MustParsePrefix("100.64.0.0/24"), nil, nil); err != nil {
+	if err := c.ConfigureMesh(ctx, "node-key-ref", 0, netip.MustParsePrefix("100.64.0.0/24"), nil); err != nil {
 		t.Fatalf("ConfigureMesh: %v", err)
 	}
 	addr, err := c.EnsureInterconnectAlias(ctx, 0)

@@ -60,15 +60,6 @@ type Privileged interface {
 	// BindPort binds a listening socket on the specific addr and returns it; the
 	// caller passes the fd to the client and closes this copy.
 	BindPort(ctx context.Context, network string, addr netip.AddrPort) (*os.File, error)
-	// ConfigureLink configures a validated direct-link port (idempotent): out of
-	// bridge0, its /32 address, offload off, the on-link host route to the peer
-	// when one is given, all read back from the kernel before it returns nil. A
-	// failure leaves no alias or host route of this call behind.
-	ConfigureLink(ctx context.Context, spec LinkSpec) error
-	// RemoveLink tears a direct-link port down (idempotent): the direct routes
-	// over it first, then its host route and address, then bridge membership is
-	// restored.
-	RemoveLink(ctx context.Context, iface string) error
 	// InterconnectAddrs reads bridge0's IPv4 addresses with each one's prefix
 	// length (-1 when unknown). A host without bridge0 yields an error wrapping
 	// wire.ErrInterconnectNoBridge; any other read failure is a different error.
@@ -79,24 +70,6 @@ type Privileged interface {
 	// RemoveInterconnectAlias removes a validated interconnect address from
 	// bridge0, and nothing else.
 	RemoveInterconnectAlias(ctx context.Context, addr netip.Addr) error
-}
-
-// LinkSpec is a direct-link port the server has validated: the Thunderbolt
-// interface, the address the server derived for it, and the peer's address on
-// the cable (invalid: no host route).
-type LinkSpec struct {
-	Iface      string
-	LinkIP     netip.Addr
-	PeerLinkIP netip.Addr
-}
-
-// linkRouter is the host-route seam the link operations drive
-// (*mesh.HostRoutes in production).
-type linkRouter interface {
-	Ensure(ctx context.Context, peer netip.Addr, iface string) error
-	Remove(ctx context.Context, peer netip.Addr, iface string) error
-	List(ctx context.Context) ([]mesh.Route, error)
-	Delete(ctx context.Context, r mesh.Route) error
 }
 
 // blackholer installs and clears the lo0 blackhole host route that holds a pod
@@ -111,14 +84,13 @@ type blackholer interface {
 }
 
 // meshDevice is the slice of the wireguard device (*mesh.WGDevice in production)
-// the applier drives: bring-up, plan apply, teardown, the direct-route withdraw,
-// and the resolved utun name. It exists so the alias plumbing around the device
-// is testable without a utun.
+// the applier drives: bring-up, plan apply, teardown, and the resolved utun
+// name. It exists so the alias plumbing around the device is testable without a
+// utun.
 type meshDevice interface {
 	Up(ctx context.Context) error
 	Apply(ctx context.Context, plan mesh.Plan) error
 	Down(ctx context.Context) error
-	WithdrawIface(ctx context.Context, iface string) (int, error)
 	Interface() string
 }
 
@@ -249,23 +221,13 @@ type darwinApplier struct {
 	command func(ctx context.Context, name string, args ...string) error
 	routes  blackholer
 	// output runs a read-only command and returns its standard output (the
-	// ifconfig read-backs of the link operations); hostRoutes is the link
-	// operations' host-route seam; ifaceAddrs lists every interface's IPv4
-	// addresses for the start-up reconcile. All three are set by
+	// bridge0 read of the interconnect verbs); ifaceAddrs lists every
+	// interface's IPv4 addresses for the utun alias reconcile. Both are set by
 	// newDarwinApplier and replaced only by unit tests.
 	output     func(ctx context.Context, name string, args ...string) ([]byte, error)
-	hostRoutes linkRouter
 	ifaceAddrs func() (map[string][]netip.Addr, error)
-	// withdraw removes the mesh's direct routes over an interface before its host
-	// route goes (withdrawDirect in production).
-	withdraw func(ctx context.Context, iface string) error
 	// newDevice builds the mesh device (newWGDevice in production).
 	newDevice func(cfg mesh.DeviceConfig, log *slog.Logger) meshDevice
-
-	// linkMu serializes the link operations; links are the ports configured,
-	// guarded by linkMu. Lock order: linkMu, then mu.
-	linkMu sync.Mutex
-	links  map[string]LinkSpec
 
 	aliasMu sync.Mutex
 	aliased map[netip.Addr]aliasState
@@ -289,7 +251,7 @@ func newDarwinApplier(nodePodCIDR netip.Prefix, log *slog.Logger) *darwinApplier
 	}
 	meshIP, _ := podnet.MeshEgressIP(nodePodCIDR)
 	linkIP, _ := podnet.MeshLinkIP(nodePodCIDR)
-	a := &darwinApplier{
+	return &darwinApplier{
 		nodePodCIDR: nodePodCIDR,
 		meshIP:      meshIP,
 		linkIP:      linkIP,
@@ -299,13 +261,9 @@ func newDarwinApplier(nodePodCIDR netip.Prefix, log *slog.Logger) *darwinApplier
 		routes:      podnet.BlackholeRoutes{},
 		aliased:     make(map[netip.Addr]aliasState),
 		output:      runOutput,
-		hostRoutes:  mesh.NewHostRoutes(),
 		ifaceAddrs:  interfaceIPv4Addrs,
-		links:       make(map[string]LinkSpec),
 		newDevice:   newWGDevice,
 	}
-	a.withdraw = a.withdrawDirect
-	return a
 }
 
 // isPodAddress reports whether ip is a pod address of the node /24 this applier
@@ -723,4 +681,31 @@ func run(ctx context.Context, name string, args ...string) error {
 		return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
 	}
 	return nil
+}
+
+// interfaceIPv4Addrs lists every interface's IPv4 addresses.
+func interfaceIPv4Addrs() (map[string][]netip.Addr, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("list interfaces: %w", err)
+	}
+	out := make(map[string][]netip.Addr, len(ifaces))
+	var errs []error
+	for _, ifi := range ifaces {
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("addresses of %s: %w", ifi.Name, err))
+			continue
+		}
+		for _, ad := range addrs {
+			ipn, ok := ad.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if ip, ok := netip.AddrFromSlice(ipn.IP); ok && ip.Unmap().Is4() {
+				out[ifi.Name] = append(out[ifi.Name], ip.Unmap())
+			}
+		}
+	}
+	return out, errors.Join(errs...)
 }

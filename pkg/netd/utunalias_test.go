@@ -142,8 +142,6 @@ func (d *fakeDevice) Down(context.Context) error {
 	return nil
 }
 
-func (d *fakeDevice) WithdrawIface(context.Context, string) (int, error) { return 0, nil }
-
 func (d *fakeDevice) Interface() string {
 	if !d.up {
 		return ""

@@ -77,6 +77,10 @@ type probeState struct {
 	misses int
 }
 
+// NewProber returns a Prober over the unprivileged ICMP pinger that calls
+// onChange (outside any lock) on every liveness transition. Run drives it.
+func NewProber(onChange func(ProbeTarget, bool)) *Prober { return newProber(nil, onChange) }
+
 // newProber returns a Prober using p (nil: the unprivileged ICMP pinger).
 func newProber(p pinger, onChange func(ProbeTarget, bool)) *Prober {
 	if p == nil {
