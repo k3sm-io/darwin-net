@@ -32,9 +32,9 @@ import (
 )
 
 // ErrRouteNotInstalled is returned when a route the mesh programmed is absent from
-// the kernel routing table — or present but bound to another interface, through
-// another gateway, or in the other form (a link route where a gateway route was
-// wanted, or the reverse) — when the applier reads the table back. It is a hard
+// the kernel routing table — or present but bound to another interface, or as a
+// gateway route where a link route was wanted — when the applier reads the table
+// back. It is a hard
 // failure, never a warning: an uninstalled peer route sends every packet for that
 // peer's pods to the host's default gateway, which is a silent cross-node
 // blackhole.
@@ -44,25 +44,19 @@ var ErrRouteNotInstalled = errors.New("mesh: kernel route not installed")
 // reports it. As a report it carries what the kernel actually holds — never what
 // a command claimed to have done — and it is what the applier verifies against.
 //
-// A route is one of two forms. A LINK route (Gateway zero) sends the prefix out of
-// Interface with the link itself as the next hop: the per-peer utun routes, and an
-// on-link /32 host route to a direct-link peer (which is how ARP comes to resolve
-// that peer on the cable). A GATEWAY route (Gateway set) sends the prefix to
-// Gateway, bound to Interface: the direct /25s through a peer's link address.
+// The mesh requests only LINK routes: the prefix goes out of Interface with the
+// link itself as the next hop (the per-peer utun routes). A report may also be a
+// GATEWAY route (Gateway set, RTF_GATEWAY), which is never the mesh's.
 type Route struct {
 	// Prefix is the masked destination prefix (a host route is a /32).
 	Prefix netip.Prefix
 	// Interface is the name of the interface the route is bound to ("utun6").
 	Interface string
-	// Gateway is the next hop of a gateway route; zero for a link route.
+	// Gateway is the next hop of a reported gateway route; zero for a link route.
+	// Reports only.
 	Gateway netip.Addr
-	// Source is the RTAX_IFA address: the source the kernel stamps on a packet
-	// it originates over the route. Requests set it on a gateway route; a report
-	// carries what the kernel returned, if anything. It is not part of the
-	// read-back comparison.
-	Source netip.Addr
-	// Flags are the kernel's RTF_* flags. Reports only; a request's flags are
-	// derived from its form.
+	// Flags are the kernel's RTF_* flags. Reports only; a request is always a
+	// link route.
 	Flags int
 }
 
@@ -74,18 +68,10 @@ func (r Route) String() string {
 	return fmt.Sprintf("%s on %s", r.Prefix, r.Interface)
 }
 
-// holds reports whether the kernel route k is the route want: same prefix, same
-// interface, and the same form — for a gateway route the kernel must report
-// RTF_GATEWAY and the same next hop, and for a link route it must not report
-// RTF_GATEWAY at all.
+// holds reports whether the kernel route k is the link route want: same prefix,
+// same interface, and not RTF_GATEWAY.
 func holds(k, want Route) bool {
-	if k.Prefix != want.Prefix || k.Interface != want.Interface {
-		return false
-	}
-	if want.Gateway.IsValid() {
-		return k.Flags&unix.RTF_GATEWAY != 0 && k.Gateway == want.Gateway
-	}
-	return k.Flags&unix.RTF_GATEWAY == 0
+	return k.Prefix == want.Prefix && k.Interface == want.Interface && k.Flags&unix.RTF_GATEWAY == 0
 }
 
 // routeTable is the kernel routing-table seam the mesh applier drives. It is
@@ -102,8 +88,7 @@ func holds(k, want Route) bool {
 // success report (route(8)'s exit status, which was 0 on a rejected write) while
 // the table held nothing. Only List is authoritative.
 type routeTable interface {
-	// Add installs r (its Prefix, Interface, Gateway and Source; Flags are
-	// derived from the form). It returns a report of the request and its verdict,
+	// Add installs the link route r (its Prefix and Interface). It returns a report of the request and its verdict,
 	// which is DIAGNOSTIC ONLY (it is quoted back in the divergence error, never
 	// parsed for a verdict), plus an error if the kernel refused the request or
 	// the request could not be made.
@@ -180,8 +165,8 @@ func (kernelRouteTable) List(_ context.Context) ([]Route, error) {
 
 // decodeRoute turns one dumped routing message into a Route: its prefix, the name
 // of the interface it is bound to, its flags, and — when the kernel flags it
-// RTF_GATEWAY with an IPv4 next hop — its gateway; RTAX_IFA, when present, is the
-// source. A route that is not RTF_UP is not in force and is skipped.
+// RTF_GATEWAY with an IPv4 next hop — its gateway. A route that is not RTF_UP is
+// not in force and is skipped.
 func decodeRoute(rm *xroute.RouteMessage, names map[int]string) (Route, bool) {
 	if rm.Flags&unix.RTF_UP == 0 {
 		return Route{}, false
@@ -194,11 +179,6 @@ func decodeRoute(rm *xroute.RouteMessage, names map[int]string) (Route, bool) {
 	if rm.Flags&unix.RTF_GATEWAY != 0 && len(rm.Addrs) > unix.RTAX_GATEWAY {
 		if gw, ok := rm.Addrs[unix.RTAX_GATEWAY].(*xroute.Inet4Addr); ok {
 			r.Gateway = netip.AddrFrom4(gw.IP)
-		}
-	}
-	if len(rm.Addrs) > unix.RTAX_IFA {
-		if ifa, ok := rm.Addrs[unix.RTAX_IFA].(*xroute.Inet4Addr); ok {
-			r.Source = netip.AddrFrom4(ifa.IP)
 		}
 	}
 	return r, true
@@ -272,77 +252,29 @@ func (t kernelRouteTable) request(ctx context.Context, typ int, r Route) (string
 
 // requestString renders a request the way route(8) would spell it.
 func requestString(r Route) string {
-	switch {
-	case r.Gateway.IsValid():
-		s := fmt.Sprintf("-net %s %s -ifp %s", r.Prefix, r.Gateway, r.Interface)
-		if r.Source.IsValid() {
-			s += " -ifa " + r.Source.String()
-		}
-		return s
-	case r.Prefix.Bits() == 32:
-		return fmt.Sprintf("-host %s -interface %s", r.Prefix.Addr(), r.Interface)
-	default:
-		return fmt.Sprintf("-net %s -interface %s", r.Prefix, r.Interface)
-	}
+	return fmt.Sprintf("-net %s -interface %s", r.Prefix, r.Interface)
 }
 
-// routeMessage is the RTM_ADD or RTM_DELETE request for r, in one of three forms,
-// each the message route(8) builds for the equivalent command. It is a pure
-// function of its arguments so every encoding is table-tested without a socket.
-//
-//   - `-net <prefix> -interface <iface>` (a link route wider than /32, the utun
-//     routes): RTF_UP|RTF_STATIC, the gateway is the interface's own AF_LINK
-//     address carrying its index (the next hop is the link itself), and the
-//     netmask says how wide the route is.
-//   - `-host <addr> -interface <iface>` (a /32 link route, the on-link host route
-//     to a direct-link peer): RTF_UP|RTF_STATIC|RTF_HOST, the AF_LINK gateway, no
-//     netmask. A host route bound to the link is what makes the kernel resolve the
-//     peer by ARP on that cable.
-//   - `-net <prefix> <gateway> -ifp <iface> [-ifa <source>]` (a gateway route, the
-//     direct /25s): RTF_UP|RTF_STATIC|RTF_GATEWAY, RTAX_GATEWAY the next hop as an
-//     IPv4 address, RTAX_IFP the interface's AF_LINK address (which binds the route
-//     to that interface), and RTAX_IFA the source address when one is set.
+// routeMessage is the RTM_ADD or RTM_DELETE request for the link route r — the
+// message route(8) builds for `-net <prefix> -interface <iface>`: RTF_UP and
+// RTF_STATIC, no RTF_GATEWAY (the next hop is the link itself, so the gateway is
+// the interface's own AF_LINK address, carrying its index), no RTF_HOST (the
+// netmask says how wide the route is). It is a pure function of its arguments so
+// the encoding is table-tested without a socket.
 func routeMessage(typ int, r Route, ifindex int) *xroute.RouteMessage {
 	prefix := r.Prefix.Masked()
-	link := &xroute.LinkAddr{Index: ifindex, Name: r.Interface}
-	msg := &xroute.RouteMessage{
+	addrs := make([]xroute.Addr, unix.RTAX_NETMASK+1)
+	addrs[unix.RTAX_DST] = &xroute.Inet4Addr{IP: prefix.Addr().As4()}
+	addrs[unix.RTAX_GATEWAY] = &xroute.LinkAddr{Index: ifindex, Name: r.Interface}
+	var mask [4]byte
+	copy(mask[:], net.CIDRMask(prefix.Bits(), 32))
+	addrs[unix.RTAX_NETMASK] = &xroute.Inet4Addr{IP: mask}
+	return &xroute.RouteMessage{
 		Type:  typ,
 		Flags: unix.RTF_UP | unix.RTF_STATIC,
 		ID:    uintptr(os.Getpid()),
+		Addrs: addrs,
 	}
-	switch {
-	case r.Gateway.IsValid():
-		addrs := make([]xroute.Addr, unix.RTAX_IFA+1)
-		addrs[unix.RTAX_DST] = &xroute.Inet4Addr{IP: prefix.Addr().As4()}
-		addrs[unix.RTAX_GATEWAY] = &xroute.Inet4Addr{IP: r.Gateway.As4()}
-		addrs[unix.RTAX_NETMASK] = &xroute.Inet4Addr{IP: maskOf(prefix)}
-		addrs[unix.RTAX_IFP] = link
-		if r.Source.IsValid() {
-			addrs[unix.RTAX_IFA] = &xroute.Inet4Addr{IP: r.Source.As4()}
-		}
-		msg.Flags |= unix.RTF_GATEWAY
-		msg.Addrs = addrs
-	case prefix.Bits() == 32:
-		addrs := make([]xroute.Addr, unix.RTAX_GATEWAY+1)
-		addrs[unix.RTAX_DST] = &xroute.Inet4Addr{IP: prefix.Addr().As4()}
-		addrs[unix.RTAX_GATEWAY] = link
-		msg.Flags |= unix.RTF_HOST
-		msg.Addrs = addrs
-	default:
-		addrs := make([]xroute.Addr, unix.RTAX_NETMASK+1)
-		addrs[unix.RTAX_DST] = &xroute.Inet4Addr{IP: prefix.Addr().As4()}
-		addrs[unix.RTAX_GATEWAY] = link
-		addrs[unix.RTAX_NETMASK] = &xroute.Inet4Addr{IP: maskOf(prefix)}
-		msg.Addrs = addrs
-	}
-	return msg
-}
-
-// maskOf returns the IPv4 netmask of prefix.
-func maskOf(prefix netip.Prefix) [4]byte {
-	var mask [4]byte
-	copy(mask[:], net.CIDRMask(prefix.Bits(), 32))
-	return mask
 }
 
 // writeRoutingSocket delivers one routing message to the kernel over a fresh

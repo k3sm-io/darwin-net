@@ -23,7 +23,6 @@ import (
 	"log/slog"
 	"net/netip"
 	"os/exec"
-	"strings"
 	"sync"
 
 	"golang.zx2c4.com/wireguard/conn"
@@ -144,11 +143,10 @@ type WGDevice struct {
 	iface string // resolved interface name after CreateTUN (e.g. "utun4")
 	dev   wgControl
 	tun   tun.Device
-	// routes is the set of routes this device has VERIFIED in the kernel table,
-	// keyed by prefix (a plan never wants two routes for one prefix) and
+	// routes is the set of prefixes this device has VERIFIED in the kernel table,
 	// re-derived from a read-back on every apply — never a record of the route
 	// requests that were made (an accepted write is not a route in the table).
-	routes   map[netip.Prefix]RouteSpec
+	routes   map[netip.Prefix]struct{}
 	applied  AppliedEndpoints // endpoints this device last programmed, per peer key
 	lastUAPI string           // the peer update IpcSet last accepted; "" once the device is gone
 }
@@ -209,7 +207,7 @@ func newWGDevice(cfg wgLink, log *slog.Logger) *WGDevice {
 		log:     log,
 		rt:      kernelRouteTable{},
 		command: execCommand,
-		routes:  make(map[netip.Prefix]RouteSpec),
+		routes:  make(map[netip.Prefix]struct{}),
 	}
 }
 
@@ -392,14 +390,13 @@ func (d *WGDevice) Apply(ctx context.Context, plan Plan) error {
 	if err != nil {
 		return err
 	}
-	d.log.Info("mesh peers applied", "peers", len(plan.Peers), "written", written, "routes", installed, "direct", len(plan.Direct), "skipped", len(plan.Skipped))
+	d.log.Info("mesh peers applied", "peers", len(plan.Peers), "written", written, "routes", installed, "skipped", len(plan.Skipped))
 	return nil
 }
 
-// reconcileRoutes converges the kernel routing table on exactly want — one utun
-// route per peer podCIDR, plus the two /25 gateway routes of each direct peer —
-// and then VERIFIES the result by reading the kernel table back, returning the
-// number of routes proven present.
+// reconcileRoutes converges the kernel routing table on exactly want — one route
+// per peer podCIDR, each bound to the mesh utun — and then VERIFIES the result by
+// reading the kernel table back, returning the number of routes proven present.
 //
 // The read-back is the whole point. The routing-socket write's verdict is on the
 // REQUEST, so "the kernel accepted the add" and "the route exists on our utun" are
@@ -407,65 +404,41 @@ func (d *WGDevice) Apply(ctx context.Context, plan Plan) error {
 // sends that peer's pod traffic to the host default gateway, which fails as a
 // silent cross-node blackhole rather than as an error anybody sees. So the device's
 // own route set is re-derived from the table on every apply, and a route that is
-// wanted but absent (or bound to another interface, through another gateway, or in
-// the other form) fails the apply loudly with ErrRouteNotInstalled, quoting the
-// routing socket's own report of the request.
-//
-// Ordering is what keeps a direct peer's traffic off the floor. Removals run
-// first, gateway routes before utun routes; additions run after, utun routes
-// before gateway routes. So a direct peer's /25s go before anything else of that
-// peer does, and come only once its utun /24 is in place: there is never a moment
-// with neither. A peer that stays never loses its utun /24 — only a departed peer's
-// is removed. A route whose spec changed (a /25 that moved to another cable) is
-// removed and re-added, which is safe for the same reason: the /24 carries the
-// peer meanwhile.
+// wanted but absent (or bound to another interface, or a gateway route where a
+// link route was wanted) fails the apply loudly with ErrRouteNotInstalled, quoting
+// the routing socket's own report of the request.
 //
 // A stale route the delete did not remove is a warning, not a failure: the desired
 // routes are all present, the lingering one stays owned so the next apply retries
 // its removal. The caller holds mu.
-func (d *WGDevice) reconcileRoutes(ctx context.Context, want []RouteSpec) (int, error) {
-	desired := make(map[netip.Prefix]RouteSpec, len(want))
-	for _, r := range want {
-		desired[r.Prefix] = r
+func (d *WGDevice) reconcileRoutes(ctx context.Context, want []netip.Prefix) (int, error) {
+	desired := make(map[netip.Prefix]struct{}, len(want))
+	for _, p := range want {
+		desired[p] = struct{}{}
 	}
-	// Removals: routes owned but no longer wanted in that exact form.
 	var stale []netip.Prefix
 	for _, p := range sortedPrefixes(d.routes) {
-		if w, ok := desired[p]; !ok || w != d.routes[p] {
-			stale = append(stale, p)
+		if _, ok := desired[p]; ok {
+			continue
+		}
+		stale = append(stale, p)
+		if _, err := d.rt.Delete(ctx, d.utunRoute(p)); err != nil {
+			d.log.Warn("delete stale mesh route", "route", p.String(), "iface", d.iface, "err", err)
 		}
 	}
-	for _, direct := range []bool{true, false} {
-		for _, p := range stale {
-			r := d.routes[p]
-			if r.Direct() != direct {
-				continue
-			}
-			if _, err := d.rt.Delete(ctx, d.kernelRoute(r)); err != nil {
-				d.log.Warn("delete stale mesh route", "route", r.String(), "iface", d.ifaceOf(r), "err", err)
-			}
-		}
-	}
-	// Additions: routes wanted and not owned in that exact form.
 	reports := make(map[netip.Prefix]string, len(want))
-	for _, direct := range []bool{false, true} {
-		for _, p := range sortedPrefixes(desired) {
-			r := desired[p]
-			if r.Direct() != direct {
-				continue
-			}
-			if have, ok := d.routes[p]; ok && have == r {
-				continue
-			}
-			out, err := d.rt.Add(ctx, d.kernelRoute(r))
-			reports[p] = out
-			if err != nil {
-				// Deliberately not fatal here: the kernel table below is the verdict.
-				// EEXIST for a route the table already holds in this form is a mesh
-				// that is fine, so an apply that stopped on this error would refuse to
-				// converge it; the read-back tells that case from a route bound elsewhere.
-				reports[p] = fmt.Sprintf("%s (error: %v)", out, err)
-			}
+	for _, p := range sortedPrefixes(desired) {
+		if _, ok := d.routes[p]; ok {
+			continue
+		}
+		out, err := d.rt.Add(ctx, d.utunRoute(p))
+		reports[p] = out
+		if err != nil {
+			// Deliberately not fatal here: the kernel table below is the verdict.
+			// EEXIST for a route the table already holds on our utun is a mesh that
+			// is fine, so an apply that stopped on this error would refuse to
+			// converge it; the read-back tells that case from a route bound elsewhere.
+			reports[p] = fmt.Sprintf("%s (error: %v)", out, err)
 		}
 	}
 
@@ -473,30 +446,26 @@ func (d *WGDevice) reconcileRoutes(ctx context.Context, want []RouteSpec) (int, 
 	if err != nil {
 		return 0, fmt.Errorf("read back kernel routes for %s: %w", d.iface, err)
 	}
-	verified := make(map[netip.Prefix]RouteSpec, len(desired))
+	verified := make(map[netip.Prefix]struct{}, len(desired))
 	var missing []netip.Prefix
 	for _, p := range sortedPrefixes(desired) {
-		if !d.inKernel(have, desired[p]) {
+		if !d.inKernel(have, p) {
 			missing = append(missing, p)
 			continue
 		}
-		verified[p] = desired[p]
+		verified[p] = struct{}{}
 	}
 	var lingering []netip.Prefix
 	for _, p := range stale {
-		r := d.routes[p]
-		if _, wanted := verified[p]; wanted {
-			continue
-		}
-		if d.inKernel(have, r) {
+		if d.inKernel(have, p) {
 			lingering = append(lingering, p)
-			verified[p] = r // still ours to remove on the next apply
+			verified[p] = struct{}{} // still ours to remove on the next apply
 		}
 	}
 	d.routes = verified
 	if len(missing) > 0 {
-		return 0, fmt.Errorf("%w: %s absent from the kernel routing table%s",
-			ErrRouteNotInstalled, d.formatSpecs(desired, missing), routeReport(reports[missing[0]]))
+		return 0, fmt.Errorf("%w: %s absent from the kernel routing table on %s%s",
+			ErrRouteNotInstalled, formatPrefixes(missing), d.iface, routeReport(reports[missing[0]]))
 	}
 	if len(lingering) > 0 {
 		d.log.Warn("stale mesh routes still in the kernel table", "routes", formatPrefixes(lingering), "iface", d.iface)
@@ -504,29 +473,16 @@ func (d *WGDevice) reconcileRoutes(ctx context.Context, want []RouteSpec) (int, 
 	return len(verified) - len(lingering), nil
 }
 
-// kernelRoute is the routing request for r: a utun route is a link route on the
-// device's utun; a direct route is a gateway route bound to its cable interface
-// and sourced from the node's mesh-egress address, so a host dial the kernel
-// sources itself still leaves from inside this node's AllowedIPs when the cable
-// goes and the packet falls back to the tunnel.
-func (d *WGDevice) kernelRoute(r RouteSpec) Route {
-	if r.Direct() {
-		return Route{Prefix: r.Prefix, Interface: r.Iface, Gateway: r.Gateway, Source: d.cfg.meshIP}
-	}
-	return Route{Prefix: r.Prefix, Interface: d.iface}
+// utunRoute is the routing request for a peer prefix: a link route on the
+// device's utun.
+func (d *WGDevice) utunRoute(p netip.Prefix) Route {
+	return Route{Prefix: p, Interface: d.iface}
 }
 
-// ifaceOf is the interface a route spec is bound to.
-func (d *WGDevice) ifaceOf(r RouteSpec) string {
-	if r.Direct() {
-		return r.Iface
-	}
-	return d.iface
-}
-
-// inKernel reports whether the kernel table have holds r in its exact form.
-func (d *WGDevice) inKernel(have []Route, r RouteSpec) bool {
-	want := d.kernelRoute(r)
+// inKernel reports whether the kernel table have holds p's utun route in its
+// exact form.
+func (d *WGDevice) inKernel(have []Route, p netip.Prefix) bool {
+	want := d.utunRoute(p)
 	for _, k := range have {
 		if holds(k, want) {
 			return true
@@ -535,75 +491,17 @@ func (d *WGDevice) inKernel(have []Route, r RouteSpec) bool {
 	return false
 }
 
-// formatSpecs renders the named routes of set for an error message.
-func (d *WGDevice) formatSpecs(set map[netip.Prefix]RouteSpec, ps []netip.Prefix) string {
-	s := make([]string, len(ps))
-	for i, p := range ps {
-		s[i] = d.kernelRoute(set[p]).String()
-	}
-	return strings.Join(s, ", ")
-}
-
-// WithdrawIface removes every direct route this device holds on iface and returns
-// how many it removed. The root helper calls it before it tears a cable down
-// (RemoveLink) or re-points it at another peer, so the /25s always leave before
-// the on-link host route they depend on. The utun routes are untouched. A route
-// the read-back still finds is kept owned and reported, like a lingering stale
-// route in reconcileRoutes.
-func (d *WGDevice) WithdrawIface(ctx context.Context, iface string) (int, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	var gone []netip.Prefix
-	for _, p := range sortedPrefixes(d.routes) {
-		r := d.routes[p]
-		if !r.Direct() || r.Iface != iface {
-			continue
-		}
-		if _, err := d.rt.Delete(ctx, d.kernelRoute(r)); err != nil {
-			d.log.Warn("withdraw direct mesh route", "route", r.String(), "err", err)
-		}
-		gone = append(gone, p)
-	}
-	if len(gone) == 0 {
-		return 0, nil
-	}
-	have, err := d.rt.List(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("read back kernel routes after withdrawing %s: %w", iface, err)
-	}
-	var left []netip.Prefix
-	for _, p := range gone {
-		if d.inKernel(have, d.routes[p]) {
-			left = append(left, p)
-			continue
-		}
-		delete(d.routes, p)
-	}
-	if len(left) > 0 {
-		return len(gone) - len(left), fmt.Errorf("%w: direct routes %s on %s are still in the kernel table after their removal",
-			ErrRouteNotInstalled, formatPrefixes(left), iface)
-	}
-	d.log.Warn("direct mesh routes withdrawn", "iface", iface, "routes", formatPrefixes(gone))
-	return len(gone), nil
-}
-
 // Down removes every route the device installed, flushes the legacy PFAnchor,
 // removes the mesh-egress aliases (the utun one, then lo0), and closes the wireguard device. It is leak-free
 // and idempotent.
 func (d *WGDevice) Down(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, direct := range []bool{true, false} {
-		for _, p := range sortedPrefixes(d.routes) {
-			r := d.routes[p]
-			if r.Direct() != direct {
-				continue
-			}
-			if _, err := d.rt.Delete(ctx, d.kernelRoute(r)); err != nil {
-				d.log.Warn("delete mesh route on teardown", "route", r.String(), "err", err)
-			}
-			delete(d.routes, p)
+	for _, p := range sortedPrefixes(d.routes) {
+		if _, err := d.rt.Delete(ctx, d.utunRoute(p)); err != nil {
+			d.log.Warn("delete mesh route on teardown", "route", p.String(), "err", err)
 		}
+		delete(d.routes, p)
 	}
 	// Backstop, not a feature: this release loads nothing into PFAnchor, but an
 	// older one loaded an MSS-clamp rule there. Flushing it unconditionally on every

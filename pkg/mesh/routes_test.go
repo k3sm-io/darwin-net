@@ -51,9 +51,6 @@ func (f *fakeRouteTable) Add(_ context.Context, r Route) (string, error) {
 	if !f.dropAdds {
 		k := r
 		k.Flags = unix.RTF_UP | unix.RTF_STATIC
-		if r.Gateway.IsValid() {
-			k.Flags |= unix.RTF_GATEWAY
-		}
 		f.table = append(f.table, k)
 	}
 	return f.addOut, f.addErr
@@ -95,15 +92,6 @@ func routeDevice(fake *fakeRouteTable) *WGDevice {
 	return d
 }
 
-// utunSpecs turns prefixes into the utun route specs a plan carries for them.
-func utunSpecs(ps []netip.Prefix) []RouteSpec {
-	out := make([]RouteSpec, len(ps))
-	for i, p := range ps {
-		out[i] = RouteSpec{Prefix: p}
-	}
-	return out
-}
-
 func mustPrefixes(t *testing.T, ss ...string) []netip.Prefix {
 	t.Helper()
 	out := make([]netip.Prefix, len(ss))
@@ -134,7 +122,7 @@ func TestReconcileRoutesFailsLoudlyWhenTheKernelDropsTheAdd(t *testing.T) {
 	}
 	d := routeDevice(fake)
 
-	n, err := d.reconcileRoutes(context.Background(), utunSpecs(mustPrefixes(t, "100.64.1.0/24")))
+	n, err := d.reconcileRoutes(context.Background(), mustPrefixes(t, "100.64.1.0/24"))
 	if err == nil {
 		t.Fatalf("reconcileRoutes reported %d installed routes and no error, but the kernel table is empty (the exact lie this test pins)", n)
 	}
@@ -161,7 +149,7 @@ func TestReconcileRoutesRecordsOnlyVerifiedRoutes(t *testing.T) {
 	d := routeDevice(fake)
 	want := mustPrefixes(t, "100.64.1.0/24", "100.64.2.0/24")
 
-	n, err := d.reconcileRoutes(context.Background(), utunSpecs(want))
+	n, err := d.reconcileRoutes(context.Background(), want)
 	if err != nil {
 		t.Fatalf("reconcileRoutes: %v", err)
 	}
@@ -175,7 +163,7 @@ func TestReconcileRoutesRecordsOnlyVerifiedRoutes(t *testing.T) {
 	}
 
 	adds := len(fake.adds)
-	if n, err := d.reconcileRoutes(context.Background(), utunSpecs(want)); err != nil || n != 2 {
+	if n, err := d.reconcileRoutes(context.Background(), want); err != nil || n != 2 {
 		t.Fatalf("second reconcileRoutes = (%d, %v), want (2, nil)", n, err)
 	}
 	if len(fake.adds) != adds {
@@ -195,7 +183,7 @@ func TestReconcileRoutesRejectsARouteOnAnotherInterface(t *testing.T) {
 	}
 	d := routeDevice(fake)
 
-	if _, err := d.reconcileRoutes(context.Background(), utunSpecs(want)); !errors.Is(err, ErrRouteNotInstalled) {
+	if _, err := d.reconcileRoutes(context.Background(), want); !errors.Is(err, ErrRouteNotInstalled) {
 		t.Fatalf("error = %v, want ErrRouteNotInstalled for a route bound to en0 instead of the utun", err)
 	}
 }
@@ -207,11 +195,11 @@ func TestReconcileRoutesWithdrawsDepartedPeerRoutes(t *testing.T) {
 	fake := &fakeRouteTable{}
 	d := routeDevice(fake)
 	two := mustPrefixes(t, "100.64.1.0/24", "100.64.2.0/24")
-	if _, err := d.reconcileRoutes(context.Background(), utunSpecs(two)); err != nil {
+	if _, err := d.reconcileRoutes(context.Background(), two); err != nil {
 		t.Fatalf("reconcileRoutes: %v", err)
 	}
 
-	n, err := d.reconcileRoutes(context.Background(), utunSpecs(two[:1]))
+	n, err := d.reconcileRoutes(context.Background(), two[:1])
 	if err != nil {
 		t.Fatalf("reconcileRoutes after departure: %v", err)
 	}
@@ -235,12 +223,12 @@ func TestReconcileRoutesKeepsRetryingALingeringStaleRoute(t *testing.T) {
 	fake := &fakeRouteTable{}
 	d := routeDevice(fake)
 	two := mustPrefixes(t, "100.64.1.0/24", "100.64.2.0/24")
-	if _, err := d.reconcileRoutes(context.Background(), utunSpecs(two)); err != nil {
+	if _, err := d.reconcileRoutes(context.Background(), two); err != nil {
 		t.Fatalf("reconcileRoutes: %v", err)
 	}
 
 	fake.dropDels = true
-	n, err := d.reconcileRoutes(context.Background(), utunSpecs(two[:1]))
+	n, err := d.reconcileRoutes(context.Background(), two[:1])
 	if err != nil {
 		t.Fatalf("a lingering stale route must not fail the apply: %v", err)
 	}
@@ -252,7 +240,7 @@ func TestReconcileRoutesKeepsRetryingALingeringStaleRoute(t *testing.T) {
 	}
 
 	deletes := len(fake.deletes)
-	if _, err := d.reconcileRoutes(context.Background(), utunSpecs(two[:1])); err != nil {
+	if _, err := d.reconcileRoutes(context.Background(), two[:1]); err != nil {
 		t.Fatalf("reconcileRoutes: %v", err)
 	}
 	if len(fake.deletes) != deletes+1 {
@@ -267,7 +255,7 @@ func TestReconcileRoutesFailsWhenTheTableCannotBeRead(t *testing.T) {
 	fake := &fakeRouteTable{listErr: errors.New("sysctl: operation not permitted")}
 	d := routeDevice(fake)
 
-	if _, err := d.reconcileRoutes(context.Background(), utunSpecs(mustPrefixes(t, "100.64.1.0/24"))); err == nil {
+	if _, err := d.reconcileRoutes(context.Background(), mustPrefixes(t, "100.64.1.0/24")); err == nil {
 		t.Fatal("reconcileRoutes reported success without being able to read the routing table")
 	}
 }

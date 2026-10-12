@@ -301,16 +301,11 @@ func (c *Client) RemoveAlias(ctx context.Context, ip netip.Addr) error {
 // when it still holds the pre-join default and nothing is live (see
 // ConfigureMeshArgs.NodePodCIDR). The zero Prefix omits the field, which is exactly
 // what an older client sends and leaves the daemon's configured identity alone.
-//
-// direct is the minor-1 DirectRoutes. The caller is responsible for sending it
-// only to a daemon that reported minor >= 1 (HelperVersion) and only for links
-// that daemon configured; nil omits the field.
-func (c *Client) ConfigureMesh(ctx context.Context, privKeyRef string, listenPort int, nodePodCIDR netip.Prefix, peers []MeshPeerArg, direct []DirectRouteArg) error {
+func (c *Client) ConfigureMesh(ctx context.Context, privKeyRef string, listenPort int, nodePodCIDR netip.Prefix, peers []MeshPeerArg) error {
 	args := &ConfigureMeshArgs{
 		LocalPrivKeyRef: privKeyRef,
 		ListenPort:      listenPort,
 		Peers:           peers,
-		DirectRoutes:    direct,
 	}
 	if nodePodCIDR.IsValid() {
 		args.NodePodCIDR = nodePodCIDR.String()
@@ -319,35 +314,6 @@ func (c *Client) ConfigureMesh(ctx context.Context, privKeyRef string, listenPor
 		Version:       CurrentVersion(),
 		Verb:          VerbConfigureMesh,
 		ConfigureMesh: args,
-	})
-	return err
-}
-
-// ConfigureLink asks the daemon to configure a direct-link port and returns the
-// address the daemon derived and configured. A daemon that predates minor 1
-// rejects the verb as unknown; HelperVersion then reports its minor 0.
-func (c *Client) ConfigureLink(ctx context.Context, args ConfigureLinkArgs) (netip.Addr, error) {
-	resp, err := c.roundTrip(ctx, Request{
-		Version:       CurrentVersion(),
-		Verb:          VerbConfigureLink,
-		ConfigureLink: &args,
-	})
-	if err != nil {
-		return netip.Addr{}, err
-	}
-	addr, err := netip.ParseAddr(resp.LinkIP)
-	if err != nil {
-		return netip.Addr{}, fmt.Errorf("netd ConfigureLink: reply carries no usable link address %q: %w", resp.LinkIP, err)
-	}
-	return addr, nil
-}
-
-// RemoveLink asks the daemon to tear a direct-link port down.
-func (c *Client) RemoveLink(ctx context.Context, iface string) error {
-	_, err := c.roundTrip(ctx, Request{
-		Version:    CurrentVersion(),
-		Verb:       VerbRemoveLink,
-		RemoveLink: &RemoveLinkArgs{Iface: iface},
 	})
 	return err
 }

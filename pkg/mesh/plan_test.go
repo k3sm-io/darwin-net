@@ -57,15 +57,6 @@ func containsPrefix(set []netip.Prefix, want string) bool {
 	return false
 }
 
-// routePrefixes returns the destination of every route in a plan's route set.
-func routePrefixes(rs []RouteSpec) []netip.Prefix {
-	out := make([]netip.Prefix, len(rs))
-	for i, r := range rs {
-		out[i] = r.Prefix
-	}
-	return out
-}
-
 // TestMeshRoutesPerPeerNotAggregate is the M3.1 acceptance for the per-peer kernel
 // routes: the route set is exactly one route per peer podCIDR, and this node's own
 // /24 and the 100.64.0.0/10 cluster aggregate are NEVER in it (routing either to
@@ -226,7 +217,7 @@ func TestMeshPlanUAPIAndKeyHex(t *testing.T) {
 		self := netip.MustParsePrefix("100.64.0.0/24")
 		plan, err := BuildPlan(self, []netv1.MeshPeerSpec{
 			peerSpec("nodeB", "100.64.1.0/24", "192.0.2.10:51820", 0x42),
-		}, nil)
+		})
 		if err != nil {
 			t.Fatalf("BuildPlan: %v", err)
 		}
@@ -262,7 +253,7 @@ func TestBuildPlanSkipsSelfAndInvalid(t *testing.T) {
 	badVersion := peerSpec("nodeD", "100.64.3.0/24", "192.0.2.4:51820", 0x04)
 	badVersion.SchemaVersion = 99 // unsupported (WithDefaults leaves a non-zero value)
 
-	plan, err := BuildPlan(self, []netv1.MeshPeerSpec{selfPeer, good, wrongAllowed, badVersion}, nil)
+	plan, err := BuildPlan(self, []netv1.MeshPeerSpec{selfPeer, good, wrongAllowed, badVersion})
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}
@@ -313,7 +304,7 @@ func TestBuildPlanWithSelfAtANonZeroIndex(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// ValidatePlan is BuildPlan plus the refusals ConfigureMesh applies, so
 			// a pass here is the plan a reconcile would program.
-			plan, err := ValidatePlan(netip.MustParsePrefix(tc.self), peers, nil)
+			plan, err := ValidatePlan(netip.MustParsePrefix(tc.self), peers)
 			if err != nil {
 				t.Fatalf("ValidatePlan: %v", err)
 			}
@@ -330,7 +321,7 @@ func TestBuildPlanWithSelfAtANonZeroIndex(t *testing.T) {
 			if len(plan.Skipped) != 0 {
 				t.Errorf("Skipped = %+v, want none", plan.Skipped)
 			}
-			routes := routePrefixes(plan.Routes)
+			routes := plan.Routes
 			if len(routes) != len(tc.wantRoutes) {
 				t.Fatalf("routes = %v, want %v", routes, tc.wantRoutes)
 			}
@@ -341,6 +332,70 @@ func TestBuildPlanWithSelfAtANonZeroIndex(t *testing.T) {
 			}
 			if containsPrefix(routes, tc.self) {
 				t.Errorf("routes = %v include this node's own %s", routes, tc.self)
+			}
+		})
+	}
+}
+
+// TestBuildPlanUtunRoutesOnly pins that a plan carries utun routes only: one /24
+// per peer, with no more-specific gateway halves and no host route, even when
+// every peer publishes direct candidates in MeshPeerSpec.Endpoints. A direct
+// candidate never becomes a route and never the selected endpoint: the underlay
+// candidate is chosen, and a peer with only a direct candidate keeps Endpoint.
+func TestBuildPlanUtunRoutesOnly(t *testing.T) {
+	self := netip.MustParsePrefix("100.64.0.0/24")
+	withBoth := peerSpec("nodeB", "100.64.1.0/24", "192.0.2.10:51820", 0x42)
+	withBoth.Endpoints = []netv1.EndpointCandidate{
+		{Address: "169.254.0.5:51820", Link: netv1.EndpointLinkDirect},
+		{Address: "192.0.2.10:51820", Link: netv1.EndpointLinkUnderlay},
+	}
+	directOnly := peerSpec("nodeC", "100.64.2.0/24", "169.254.0.9:51820", 0x43)
+	directOnly.Endpoints = []netv1.EndpointCandidate{{Address: "169.254.0.9:51820", Link: netv1.EndpointLinkDirect}}
+	future := peerSpec("nodeD", "100.64.3.0/24", "192.0.2.12:51820", 0x44)
+	future.Endpoints = []netv1.EndpointCandidate{
+		{Address: "203.0.113.9:51820", Link: "satellite"},
+		{Address: "169.254.0.13:51820", Link: netv1.EndpointLinkDirect},
+	}
+	peers := []netv1.MeshPeerSpec{withBoth, directOnly, future}
+
+	for _, build := range []struct {
+		name string
+		fn   func(netip.Prefix, []netv1.MeshPeerSpec) (Plan, error)
+	}{{"BuildPlan", BuildPlan}, {"ValidatePlan", ValidatePlan}} {
+		t.Run(build.name, func(t *testing.T) {
+			plan, err := build.fn(self, peers)
+			if err != nil {
+				t.Fatalf("%s: %v", build.name, err)
+			}
+			if len(plan.Skipped) != 0 {
+				t.Fatalf("Skipped = %+v, want none (a direct or unknown candidate never skips a peer)", plan.Skipped)
+			}
+			want := []netip.Prefix{
+				netip.MustParsePrefix("100.64.1.0/24"),
+				netip.MustParsePrefix("100.64.2.0/24"),
+				netip.MustParsePrefix("100.64.3.0/24"),
+			}
+			if len(plan.Routes) != len(want) {
+				t.Fatalf("routes = %v, want exactly the utun /24s %v", plan.Routes, want)
+			}
+			for i, r := range plan.Routes {
+				if r != want[i] || r.Bits() != nodeCIDRBits {
+					t.Fatalf("route %d = %s, want the utun /24 %s (routes %v)", i, r, want[i], plan.Routes)
+				}
+			}
+			endpoints := map[string]string{}
+			for _, p := range plan.Peers {
+				endpoints[p.NodeName] = p.Endpoint
+			}
+			wantEP := map[string]string{
+				"nodeB": "192.0.2.10:51820",
+				"nodeC": "169.254.0.9:51820",
+				"nodeD": "192.0.2.12:51820",
+			}
+			for node, ep := range wantEP {
+				if endpoints[node] != ep {
+					t.Errorf("peer %s endpoint = %q, want %q", node, endpoints[node], ep)
+				}
 			}
 		})
 	}
