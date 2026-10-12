@@ -25,6 +25,8 @@
  *
  * Usage:  bindcases <base-port> <low-port> <unix-dir>
  *         bindcases <base-port> <low-port> <unix-dir> connect <in-dst> <out-dst>
+ *         bindcases <base-port> <low-port> <unix-dir> interconnect
+ *                   <cluster-dst> <ic-dst> <out-dst> <ic-ip>
  *   base-port  a free high port; case i uses base-port + i.
  *   low-port   a port below K3SM_BIND_MIN_PORT (the privileged-range carve).
  *   unix-dir   a writable directory for the AF_UNIX case's socket path.
@@ -33,6 +35,13 @@
  * The two destinations are supplied rather than compiled in so the gate owns ONE
  * copy of the in-scope/out-of-scope fact — the env it exports and the addresses
  * it dials cannot drift apart.
+ *
+ * The INTERCONNECT table (B522, run by pkg/podnet's
+ * TestInterconnectEnvPinsSourceInScope) takes the same approach with three
+ * destinations: one inside K3SM_CLUSTER_CIDRS, one inside
+ * K3SM_INTERCONNECT_CIDRS, one inside neither. ic-ip is the interconnect
+ * address, which the explicit-bind case binds. Unlike the other two tables it
+ * needs root, because ic-ip must exist on the host (a lo0 alias) to be bound.
  *
  * WHAT THE CONNECT TABLE OBSERVES, AND WHY IT USES TEST-NET DESTINATIONS. The
  * connect() rung's whole claim is about SOURCE selection, so a case is only
@@ -329,12 +338,109 @@ static int run_connect_cases(const char *unixdir, const char *in_dst, const char
     return 0;
 }
 
+/* ========================== the interconnect table ===================== */
+
+/*
+ * Which socket operation an interconnect case performs. Every DIAL case is
+ * SOCK_DGRAM, so connect(2) only fills in the pcb and nothing is sent; the BIND
+ * cases are SOCK_STREAM binds that never listen.
+ */
+enum ic_op {
+    IC_DIAL_CLUSTER = 0, /* connect to <cluster-dst> */
+    IC_DIAL_IC,          /* connect to <ic-dst> */
+    IC_DIAL_OUT,         /* connect to <out-dst> */
+    IC_DIAL_IC_PREBOUND, /* bind 0.0.0.0:0, then connect to <ic-dst> */
+    IC_BIND_WILDCARD,    /* bind 0.0.0.0:<base> */
+    IC_BIND_IC,          /* bind <ic-ip>:<base+1> */
+};
+
+typedef struct {
+    const char *name;
+    enum ic_op op;
+} iccase_t;
+
+static const iccase_t iccases[] = {
+    {"ic_dial_interconnect", IC_DIAL_IC},
+    {"ic_dial_cluster", IC_DIAL_CLUSTER},
+    {"ic_dial_elsewhere", IC_DIAL_OUT},
+    {"ic_dial_interconnect_prebound", IC_DIAL_IC_PREBOUND},
+    {"ic_bind_wildcard", IC_BIND_WILDCARD},
+    {"ic_bind_interconnect", IC_BIND_IC},
+};
+
+static const size_t niccases = sizeof iccases / sizeof iccases[0];
+
+/*
+ * run_interconnect_cases walks the interconnect table and prints one line per
+ * case in the shape the other tables use:
+ *
+ *     CASE=<name> RC=<rc> ERRNO=<n> LOCAL=<getsockname> REUSE=<0|1>
+ */
+static int run_interconnect_cases(unsigned base, const char *cluster_dst, const char *ic_dst,
+                                  const char *out_dst, const char *ic_ip) {
+    struct in_addr cl_a, ic_a, out_a, icip_a;
+    if (inet_pton(AF_INET, cluster_dst, &cl_a) != 1 || inet_pton(AF_INET, ic_dst, &ic_a) != 1 ||
+        inet_pton(AF_INET, out_dst, &out_a) != 1 || inet_pton(AF_INET, ic_ip, &icip_a) != 1) {
+        fprintf(stderr, "bindcases: interconnect arguments must be IPv4 literals\n");
+        return 2;
+    }
+    for (size_t i = 0; i < niccases; i++) {
+        const iccase_t *c = &iccases[i];
+        int is_bind = c->op == IC_BIND_WILDCARD || c->op == IC_BIND_IC;
+        int fd = socket(AF_INET, is_bind ? SOCK_STREAM : SOCK_DGRAM, 0);
+        if (fd < 0) {
+            printf("CASE=%s RC=-1 ERRNO=%d LOCAL=- REUSE=-1\n", c->name, errno);
+            continue;
+        }
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET;
+        sa.sin_len = (unsigned char)sizeof sa;
+
+        if (c->op == IC_DIAL_IC_PREBOUND) {
+            sa.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (bind(fd, (const struct sockaddr *)&sa, (socklen_t)sizeof sa) != 0) {
+                printf("CASE=%s RC=-1 ERRNO=%d LOCAL=- REUSE=-1\n", c->name, errno);
+                close(fd);
+                continue;
+            }
+        }
+
+        errno = 0;
+        int rc;
+        if (is_bind) {
+            sa.sin_port = htons((unsigned short)(base + (c->op == IC_BIND_IC ? 1u : 0u)));
+            sa.sin_addr.s_addr = c->op == IC_BIND_IC ? icip_a.s_addr : htonl(INADDR_ANY);
+            rc = bind(fd, (const struct sockaddr *)&sa, (socklen_t)sizeof sa);
+        } else {
+            sa.sin_port = htons(B218_DEAD_PORT);
+            sa.sin_addr = c->op == IC_DIAL_CLUSTER ? cl_a : c->op == IC_DIAL_OUT ? out_a : ic_a;
+            rc = connect(fd, (const struct sockaddr *)&sa, (socklen_t)sizeof sa);
+        }
+        int err = rc == 0 ? 0 : errno;
+        char local[128];
+        if (rc == 0) {
+            render_local(fd, local, sizeof local);
+        } else {
+            snprintf(local, sizeof local, "-");
+        }
+        printf("CASE=%s RC=%d ERRNO=%d LOCAL=%s REUSE=%d\n", c->name, rc, err, local,
+               reuseaddr_of(fd));
+        fflush(stdout);
+        close(fd);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc != 4 && !(argc == 7 && strcmp(argv[4], "connect") == 0)) {
+    if (argc != 4 && !(argc == 7 && strcmp(argv[4], "connect") == 0) &&
+        !(argc == 9 && strcmp(argv[4], "interconnect") == 0)) {
         fprintf(stderr,
                 "usage: %s <base-port> <low-port> <unix-dir>\n"
-                "       %s <base-port> <low-port> <unix-dir> connect <in-dst> <out-dst>\n",
-                argv[0], argv[0]);
+                "       %s <base-port> <low-port> <unix-dir> connect <in-dst> <out-dst>\n"
+                "       %s <base-port> <low-port> <unix-dir> interconnect <cluster-dst> <ic-dst> "
+                "<out-dst> <ic-ip>\n",
+                argv[0], argv[0], argv[0]);
         return 2;
     }
     unsigned base = (unsigned)strtoul(argv[1], NULL, 10);
@@ -346,6 +452,9 @@ int main(int argc, char **argv) {
      * form must stay byte-identical to what it printed before B218. */
     if (argc == 7) {
         return run_connect_cases(unixdir, argv[5], argv[6]);
+    }
+    if (argc == 9) {
+        return run_interconnect_cases(base, argv[5], argv[6], argv[7], argv[8]);
     }
 
     for (size_t i = 0; i < ncases; i++) {

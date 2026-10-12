@@ -98,7 +98,7 @@ func TestShimBindEnvNamesMatchC(t *testing.T) {
 	// Match only real getenv() calls, never the K3SM_* names in the .c comments.
 	// The K3SM_DNS_* names are the resolver ABI and are guarded separately by
 	// pkg/dns; this pattern deliberately does not see them.
-	re := regexp.MustCompile(`getenv\("(K3SM_(?:POD|BIND|CLUSTER)_[A-Z0-9_]+)"\)`)
+	re := regexp.MustCompile(`getenv\("(K3SM_(?:POD|BIND|CLUSTER|INTERCONNECT)_[A-Z0-9_]+)"\)`)
 	matches := re.FindAllStringSubmatch(string(src), -1)
 	if len(matches) == 0 {
 		t.Fatalf("no getenv(\"K3SM_POD_*\"/\"K3SM_BIND_*\"/\"K3SM_CLUSTER_*\") calls found in %s — regex or shim layout drifted", bindShimPath)
@@ -113,7 +113,7 @@ func TestShimBindEnvNamesMatchC(t *testing.T) {
 	}
 	slices.Sort(got)
 
-	want := []string{EnvPodIP, EnvBindDebug, EnvClusterCIDRs}
+	want := []string{EnvPodIP, EnvBindDebug, EnvClusterCIDRs, EnvInterconnectIP, EnvInterconnectCIDRs}
 	slices.Sort(want)
 
 	if !slices.Equal(got, want) {
@@ -347,5 +347,119 @@ func TestShimMaxClusterCIDRsMatchesC(t *testing.T) {
 	}
 	if cMax != MaxClusterCIDRs {
 		t.Errorf("cluster-CIDR cap drift: %s #define K3SM_MAX_CLUSTER_CIDRS = %d, but pkg/podnet MaxClusterCIDRs = %d", bindShimPath, cMax, MaxClusterCIDRs)
+	}
+}
+
+// TestShimInterconnectRangeMatchesC binds the C shim's link-local ceiling on
+// interconnect CIDRs to the Go side's interconnectRange. A drift would let the
+// encoder emit a scope the shim refuses (the pin silently off for every
+// opted-in pod) or let the shim accept one the encoder would never produce.
+func TestShimInterconnectRangeMatchesC(t *testing.T) {
+	src, err := os.ReadFile(bindShimPath)
+	if err != nil {
+		t.Fatalf("read shim source %s: %v", bindShimPath, err)
+	}
+	netRe := regexp.MustCompile(`#define\s+K3SM_INTERCONNECT_RANGE_NET\s+0x([0-9a-fA-F]{8})u?`)
+	bitsRe := regexp.MustCompile(`#define\s+K3SM_INTERCONNECT_RANGE_BITS\s+(\d+)`)
+	nm, bm := netRe.FindStringSubmatch(string(src)), bitsRe.FindStringSubmatch(string(src))
+	if nm == nil || bm == nil {
+		t.Fatalf("no `#define K3SM_INTERCONNECT_RANGE_NET 0x<hex>` / `K3SM_INTERCONNECT_RANGE_BITS <n>` in %s — regex or shim layout drifted", bindShimPath)
+	}
+	n, err := strconv.ParseUint(nm[1], 16, 32)
+	if err != nil {
+		t.Fatalf("parse K3SM_INTERCONNECT_RANGE_NET %q: %v", nm[1], err)
+	}
+	bits, err := strconv.Atoi(bm[1])
+	if err != nil {
+		t.Fatalf("parse K3SM_INTERCONNECT_RANGE_BITS %q: %v", bm[1], err)
+	}
+	cRange := netip.PrefixFrom(netip.AddrFrom4([4]byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}), bits)
+	if cRange != interconnectRange {
+		t.Errorf("interconnect range drift: %s says %s, pkg/podnet interconnectRange = %s", bindShimPath, cRange, interconnectRange)
+	}
+}
+
+func TestInterconnectEnv(t *testing.T) {
+	pfx := func(ss ...string) []netip.Prefix {
+		out := make([]netip.Prefix, 0, len(ss))
+		for _, s := range ss {
+			out = append(out, netip.MustParsePrefix(s))
+		}
+		return out
+	}
+	ip := netip.MustParseAddr("169.254.0.11")
+	want := func(ip, cidrs string) map[string]string {
+		return map[string]string{EnvInterconnectIP: ip, EnvInterconnectCIDRs: cidrs}
+	}
+	tooMany := make([]netip.Prefix, 0, MaxClusterCIDRs+1)
+	for i := 0; i <= MaxClusterCIDRs; i++ {
+		tooMany = append(tooMany, netip.PrefixFrom(netip.AddrFrom4([4]byte{169, 254, byte(i), 0}), 24))
+	}
+	atCap := tooMany[:MaxClusterCIDRs]
+
+	tests := []struct {
+		name  string
+		ip    netip.Addr
+		cidrs []netip.Prefix
+		want  map[string]string
+	}{
+		{"the interconnect range", ip, pfx("169.254.0.0/24"), want("169.254.0.11", "169.254.0.0/24")},
+		{"4-in-6 ip is unmapped", netip.MustParseAddr("::ffff:169.254.0.11"), pfx("169.254.0.0/24"), want("169.254.0.11", "169.254.0.0/24")},
+		{"4-in-6 prefix is unmapped", ip, []netip.Prefix{netip.PrefixFrom(netip.MustParseAddr("::ffff:169.254.0.0"), 24)}, want("169.254.0.11", "169.254.0.0/24")},
+		{"unmasked prefix is masked", ip, pfx("169.254.0.9/24"), want("169.254.0.11", "169.254.0.0/24")},
+		{"duplicates dropped, order kept", ip, pfx("169.254.255.0/24", "169.254.0.0/24", "169.254.0.0/24"), want("169.254.0.11", "169.254.255.0/24,169.254.0.0/24")},
+		{"the whole link-local range is allowed", ip, pfx("169.254.0.0/16"), want("169.254.0.11", "169.254.0.0/16")},
+		{"a prefix outside link-local is skipped", ip, pfx("10.42.0.0/16", "169.254.0.0/24"), want("169.254.0.11", "169.254.0.0/24")},
+		{"a prefix wider than /16 is skipped", ip, pfx("169.0.0.0/8", "169.254.0.0/24"), want("169.254.0.11", "169.254.0.0/24")},
+		{"/0 is skipped", ip, pfx("0.0.0.0/0", "169.254.0.0/24"), want("169.254.0.11", "169.254.0.0/24")},
+		{"an IPv6 prefix is skipped", ip, pfx("fe80::/10", "169.254.0.0/24"), want("169.254.0.11", "169.254.0.0/24")},
+		{"exactly the cap", ip, atCap, want("169.254.0.11", "169.254.0.0/24,169.254.1.0/24,169.254.2.0/24,169.254.3.0/24,169.254.4.0/24,169.254.5.0/24,169.254.6.0/24,169.254.7.0/24")},
+		{"over the cap", ip, tooMany, nil},
+		{"ip outside every cidr", netip.MustParseAddr("169.254.9.209"), pfx("169.254.0.0/24"), nil},
+		{"ip outside link-local", netip.MustParseAddr("100.64.0.7"), pfx("169.254.0.0/24"), nil},
+		{"ip only inside a skipped cidr", netip.MustParseAddr("10.42.0.7"), pfx("10.42.0.0/16", "169.254.0.0/24"), nil},
+		{"no cidrs", ip, nil, nil},
+		{"only unusable cidrs", ip, pfx("10.42.0.0/16", "0.0.0.0/0"), nil},
+		{"invalid prefix only", ip, []netip.Prefix{{}}, nil},
+		{"network address", netip.MustParseAddr("169.254.0.0"), pfx("169.254.0.0/24"), nil},
+		{"broadcast address", netip.MustParseAddr("169.254.0.255"), pfx("169.254.0.0/24"), nil},
+		{"lowest host address", netip.MustParseAddr("169.254.0.1"), pfx("169.254.0.0/24"), want("169.254.0.1", "169.254.0.0/24")},
+		{"highest host address", netip.MustParseAddr("169.254.0.254"), pfx("169.254.0.0/24"), want("169.254.0.254", "169.254.0.0/24")},
+		{"broadcast of one containing cidr, host in another", netip.MustParseAddr("169.254.0.255"), pfx("169.254.0.0/16", "169.254.0.0/24"), nil},
+		{"inside a /29 but on neither of its edges", ip, pfx("169.254.0.8/29", "169.254.0.0/24"), want("169.254.0.11", "169.254.0.8/29,169.254.0.0/24")},
+		{"a /32 is its own host", ip, pfx("169.254.0.11/32"), want("169.254.0.11", "169.254.0.11/32")},
+		{"a /31 has no network or broadcast", netip.MustParseAddr("169.254.0.10"), pfx("169.254.0.10/31"), want("169.254.0.10", "169.254.0.10/31")},
+		{"zero ip", netip.Addr{}, pfx("169.254.0.0/24"), nil},
+		{"unspecified ip", netip.IPv4Unspecified(), pfx("0.0.0.0/0", "169.254.0.0/24"), nil},
+		{"IPv6 ip", netip.MustParseAddr("fe80::1"), pfx("169.254.0.0/24"), nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := InterconnectEnv(tt.ip, tt.cidrs)
+			if !maps.Equal(got, tt.want) {
+				t.Errorf("InterconnectEnv(%v, %v) = %v, want %v", tt.ip, tt.cidrs, got, tt.want)
+			}
+			if tt.want == nil && got != nil {
+				t.Errorf("InterconnectEnv(%v, %v) = non-nil empty map; nil means inject nothing", tt.ip, tt.cidrs)
+			}
+		})
+	}
+}
+
+// TestInterconnectEnvKeepsBindDisciplineOutput pins the additive contract: the
+// interconnect pair is a separate map, so BindDisciplineEnvWithCIDRs, which
+// k3sm's provider already calls, emits exactly what it did before.
+func TestInterconnectEnvKeepsBindDisciplineOutput(t *testing.T) {
+	addr := netip.MustParseAddr("100.64.0.7")
+	got := BindDisciplineEnvWithCIDRs(addr, []netip.Prefix{netip.MustParsePrefix("10.42.0.0/16")})
+	want := map[string]string{EnvPodIP: "100.64.0.7", EnvClusterCIDRs: "10.42.0.0/16"}
+	if !maps.Equal(got, want) {
+		t.Errorf("BindDisciplineEnvWithCIDRs = %v, want %v", got, want)
+	}
+	ic := InterconnectEnv(netip.MustParseAddr("169.254.0.11"), []netip.Prefix{netip.MustParsePrefix("169.254.0.0/24")})
+	for k := range ic {
+		if _, clash := got[k]; clash {
+			t.Errorf("InterconnectEnv key %s collides with the bind-discipline map", k)
+		}
 	}
 }
