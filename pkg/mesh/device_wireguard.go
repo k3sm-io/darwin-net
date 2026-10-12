@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -36,6 +37,10 @@ import (
 // never evaluated, and k3sm does not own pf. The name is kept only so teardown
 // (WGDevice.Down) and the k3sm uninstall can flush an anchor an older release left
 // behind.
+// tunNameFileEnv is the variable wireguard-go's darwin TUN creation reads to pick a
+// file to write the interface name to.
+const tunNameFileEnv = "WG_TUN_NAME_FILE"
+
 const PFAnchor = "io.k3sm.mesh"
 
 // commandFunc runs one host command and returns its combined output. It is the
@@ -139,6 +144,10 @@ type WGDevice struct {
 	log     *slog.Logger
 	rt      routeTable
 	command commandFunc // every spawned host command (ifconfig, pfctl) goes through it
+	// createTUN and unsetenv are seams so a test can observe that the environment is
+	// scrubbed before the utun is created, with no real device and no root.
+	createTUN func(name string, mtu int) (tun.Device, error)
+	unsetenv  func(key string) error
 
 	mu    sync.Mutex
 	iface string // resolved interface name after CreateTUN (e.g. "utun4")
@@ -205,11 +214,13 @@ func newWGDevice(cfg wgLink, log *slog.Logger) *WGDevice {
 		log = slog.Default()
 	}
 	return &WGDevice{
-		cfg:     cfg,
-		log:     log,
-		rt:      kernelRouteTable{},
-		command: execCommand,
-		routes:  make(map[netip.Prefix]RouteSpec),
+		cfg:       cfg,
+		log:       log,
+		rt:        kernelRouteTable{},
+		command:   execCommand,
+		createTUN: tun.CreateTUN,
+		unsetenv:  os.Unsetenv,
+		routes:    make(map[netip.Prefix]RouteSpec),
 	}
 }
 
@@ -245,7 +256,13 @@ func (d *WGDevice) Up(ctx context.Context) error {
 		return fmt.Errorf("mesh private key: %w", err)
 	}
 
-	tunDev, err := tun.CreateTUN(d.cfg.name, d.cfg.mtu)
+	// wireguard-go's tun_darwin.go writes the interface name, as root, to the path in
+	// $WG_TUN_NAME_FILE when the requested name is "utun" (our default). That is an
+	// environment-controlled file write in a root process, so clear it first.
+	if err := d.unsetenv(tunNameFileEnv); err != nil {
+		return fmt.Errorf("clear %s: %w", tunNameFileEnv, err)
+	}
+	tunDev, err := d.createTUN(d.cfg.name, d.cfg.mtu)
 	if err != nil {
 		return fmt.Errorf("create utun %q: %w", d.cfg.name, err)
 	}
