@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 // Package linkwatch reports network-interface link changes: an interface coming
-// up, going down, or vanishing. It is how the mesh learns that a direct-link
-// cable was plugged or pulled without waiting for its periodic resync.
+// up, going down, or vanishing. Its consumer is k3sm's interconnect reporter,
+// which learns from it that a Thunderbolt cable was plugged or pulled without
+// waiting for its periodic resync.
 //
 // Two sources feed one stream. The PRIMARY, and the only mandatory one, is a
 // poll every 2 s (Poller) of net.Interfaces() flags plus each up interface's
