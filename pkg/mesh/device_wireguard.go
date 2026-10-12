@@ -37,11 +37,11 @@ import (
 // never evaluated, and k3sm does not own pf. The name is kept only so teardown
 // (WGDevice.Down) and the k3sm uninstall can flush an anchor an older release left
 // behind.
+const PFAnchor = "io.k3sm.mesh"
+
 // tunNameFileEnv is the variable wireguard-go's darwin TUN creation reads to pick a
 // file to write the interface name to.
 const tunNameFileEnv = "WG_TUN_NAME_FILE"
-
-const PFAnchor = "io.k3sm.mesh"
 
 // commandFunc runs one host command and returns its combined output. It is the
 // single seam every command the WGDevice spawns goes through, so the full set of
