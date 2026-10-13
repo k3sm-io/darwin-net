@@ -492,3 +492,35 @@ func TestWithdrawnLinkVerbsAreUnknown(t *testing.T) {
 		t.Fatalf("a withdrawn verb touched the host: %v", h.ops)
 	}
 }
+
+// interconnectLedgerGolden is the content of the apis fixture
+// net/v1alpha1/testdata/interconnect-ledger.golden.json, inlined because a lone
+// clone of this module has no sibling apis checkout.
+const interconnectLedgerGolden = `{"aliases":[{"slot":0,"address":"169.254.0.9"},{"slot":1,"address":"169.254.0.10"},{"slot":2,"address":"169.254.0.11"}]}` + "\n"
+
+// TestPersistInterconnectGolden pins the bytes the daemon writes for a
+// three-alias ledger to the shared fixture, so the on-disk shape is the one the
+// apis type defines and a restart reads it back unchanged.
+func TestPersistInterconnectGolden(t *testing.T) {
+	s, statePath := icServer(t, "", newBridgeHost(nil), "")
+	s.persistInterconnect(ownedEntries(map[int]netip.Addr{
+		2: netip.MustParseAddr("169.254.0.11"),
+		0: netip.MustParseAddr("169.254.0.9"),
+		1: netip.MustParseAddr("169.254.0.10"),
+	}))
+	got, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != interconnectLedgerGolden {
+		t.Fatalf("ledger bytes:\n%q\nwant\n%q", got, interconnectLedgerGolden)
+	}
+	derived := map[int]netip.Addr{
+		0: netip.MustParseAddr("169.254.0.9"),
+		1: netip.MustParseAddr("169.254.0.10"),
+		2: netip.MustParseAddr("169.254.0.11"),
+	}
+	if owned := s.restoreInterconnect(derived); !maps.Equal(owned, derived) {
+		t.Fatalf("restored %v, want %v", owned, derived)
+	}
+}
