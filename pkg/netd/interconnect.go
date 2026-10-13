@@ -20,7 +20,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -305,24 +304,13 @@ func (s *Server) dropOwned(slot int) {
 	s.persistInterconnect(snap)
 }
 
-// interconnectEntry is one owned alias in the persisted ledger.
-type interconnectEntry struct {
-	Slot    int    `json:"slot"`
-	Address string `json:"address"`
-}
-
-// interconnectLedger is the persisted shape of the owned interconnect aliases.
-type interconnectLedger struct {
-	Aliases []interconnectEntry `json:"aliases"`
-}
-
 // ownedEntries renders the owned set as ledger entries, by slot.
-func ownedEntries(owned map[int]netip.Addr) []interconnectEntry {
-	out := make([]interconnectEntry, 0, len(owned))
+func ownedEntries(owned map[int]netip.Addr) []netv1alpha1.InterconnectLedgerEntry {
+	out := make([]netv1alpha1.InterconnectLedgerEntry, 0, len(owned))
 	for slot, addr := range owned {
-		out = append(out, interconnectEntry{Slot: slot, Address: addr.String()})
+		out = append(out, netv1alpha1.InterconnectLedgerEntry{Slot: slot, Address: addr.String()})
 	}
-	slices.SortFunc(out, func(a, b interconnectEntry) int { return a.Slot - b.Slot })
+	slices.SortFunc(out, func(a, b netv1alpha1.InterconnectLedgerEntry) int { return a.Slot - b.Slot })
 	return out
 }
 
@@ -330,13 +318,13 @@ func ownedEntries(owned map[int]netip.Addr) []interconnectEntry {
 // set. A failure is logged, never fatal: after a restart the reconcile would
 // remove the unrecorded alias, which is the safe direction (the alias is one of
 // this node's own derived addresses, and k3sm ensures it again).
-func (s *Server) persistInterconnect(entries []interconnectEntry) {
+func (s *Server) persistInterconnect(entries []netv1alpha1.InterconnectLedgerEntry) {
 	if s.cfg.InterconnectStatePath == "" {
 		return
 	}
-	raw, err := json.Marshal(interconnectLedger{Aliases: entries})
+	raw, err := netv1alpha1.InterconnectLedger{Aliases: entries}.Marshal()
 	if err == nil {
-		err = writeFileAtomic(s.cfg.InterconnectStatePath, ".interconnect-*", append(raw, '\n'))
+		err = writeFileAtomic(s.cfg.InterconnectStatePath, ".interconnect-*", raw)
 	}
 	if err != nil {
 		s.log.Error("netd: persisting the owned interconnect aliases failed (a helper restart will remove the unrecorded ones)",
@@ -361,8 +349,8 @@ func (s *Server) restoreInterconnect(derived map[int]netip.Addr) map[int]netip.A
 		}
 		return owned
 	}
-	var l interconnectLedger
-	if err := json.Unmarshal(raw, &l); err != nil {
+	l, err := netv1alpha1.ParseInterconnectLedger(raw)
+	if err != nil {
 		s.log.Warn("netd: the owned interconnect aliases file is malformed (treating none as owned)", "path", path, "err", err)
 		return owned
 	}
