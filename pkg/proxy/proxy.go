@@ -51,7 +51,8 @@ const dialTimeout = 5 * time.Second
 const udpFlowIdleTimeout = 30 * time.Second
 
 // Proxy is the userspace Service proxy: it owns one listening socket per bound
-// Service port (a ClusterIP:port on an lo0 alias, plus *:NodePort when set) and
+// Service port (a ClusterIP:port on an lo0 alias, plus the NodePort listeners
+// when set: *:NodePort by default, or one per WithNodePortAddresses address) and
 // L4-load-balances accepted connections to the Ready backends in its
 // RoutingTable.
 //
@@ -130,6 +131,10 @@ type Proxy struct {
 	// guests' live lease addresses come from. Read-only after New, which resolves
 	// it (falling back to the policy table's seed) before building relays.
 	vmnet netip.Prefix
+	// nodePortAddrs is the address set every NodePort listener binds
+	// (WithNodePortAddresses). Empty, the default, binds the wildcard. Read-only
+	// after New.
+	nodePortAddrs []netip.Addr
 	// relays is the per-pod TCP relay manager on vm pods' published addresses
 	// (podrelay.go). Built by New when there is a routing table to observe, nil
 	// otherwise; Run drives it and shuts it down.
@@ -145,10 +150,11 @@ type Proxy struct {
 	// listenUDP binds the ClusterIP datagram socket on the specific VIP address (the
 	// default is net.ListenUDP; binder is stream-only).
 	listenUDP func(ap netip.AddrPort) (udpVIPConn, error)
-	// listenNodePort binds the node-wide NodePort stream listener (the default is
-	// net.Listen). It is not binder: a binder binds one specific alias address, while
-	// NodePort binds the wildcard ":port" (both address families) so every node
-	// interface answers.
+	// listenNodePort binds one NodePort stream listener (the default is
+	// net.Listen). It is not binder: a binder binds one specific alias address
+	// through the netd helper, while a NodePort binds the wildcard ":port" (both
+	// address families) or, under WithNodePortAddresses, each configured address
+	// "a.b.c.d:port", none of which needs privilege (a NodePort is >=1024).
 	listenNodePort func(network, address string) (net.Listener, error)
 	// dialBackend dials a backend through the dialer dialerFor selected (the default
 	// is d.DialContext with a background context, the dialer's own Timeout bounding
@@ -261,6 +267,24 @@ func WithNodeAddress(addr netip.Addr) Option {
 	return func(p *Proxy) { p.nodeAddr = addr.Unmap() }
 }
 
+// WithNodePortAddresses sets the addresses every NodePort listener binds, in
+// place of the wildcard: the kube-proxy --nodeport-addresses analog. The
+// caller resolves them once (ResolveNodePortAddresses) and they are fixed for
+// the life of the proxy. Each NodePort binds every address in the set or none:
+// a failed bind closes the ones already open and the port is retried as a
+// whole. No addresses (the default) keeps the wildcard ":port", so every
+// interface answers. Invalid addresses are dropped.
+func WithNodePortAddresses(addrs ...netip.Addr) Option {
+	return func(p *Proxy) {
+		p.nodePortAddrs = nil
+		for _, a := range addrs {
+			if a.IsValid() {
+				p.nodePortAddrs = append(p.nodePortAddrs, a.Unmap())
+			}
+		}
+	}
+}
+
 // WithInfraVIPExemptions marks one or more infra VIPs as owned by a node-local
 // binder rather than the Service proxy, so the proxy never takes ownership of
 // them: no lo0 alias, no listening socket, no routing-table entry.
@@ -320,7 +344,7 @@ func WithPolicyTable(t *PolicyTable) Option {
 // socketPath (empty uses the default socket), so the Service proxy runs
 // unprivileged. It is the one construction-time selection wiring both seams to the
 // helper; the direct ifconfig/net.Listen path remains the default for an explicit
-// run-as-root mode. The node-wide *:NodePort listener is always bound directly (it
+// run-as-root mode. The NodePort listeners are always bound directly (a NodePort
 // is >=1024 and needs no privilege).
 func WithNetdHelper(socketPath string) Option {
 	return func(p *Proxy) {
@@ -753,11 +777,11 @@ func (p *Proxy) runWorker(w *portWorker) {
 // openListener binds the sockets for one Service port. For TCP it opens the
 // ClusterIP stream listener on the specific lo0 alias address (net.Listen on
 // clusterIP:port, never :port, so the bound source identity is the VIP) and, when
-// NodePort is set, a node-wide *:NodePort stream listener. For UDP it opens the
+// NodePort is set, the NodePort stream listeners (see openNodePort). For UDP it opens the
 // ClusterIP datagram relay (see the UDP branch below and udprelay.go); UDP
 // NodePort is deferred. It ensures the lo0 alias exists first.
 //
-// NodePort semantics (TCP): the *:NodePort listener load-balances to all Ready
+// NodePort semantics (TCP): the NodePort listeners load-balance to all Ready
 // backends via PickStickyCluster — externalTrafficPolicy: Cluster.
 // internalTrafficPolicy:Local is ignored on this path (KEP-2086: iTP governs the
 // ClusterIP path only). externalTrafficPolicy: Local is also not honored: the
@@ -825,31 +849,64 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	l.clusterIP = cl
 	go p.serve(cl, key, internalListener)
 
-	// NodePort listener: bind the wildcard (*:NodePort) so every node interface
-	// answers, load-balancing to ALL Ready backends via the external scope
-	// (externalTrafficPolicy: Cluster — PickStickyCluster ignores internalTrafficPolicy:
-	// Local while applying ClientIP session affinity over the Cluster pool; the splice
-	// does not preserve client src IP, so eTP:Local is not honored either).
+	// NodePort listeners, load-balancing to ALL Ready backends via the external
+	// scope (externalTrafficPolicy: Cluster — PickStickyCluster ignores
+	// internalTrafficPolicy: Local while applying ClientIP session affinity over the
+	// Cluster pool; the splice does not preserve client src IP, so eTP:Local is not
+	// honored either).
 	if port.NodePort != 0 {
-		nodeAddr := net.JoinHostPort("", strconv.Itoa(int(port.NodePort)))
-		rawNL, err := p.listenNodePort("tcp", nodeAddr)
+		nls, err := p.openNodePort(port.NodePort)
 		if err != nil {
 			_ = cl.Close()
 			_ = p.alias.Remove(ctx, ip)
-			return nil, fmt.Errorf("listen nodePort %s: %w", nodeAddr, err)
+			return nil, err
 		}
-		nl := tcpseg.WrapListener(rawNL)
-		l.nodePort = nl
-		go p.serve(nl, key, externalListener)
+		l.nodePorts = nls
+		for _, nl := range nls {
+			go p.serve(nl, key, externalListener)
+		}
 	}
 	return l, nil
+}
+
+// nodePortBindAddrs is where a NodePort listens: the wildcard ":port" by
+// default, or one "addr:port" per WithNodePortAddresses address.
+func (p *Proxy) nodePortBindAddrs(nodePort int32) []string {
+	port := strconv.Itoa(int(nodePort))
+	if len(p.nodePortAddrs) == 0 {
+		return []string{net.JoinHostPort("", port)}
+	}
+	out := make([]string, 0, len(p.nodePortAddrs))
+	for _, a := range p.nodePortAddrs {
+		out = append(out, net.JoinHostPort(a.String(), port))
+	}
+	return out
+}
+
+// openNodePort binds every listener of one NodePort, all or nothing: if any
+// bind fails the listeners already open are closed before it returns, so a
+// NodePort is never half-served (reachable on some configured addresses and
+// silently absent on others). Each listener clamps its TCP segment size.
+func (p *Proxy) openNodePort(nodePort int32) ([]net.Listener, error) {
+	var nls []net.Listener
+	for _, addr := range p.nodePortBindAddrs(nodePort) {
+		raw, err := p.listenNodePort("tcp", addr)
+		if err != nil {
+			for _, nl := range nls {
+				_ = nl.Close()
+			}
+			return nil, fmt.Errorf("listen nodePort %s: %w", addr, err)
+		}
+		nls = append(nls, tcpseg.WrapListener(raw))
+	}
+	return nls, nil
 }
 
 // internalListener and externalListener name the accept-path scope threaded through
 // serve/handle, so a call site reads its intent rather than a bare bool (matching the
 // file's Locality/trafficPolicy enum idiom). The ClusterIP (east-west) listener is
 // internal — it honors internalTrafficPolicy:Local and ClientIP affinity (PickSticky);
-// the *:NodePort listener is external — externalTrafficPolicy governs it, so it routes
+// a NodePort listener is external — externalTrafficPolicy governs it, so it routes
 // to ALL Ready backends with ClientIP affinity over that Cluster pool
 // (PickStickyCluster), ignoring iTP:Local.
 const (
@@ -859,7 +916,7 @@ const (
 
 // serve accepts TCP connections on ln and proxies each to a backend chosen by the
 // routing table. external selects the accept-path scope: the ClusterIP listener
-// passes internalListener (iTP:Local + ClientIP affinity honored); the *:NodePort
+// passes internalListener (iTP:Local + ClientIP affinity honored); a NodePort
 // listener passes externalListener (externalTrafficPolicy:Cluster — route to all
 // Ready backends). It returns when ln is closed (Accept errors).
 func (p *Proxy) serve(ln net.Listener, key PortKey, external bool) {
@@ -873,7 +930,7 @@ func (p *Proxy) serve(ln net.Listener, key PortKey, external bool) {
 }
 
 // handle proxies one accepted client connection to a Ready backend. external selects
-// the picker: the external (*:NodePort) path uses PickStickyCluster
+// the picker: the external (NodePort) path uses PickStickyCluster
 // (externalTrafficPolicy:Cluster — ClientIP session affinity over all Ready backends,
 // ignoring iTP:Local); the internal (ClusterIP) path uses PickSticky, honoring
 // iTP:Local and ClientIP session affinity. Both paths extract the client IP with its
@@ -1033,7 +1090,9 @@ func (w writeOnly) Write(p []byte) (int, error) { return w.c.Write(p) }
 type listener struct {
 	key       PortKey
 	clusterIP net.Listener
-	nodePort  net.Listener
+	// nodePorts are the NodePort listeners: one wildcard listener, or one per
+	// configured NodePort address. Empty when the port has no NodePort.
+	nodePorts []net.Listener
 	// udp is the ClusterIP UDP datagram relay; it is non-nil only for a UDP port
 	// (nil for TCP). Close reaps it, joining its dispatcher, sweeper, and per-flow
 	// reader goroutines.
@@ -1049,8 +1108,8 @@ func (l *listener) Close() {
 	if l.clusterIP != nil {
 		_ = l.clusterIP.Close()
 	}
-	if l.nodePort != nil {
-		_ = l.nodePort.Close()
+	for _, nl := range l.nodePorts {
+		_ = nl.Close()
 	}
 	if l.udp != nil {
 		// Tears down the VIP datagram socket, the sweeper, and every per-flow upstream
