@@ -187,8 +187,10 @@ func TestBackendDialsClampTCPMaxSeg(t *testing.T) {
 		if _, ok := l.clusterIP.(*tcpseg.Listener); !ok {
 			t.Errorf("ClusterIP listener is %T, want *tcpseg.Listener", l.clusterIP)
 		}
-		if _, ok := l.nodePorts[0].(*tcpseg.Listener); !ok {
-			t.Errorf("NodePort listener is %T, want *tcpseg.Listener", l.nodePorts[0])
+		for addr, nl := range l.nodePorts.lns {
+			if _, ok := nl.(*tcpseg.Listener); !ok {
+				t.Errorf("NodePort listener on %s is %T, want *tcpseg.Listener", addr, nl)
+			}
 		}
 	})
 }

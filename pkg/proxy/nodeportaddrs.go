@@ -97,9 +97,9 @@ func ValidateNodePortAddresses(spec string) error {
 // them), loopback, and node (this node's own address) even when node is not
 // yet on an interface: the node address is aliased by the pod network during
 // startup, after the spec is resolved. The result is IPv4 only, deduplicated
-// and sorted. Resolution happens ONCE, when the caller builds the proxy, and
-// the set is fixed for the life of the process: an address that appears on the
-// host later is not picked up until the daemon restarts.
+// and sorted. It is a snapshot of the host at the call: an address that
+// appears on the host later is not picked up until the caller resolves the
+// spec again and swaps the result in (Proxy.PrepareNodePortAddresses).
 //
 // An IPv6 CIDR is refused rather than skipped, and so is a spec that selects
 // no address: either would leave every NodePort unbound with nothing saying why.

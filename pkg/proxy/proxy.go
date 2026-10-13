@@ -24,7 +24,6 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"strconv"
 	"sync"
 	"time"
 
@@ -131,10 +130,14 @@ type Proxy struct {
 	// guests' live lease addresses come from. Read-only after New, which resolves
 	// it (falling back to the policy table's seed) before building relays.
 	vmnet netip.Prefix
-	// nodePortAddrs is the address set every NodePort listener binds
-	// (WithNodePortAddresses). Empty, the default, binds the wildcard. Read-only
-	// after New.
+	// nodePortAddrs is the initial address set every NodePort listener binds
+	// (WithNodePortAddresses). Empty, the default, binds the wildcard. New
+	// copies it into np; it is not read after that.
 	nodePortAddrs []netip.Addr
+	// np is the NodePort address set in force and every open NodePort's
+	// listeners, swappable as a whole (PrepareNodePortAddresses). Built by New;
+	// it carries its own lock (see nodePortSet).
+	np *nodePortSet
 	// relays is the per-pod TCP relay manager on vm pods' published addresses
 	// (podrelay.go). Built by New when there is a routing table to observe, nil
 	// otherwise; Run drives it and shuts it down.
@@ -269,8 +272,8 @@ func WithNodeAddress(addr netip.Addr) Option {
 
 // WithNodePortAddresses sets the addresses every NodePort listener binds, in
 // place of the wildcard: the kube-proxy --nodeport-addresses analog. The
-// caller resolves them once (ResolveNodePortAddresses) and they are fixed for
-// the life of the proxy. Each NodePort binds every address in the set or none:
+// caller resolves them (ResolveNodePortAddresses); they hold until a later
+// PrepareNodePortAddresses swaps them. Each NodePort binds every address in the set or none:
 // a failed bind closes the ones already open and the port is retried as a
 // whole. No addresses (the default) keeps the wildcard ":port", so every
 // interface answers. Invalid addresses are dropped.
@@ -383,6 +386,7 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 	for _, o := range opts {
 		o(p)
 	}
+	p.np = newNodePortSet(p.nodePortAddrs, p.listenNodePort)
 	// An option cannot leave the aggregate invalid (WithClusterPodCIDR ignores an
 	// invalid prefix), but a zero-value Proxy assembled another way could: restore
 	// the default so the scoping predicate never degrades to "never bind" silently
@@ -777,7 +781,7 @@ func (p *Proxy) runWorker(w *portWorker) {
 // openListener binds the sockets for one Service port. For TCP it opens the
 // ClusterIP stream listener on the specific lo0 alias address (net.Listen on
 // clusterIP:port, never :port, so the bound source identity is the VIP) and, when
-// NodePort is set, the NodePort stream listeners (see openNodePort). For UDP it opens the
+// NodePort is set, the NodePort stream listeners (see nodePortSet.open). For UDP it opens the
 // ClusterIP datagram relay (see the UDP branch below and udprelay.go); UDP
 // NodePort is deferred. It ensures the lo0 alias exists first.
 //
@@ -855,51 +859,15 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	// Cluster pool; the splice does not preserve client src IP, so eTP:Local is not
 	// honored either).
 	if port.NodePort != 0 {
-		nls, err := p.openNodePort(port.NodePort)
+		g, err := p.np.open(port.NodePort, func(nl net.Listener) { p.serve(nl, key, externalListener) })
 		if err != nil {
 			_ = cl.Close()
 			_ = p.alias.Remove(ctx, ip)
 			return nil, err
 		}
-		l.nodePorts = nls
-		for _, nl := range nls {
-			go p.serve(nl, key, externalListener)
-		}
+		l.nodePorts = g
 	}
 	return l, nil
-}
-
-// nodePortBindAddrs is where a NodePort listens: the wildcard ":port" by
-// default, or one "addr:port" per WithNodePortAddresses address.
-func (p *Proxy) nodePortBindAddrs(nodePort int32) []string {
-	port := strconv.Itoa(int(nodePort))
-	if len(p.nodePortAddrs) == 0 {
-		return []string{net.JoinHostPort("", port)}
-	}
-	out := make([]string, 0, len(p.nodePortAddrs))
-	for _, a := range p.nodePortAddrs {
-		out = append(out, net.JoinHostPort(a.String(), port))
-	}
-	return out
-}
-
-// openNodePort binds every listener of one NodePort, all or nothing: if any
-// bind fails the listeners already open are closed before it returns, so a
-// NodePort is never half-served (reachable on some configured addresses and
-// silently absent on others). Each listener clamps its TCP segment size.
-func (p *Proxy) openNodePort(nodePort int32) ([]net.Listener, error) {
-	var nls []net.Listener
-	for _, addr := range p.nodePortBindAddrs(nodePort) {
-		raw, err := p.listenNodePort("tcp", addr)
-		if err != nil {
-			for _, nl := range nls {
-				_ = nl.Close()
-			}
-			return nil, fmt.Errorf("listen nodePort %s: %w", addr, err)
-		}
-		nls = append(nls, tcpseg.WrapListener(raw))
-	}
-	return nls, nil
 }
 
 // internalListener and externalListener name the accept-path scope threaded through
@@ -1090,9 +1058,9 @@ func (w writeOnly) Write(p []byte) (int, error) { return w.c.Write(p) }
 type listener struct {
 	key       PortKey
 	clusterIP net.Listener
-	// nodePorts are the NodePort listeners: one wildcard listener, or one per
-	// configured NodePort address. Empty when the port has no NodePort.
-	nodePorts []net.Listener
+	// nodePorts is the NodePort listener group: one wildcard listener, or one
+	// per address in the NodePort set. Nil when the port has no NodePort.
+	nodePorts *nodePortGroup
 	// udp is the ClusterIP UDP datagram relay; it is non-nil only for a UDP port
 	// (nil for TCP). Close reaps it, joining its dispatcher, sweeper, and per-flow
 	// reader goroutines.
@@ -1108,9 +1076,7 @@ func (l *listener) Close() {
 	if l.clusterIP != nil {
 		_ = l.clusterIP.Close()
 	}
-	for _, nl := range l.nodePorts {
-		_ = nl.Close()
-	}
+	l.nodePorts.close()
 	if l.udp != nil {
 		// Tears down the VIP datagram socket, the sweeper, and every per-flow upstream
 		// socket + reader, joining them all before returning (no stranded goroutine).
