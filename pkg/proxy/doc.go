@@ -56,11 +56,15 @@ limitations under the License.
 // A Service port with a non-zero NodePort additionally opens NodePort TCP
 // listeners that L4-load-balance to all Ready backends. By default that is one
 // *:NodePort listener on the wildcard, so every node interface answers (the
-// upstream default). WithNodePortAddresses replaces the wildcard with a fixed
-// address set — the kube-proxy --nodeport-addresses analog, resolved once by
+// upstream default). WithNodePortAddresses replaces the wildcard with an
+// address set — the kube-proxy --nodeport-addresses analog, resolved by
 // ResolveNodePortAddresses from a CIDR list or the NodePortPresetLocal preset
 // (loopback plus the node's own address) — and each NodePort then binds every
-// address in the set or none. NodePort listeners are bound in-process (a plain
+// address in the set or none. The set can be swapped while the proxy runs
+// (PrepareNodePortAddresses, then Commit or Abort): every open NodePort binds
+// the new addresses first, all or nothing across NodePorts, and only a commit
+// closes the addresses that left the set. Closing a listener never closes the
+// connections it accepted. NodePort listeners are bound in-process (a plain
 // net.Listen); they never go through the root netd helper — a >=1024 port needs
 // no privilege, so there is no helper NodePort path.
 //
