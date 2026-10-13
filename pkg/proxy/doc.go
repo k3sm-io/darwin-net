@@ -17,8 +17,8 @@ limitations under the License.
 // Package proxy is k3sm's userspace Service proxy: the macOS-native analog of
 // kube-proxy (which is Linux-only and never built here). It owns one listening
 // socket per ClusterIP:port — bound on a dedicated lo0 alias so loopback stamps
-// the VIP as the source identity — plus a node-wide *:NodePort socket when a
-// port declares one, and L4-load-balances accepted connections to the Ready
+// the VIP as the source identity — plus NodePort sockets when a port declares
+// one, and L4-load-balances accepted connections to the Ready
 // backends watched from the Services/EndpointSlices APIs.
 //
 // # Layers
@@ -53,12 +53,16 @@ limitations under the License.
 //
 // # NodePort
 //
-// A Service port with a non-zero NodePort additionally opens a node-wide
-// *:NodePort TCP listener (bound to the wildcard so every node interface answers)
-// that L4-load-balances to all Ready backends. The NodePort listener is bound
-// in-process (a plain net.Listen on the wildcard); it never goes through the root
-// netd helper, which binds only specific-address ports and rejects the wildcard — a
-// >=1024 wildcard needs no privilege, so there is no helper NodePort path.
+// A Service port with a non-zero NodePort additionally opens NodePort TCP
+// listeners that L4-load-balance to all Ready backends. By default that is one
+// *:NodePort listener on the wildcard, so every node interface answers (the
+// upstream default). WithNodePortAddresses replaces the wildcard with a fixed
+// address set — the kube-proxy --nodeport-addresses analog, resolved once by
+// ResolveNodePortAddresses from a CIDR list or the NodePortPresetLocal preset
+// (loopback plus the node's own address) — and each NodePort then binds every
+// address in the set or none. NodePort listeners are bound in-process (a plain
+// net.Listen); they never go through the root netd helper — a >=1024 port needs
+// no privilege, so there is no helper NodePort path.
 //
 // The NodePort path is externalTrafficPolicy: Cluster and is a distinct selector from
 // the ClusterIP path: it calls RoutingTable.PickStickyCluster (the external scope of
@@ -66,7 +70,7 @@ limitations under the License.
 // internalTrafficPolicy: Local. internalTrafficPolicy governs the ClusterIP
 // (east-west) path only, externalTrafficPolicy governs NodePort (KEP-2086), so an
 // iTP:Local Service still serves its NodePort to all backends rather than dropping
-// when the node has no local endpoint — the *:NodePort listener no longer shares the
+// when the node has no local endpoint — the NodePort listeners no longer share the
 // ClusterIP's iTP:Local filter.
 //
 // ClientIP session affinity is applied on the NodePort path too, over the
@@ -88,8 +92,8 @@ limitations under the License.
 //     independent module.
 //
 // Security caveat: internalTrafficPolicy:Local is not a mesh-containment boundary for
-// a Service that also exposes a NodePort. The *:NodePort listener binds the wildcard
-// (reachable over the wireguard mesh and lo0), and PickStickyCluster routes to remote
+// a Service that also exposes a NodePort. The NodePort listeners are reachable over
+// the wireguard mesh and lo0 (the wildcard, or a set naming the node address), and PickStickyCluster routes to remote
 // backends, so any pod that can dial nodeIP:NodePort reaches remote backends the
 // iTP:Local ClusterIP path would drop. iTP:Local bounds only the ClusterIP (east-west)
 // selector, never the NodePort surface — treat it as a routing policy, not an isolation
