@@ -50,11 +50,11 @@ type countingLister struct {
 	rounds atomic.Int64
 }
 
-func (l *countingLister) listServices(ctx context.Context) ([]corev1.Service, error) {
+func (l *countingLister) listServices(ctx context.Context) ([]corev1.Service, string, error) {
 	return l.inner.listServices(ctx)
 }
 
-func (l *countingLister) listEndpointSlices(ctx context.Context) ([]discoveryv1.EndpointSlice, error) {
+func (l *countingLister) listEndpointSlices(ctx context.Context) ([]discoveryv1.EndpointSlice, string, error) {
 	defer l.rounds.Add(1)
 	return l.inner.listEndpointSlices(ctx)
 }

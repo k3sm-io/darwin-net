@@ -80,6 +80,27 @@ type Watcher struct {
 	relistBackoff   time.Duration
 	relists         atomic.Int64
 
+	// divWarned holds the keys whose divergence Warn has fired in their current
+	// episode (a key leaves it on the first pass where it no longer diverges);
+	// breakerWarned is the same for the repair circuit breaker, per divergence
+	// episode. repairedFromLive holds the Services whose table entries were last
+	// delivered from a live list rather than the store; once the two views agree
+	// again they are re-delivered from the store, so a delete the store saw after
+	// the list cannot leave a repaired set behind. All three are touched only by
+	// the anti-entropy goroutine.
+	divWarned        map[PortKey]bool
+	breakerWarned    bool
+	repairedFromLive map[string]bool
+
+	// swapMu makes "is my informer set current" and the handler's delivery one
+	// step with respect to relist's swap: every handler holds it shared for the
+	// whole event, and relist takes it exclusively to swap. So once the swap
+	// returns, no handler of the retiring set is mid-delivery and none will start
+	// one: a retiring set can never deliver an object older than the current
+	// store holds. It never nests inside a reconcile stripe (handlers take it
+	// first; the anti-entropy goroutine never holds a stripe while swapping).
+	swapMu sync.RWMutex
+
 	// eTPLocalWarned throttles the externalTrafficPolicy:Local-unhonored datapath
 	// Warn to once per contiguous eTP:Local-on-NodePort episode, keyed by
 	// "namespace/name". It is touched ONLY from onService / onServiceDelete, which
@@ -89,9 +110,9 @@ type Watcher struct {
 	// single-goroutine property is an implicit client-go behavior, and the failure
 	// mode of a future refactor breaking it is a fatal `concurrent map writes` throw
 	// that crashes k3sm-netd (a node data-path DoS), so the near-free lock removes
-	// the reliance on an un-contracted invariant. A relist does break it, briefly:
-	// around the swap the retiring set's handler and the new set's may each be
-	// running one event, on two goroutines, and eTPMu is what keeps that safe.
+	// the reliance on an un-contracted invariant. A relist moves the handler to a
+	// new informer's goroutine; swapMu keeps the two sets' handlers from
+	// overlapping, and eTPMu covers the hand-off regardless.
 	eTPMu          sync.Mutex
 	eTPLocalWarned map[string]bool
 
@@ -116,9 +137,9 @@ type Watcher struct {
 	// so they too deliver a whole Service's snapshot without being interleaved.
 	//
 	// Striping bounds the contention: only Services that hash together wait on each
-	// other. The lock is held across ReconcilePolicy, whose sole blocking point is a
-	// buffered per-worker channel drained by a loop with no unbounded wait, so it is
-	// never held on a network round-trip. It is NOT held while onService runs the
+	// other. The lock is held across reconcileServicePort, whose sole blocking
+	// point is a buffered per-worker channel drained by a loop with no unbounded
+	// wait, so it is never held on a network round-trip. It is NOT held while onService runs the
 	// eTP Warn (eTPMu is taken and released before this one — the two never nest).
 	reconcileMu [reconcileStripes]sync.Mutex
 
@@ -195,14 +216,16 @@ func NewWatcher(client kubernetes.Interface, proxy *Proxy, log *slog.Logger, opt
 		log = slog.Default()
 	}
 	w := &Watcher{
-		proxy:          proxy,
-		client:         client,
-		log:            log,
-		eTPLocalWarned: make(map[string]bool),
-		antiEntropy:    DefaultAntiEntropyInterval,
-		lister:         clientLister{client: client},
-		confirmDelay:   antiEntropyConfirmDelay,
-		relistBackoff:  relistBackoffInitial,
+		proxy:            proxy,
+		client:           client,
+		log:              log,
+		eTPLocalWarned:   make(map[string]bool),
+		antiEntropy:      DefaultAntiEntropyInterval,
+		lister:           clientLister{client: client},
+		confirmDelay:     antiEntropyConfirmDelay,
+		relistBackoff:    relistBackoffInitial,
+		divWarned:        make(map[PortKey]bool),
+		repairedFromLive: make(map[string]bool),
 	}
 	w.inf.Store(newInformerSet(client))
 	for _, o := range opts {
@@ -240,33 +263,28 @@ func (w *Watcher) Run(ctx context.Context) error {
 // relist stays silent until it is swapped in (relist then reconciles everything
 // from it), and a retired set's late events are dropped.
 func (w *Watcher) addHandlers(set *informerSet) error {
-	current := func() bool { return w.informers() == set }
+	// gated runs fn only while set is current, holding swapMu shared for the whole
+	// delivery so relist cannot swap mid-event (see swapMu).
+	gated := func(fn func(any)) func(any) {
+		return func(obj any) {
+			w.swapMu.RLock()
+			defer w.swapMu.RUnlock()
+			if w.informers() == set {
+				fn(obj)
+			}
+		}
+	}
+	onService, onServiceDelete := gated(w.onService), gated(w.onServiceDelete)
 	svcHandler := cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) {
-			if current() {
-				w.onService(obj)
-			}
-		},
-		UpdateFunc: func(_, obj any) {
-			if current() {
-				w.onService(obj)
-			}
-		},
-		DeleteFunc: func(obj any) {
-			if current() {
-				w.onServiceDelete(obj)
-			}
-		},
+		AddFunc:    onService,
+		UpdateFunc: func(_, obj any) { onService(obj) },
+		DeleteFunc: onServiceDelete,
 	}
 	if _, err := set.svcs.AddEventHandler(svcHandler); err != nil {
 		return fmt.Errorf("add service handler: %w", err)
 	}
 
-	onSlice := func(obj any) {
-		if current() {
-			w.onSlice(obj)
-		}
-	}
+	onSlice := gated(w.onSlice)
 	sliceHandler := cache.ResourceEventHandlerFuncs{
 		AddFunc:    onSlice,
 		UpdateFunc: func(_, obj any) { onSlice(obj) },
