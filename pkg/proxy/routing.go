@@ -99,6 +99,14 @@ const (
 	trafficLocal
 )
 
+// String renders the policy with its upstream internalTrafficPolicy spelling.
+func (p trafficPolicy) String() string {
+	if p == trafficLocal {
+		return "Local"
+	}
+	return "Cluster"
+}
+
 // backend is one dialable endpoint plus its precomputed locality. It is the
 // routing table's internal view of a netv1.Endpoint: only Ready endpoints are
 // admitted, so a backend in the table is always selectable.
@@ -169,8 +177,15 @@ type RoutingTable struct {
 	snap atomic.Pointer[routingSnapshot]
 	// mu serializes writers only (SetEndpointsPolicy, Delete, SetTransportOverrides):
 	// each loads the current snapshot, derives the next, and stores it, and two
-	// writers racing would otherwise lose one's update. No reader takes it.
+	// writers racing would otherwise lose one's update. The pick path never takes
+	// it; the cold paths that read meta (a drop with no portState, VIPStates) do.
 	mu sync.Mutex
+	// meta holds one keyMeta per installed key, including a key whose backend set
+	// is empty and so has no portState. It carries the owning Service's name, the
+	// key's backend-set generation and its drop-warning throttle, all of which must
+	// outlive a portState swap. Guarded by mu; an entry is removed by Delete. Nil
+	// on a zero-value table until the first install.
+	meta map[PortKey]*keyMeta
 	// observer, when set, is told about every generation a writer stores, in store
 	// order, while mu is still held: transport reports whether the generation
 	// replaced the transport overrides. It is the owning Proxy's per-pod relay
@@ -332,24 +347,30 @@ type portState struct {
 	// nil when there are no node-local backends.
 	allSet   map[netip.AddrPort]struct{}
 	localSet map[netip.AddrPort]struct{}
+	// gen is the key's backend-set generation this state was installed under (see
+	// keyMeta.gen). Two states with the same gen carry the same set and policy.
+	gen uint64
+	// meta is the key's long-lived bookkeeping (Service name, drop throttle). It
+	// is shared by every portState installed for the key under one Service name.
+	meta *keyMeta
 
 	// The two atomics below are the only fields a pick writes, and they are
 	// deliberately the last fields, pushed onto a cache line of their own.
 	//
-	// The leading pad's 80 is the end of the read-only block above (all 0+24,
+	// The leading pad's 96 is the end of the read-only block above (all 0+24,
 	// locals 24+24, policy 48+1, affinityMode 49+1, six bytes of alignment so the
 	// 8-byte time.Duration starts at 56, affinityTimeout 56+8, allSet 64+8,
-	// localSet 72+8), so cursor lands at exactly cacheLineSize. The trailing
+	// localSet 72+8, gen 80+8, meta 88+8), so cursor lands at exactly cacheLineSize. The trailing
 	// pad's 12 is sizeof(cursor)+sizeof(warned), which rounds the struct to
 	// 2*cacheLineSize: heap objects of that size class are 256-byte aligned, so
 	// back-to-back portStates never put one key's atomics on the line holding the
 	// next key's read-only header.
 	//
-	// Reordering, adding, or resizing ANY read-only field above invalidates the 80
+	// Reordering, adding, or resizing ANY read-only field above invalidates the 96
 	// and silently re-shares the line. TestPortStateCursorIsolatedCacheLine is the
 	// alarm on that: when it goes red, recompute the pads, do not relax the test.
 	// The cost is 256 B per Service port — 256 KiB at 1,000 ports.
-	_ [cacheLineSize - 80]byte
+	_ [cacheLineSize - 96]byte
 	// cursor is the round-robin cursor over the active pool, advanced atomically
 	// by every pick. SetEndpointsPolicy installs a fresh state (cursor 0) on any
 	// change so distribution restarts deterministically.
@@ -360,6 +381,63 @@ type portState struct {
 	// sees true and stays quiet. A new state (a reconcile) clears it.
 	warned atomic.Bool
 	_      [cacheLineSize - 12]byte
+}
+
+// keyMeta is the per-key bookkeeping that outlives any one portState: the owning
+// Service's name, the key's backend-set generation, and the once-per-generation
+// drop warning.
+//
+// namespace and name are written once, before the keyMeta is published in meta,
+// and never again: an install under a different Service name replaces the whole
+// keyMeta, so the lock-free drop path may read them through a portState. gen and
+// policy are guarded by RoutingTable.mu. dropWarned is an atomic because the drop
+// path claims it without the lock.
+type keyMeta struct {
+	namespace string
+	name      string
+	// gen numbers the distinct backend sets installed for the key, starting at 1.
+	// An install bumps it when the Ready set, the node-local subset or the policy
+	// differs from the current one; re-installing an identical set keeps it.
+	gen uint64
+	// policy is the latest installed policy, read under mu by a drop on a key with
+	// no portState (an empty set).
+	policy trafficPolicy
+	// dropWarned is the last generation whose dropped-connection Warn has fired:
+	// the first drop of a generation to win the compare-and-swap logs, every other
+	// drop of that generation stays at Debug, and a newer generation re-arms it.
+	dropWarned atomic.Uint64
+	// lastDropWarn is when the key's last drop Warn fired (Unix nanoseconds). It
+	// floors the Warn rate at one per dropWarnFloor however fast the generation
+	// churns, and is carried over when the keyMeta is replaced.
+	lastDropWarn atomic.Int64
+}
+
+// dropWarnFloor is the minimum interval between two drop Warns for one key.
+const dropWarnFloor = 10 * time.Second
+
+// claimDropWarn reports whether the caller is the first to warn about a dropped
+// connection under generation gen at time now, recording the claim. A claim for
+// an older generation than one already warned loses, so a pick that loaded a
+// stale portState cannot re-warn after a newer set has. Within dropWarnFloor of
+// the key's previous Warn every claim loses without consuming the generation, so
+// a generation first dropped inside the floor still warns once it has passed.
+func (m *keyMeta) claimDropWarn(gen uint64, now time.Time) bool {
+	last := m.lastDropWarn.Load()
+	if last != 0 && now.UnixNano()-last < int64(dropWarnFloor) {
+		return false
+	}
+	for {
+		warned := m.dropWarned.Load()
+		if warned >= gen {
+			return false
+		}
+		if m.dropWarned.CompareAndSwap(warned, gen) {
+			break
+		}
+	}
+	// A concurrent claim for another generation that also passed the floor check
+	// loses here, so the floor holds exactly.
+	return m.lastDropWarn.CompareAndSwap(last, now.UnixNano())
 }
 
 // PortKey identifies one bound Service port: the ClusterIP plus the Service Port
@@ -426,23 +504,40 @@ func (t *RoutingTable) SetEndpoints(key PortKey, eps []netv1.Endpoint) int {
 // Service toggled ClientIP->None (or drained) leaves no stale bindings to resurrect.
 // Membership sets over the full and node-local pools are precomputed here (the O(N)
 // slice build is already paid) so PickSticky re-validation is O(1).
+//
+// SetEndpointsPolicy records no Service name for the key; the reconcile path
+// installs through installEndpoints, which carries the name the drop Warn and
+// VIPStates report.
 func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, policy trafficPolicy, aff affinityConfig) int {
+	return t.installEndpoints(key, serviceRef{}, eps, policy, aff)
+}
+
+// serviceRef names the Service that owns a routing-table key.
+type serviceRef struct {
+	Namespace string
+	Name      string
+}
+
+// String renders the reference as namespace/name, or the empty string when unset.
+func (r serviceRef) String() string {
+	if r.Namespace == "" && r.Name == "" {
+		return ""
+	}
+	return r.Namespace + "/" + r.Name
+}
+
+// installEndpoints is SetEndpointsPolicy carrying the owning Service's name. It
+// also maintains the key's keyMeta: a new Service name starts a fresh keyMeta (so
+// its drop warning is armed), and the generation is bumped whenever the installed
+// Ready set, node-local subset or policy differs from the current one.
+func (t *RoutingTable) installEndpoints(key PortKey, svc serviceRef, eps []netv1.Endpoint, policy trafficPolicy, aff affinityConfig) int {
 	ready := make([]backend, 0, len(eps))
 	for _, ep := range eps {
-		if !ep.Ready {
+		ap, ok := admitEndpoint(ep)
+		if !ok {
 			continue
 		}
-		if err := ep.Validate(); err != nil {
-			continue
-		}
-		addr, err := netip.ParseAddr(ep.IP)
-		if err != nil {
-			continue
-		}
-		ready = append(ready, backend{
-			addr:     netip.AddrPortFrom(addr, uint16(ep.Port)),
-			locality: t.classify(addr),
-		})
+		ready = append(ready, backend{addr: ap, locality: t.classify(ap.Addr())})
 	}
 	sort.Slice(ready, func(i, j int) bool {
 		if ready[i].addr.Addr() != ready[j].addr.Addr() {
@@ -486,6 +581,7 @@ func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, pol
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	m := t.advanceMeta(key, svc, ready, locals, policy)
 	if len(ready) == 0 {
 		// Store first, purge second: a sticky pick that loaded the old generation
 		// re-validates against the current one under affMu before it records, so
@@ -503,6 +599,8 @@ func (t *RoutingTable) SetEndpointsPolicy(key PortKey, eps []netv1.Endpoint, pol
 		affinityTimeout: aff.timeout,
 		allSet:          allSet,
 		localSet:        localSet,
+		gen:             m.gen,
+		meta:            m,
 	}), false)
 	if aff.mode != affinityClientIP {
 		// Affinity off for this port: purge bindings so a Service toggled
@@ -521,6 +619,80 @@ func (t *RoutingTable) Delete(key PortKey) {
 	defer t.mu.Unlock()
 	t.store(t.load().withState(key, nil), false)
 	t.purgeAffinity(key) // after the store, as in SetEndpointsPolicy
+	delete(t.meta, key)
+}
+
+// admitEndpoint is the table's single admission rule: an endpoint is routable iff
+// it is Ready, passes netv1.Endpoint.Validate, and its IP parses. The returned
+// address is what the table stores and VIPStates renders (AddrPort.String), and
+// APIBackendSets applies the same rule, so the two views compare equal.
+func admitEndpoint(ep netv1.Endpoint) (netip.AddrPort, bool) {
+	if !ep.Ready {
+		return netip.AddrPort{}, false
+	}
+	if err := ep.Validate(); err != nil {
+		return netip.AddrPort{}, false
+	}
+	addr, err := netip.ParseAddr(ep.IP)
+	if err != nil {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(addr, uint16(ep.Port)), true
+}
+
+// advanceMeta returns key's keyMeta for an install of (ready, locals, policy) by
+// svc, creating or replacing it and bumping its generation as needed. The caller
+// holds mu and has not yet stored the new generation, so the current portState is
+// the previous install.
+func (t *RoutingTable) advanceMeta(key PortKey, svc serviceRef, ready, locals []backend, policy trafficPolicy) *keyMeta {
+	if t.meta == nil {
+		t.meta = make(map[PortKey]*keyMeta)
+	}
+	m := t.meta[key]
+	if m == nil || m.namespace != svc.Namespace || m.name != svc.Name {
+		var gen uint64
+		var lastWarn int64
+		if m != nil {
+			gen, lastWarn = m.gen, m.lastDropWarn.Load()
+		}
+		m = &keyMeta{namespace: svc.Namespace, name: svc.Name, gen: gen + 1, policy: policy}
+		m.lastDropWarn.Store(lastWarn)
+		t.meta[key] = m
+		return m
+	}
+	if !sameInstall(t.load().states[key], m.policy, ready, locals, policy) {
+		m.gen++
+	}
+	m.policy = policy
+	return m
+}
+
+// sameInstall reports whether an install of (ready, locals, policy) is the set
+// prev (the current portState, nil for an empty set) already holds under
+// prevPolicy. The comparison is over address SETS, so the same endpoints listed
+// in another order or with a duplicate (one address in two slices) are the same
+// install. Locality is a function of the address, so comparing the full set and
+// the node-local set is a complete comparison.
+func sameInstall(prev *portState, prevPolicy trafficPolicy, ready, locals []backend, policy trafficPolicy) bool {
+	if policy != prevPolicy {
+		return false
+	}
+	if prev == nil {
+		return len(ready) == 0
+	}
+	return sameAddrSet(prev.allSet, ready) && sameAddrSet(prev.localSet, locals)
+}
+
+// sameAddrSet reports whether bs holds exactly the addresses in set.
+func sameAddrSet(set map[netip.AddrPort]struct{}, bs []backend) bool {
+	seen := make(map[netip.AddrPort]struct{}, len(bs))
+	for _, b := range bs {
+		if _, ok := set[b.addr]; !ok {
+			return false
+		}
+		seen[b.addr] = struct{}{}
+	}
+	return len(seen) == len(set)
 }
 
 // VMPodTransport is the live half of one vm-RuntimeClass pod's two-address
@@ -743,6 +915,50 @@ var ErrNoBackends = fmt.Errorf("proxy: no ready backends for service port")
 // distinct from ErrNoBackends (no Ready endpoints at all) and never occurs under an
 // unknown podCIDR — that path fails open to all backends (see Pick).
 var ErrNoLocalBackends = fmt.Errorf("proxy: no node-local backends for internalTrafficPolicy:Local service port")
+
+// warnDrop reports a connection dropped on key for reason (ErrNoBackends or
+// ErrNoLocalBackends). It logs at Warn once per (key, backend-set generation) and
+// returns true for that one call; every other drop of the same generation returns
+// false so the caller keeps its per-connection Debug line. A later, different
+// backend set or policy is a new generation and warns again, but never sooner
+// than dropWarnFloor after the key's previous Warn.
+//
+// The common case reads the current portState lock-free and claims the
+// generation with a compare-and-swap. A key whose set is empty has no portState;
+// that cold path reads its keyMeta under mu. A key with no keyMeta at all was
+// never installed or was just deleted (a connection racing the listener close),
+// and is not warned about.
+func (t *RoutingTable) warnDrop(key PortKey, external bool, reason error, now time.Time) bool {
+	var (
+		m              *keyMeta
+		gen            uint64
+		policy         trafficPolicy
+		all, nodeLocal int
+	)
+	if st := t.load().states[key]; st != nil && st.meta != nil {
+		m, gen, policy, all, nodeLocal = st.meta, st.gen, st.policy, len(st.all), len(st.locals)
+	} else {
+		t.mu.Lock()
+		m = t.meta[key]
+		if m != nil {
+			gen, policy = m.gen, m.policy
+		}
+		t.mu.Unlock()
+	}
+	if m == nil || !m.claimDropWarn(gen, now) {
+		return false
+	}
+	t.logger().Warn("service port is dropping connections: no backend to route to",
+		"vip", key.String(),
+		"service", serviceRef{Namespace: m.namespace, Name: m.name}.String(),
+		"policy", policy.String(),
+		"backends", all,
+		"localBackends", nodeLocal,
+		"external", external,
+		"generation", gen,
+		"reason", reason.Error())
+	return true
+}
 
 // activePool returns the policy-correct backend pool for st together with a
 // membership set over that exact pool, or an error that must be surfaced (never

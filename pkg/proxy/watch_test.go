@@ -478,7 +478,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 			<-runDone
 		}()
 
-		if !cache.WaitForCacheSync(ctx.Done(), w.svcs.HasSynced, w.slices.HasSynced) {
+		if !cache.WaitForCacheSync(ctx.Done(), w.informers().svcs.HasSynced, w.informers().slices.HasSynced) {
 			t.Fatal("informer cache sync failed")
 		}
 		gate.wait(t)
@@ -526,13 +526,13 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 				sl := orderSlice("10.42.0.5", 8080)
 
 				deliverSvc := func() {
-					if err := w.svcs.GetStore().Add(svc); err != nil {
+					if err := w.informers().svcs.GetStore().Add(svc); err != nil {
 						t.Fatalf("seed service store: %v", err)
 					}
 					w.onService(svc)
 				}
 				deliverSlice := func() {
-					if err := w.slices.GetStore().Add(sl); err != nil {
+					if err := w.informers().slices.GetStore().Add(sl); err != nil {
 						t.Fatalf("seed slice store: %v", err)
 					}
 					w.onSlice(sl)
@@ -572,7 +572,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			runDone := make(chan struct{})
 			go func() { defer close(runDone); _ = w.Run(ctx) }()
-			if !cache.WaitForCacheSync(ctx.Done(), w.svcs.HasSynced, w.slices.HasSynced) {
+			if !cache.WaitForCacheSync(ctx.Done(), w.informers().svcs.HasSynced, w.informers().slices.HasSynced) {
 				cancel()
 				<-runDone
 				t.Fatal("informer cache sync failed")
@@ -624,7 +624,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 		px, tbl := newOrderProxy(t)
 		w := NewWatcher(fake.NewSimpleClientset(), px, slog.New(slog.DiscardHandler))
 		sl := orderSlice("10.42.0.5", 8080)
-		if err := w.slices.GetStore().Add(sl); err != nil {
+		if err := w.informers().slices.GetStore().Add(sl); err != nil {
 			t.Fatalf("seed slice store: %v", err)
 		}
 		w.onSlice(sl)
@@ -664,7 +664,7 @@ func TestReconcileSnapshotIsNotOvertaken(t *testing.T) {
 		w := NewWatcher(fake.NewSimpleClientset(), px, slog.New(slog.DiscardHandler))
 
 		svc := orderService(vip, port)
-		if err := w.svcs.GetStore().Add(svc); err != nil {
+		if err := w.informers().svcs.GetStore().Add(svc); err != nil {
 			t.Fatalf("iteration %d: seed service store: %v", i, err)
 		}
 		// Unrelated slices: they widen the snapshot, and slicesForService must filter
@@ -673,7 +673,7 @@ func TestReconcileSnapshotIsNotOvertaken(t *testing.T) {
 			pad := orderSlice("10.42.9.9", 8080)
 			pad.Name = "noise-" + strconv.Itoa(j)
 			pad.Labels[discoveryv1.LabelServiceName] = "other"
-			if err := w.slices.GetStore().Add(pad); err != nil {
+			if err := w.informers().slices.GetStore().Add(pad); err != nil {
 				t.Fatalf("iteration %d: seed padding: %v", i, err)
 			}
 		}
@@ -692,7 +692,7 @@ func TestReconcileSnapshotIsNotOvertaken(t *testing.T) {
 		// The fresh reconciler: the slice exists before it snapshots, so its snapshot
 		// carries the backend.
 		<-entered
-		if err := w.slices.GetStore().Add(orderSlice("10.42.0.5", 8080)); err != nil {
+		if err := w.informers().slices.GetStore().Add(orderSlice("10.42.0.5", 8080)); err != nil {
 			t.Fatalf("iteration %d: seed slice store: %v", i, err)
 		}
 		w.reconcileService(svc)

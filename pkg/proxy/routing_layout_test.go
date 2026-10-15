@@ -76,6 +76,8 @@ func TestPortStateCursorIsolatedCacheLine(t *testing.T) {
 			{"affinityTimeout", unsafe.Offsetof(st.affinityTimeout), unsafe.Sizeof(st.affinityTimeout)},
 			{"allSet", unsafe.Offsetof(st.allSet), unsafe.Sizeof(st.allSet)},
 			{"localSet", unsafe.Offsetof(st.localSet), unsafe.Sizeof(st.localSet)},
+			{"gen", unsafe.Offsetof(st.gen), unsafe.Sizeof(st.gen)},
+			{"meta", unsafe.Offsetof(st.meta), unsafe.Sizeof(st.meta)},
 		}
 		for _, f := range readOnly {
 			for _, line := range [2]uintptr{f.off / cacheLineSize, (f.off + f.size - 1) / cacheLineSize} {

@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -79,6 +80,14 @@ const udpFlowIdleTimeout = 30 * time.Second
 //   - The RoutingTable has its own internal lock and is shared read-only by the
 //     accept paths and written by the workers.
 type Proxy struct {
+	// synced is what Synced reports. The Watcher driving this Proxy writes it
+	// (see Watcher.Synced); it is false on a Proxy no Watcher has synced.
+	synced atomic.Bool
+
+	// now is the accept path's clock (affinity TTLs, the drop-Warn floor). It is
+	// time.Now outside tests and is set before any connection is handled.
+	now func() time.Time
+
 	table  *RoutingTable
 	alias  aliasManager
 	binder binder
@@ -382,6 +391,7 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 		listenUDP:      listenUDPVIP,
 		listenNodePort: net.Listen,
 		dialBackend:    dialWith,
+		now:            time.Now,
 	}
 	for _, o := range opts {
 		o(p)
@@ -496,7 +506,11 @@ type portWorker struct {
 // table atomically with endpoints so a pick never observes a stale (policy,
 // affinity, backends) pairing.
 type portEvent struct {
+	// barrier, when non-nil, marks a flush: the worker closes it once every event
+	// queued before it has been applied, and the event carries nothing else.
+	barrier   chan struct{}
 	port      *netv1.ServicePort
+	svc       serviceRef
 	policy    trafficPolicy
 	affinity  affinityConfig
 	endpoints []netv1.Endpoint
@@ -608,7 +622,15 @@ func (p *Proxy) Reconcile(clusterIP string, port *netv1.ServicePort, endpoints [
 // endpoints) reach the routing table together.
 //
 // ReconcilePolicy is safe for concurrent callers (the informer event handlers).
+// It records no owning Service name; the Watcher reconciles through
+// reconcileServicePort, which does.
 func (p *Proxy) ReconcilePolicy(clusterIP string, port *netv1.ServicePort, policy trafficPolicy, affinity affinityConfig, endpoints []netv1.Endpoint) error {
+	return p.reconcileServicePort(serviceRef{}, clusterIP, port, policy, affinity, endpoints)
+}
+
+// reconcileServicePort is ReconcilePolicy carrying the owning Service's name to
+// the routing table, where the dropped-connection Warn and VIPStates report it.
+func (p *Proxy) reconcileServicePort(svc serviceRef, clusterIP string, port *netv1.ServicePort, policy trafficPolicy, affinity affinityConfig, endpoints []netv1.Endpoint) error {
 	if port == nil {
 		return errors.New("proxy: reconcile requires a port (use ReconcileDelete to remove)")
 	}
@@ -630,11 +652,48 @@ func (p *Proxy) ReconcilePolicy(clusterIP string, port *netv1.ServicePort, polic
 		return errors.New("proxy: shutting down")
 	}
 	select {
-	case w.ch <- portEvent{port: port, policy: policy, affinity: affinity, endpoints: endpoints}:
+	case w.ch <- portEvent{port: port, svc: svc, policy: policy, affinity: affinity, endpoints: endpoints}:
 		return nil
 	case <-w.stop:
 		return errors.New("proxy: worker stopped")
 	}
+}
+
+// Synced reports whether the routing table has been built from synced informers:
+// it mirrors Watcher.Synced for the Watcher driving this Proxy (one Watcher per
+// Proxy), and is false when none has synced it. It never blocks.
+func (p *Proxy) Synced() bool {
+	return p.synced.Load()
+}
+
+// barrier blocks until every port worker has applied every event delivered to it
+// before the call, or ctx is done. Each worker's channel is FIFO, so a barrier
+// event closed by the worker proves everything queued ahead of it reached the
+// routing table. A worker that stops meanwhile has nothing left to apply.
+func (p *Proxy) barrier(ctx context.Context) error {
+	p.mu.Lock()
+	ws := make([]*portWorker, 0, len(p.workers))
+	for _, w := range p.workers {
+		ws = append(ws, w)
+	}
+	p.mu.Unlock()
+	for _, w := range ws {
+		done := make(chan struct{})
+		select {
+		case w.ch <- portEvent{barrier: done}:
+		case <-w.stop:
+			continue
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case <-done:
+		case <-w.stop:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 // ReconcileDelete tells the worker for clusterIP:port/proto to tear down its
@@ -761,6 +820,10 @@ func (p *Proxy) runWorker(w *portWorker) {
 				open(pending)
 			}
 		case ev := <-w.ch:
+			if ev.barrier != nil {
+				close(ev.barrier)
+				continue
+			}
 			if ev.port == nil {
 				if ln != nil {
 					ln.Close()
@@ -770,7 +833,7 @@ func (p *Proxy) runWorker(w *portWorker) {
 				p.removeWorker(w)
 				return
 			}
-			p.table.SetEndpointsPolicy(w.key, ev.endpoints, ev.policy, ev.affinity)
+			p.table.installEndpoints(w.key, ev.svc, ev.endpoints, ev.policy, ev.affinity)
 			if ln == nil {
 				open(ev.port)
 			}
@@ -912,17 +975,23 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		be  backend
 		err error
 	)
+	now := p.now()
 	if external {
-		be, err = p.table.PickStickyCluster(key, src, time.Now())
+		be, err = p.table.PickStickyCluster(key, src, now)
 	} else {
-		be, err = p.table.PickSticky(key, src, time.Now())
+		be, err = p.table.PickSticky(key, src, now)
 	}
 	if err != nil {
-		// Distinct messages so the two drop reasons are greppable, but both stay at
-		// Debug: handle logs per-connection, so Info here would flood a steady-state
-		// iTP:Local-starved Service; the throttled activePool Warn (once per backend
-		// set) is the observable signal. The ErrNoLocalBackends arm is ClusterIP-only —
-		// PickStickyCluster (external) forces the Cluster pool and never returns it.
+		// The first drop of each backend-set generation is a Warn naming the VIP,
+		// the Service, the policy and the backend counts (warnDrop); every later
+		// drop of the same set stays at Debug, since handle runs per connection and
+		// a steady-state starved Service would otherwise flood the log. Distinct
+		// Debug messages keep the two drop reasons greppable. The
+		// ErrNoLocalBackends arm is ClusterIP-only — PickStickyCluster (external)
+		// forces the Cluster pool and never returns it.
+		if p.table.warnDrop(key, external, err, now) {
+			return
+		}
 		if errors.Is(err, ErrNoLocalBackends) {
 			p.logger().Debug("no node-local backend for internalTrafficPolicy:Local connection", "vip", key.String(), "err", err)
 		} else {
