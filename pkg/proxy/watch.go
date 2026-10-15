@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -41,12 +43,42 @@ import (
 //
 // That last property only holds if a recompute's snapshot cannot be overtaken by
 // an older one — see reconcileMu, which is what makes it true.
+//
+// The informers run a 0 resync period, so a watch event the store never received
+// is not re-derived by the informers themselves. The anti-entropy pass
+// (WithAntiEntropyInterval) is the backstop: it compares an uncached LIST against
+// the store, repairs a diverging Service from the live objects, and replaces the
+// informers so the store converges.
 type Watcher struct {
-	proxy   *Proxy
-	factory informers.SharedInformerFactory
-	svcs    cache.SharedIndexInformer
-	slices  cache.SharedIndexInformer
-	log     *slog.Logger
+	proxy  *Proxy
+	client kubernetes.Interface
+	log    *slog.Logger
+
+	// inf is the current informer set (factory, Service and EndpointSlice
+	// informers). It is replaced only by relist, from the anti-entropy goroutine;
+	// every reader loads it once per operation. Event handlers are bound to the set
+	// that registered them and ignore events once their set is no longer current,
+	// so a retiring set and a syncing one never reconcile.
+	inf atomic.Pointer[informerSet]
+
+	// antiEntropy is the interval between anti-entropy passes; zero disables them.
+	// lister is the uncached read the pass compares against (clientLister in
+	// production). confirmDelay is the pause before a divergence is re-listed and
+	// confirmed, so a store merely a watch-latency behind the LIST is not repaired.
+	// All three are set at construction and read-only afterwards.
+	antiEntropy  time.Duration
+	lister       liveLister
+	confirmDelay time.Duration
+
+	// episodeRelisted, nextRelist and relistBackoff throttle relist to at most once
+	// per divergence episode (a run of consecutive diverging passes), and no sooner
+	// than relistBackoff after the previous relist. They are touched only by the
+	// anti-entropy goroutine, so they need no lock. relists counts completed
+	// relists (diagnostics and tests).
+	episodeRelisted bool
+	nextRelist      time.Time
+	relistBackoff   time.Duration
+	relists         atomic.Int64
 
 	// eTPLocalWarned throttles the externalTrafficPolicy:Local-unhonored datapath
 	// Warn to once per contiguous eTP:Local-on-NodePort episode, keyed by
@@ -57,7 +89,9 @@ type Watcher struct {
 	// single-goroutine property is an implicit client-go behavior, and the failure
 	// mode of a future refactor breaking it is a fatal `concurrent map writes` throw
 	// that crashes k3sm-netd (a node data-path DoS), so the near-free lock removes
-	// the reliance on an un-contracted invariant.
+	// the reliance on an un-contracted invariant. A relist does break it, briefly:
+	// around the swap the retiring set's handler and the new set's may each be
+	// running one event, on two goroutines, and eTPMu is what keeps that safe.
 	eTPMu          sync.Mutex
 	eTPLocalWarned map[string]bool
 
@@ -72,9 +106,14 @@ type Watcher struct {
 	//	Slice handler:            snapshot slices -> [pod] -> send [pod]
 	//
 	// The worker applies both in arrival order, so the table ends on the empty set
-	// and — the informers run a 0 resync period — nothing ever recomputes it. The
-	// Service blackholes until its next real event. The proxy's per-VIP worker
-	// serializes DELIVERY, which is not the same guarantee.
+	// and — the informers run a 0 resync period — no informer event recomputes it.
+	// The Service blackholes until its next real event: the anti-entropy pass
+	// compares the store, not the table, against the API, so it does not see this
+	// drift either. The proxy's per-VIP worker serializes DELIVERY, which is not the
+	// same guarantee.
+	//
+	// The anti-entropy repair and the post-relist reconcile take the same stripe,
+	// so they too deliver a whole Service's snapshot without being interleaved.
 	//
 	// Striping bounds the contention: only Services that hash together wait on each
 	// other. The lock is held across ReconcilePolicy, whose sole blocking point is a
@@ -107,21 +146,65 @@ func WithStaticBackends(backends map[string][]netv1.Endpoint) WatcherOption {
 	return func(w *Watcher) { w.static = backends }
 }
 
+// DefaultAntiEntropyInterval is the default period between anti-entropy passes.
+const DefaultAntiEntropyInterval = 30 * time.Second
+
+// WithAntiEntropyInterval sets how often the Watcher compares an uncached LIST of
+// Services and EndpointSlices against its informer store (default
+// DefaultAntiEntropyInterval). Zero or a negative value disables the check.
+func WithAntiEntropyInterval(d time.Duration) WatcherOption {
+	return func(w *Watcher) { w.antiEntropy = max(d, 0) }
+}
+
+// informerSet is one generation of the Watcher's informers. stop is closed (once)
+// to stop them, when Run returns or when relist retires the set.
+type informerSet struct {
+	factory  informers.SharedInformerFactory
+	svcs     cache.SharedIndexInformer
+	slices   cache.SharedIndexInformer
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+// newInformerSet builds unstarted Service and EndpointSlice informers over client,
+// with a 0 resync period (see Watcher).
+func newInformerSet(client kubernetes.Interface) *informerSet {
+	f := informers.NewSharedInformerFactory(client, 0)
+	return &informerSet{
+		factory: f,
+		svcs:    f.Core().V1().Services().Informer(),
+		slices:  f.Discovery().V1().EndpointSlices().Informer(),
+		stop:    make(chan struct{}),
+	}
+}
+
+// close stops the set's informers. It is idempotent.
+func (s *informerSet) close() {
+	s.stopOnce.Do(func() { close(s.stop) })
+}
+
+// informers returns the current informer set.
+func (w *Watcher) informers() *informerSet {
+	return w.inf.Load()
+}
+
 // NewWatcher builds a Watcher over client for the given Proxy. It wires Service
 // and EndpointSlice informers but does not start them; call Run.
 func NewWatcher(client kubernetes.Interface, proxy *Proxy, log *slog.Logger, opts ...WatcherOption) *Watcher {
 	if log == nil {
 		log = slog.Default()
 	}
-	f := informers.NewSharedInformerFactory(client, 0)
 	w := &Watcher{
 		proxy:          proxy,
-		factory:        f,
-		svcs:           f.Core().V1().Services().Informer(),
-		slices:         f.Discovery().V1().EndpointSlices().Informer(),
+		client:         client,
 		log:            log,
 		eTPLocalWarned: make(map[string]bool),
+		antiEntropy:    DefaultAntiEntropyInterval,
+		lister:         clientLister{client: client},
+		confirmDelay:   antiEntropyConfirmDelay,
+		relistBackoff:  relistBackoffInitial,
 	}
+	w.inf.Store(newInformerSet(client))
 	for _, o := range opts {
 		o(w)
 	}
@@ -130,32 +213,69 @@ func NewWatcher(client kubernetes.Interface, proxy *Proxy, log *slog.Logger, opt
 
 // Run starts the informers and blocks until ctx is cancelled. It registers event
 // handlers that reconcile the affected Service on any Service or EndpointSlice
-// change, then waits for cache sync before processing.
+// change, waits for cache sync, and then runs the anti-entropy pass every
+// interval until ctx is done.
 func (w *Watcher) Run(ctx context.Context) error {
-	svcHandler := cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj any) { w.onService(obj) },
-		UpdateFunc: func(_, obj any) { w.onService(obj) },
-		DeleteFunc: func(obj any) { w.onServiceDelete(obj) },
+	set := w.informers()
+	if err := w.addHandlers(set); err != nil {
+		return err
 	}
-	if _, err := w.svcs.AddEventHandler(svcHandler); err != nil {
+	set.factory.Start(set.stop)
+	if !cache.WaitForCacheSync(ctx.Done(), set.svcs.HasSynced, set.slices.HasSynced) {
+		set.close()
+		return fmt.Errorf("informer cache sync failed")
+	}
+	if w.antiEntropy > 0 {
+		w.runAntiEntropy(ctx)
+	} else {
+		<-ctx.Done()
+	}
+	// runAntiEntropy has returned, so no relist can swap the set after this load.
+	w.informers().close()
+	return ctx.Err()
+}
+
+// addHandlers registers the Service and EndpointSlice handlers on set. Each
+// handler acts only while set is the current informer set: a set being synced by
+// relist stays silent until it is swapped in (relist then reconciles everything
+// from it), and a retired set's late events are dropped.
+func (w *Watcher) addHandlers(set *informerSet) error {
+	current := func() bool { return w.informers() == set }
+	svcHandler := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			if current() {
+				w.onService(obj)
+			}
+		},
+		UpdateFunc: func(_, obj any) {
+			if current() {
+				w.onService(obj)
+			}
+		},
+		DeleteFunc: func(obj any) {
+			if current() {
+				w.onServiceDelete(obj)
+			}
+		},
+	}
+	if _, err := set.svcs.AddEventHandler(svcHandler); err != nil {
 		return fmt.Errorf("add service handler: %w", err)
 	}
 
-	sliceHandler := cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj any) { w.onSlice(obj) },
-		UpdateFunc: func(_, obj any) { w.onSlice(obj) },
-		DeleteFunc: func(obj any) { w.onSlice(obj) },
+	onSlice := func(obj any) {
+		if current() {
+			w.onSlice(obj)
+		}
 	}
-	if _, err := w.slices.AddEventHandler(sliceHandler); err != nil {
+	sliceHandler := cache.ResourceEventHandlerFuncs{
+		AddFunc:    onSlice,
+		UpdateFunc: func(_, obj any) { onSlice(obj) },
+		DeleteFunc: onSlice,
+	}
+	if _, err := set.slices.AddEventHandler(sliceHandler); err != nil {
 		return fmt.Errorf("add endpointslice handler: %w", err)
 	}
-
-	w.factory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), w.svcs.HasSynced, w.slices.HasSynced) {
-		return fmt.Errorf("informer cache sync failed")
-	}
-	<-ctx.Done()
-	return ctx.Err()
+	return nil
 }
 
 // onService recomputes desired state for a changed Service and reconciles each of
@@ -233,6 +353,11 @@ func (w *Watcher) onServiceDelete(obj any) {
 	w.eTPMu.Lock()
 	delete(w.eTPLocalWarned, svc.Namespace+"/"+svc.Name)
 	w.eTPMu.Unlock()
+	w.deleteServicePorts(svc)
+}
+
+// deleteServicePorts tears down every port svc owned, under its reconcile stripe.
+func (w *Watcher) deleteServicePorts(svc *corev1.Service) {
 	vip, _, _, ok, _ := serviceToVIP(svc)
 	if !ok {
 		return
@@ -263,7 +388,7 @@ func (w *Watcher) onSlice(obj any) {
 		return
 	}
 	key := sl.Namespace + "/" + svcName
-	item, exists, err := w.svcs.GetStore().GetByKey(key)
+	item, exists, err := w.informers().svcs.GetStore().GetByKey(key)
 	if err != nil || !exists {
 		return
 	}
@@ -291,8 +416,7 @@ func (w *Watcher) reconcileService(svc *corev1.Service) {
 }
 
 // applyService delivers svc's per-port backend sets, derived from slices (or the
-// static override), to the proxy, together with the Service's name. The caller
-// holds svc's reconcile stripe.
+// static override), to the proxy. The caller holds svc's reconcile stripe.
 func (w *Watcher) applyService(svc *corev1.Service, slices []*discoveryv1.EndpointSlice) {
 	vip, policy, affinity, ok, _ := serviceToVIP(svc)
 	if !ok {
@@ -347,7 +471,7 @@ func (w *Watcher) serviceStripe(key string) *sync.Mutex {
 // slicesForService returns the cached EndpointSlices labeled for the Service.
 func (w *Watcher) slicesForService(namespace, name string) []*discoveryv1.EndpointSlice {
 	var out []*discoveryv1.EndpointSlice
-	for _, item := range w.slices.GetStore().List() {
+	for _, item := range w.informers().slices.GetStore().List() {
 		sl, ok := item.(*discoveryv1.EndpointSlice)
 		if !ok || sl.Namespace != namespace {
 			continue
