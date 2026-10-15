@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
 )
@@ -63,6 +64,9 @@ func TestNoBackendDropWarnsOncePerKey(t *testing.T) {
 	h := &captureHandler{}
 	tbl := NewRoutingTable(netip.MustParsePrefix("100.64.0.0/24"))
 	p := New(tbl, WithLogger(slog.New(h)))
+	// Each step runs past the per-key Warn floor, so only the generation decides.
+	clock := time.Unix(1_000_000, 0)
+	p.now = func() time.Time { return clock }
 
 	type want struct {
 		warns    int
@@ -109,6 +113,7 @@ func TestNoBackendDropWarnsOncePerKey(t *testing.T) {
 		},
 	}
 	for _, s := range steps {
+		clock = clock.Add(dropWarnFloor + time.Second)
 		s.install()
 		for range s.drops {
 			dropOne(t, p, key)
@@ -133,6 +138,7 @@ func TestNoBackendDropWarnsOncePerKey(t *testing.T) {
 	}
 
 	t.Run("a deleted key is not warned about", func(t *testing.T) {
+		clock = clock.Add(dropWarnFloor + time.Second)
 		before := len(dropWarns(h))
 		tbl.Delete(key)
 		dropOne(t, p, key)

@@ -79,6 +79,10 @@ const udpFlowIdleTimeout = 30 * time.Second
 //   - The RoutingTable has its own internal lock and is shared read-only by the
 //     accept paths and written by the workers.
 type Proxy struct {
+	// now is the accept path's clock (affinity TTLs, the drop-Warn floor). It is
+	// time.Now outside tests and is set before any connection is handled.
+	now func() time.Time
+
 	table  *RoutingTable
 	alias  aliasManager
 	binder binder
@@ -382,6 +386,7 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 		listenUDP:      listenUDPVIP,
 		listenNodePort: net.Listen,
 		dialBackend:    dialWith,
+		now:            time.Now,
 	}
 	for _, o := range opts {
 		o(p)
@@ -921,10 +926,11 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		be  backend
 		err error
 	)
+	now := p.now()
 	if external {
-		be, err = p.table.PickStickyCluster(key, src, time.Now())
+		be, err = p.table.PickStickyCluster(key, src, now)
 	} else {
-		be, err = p.table.PickSticky(key, src, time.Now())
+		be, err = p.table.PickSticky(key, src, now)
 	}
 	if err != nil {
 		// The first drop of each backend-set generation is a Warn naming the VIP,
@@ -934,7 +940,7 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		// Debug messages keep the two drop reasons greppable. The
 		// ErrNoLocalBackends arm is ClusterIP-only — PickStickyCluster (external)
 		// forces the Cluster pool and never returns it.
-		if p.table.warnDrop(key, external, err) {
+		if p.table.warnDrop(key, external, err, now) {
 			return
 		}
 		if errors.Is(err, ErrNoLocalBackends) {

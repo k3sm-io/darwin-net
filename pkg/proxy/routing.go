@@ -406,22 +406,38 @@ type keyMeta struct {
 	// the first drop of a generation to win the compare-and-swap logs, every other
 	// drop of that generation stays at Debug, and a newer generation re-arms it.
 	dropWarned atomic.Uint64
+	// lastDropWarn is when the key's last drop Warn fired (Unix nanoseconds). It
+	// floors the Warn rate at one per dropWarnFloor however fast the generation
+	// churns, and is carried over when the keyMeta is replaced.
+	lastDropWarn atomic.Int64
 }
 
+// dropWarnFloor is the minimum interval between two drop Warns for one key.
+const dropWarnFloor = 10 * time.Second
+
 // claimDropWarn reports whether the caller is the first to warn about a dropped
-// connection under generation gen, recording the claim. A claim for an older
-// generation than one already warned loses, so a pick that loaded a stale
-// portState cannot re-warn after a newer set has.
-func (m *keyMeta) claimDropWarn(gen uint64) bool {
+// connection under generation gen at time now, recording the claim. A claim for
+// an older generation than one already warned loses, so a pick that loaded a
+// stale portState cannot re-warn after a newer set has. Within dropWarnFloor of
+// the key's previous Warn every claim loses without consuming the generation, so
+// a generation first dropped inside the floor still warns once it has passed.
+func (m *keyMeta) claimDropWarn(gen uint64, now time.Time) bool {
+	last := m.lastDropWarn.Load()
+	if last != 0 && now.UnixNano()-last < int64(dropWarnFloor) {
+		return false
+	}
 	for {
-		last := m.dropWarned.Load()
-		if last >= gen {
+		warned := m.dropWarned.Load()
+		if warned >= gen {
 			return false
 		}
-		if m.dropWarned.CompareAndSwap(last, gen) {
-			return true
+		if m.dropWarned.CompareAndSwap(warned, gen) {
+			break
 		}
 	}
+	// A concurrent claim for another generation that also passed the floor check
+	// loses here, so the floor holds exactly.
+	return m.lastDropWarn.CompareAndSwap(last, now.UnixNano())
 }
 
 // PortKey identifies one bound Service port: the ClusterIP plus the Service Port
@@ -626,10 +642,12 @@ func (t *RoutingTable) advanceMeta(key PortKey, svc serviceRef, ready, locals []
 	m := t.meta[key]
 	if m == nil || m.namespace != svc.Namespace || m.name != svc.Name {
 		var gen uint64
+		var lastWarn int64
 		if m != nil {
-			gen = m.gen
+			gen, lastWarn = m.gen, m.lastDropWarn.Load()
 		}
 		m = &keyMeta{namespace: svc.Namespace, name: svc.Name, gen: gen + 1, policy: policy}
+		m.lastDropWarn.Store(lastWarn)
 		t.meta[key] = m
 		return m
 	}
@@ -642,8 +660,10 @@ func (t *RoutingTable) advanceMeta(key PortKey, svc serviceRef, ready, locals []
 
 // sameInstall reports whether an install of (ready, locals, policy) is the set
 // prev (the current portState, nil for an empty set) already holds under
-// prevPolicy. Locality is a function of the address, so comparing the full set's
-// addresses and the subset's size is a complete comparison.
+// prevPolicy. The comparison is over address SETS, so the same endpoints listed
+// in another order or with a duplicate (one address in two slices) are the same
+// install. Locality is a function of the address, so comparing the full set and
+// the node-local set is a complete comparison.
 func sameInstall(prev *portState, prevPolicy trafficPolicy, ready, locals []backend, policy trafficPolicy) bool {
 	if policy != prevPolicy {
 		return false
@@ -651,10 +671,19 @@ func sameInstall(prev *portState, prevPolicy trafficPolicy, ready, locals []back
 	if prev == nil {
 		return len(ready) == 0
 	}
-	if len(prev.locals) != len(locals) {
-		return false
+	return sameAddrSet(prev.allSet, ready) && sameAddrSet(prev.localSet, locals)
+}
+
+// sameAddrSet reports whether bs holds exactly the addresses in set.
+func sameAddrSet(set map[netip.AddrPort]struct{}, bs []backend) bool {
+	seen := make(map[netip.AddrPort]struct{}, len(bs))
+	for _, b := range bs {
+		if _, ok := set[b.addr]; !ok {
+			return false
+		}
+		seen[b.addr] = struct{}{}
 	}
-	return slices.EqualFunc(prev.all, ready, func(a, b backend) bool { return a.addr == b.addr })
+	return len(seen) == len(set)
 }
 
 // VMPodTransport is the live half of one vm-RuntimeClass pod's two-address
@@ -882,14 +911,15 @@ var ErrNoLocalBackends = fmt.Errorf("proxy: no node-local backends for internalT
 // ErrNoLocalBackends). It logs at Warn once per (key, backend-set generation) and
 // returns true for that one call; every other drop of the same generation returns
 // false so the caller keeps its per-connection Debug line. A later, different
-// backend set or policy is a new generation and warns again.
+// backend set or policy is a new generation and warns again, but never sooner
+// than dropWarnFloor after the key's previous Warn.
 //
 // The common case reads the current portState lock-free and claims the
 // generation with a compare-and-swap. A key whose set is empty has no portState;
 // that cold path reads its keyMeta under mu. A key with no keyMeta at all was
 // never installed or was just deleted (a connection racing the listener close),
 // and is not warned about.
-func (t *RoutingTable) warnDrop(key PortKey, external bool, reason error) bool {
+func (t *RoutingTable) warnDrop(key PortKey, external bool, reason error, now time.Time) bool {
 	var (
 		m              *keyMeta
 		gen            uint64
@@ -906,7 +936,7 @@ func (t *RoutingTable) warnDrop(key PortKey, external bool, reason error) bool {
 		}
 		t.mu.Unlock()
 	}
-	if m == nil || !m.claimDropWarn(gen) {
+	if m == nil || !m.claimDropWarn(gen, now) {
 		return false
 	}
 	t.logger().Warn("service port is dropping connections: no backend to route to",
