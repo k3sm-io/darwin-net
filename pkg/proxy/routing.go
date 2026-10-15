@@ -533,20 +533,11 @@ func (r serviceRef) String() string {
 func (t *RoutingTable) installEndpoints(key PortKey, svc serviceRef, eps []netv1.Endpoint, policy trafficPolicy, aff affinityConfig) int {
 	ready := make([]backend, 0, len(eps))
 	for _, ep := range eps {
-		if !ep.Ready {
+		ap, ok := admitEndpoint(ep)
+		if !ok {
 			continue
 		}
-		if err := ep.Validate(); err != nil {
-			continue
-		}
-		addr, err := netip.ParseAddr(ep.IP)
-		if err != nil {
-			continue
-		}
-		ready = append(ready, backend{
-			addr:     netip.AddrPortFrom(addr, uint16(ep.Port)),
-			locality: t.classify(addr),
-		})
+		ready = append(ready, backend{addr: ap, locality: t.classify(ap.Addr())})
 	}
 	sort.Slice(ready, func(i, j int) bool {
 		if ready[i].addr.Addr() != ready[j].addr.Addr() {
@@ -629,6 +620,24 @@ func (t *RoutingTable) Delete(key PortKey) {
 	t.store(t.load().withState(key, nil), false)
 	t.purgeAffinity(key) // after the store, as in SetEndpointsPolicy
 	delete(t.meta, key)
+}
+
+// admitEndpoint is the table's single admission rule: an endpoint is routable iff
+// it is Ready, passes netv1.Endpoint.Validate, and its IP parses. The returned
+// address is what the table stores and VIPStates renders (AddrPort.String), and
+// APIBackendSets applies the same rule, so the two views compare equal.
+func admitEndpoint(ep netv1.Endpoint) (netip.AddrPort, bool) {
+	if !ep.Ready {
+		return netip.AddrPort{}, false
+	}
+	if err := ep.Validate(); err != nil {
+		return netip.AddrPort{}, false
+	}
+	addr, err := netip.ParseAddr(ep.IP)
+	if err != nil {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(addr, uint16(ep.Port)), true
 }
 
 // advanceMeta returns key's keyMeta for an install of (ready, locals, policy) by

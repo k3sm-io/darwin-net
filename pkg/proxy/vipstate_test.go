@@ -22,6 +22,10 @@ import (
 	"slices"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	netv1 "k3sm.io/apis/net/v1"
 )
 
@@ -140,4 +144,88 @@ func strsEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestAPIBackendSets pins the shared derivation from API objects to Ready
+// backend sets: only Ready endpoints are admitted (not-Ready, unknown-readiness
+// and terminating ones are left out), slices of other Services and IPv6 slices
+// are ignored, a static override replaces the slices, unserved Services yield
+// no keys, and every address renders through netip exactly as the routing table
+// stores it, so a non-canonical IPv6 literal compares equal to the table's view.
+func TestAPIBackendSets(t *testing.T) {
+	t.Parallel()
+	tru, fls := true, false
+	http := "http"
+	p8080 := int32(8080)
+	svc := func(ns, name, vip string) *corev1.Service {
+		return &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+			Spec: corev1.ServiceSpec{
+				Type: corev1.ServiceTypeClusterIP, ClusterIP: vip,
+				Ports: []corev1.ServicePort{{Name: "http", Port: 80, Protocol: corev1.ProtocolTCP}},
+			},
+		}
+	}
+	slice := func(name, svcName string, at discoveryv1.AddressType, eps ...discoveryv1.Endpoint) *discoveryv1.EndpointSlice {
+		return &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default", Name: name,
+				Labels: map[string]string{discoveryv1.LabelServiceName: svcName},
+			},
+			AddressType: at,
+			Endpoints:   eps,
+			Ports:       []discoveryv1.EndpointPort{{Name: &http, Port: &p8080}},
+		}
+	}
+	ep := func(addr string, ready *bool, terminating bool) discoveryv1.Endpoint {
+		return discoveryv1.Endpoint{
+			Addresses: []string{addr},
+			Conditions: discoveryv1.EndpointConditions{
+				Ready: ready, Serving: &tru, Terminating: &terminating,
+			},
+		}
+	}
+	web := PortKey{ClusterIP: "10.43.0.80", Port: 80, Protocol: netv1.ProtocolTCP}
+	api := PortKey{ClusterIP: "10.43.0.1", Port: 80, Protocol: netv1.ProtocolTCP}
+
+	headless := svc("default", "headless", corev1.ClusterIPNone)
+	services := []*corev1.Service{svc("default", "web", "10.43.0.80"), svc("default", "kubernetes", "10.43.0.1"), headless}
+	sls := []*discoveryv1.EndpointSlice{
+		slice("web-a", "web", discoveryv1.AddressTypeIPv4,
+			ep("10.42.0.5", &tru, false),
+			ep("10.42.0.6", &fls, false),
+			ep("10.42.0.7", nil, false),
+			ep("10.42.0.8", &fls, true),
+		),
+		slice("web-b", "web", discoveryv1.AddressTypeIPv4, ep("10.42.0.5", &tru, false), ep("10.42.1.9", &tru, false)),
+		slice("web-v6", "web", discoveryv1.AddressTypeIPv6, ep("fd00::5", &tru, false)),
+		slice("other", "other", discoveryv1.AddressTypeIPv4, ep("10.42.0.99", &tru, false)),
+		slice("headless-a", "headless", discoveryv1.AddressTypeIPv4, ep("10.42.0.50", &tru, false)),
+	}
+	static := map[string][]netv1.Endpoint{
+		"default/kubernetes": {{IP: "FD00:0:0::1", Port: 6444, Ready: true}},
+	}
+
+	got := APIBackendSets(services, sls, static)
+	want := map[PortKey]BackendSet{
+		web: {"10.42.0.5:8080", "10.42.1.9:8080"},
+		api: {"[fd00::1]:6444"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("APIBackendSets = %v, want %v", got, want)
+	}
+	for k, w := range want {
+		if !slices.Equal(got[k], w) {
+			t.Errorf("APIBackendSets[%s] = %v, want %v", k, got[k], w)
+		}
+	}
+
+	// The table's own rendering of the same endpoints agrees, the non-canonical
+	// IPv6 literal included.
+	tbl := NewRoutingTable(netip.Prefix{})
+	tbl.installEndpoints(web, serviceRef{"default", "web"}, endpointsForPort(sls[:2], "http"), trafficCluster, affinityConfig{})
+	tbl.installEndpoints(api, serviceRef{"default", "kubernetes"}, static["default/kubernetes"], trafficCluster, affinityConfig{})
+	if d := DiffBackendSets(got, BackendSets(tbl.VIPStates())); len(d) != 0 {
+		t.Errorf("the table and APIBackendSets disagree: %+v", d)
+	}
 }

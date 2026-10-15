@@ -18,8 +18,6 @@ package proxy
 
 import (
 	"context"
-	"net"
-	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -167,25 +165,13 @@ func storeView(set *informerSet) serviceView {
 }
 
 // backendSets returns the Ready backend set the proxy would install for each of
-// key's served ports under view, using the same derivation reconcileService uses
-// (serviceToVIP, then the static override or the matched slices).
+// key's served ports under view: APIBackendSets over that one Service.
 func (w *Watcher) backendSets(key string, v serviceView) map[PortKey]BackendSet {
-	vip, _, _, ok, _ := serviceToVIP(v.svcs[key])
-	if !ok {
+	svc := v.svcs[key]
+	if svc == nil {
 		return nil
 	}
-	out := make(map[PortKey]BackendSet, len(vip.Ports))
-	for _, p := range vip.Ports {
-		pk := PortKey{ClusterIP: vip.ClusterIP, Port: p.Port, Protocol: defaultProto(p.Protocol)}
-		set := BackendSet{}
-		for _, ep := range w.backendsForPort(key, v.slices[key], p.Name) {
-			if ep.Ready {
-				set = append(set, net.JoinHostPort(ep.IP, strconv.Itoa(int(ep.Port))))
-			}
-		}
-		out[pk] = set
-	}
-	return out
+	return APIBackendSets([]*corev1.Service{svc}, v.slices[key], w.static)
 }
 
 // divergences compares live against store per Service and returns the diverging

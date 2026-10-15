@@ -21,6 +21,9 @@ import (
 	"net/netip"
 	"slices"
 
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+
 	netv1 "k3sm.io/apis/net/v1"
 )
 
@@ -105,6 +108,55 @@ func BackendSets(states []VIPState) map[PortKey]BackendSet {
 	out := make(map[PortKey]BackendSet, len(states))
 	for _, s := range states {
 		out[s.Key()] = BackendSet(s.Backends)
+	}
+	return out
+}
+
+// APIBackendSets derives, from Services and EndpointSlices as the API serves
+// them, the Ready backend set this proxy installs for each served Service port.
+// It is the same derivation the Watcher applies to its informer store: a Service
+// is served per serviceToVIP (ClusterIP set, not headless or ExternalName, TCP or
+// UDP ports), each port's endpoints come from the IPv4 slices labeled for the
+// Service and matched by port name, and an endpoint is admitted by the routing
+// table's own rule (Ready, valid, parseable IP; not-Ready and terminating ones
+// are left out). Addresses render as netip.AddrPort.String, exactly as
+// VIPStates renders them, so the two views compare equal through
+// DiffBackendSets.
+//
+// static is the Watcher's fixed-backend override, keyed "namespace/name" (see
+// WithStaticBackends); a Service named there takes those endpoints instead of
+// its slices. Pass nil when there is none. Inputs are not modified.
+func APIBackendSets(services []*corev1.Service, slices []*discoveryv1.EndpointSlice, static map[string][]netv1.Endpoint) map[PortKey]BackendSet {
+	byService := make(map[string][]*discoveryv1.EndpointSlice)
+	for _, sl := range slices {
+		if sl == nil {
+			continue
+		}
+		if name := sl.Labels[discoveryv1.LabelServiceName]; name != "" {
+			key := sl.Namespace + "/" + name
+			byService[key] = append(byService[key], sl)
+		}
+	}
+	out := make(map[PortKey]BackendSet)
+	for _, svc := range services {
+		vip, _, _, ok, _ := serviceToVIP(svc)
+		if !ok {
+			continue
+		}
+		key := svc.Namespace + "/" + svc.Name
+		for _, p := range vip.Ports {
+			eps, pinned := static[key]
+			if !pinned {
+				eps = endpointsForPort(byService[key], p.Name)
+			}
+			set := BackendSet{}
+			for _, ep := range eps {
+				if ap, ok := admitEndpoint(ep); ok {
+					set = append(set, ap.String())
+				}
+			}
+			out[PortKey{ClusterIP: vip.ClusterIP, Port: p.Port, Protocol: defaultProto(p.Protocol)}] = BackendSet(normalizeSet(set))
+		}
 	}
 	return out
 }
