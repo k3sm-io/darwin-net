@@ -101,6 +101,12 @@ type Watcher struct {
 	// first; the anti-entropy goroutine never holds a stripe while swapping).
 	swapMu sync.RWMutex
 
+	// synced is what Synced reports: set once the initial informer set has synced
+	// and its store has been applied to the routing table, cleared while a relist
+	// replaces the informers (until the fresh set has synced and been applied) and
+	// when Run returns. Read lock-free.
+	synced atomic.Bool
+
 	// eTPLocalWarned throttles the externalTrafficPolicy:Local-unhonored datapath
 	// Warn to once per contiguous eTP:Local-on-NodePort episode, keyed by
 	// "namespace/name". It is touched ONLY from onService / onServiceDelete, which
@@ -248,14 +254,48 @@ func (w *Watcher) Run(ctx context.Context) error {
 		set.close()
 		return fmt.Errorf("informer cache sync failed")
 	}
+	if w.applyStore(ctx, set) {
+		w.setSynced(true)
+	}
 	if w.antiEntropy > 0 {
 		w.runAntiEntropy(ctx)
 	} else {
 		<-ctx.Done()
 	}
 	// runAntiEntropy has returned, so no relist can swap the set after this load.
+	w.setSynced(false)
 	w.informers().close()
 	return ctx.Err()
+}
+
+// Synced reports whether the routing table reflects a fully synced informer
+// store: true once the initial Service and EndpointSlice informers have synced
+// and every Service in their store has been applied to the table, false before
+// that, while a relist is replacing the informers (until the fresh set has
+// synced and been applied), and after Run returns. A caller comparing
+// Proxy.VIPStates against the API should wait for it. It never blocks.
+func (w *Watcher) Synced() bool {
+	return w.synced.Load()
+}
+
+// setSynced records the sync signal on the Watcher and on its Proxy.
+func (w *Watcher) setSynced(v bool) {
+	w.synced.Store(v)
+	if w.proxy != nil {
+		w.proxy.synced.Store(v)
+	}
+}
+
+// applyStore reconciles every Service in set's store and waits until the proxy's
+// workers have installed the result. It reports false if ctx ended first.
+func (w *Watcher) applyStore(ctx context.Context, set *informerSet) bool {
+	for _, svc := range storeView(set).svcs {
+		w.reconcileService(svc)
+	}
+	if w.proxy == nil {
+		return ctx.Err() == nil
+	}
+	return w.proxy.barrier(ctx) == nil
 }
 
 // addHandlers registers the Service and EndpointSlice handlers on set. Each

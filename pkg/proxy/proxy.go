@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -79,6 +80,10 @@ const udpFlowIdleTimeout = 30 * time.Second
 //   - The RoutingTable has its own internal lock and is shared read-only by the
 //     accept paths and written by the workers.
 type Proxy struct {
+	// synced is what Synced reports. The Watcher driving this Proxy writes it
+	// (see Watcher.Synced); it is false on a Proxy no Watcher has synced.
+	synced atomic.Bool
+
 	// now is the accept path's clock (affinity TTLs, the drop-Warn floor). It is
 	// time.Now outside tests and is set before any connection is handled.
 	now func() time.Time
@@ -501,6 +506,9 @@ type portWorker struct {
 // table atomically with endpoints so a pick never observes a stale (policy,
 // affinity, backends) pairing.
 type portEvent struct {
+	// barrier, when non-nil, marks a flush: the worker closes it once every event
+	// queued before it has been applied, and the event carries nothing else.
+	barrier   chan struct{}
 	port      *netv1.ServicePort
 	svc       serviceRef
 	policy    trafficPolicy
@@ -651,6 +659,43 @@ func (p *Proxy) reconcileServicePort(svc serviceRef, clusterIP string, port *net
 	}
 }
 
+// Synced reports whether the routing table has been built from synced informers:
+// it mirrors Watcher.Synced for the Watcher driving this Proxy (one Watcher per
+// Proxy), and is false when none has synced it. It never blocks.
+func (p *Proxy) Synced() bool {
+	return p.synced.Load()
+}
+
+// barrier blocks until every port worker has applied every event delivered to it
+// before the call, or ctx is done. Each worker's channel is FIFO, so a barrier
+// event closed by the worker proves everything queued ahead of it reached the
+// routing table. A worker that stops meanwhile has nothing left to apply.
+func (p *Proxy) barrier(ctx context.Context) error {
+	p.mu.Lock()
+	ws := make([]*portWorker, 0, len(p.workers))
+	for _, w := range p.workers {
+		ws = append(ws, w)
+	}
+	p.mu.Unlock()
+	for _, w := range ws {
+		done := make(chan struct{})
+		select {
+		case w.ch <- portEvent{barrier: done}:
+		case <-w.stop:
+			continue
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case <-done:
+		case <-w.stop:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
 // ReconcileDelete tells the worker for clusterIP:port/proto to tear down its
 // listeners and exit.
 func (p *Proxy) ReconcileDelete(key PortKey) {
@@ -775,6 +820,10 @@ func (p *Proxy) runWorker(w *portWorker) {
 				open(pending)
 			}
 		case ev := <-w.ch:
+			if ev.barrier != nil {
+				close(ev.barrier)
+				continue
+			}
 			if ev.port == nil {
 				if ln != nil {
 					ln.Close()

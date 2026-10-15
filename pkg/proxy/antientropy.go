@@ -463,11 +463,16 @@ func (w *Watcher) relist(ctx context.Context) bool {
 		w.log.Warn("anti-entropy relist: register handlers", "err", err)
 		return false
 	}
+	// Not synced until the fresh set is applied. A failed sync keeps the old set,
+	// which is still synced and applied, so it restores the signal.
+	wasSynced := w.synced.Load()
+	w.setSynced(false)
 	next.factory.Start(next.stop)
 	syncCtx, cancel := context.WithTimeout(ctx, relistSyncTimeout)
 	defer cancel()
 	if !cache.WaitForCacheSync(syncCtx.Done(), next.svcs.HasSynced, next.slices.HasSynced) {
 		next.close()
+		w.setSynced(wasSynced)
 		w.log.Warn("anti-entropy relist: replacement informers did not sync; keeping the current ones")
 		return false
 	}
@@ -483,8 +488,8 @@ func (w *Watcher) relist(ctx context.Context) bool {
 			w.deleteServicePorts(svc)
 		}
 	}
-	for _, svc := range fresh.svcs {
-		w.reconcileService(svc)
+	if w.applyStore(ctx, next) {
+		w.setSynced(true)
 	}
 	clear(w.repairedFromLive)
 	w.log.Info("replaced the service informers after a store divergence", "services", len(fresh.svcs))
