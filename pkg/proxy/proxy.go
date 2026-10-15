@@ -497,6 +497,7 @@ type portWorker struct {
 // affinity, backends) pairing.
 type portEvent struct {
 	port      *netv1.ServicePort
+	svc       serviceRef
 	policy    trafficPolicy
 	affinity  affinityConfig
 	endpoints []netv1.Endpoint
@@ -608,7 +609,15 @@ func (p *Proxy) Reconcile(clusterIP string, port *netv1.ServicePort, endpoints [
 // endpoints) reach the routing table together.
 //
 // ReconcilePolicy is safe for concurrent callers (the informer event handlers).
+// It records no owning Service name; the Watcher reconciles through
+// reconcileServicePort, which does.
 func (p *Proxy) ReconcilePolicy(clusterIP string, port *netv1.ServicePort, policy trafficPolicy, affinity affinityConfig, endpoints []netv1.Endpoint) error {
+	return p.reconcileServicePort(serviceRef{}, clusterIP, port, policy, affinity, endpoints)
+}
+
+// reconcileServicePort is ReconcilePolicy carrying the owning Service's name to
+// the routing table, where the dropped-connection Warn and VIPStates report it.
+func (p *Proxy) reconcileServicePort(svc serviceRef, clusterIP string, port *netv1.ServicePort, policy trafficPolicy, affinity affinityConfig, endpoints []netv1.Endpoint) error {
 	if port == nil {
 		return errors.New("proxy: reconcile requires a port (use ReconcileDelete to remove)")
 	}
@@ -630,7 +639,7 @@ func (p *Proxy) ReconcilePolicy(clusterIP string, port *netv1.ServicePort, polic
 		return errors.New("proxy: shutting down")
 	}
 	select {
-	case w.ch <- portEvent{port: port, policy: policy, affinity: affinity, endpoints: endpoints}:
+	case w.ch <- portEvent{port: port, svc: svc, policy: policy, affinity: affinity, endpoints: endpoints}:
 		return nil
 	case <-w.stop:
 		return errors.New("proxy: worker stopped")
@@ -770,7 +779,7 @@ func (p *Proxy) runWorker(w *portWorker) {
 				p.removeWorker(w)
 				return
 			}
-			p.table.SetEndpointsPolicy(w.key, ev.endpoints, ev.policy, ev.affinity)
+			p.table.installEndpoints(w.key, ev.svc, ev.endpoints, ev.policy, ev.affinity)
 			if ln == nil {
 				open(ev.port)
 			}
@@ -918,11 +927,16 @@ func (p *Proxy) handle(client net.Conn, key PortKey, external bool) {
 		be, err = p.table.PickSticky(key, src, time.Now())
 	}
 	if err != nil {
-		// Distinct messages so the two drop reasons are greppable, but both stay at
-		// Debug: handle logs per-connection, so Info here would flood a steady-state
-		// iTP:Local-starved Service; the throttled activePool Warn (once per backend
-		// set) is the observable signal. The ErrNoLocalBackends arm is ClusterIP-only —
-		// PickStickyCluster (external) forces the Cluster pool and never returns it.
+		// The first drop of each backend-set generation is a Warn naming the VIP,
+		// the Service, the policy and the backend counts (warnDrop); every later
+		// drop of the same set stays at Debug, since handle runs per connection and
+		// a steady-state starved Service would otherwise flood the log. Distinct
+		// Debug messages keep the two drop reasons greppable. The
+		// ErrNoLocalBackends arm is ClusterIP-only — PickStickyCluster (external)
+		// forces the Cluster pool and never returns it.
+		if p.table.warnDrop(key, external, err) {
+			return
+		}
 		if errors.Is(err, ErrNoLocalBackends) {
 			p.logger().Debug("no node-local backend for internalTrafficPolicy:Local connection", "vip", key.String(), "err", err)
 		} else {

@@ -279,21 +279,31 @@ func (w *Watcher) onSlice(obj any) {
 // the proxy, carrying the Service's internalTrafficPolicy (so the routing table
 // can filter to node-local backends) and its ClientIP session-affinity config.
 func (w *Watcher) reconcileService(svc *corev1.Service) {
+	if _, _, _, ok, _ := serviceToVIP(svc); !ok {
+		return
+	}
+	// Snapshot and deliver under the Service's stripe so a slower goroutine cannot
+	// land an older backend set on top of a newer one (see reconcileMu).
+	mu := w.serviceStripe(svc.Namespace + "/" + svc.Name)
+	mu.Lock()
+	defer mu.Unlock()
+	w.applyService(svc, w.slicesForService(svc.Namespace, svc.Name))
+}
+
+// applyService delivers svc's per-port backend sets, derived from slices (or the
+// static override), to the proxy, together with the Service's name. The caller
+// holds svc's reconcile stripe.
+func (w *Watcher) applyService(svc *corev1.Service, slices []*discoveryv1.EndpointSlice) {
 	vip, policy, affinity, ok, _ := serviceToVIP(svc)
 	if !ok {
 		return
 	}
 	key := svc.Namespace + "/" + svc.Name
-	// Snapshot and deliver under the Service's stripe so a slower goroutine cannot
-	// land an older backend set on top of a newer one (see reconcileMu).
-	mu := w.serviceStripe(key)
-	mu.Lock()
-	defer mu.Unlock()
-	slices := w.slicesForService(svc.Namespace, svc.Name)
+	ref := serviceRef{Namespace: svc.Namespace, Name: svc.Name}
 	for i := range vip.Ports {
 		p := vip.Ports[i]
 		eps := w.backendsForPort(key, slices, p.Name)
-		if err := w.proxy.ReconcilePolicy(vip.ClusterIP, &p, policy, affinity, eps); err != nil {
+		if err := w.proxy.reconcileServicePort(ref, vip.ClusterIP, &p, policy, affinity, eps); err != nil {
 			w.log.Error("reconcile service port", "service", key, "port", p.Port, "err", err)
 		}
 	}
