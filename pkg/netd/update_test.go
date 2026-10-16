@@ -323,8 +323,19 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 			}
 		}, "not in the set"},
 		{"a setuid file", func(t *testing.T, src string, _ map[string]string) {
-			if err := unix.Chmod(filepath.Join(src, "k3sm-execshim"), 0o4755); err != nil {
+			p := filepath.Join(src, "k3sm-execshim")
+			if err := unix.Chmod(p, 0o4755); err != nil {
 				t.Fatal(err)
+			}
+			fi, err := os.Lstat(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fi.Mode()&os.ModeSetuid == 0 {
+				// A sandbox (sandbox-exec) or the filesystem can drop a set-id
+				// bit on chmod; without it this fixture would not exercise the
+				// refusal.
+				t.Skip("the set-id bit did not stick after chmod 4755 (dropped by the sandbox or the filesystem)")
 			}
 		}, "set-id"},
 		{"a fifo", func(t *testing.T, src string, _ map[string]string) {
