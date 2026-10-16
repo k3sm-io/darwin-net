@@ -104,6 +104,15 @@ func (p updatePayload) requireTeam() bool {
 	return p.Signature == updatesv1alpha1.UpdateSignatureRequired
 }
 
+// policyName is the payload's code-signing policy for a log line: an empty
+// policy is if-signed.
+func (p updatePayload) policyName() string {
+	if p.Signature == "" {
+		return string(updatesv1alpha1.UpdateSignatureIfSigned)
+	}
+	return string(p.Signature)
+}
+
 // installedVersionFunc reports the release version of the installed k3sm at
 // path. It is the seam the unit tests replace.
 type installedVersionFunc func(ctx context.Context, path string) (string, error)
@@ -161,8 +170,8 @@ func execInstaller(ctx context.Context, run installerRun) error {
 //     service uid owns, and the bytes netd copies out of it into a root-only
 //     file hash to the payload's sha256;
 //  4. netd extracts that copy itself into a fresh root-only staging directory;
-//  5. every member of the staged set is a Mach-O (the cp-payload version
-//     markers aside) and passes the code-signing policy against the installed
+//  5. every member of the staged set is a Mach-O (cp-payload version markers,
+//     by shape, aside) and passes the code-signing policy against the installed
 //     k3sm, where a team counts only behind a Developer ID signature; then the
 //     downgrade check;
 //  6. Installing: the one exec of the staged k3sm, then Done or Failed.
@@ -223,6 +232,7 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 		return s.updateFailed(err, "")
 	}
 	defer copied.Close()
+	log.Info("netd: update archive digest matched", "sha256", payload.SHA256)
 
 	dir, err := os.MkdirTemp(root, updateDirPrefix)
 	if err != nil {
@@ -244,7 +254,14 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 	}
 	_ = copied.Close()
 
-	installed, tree, err := inspectStagedTree(ctx, s.inspector, dir, s.installedK3sm)
+	set, err := stagedSigningSet(dir)
+	if err != nil {
+		log.Warn("netd: update code signing refused", "err", err)
+		return s.updateFailed(err, "")
+	}
+	log.Info("netd: update set extracted", "members", set.Members, "macho", len(set.MachOs),
+		"markers-skipped", len(set.Markers), "markers", set.Markers)
+	installed, tree, err := inspectStagedTree(ctx, s.inspector, dir, set, s.installedK3sm)
 	if err == nil {
 		err = checkCodeSigning(installed, tree, payload.requireTeam())
 	}
@@ -252,11 +269,17 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 		log.Warn("netd: update code signing refused", "err", err)
 		return s.updateFailed(err, "")
 	}
-	if !payload.AllowDowngrade {
-		if err := s.checkNotDowngrade(ctx, payload.Version); err != nil {
+	log.Info("netd: update code signing accepted", "signer", treeSigner(tree),
+		"installed-signer", signerName(installed), "policy", payload.policyName())
+	if payload.AllowDowngrade {
+		log.Info("netd: update version compare skipped: the payload allows a downgrade")
+	} else {
+		installedVersion, err := s.checkNotDowngrade(ctx, payload.Version)
+		if err != nil {
 			log.Warn("netd: update refused as a downgrade", "err", err)
 			return s.updateFailed(err, "")
 		}
+		log.Info("netd: update version compare passed", "installed", installedVersion)
 	}
 
 	logPath := filepath.Join(dir, updateLogName)
@@ -275,7 +298,7 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 		argv = append(argv, "--allow-downgrade")
 	}
 	st.emitPhase(s, wire.UpdatePhaseInstalling)
-	log.Info("netd: running the staged installer", "dir", dir)
+	log.Info("netd: running the staged installer", "dir", dir, "argv", argv)
 
 	// The installer restarts this daemon, so its run must not end with this
 	// daemon's context: it is bounded by its own wall clock only.
@@ -359,6 +382,8 @@ func (s *Server) verifyUpdatePayload(a *wire.ApplyUpdateArgs) (updatePayload, er
 		return updatePayload{}, fmt.Errorf("%w: the signer certificate names CN=%q O=%q, not CN=%q O=%q", errUpdateRefused,
 			signer.Subject.CommonName, signer.Subject.Organization, wire.UpdateSignerCommonName, wire.UpdateSignerOrganization)
 	}
+	s.log.Info("netd: update signer accepted", "cn", signer.Subject.CommonName,
+		"serial", signer.SerialNumber.String(), "not-after", signer.NotAfter.UTC().Format(time.RFC3339))
 	pub, ok := signer.PublicKey.(*ecdsa.PublicKey)
 	if !ok {
 		return updatePayload{}, fmt.Errorf("%w: the signer key is %T, not ECDSA", errUpdateRefused, signer.PublicKey)
@@ -367,6 +392,7 @@ func (s *Server) verifyUpdatePayload(a *wire.ApplyUpdateArgs) (updatePayload, er
 	if !ecdsa.VerifyASN1(pub, digest[:], a.Signature) {
 		return updatePayload{}, fmt.Errorf("%w: the payload signature does not verify", errUpdateRefused)
 	}
+	s.log.Info("netd: update payload signature verified")
 	return parseUpdatePayload(a.Payload)
 }
 
@@ -548,20 +574,21 @@ func copyVerifiedArchive(archive *os.File, root, want string) (*os.File, error) 
 
 // checkNotDowngrade refuses a version below the installed k3sm's, and refuses
 // when the two cannot be ordered (an installed dev build, say): without
-// allowDowngrade the daemon installs only what it can prove is not older.
-func (s *Server) checkNotDowngrade(ctx context.Context, version string) error {
+// allowDowngrade the daemon installs only what it can prove is not older. It
+// returns the installed version it compared against.
+func (s *Server) checkNotDowngrade(ctx context.Context, version string) (string, error) {
 	installed, err := s.installedVersion(ctx, s.installedK3sm)
 	if err != nil {
-		return fmt.Errorf("%w: read the installed version: %w", errUpdateRefused, err)
+		return "", fmt.Errorf("%w: read the installed version: %w", errUpdateRefused, err)
 	}
 	cmp, ok := compareReleases(version, installed)
 	switch {
 	case !ok:
-		return fmt.Errorf("%w: %s cannot be ordered against the installed %q; the payload must allow a downgrade", errUpdateRefused, version, installed)
+		return "", fmt.Errorf("%w: %s cannot be ordered against the installed %q; the payload must allow a downgrade", errUpdateRefused, version, installed)
 	case cmp < 0:
-		return fmt.Errorf("%w: %s is below the installed %s and the payload does not allow a downgrade", errUpdateRefused, version, installed)
+		return "", fmt.Errorf("%w: %s is below the installed %s and the payload does not allow a downgrade", errUpdateRefused, version, installed)
 	}
-	return nil
+	return installed, nil
 }
 
 // probeInstalledVersion is the production installedVersionFunc: it runs

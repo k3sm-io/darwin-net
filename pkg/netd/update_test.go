@@ -587,6 +587,78 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 		}
 	})
 
+	t.Run("logs each check at Info, in order, on a successful apply", func(t *testing.T) {
+		var buf bytes.Buffer
+		h := newUpdateHarness(t, selfUID(), func(c *Config) {
+			c.Logger = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		})
+		members := withMember(releaseMembers("TEAM:ABCDE12345"), "cp-payload/zot.version", &tarMember{name: "cp-payload/zot.version", body: "v2.1.20 minimal\n", mode: 0o644})
+		args := h.request(members, "v0.2.0", "", false)
+		resp := h.apply(args)
+		if !resp.OK || resp.Phase != wire.UpdatePhaseDone {
+			t.Fatalf("resp = %+v, want OK Done", resp)
+		}
+		var payload struct {
+			SHA256 string `json:"sha256"`
+		}
+		if err := json.Unmarshal(args.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		var lines []map[string]any
+		for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+			var m map[string]any
+			if err := json.Unmarshal([]byte(l), &m); err != nil {
+				t.Fatalf("log line %q: %v", l, err)
+			}
+			if m["level"] == "INFO" {
+				lines = append(lines, m)
+			}
+		}
+		want := []struct {
+			msg   string
+			attrs map[string]any
+		}{
+			{"netd: update signer accepted", map[string]any{"cn": wire.UpdateSignerCommonName}},
+			{"netd: update payload signature verified", nil},
+			{"netd: update archive digest matched", map[string]any{"sha256": payload.SHA256, "version": "v0.2.0"}},
+			{"netd: update set extracted", map[string]any{"members": float64(9), "macho": float64(7), "markers-skipped": float64(2)}},
+			{"netd: update code signing accepted", map[string]any{"signer": "team ABCDE12345", "policy": "if-signed"}},
+			{"netd: update version compare passed", map[string]any{"installed": "v0.1.9"}},
+			{"netd: running the staged installer", nil},
+			{"netd: the staged installer finished", nil},
+		}
+		i := 0
+		for _, l := range lines {
+			if i < len(want) && l["msg"] == want[i].msg {
+				for k, v := range want[i].attrs {
+					if l[k] != v {
+						t.Errorf("%q: %s = %v, want %v", want[i].msg, k, l[k], v)
+					}
+				}
+				i++
+			}
+		}
+		if i != len(want) {
+			t.Fatalf("Info lines %v: missing %q (or out of order)", lines, want[i].msg)
+		}
+		for _, l := range lines {
+			switch l["msg"] {
+			case "netd: update signer accepted":
+				if l["serial"] == "" || l["serial"] == nil || l["not-after"] == nil {
+					t.Errorf("signer line %v lacks the serial or not-after", l)
+				}
+			case "netd: update set extracted":
+				if got := fmt.Sprint(l["markers"]); got != "[cp-payload/kube.version cp-payload/zot.version]" {
+					t.Errorf("markers = %s", got)
+				}
+			case "netd: running the staged installer":
+				if got, want := fmt.Sprint(l["argv"]), fmt.Sprint(h.inst.argv); got != want {
+					t.Errorf("argv logged %s, ran %s", got, want)
+				}
+			}
+		}
+	})
+
 	t.Run("passes --allow-downgrade when the payload allows it and installs below the installed tag", func(t *testing.T) {
 		h := newUpdateHarness(t, selfUID())
 		h.version = "v0.3.0"
@@ -824,6 +896,12 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 		{"a non-Mach-O cp-payload executable", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/kine", &tarMember{name: "cp-payload/kine", body: "#!/bin/sh\nADHOC", mode: 0o755}), "", "the staged cp-payload/kine is not a Mach-O"},
 		{"a non-Mach-O file named like a marker below cp-payload/bin", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/bin/kube.version", &tarMember{name: "cp-payload/bin/kube.version", body: "v1\n", mode: 0o644}), "", "the staged cp-payload/bin/kube.version is not a Mach-O"},
 		{"a cp-payload marker that is an invalidly signed Mach-O", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/kube.version", &tarMember{name: "cp-payload/kube.version", body: machO + "marker\nBROKEN", mode: 0o644}), "", "the staged cp-payload/kube.version is not validly signed"},
+		{"a cp-payload/zot.version text marker is skipped", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/zot.version", &tarMember{name: "cp-payload/zot.version", body: "v2.1.20 minimal\n", mode: 0o644}), "", ""},
+		{"a cp-payload/other.version text marker is skipped", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/other.version", &tarMember{name: "cp-payload/other.version", body: "v0.0.1\n", mode: 0o644}), "", ""},
+		{"a cp-payload .version file of 4 KiB", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/zot.version", &tarMember{name: "cp-payload/zot.version", body: strings.Repeat("v", 4<<10), mode: 0o644}), "", "the staged cp-payload/zot.version is not a Mach-O"},
+		{"a cp-payload .version file with a non-printable byte", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/zot.version", &tarMember{name: "cp-payload/zot.version", body: "v2.1.20\x01\n", mode: 0o644}), "", "the staged cp-payload/zot.version is not a Mach-O"},
+		{"a non-Mach-O cp-payload/bin/x.version", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/bin/x.version", &tarMember{name: "cp-payload/bin/x.version", body: "v1\n", mode: 0o644}), "", "the staged cp-payload/bin/x.version is not a Mach-O"},
+		{"a validly signed .version Mach-O is checked and accepted", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/zot.version", &tarMember{name: "cp-payload/zot.version", body: machO + "marker\nADHOC", mode: 0o644}), "", ""},
 		{"a FAT64 universal k3sm-vmhost", "ADHOC", withMember(releaseMembers("ADHOC"), "k3sm-vmhost", &tarMember{name: "k3sm-vmhost", body: "\xca\xfe\xba\xbfvmhost\nADHOC", mode: 0o755}), "", ""},
 		{"a byte-swapped FAT64 universal k3sm", "ADHOC", withMember(releaseMembers("ADHOC"), "k3sm", &tarMember{name: "k3sm", body: "\xbf\xba\xfe\xcak3sm\nADHOC", mode: 0o755}), "", ""},
 		{"one team on an ad-hoc install", "ADHOC", team("ABCDE12345"), "", ""},

@@ -19,6 +19,7 @@ package netd
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -139,5 +140,71 @@ func TestValidTeamIDAndRequirement(t *testing.T) {
 		if !strings.Contains(req, part) {
 			t.Errorf("requirement %q lacks %q", req, part)
 		}
+	}
+}
+
+// TestCheckCodeSigningVersionMarkers pins the cp-payload version-marker rule
+// of the staged set: a marker is skipped by shape (directly under cp-payload/,
+// a .version name, under 4 KiB, printable ASCII and newlines), a .version
+// Mach-O is checked, and every other non-Mach-O refuses.
+func TestCheckCodeSigningVersionMarkers(t *testing.T) {
+	cases := []struct {
+		name       string
+		rel, body  string
+		wantMachO  bool
+		wantMarker bool
+		wantErr    string
+	}{
+		{name: "cp-payload/zot.version (text) is skipped", rel: "cp-payload/zot.version", body: "v2.1.20 minimal\n", wantMarker: true},
+		{name: "a cp-payload/other.version text file is skipped", rel: "cp-payload/other.version", body: "v9.9.9\nsecond line\n", wantMarker: true},
+		{name: "an empty cp-payload marker is skipped", rel: "cp-payload/empty.version", body: "", wantMarker: true},
+		{name: "a marker just under 4 KiB is skipped", rel: "cp-payload/big.version", body: strings.Repeat("v", maxVersionMarkerBytes-1), wantMarker: true},
+		{name: "a .version file of 4 KiB is refused", rel: "cp-payload/huge.version", body: strings.Repeat("v", maxVersionMarkerBytes), wantErr: "the staged cp-payload/huge.version is not a Mach-O"},
+		{name: "a .version file with a non-printable byte is refused", rel: "cp-payload/bin.version", body: "v1.0.0\x00\n", wantErr: "the staged cp-payload/bin.version is not a Mach-O"},
+		{name: "a .version file with a tab is refused", rel: "cp-payload/tab.version", body: "v1\t0\n", wantErr: "the staged cp-payload/tab.version is not a Mach-O"},
+		{name: "a .version file with a high byte is refused", rel: "cp-payload/utf8.version", body: "v1 \xc3\xa9\n", wantErr: "the staged cp-payload/utf8.version is not a Mach-O"},
+		{name: "a .version Mach-O is checked", rel: "cp-payload/kine.version", body: machO + "marker\nADHOC", wantMachO: true},
+		{name: "cp-payload/bin/x.version is refused as a non-Mach-O", rel: "cp-payload/bin/x.version", body: "v1\n", wantErr: "the staged cp-payload/bin/x.version is not a Mach-O"},
+		{name: "a bare .version name is refused", rel: "cp-payload/.version", body: "v1\n", wantErr: "the staged cp-payload/.version is not a Mach-O"},
+		{name: "a top-level .version file is refused", rel: "k3sm.version", body: "v1\n", wantErr: "the staged k3sm.version is not a Mach-O"},
+		{name: "a cp-payload text file of another name is refused", rel: "cp-payload/zot.txt", body: "v1\n", wantErr: "the staged cp-payload/zot.txt is not a Mach-O"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			write := func(rel, body string) {
+				p := filepath.Join(dir, filepath.FromSlash(rel))
+				if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, f := range updateSetFiles {
+				write(f, machO+f+"\nADHOC")
+			}
+			write("cp-payload/kine", machO+"kine\nADHOC")
+			write(tc.rel, tc.body)
+			set, err := stagedSigningSet(dir)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := slices.Contains(set.MachOs, tc.rel); got != tc.wantMachO {
+				t.Errorf("%s among the checked Mach-Os = %v, want %v (%v)", tc.rel, got, tc.wantMachO, set.MachOs)
+			}
+			if got := slices.Contains(set.Markers, tc.rel); got != tc.wantMarker {
+				t.Errorf("%s among the skipped markers = %v, want %v (%v)", tc.rel, got, tc.wantMarker, set.Markers)
+			}
+			if want := len(updateSetFiles) + 2; set.Members != want {
+				t.Errorf("members = %d, want %d", set.Members, want)
+			}
+		})
 	}
 }

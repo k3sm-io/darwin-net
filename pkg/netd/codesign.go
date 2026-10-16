@@ -27,7 +27,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -199,17 +198,54 @@ var machOMagics = []uint32{
 	0xcafebabf, 0xbfbafeca, // FAT_MAGIC_64
 }
 
-// updatePayloadMarkers are the cp-payload files that are data, not code: the
-// version markers the k3sm installer copies beside the payload and never
-// executes or loads. They are the only staged files that may be something
-// other than a Mach-O. The installer's signing scan skips every non-Mach-O
-// file; netd skips only these, and checks one of them like any other member
-// when it is a Mach-O.
-var updatePayloadMarkers = []string{
-	updatePayloadDir + "/etcd.version",
-	updatePayloadDir + "/etcdutl.version",
-	updatePayloadDir + "/kine.version",
-	updatePayloadDir + "/kube.version",
+// versionMarkerSuffix and maxVersionMarkerBytes give the shape of a cp-payload
+// version marker: a file the k3sm installer copies beside the payload as data
+// and never executes or loads (etcd.version, kine.version, zot.version and the
+// like). See isVersionMarker.
+const (
+	versionMarkerSuffix   = ".version"
+	maxVersionMarkerBytes = 4 << 10
+)
+
+// isVersionMarker reports whether the regular file at p, staged as rel, has
+// the shape of a version marker: directly under cp-payload/ (not deeper), a
+// name ending in .version, smaller than maxVersionMarkerBytes, and only
+// printable ASCII and newlines. The installer's signing scan skips every
+// non-Mach-O file; netd skips only files of this shape, so a component added
+// to the payload needs no change here, and any other non-Mach-O still
+// refuses. A marker that is a Mach-O is never asked: the caller checks it like
+// any other member.
+func isVersionMarker(rel, p string) (bool, error) {
+	dir, name, ok := strings.Cut(rel, "/")
+	if !ok || dir != updatePayloadDir || strings.Contains(name, "/") ||
+		!strings.HasSuffix(name, versionMarkerSuffix) || len(name) == len(versionMarkerSuffix) {
+		return false, nil
+	}
+	f, err := os.OpenFile(p, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return false, fmt.Errorf("open %s: %w", p, err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", p, err)
+	}
+	if !fi.Mode().IsRegular() || fi.Size() >= maxVersionMarkerBytes {
+		return false, nil
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxVersionMarkerBytes))
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", p, err)
+	}
+	if len(b) >= maxVersionMarkerBytes {
+		return false, nil
+	}
+	for _, c := range b {
+		if c != '\n' && (c < 0x20 || c > 0x7e) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // isMachO reports whether the regular file at p starts with a Mach-O magic.
@@ -235,14 +271,25 @@ func isMachO(p string) (bool, error) {
 	return false, nil
 }
 
-// stagedSigningSet lists, sorted, the slash-separated relative paths of the
-// staged files the signing policy checks: every regular file under dir (the
-// updateSetFiles at the top and the whole cp-payload tree), each of which must
-// be a Mach-O. A file that is not one refuses before any signature is read,
-// except an updatePayloadMarkers file, which is skipped. Anything under dir
-// that is neither a directory nor a regular file refuses.
-func stagedSigningSet(dir string) ([]string, error) {
-	var out []string
+// stagedSet is the staged tree as the signing policy sees it.
+type stagedSet struct {
+	// Members counts the regular files under the staging directory.
+	Members int
+	// MachOs are the sorted slash-separated relative paths of the Mach-Os,
+	// the files whose signatures the policy checks.
+	MachOs []string
+	// Markers are the sorted relative paths of the cp-payload version markers
+	// skipped as data (isVersionMarker).
+	Markers []string
+}
+
+// stagedSigningSet walks the staged tree: every regular file under dir (the
+// updateSetFiles at the top and the whole cp-payload tree) must be a Mach-O,
+// except a cp-payload version marker (isVersionMarker), which is skipped. A
+// file that is neither refuses before any signature is read, and so does
+// anything under dir that is neither a directory nor a regular file.
+func stagedSigningSet(dir string) (stagedSet, error) {
+	var set stagedSet
 	var refusal error
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -260,32 +307,40 @@ func stagedSigningSet(dir string) ([]string, error) {
 			refusal = fmt.Errorf("%w: the staged %s is not a regular file", errUpdateRefused, rel)
 			return fs.SkipAll
 		}
+		set.Members++
 		ok, err := isMachO(p)
-		switch {
-		case err != nil:
+		if err != nil {
 			return err
-		case ok:
-			out = append(out, rel)
-		case slices.Contains(updatePayloadMarkers, rel):
-		default:
-			refusal = fmt.Errorf("%w: the staged %s is not a Mach-O, and every member of the build set must be one", errUpdateRefused, rel)
-			return fs.SkipAll
 		}
-		return nil
+		if ok {
+			set.MachOs = append(set.MachOs, rel)
+			return nil
+		}
+		marker, err := isVersionMarker(rel, p)
+		if err != nil {
+			return err
+		}
+		if marker {
+			set.Markers = append(set.Markers, rel)
+			return nil
+		}
+		refusal = fmt.Errorf("%w: the staged %s is not a Mach-O, and every member of the build set must be one", errUpdateRefused, rel)
+		return fs.SkipAll
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list the staged build set: %w", err)
+		return stagedSet{}, fmt.Errorf("list the staged build set: %w", err)
 	}
 	if refusal != nil {
-		return nil, refusal
+		return stagedSet{}, refusal
 	}
-	sort.Strings(out)
+	sort.Strings(set.MachOs)
+	sort.Strings(set.Markers)
 	for _, m := range updateSetFiles {
-		if i := sort.SearchStrings(out, m); i == len(out) || out[i] != m {
-			return nil, fmt.Errorf("%w: the staged set carries no Mach-O %s", errUpdateRefused, m)
+		if i := sort.SearchStrings(set.MachOs, m); i == len(set.MachOs) || set.MachOs[i] != m {
+			return stagedSet{}, fmt.Errorf("%w: the staged set carries no Mach-O %s", errUpdateRefused, m)
 		}
 	}
-	return out, nil
+	return set, nil
 }
 
 // checkCodeSigning applies the update code-signing policy to the staged tree
@@ -348,19 +403,25 @@ func signerName(sig codeSignature) string {
 	return "no team (ad hoc or not Developer ID)"
 }
 
-// inspectStagedTree inspects every member of stagedSigningSet and the
-// installed k3sm.
-func inspectStagedTree(ctx context.Context, in codeInspector, dir, installedPath string) (codeSignature, map[string]codeSignature, error) {
-	rels, err := stagedSigningSet(dir)
-	if err != nil {
-		return codeSignature{}, nil, err
+// treeSigner renders the one signer of a tree checkCodeSigning accepted.
+func treeSigner(tree map[string]codeSignature) string {
+	for _, sig := range tree {
+		if t := sig.team(); t != "" {
+			return "team " + t
+		}
 	}
+	return "no team (ad hoc or not Developer ID)"
+}
+
+// inspectStagedTree inspects the installed k3sm and every Mach-O of set,
+// staged under dir.
+func inspectStagedTree(ctx context.Context, in codeInspector, dir string, set stagedSet, installedPath string) (codeSignature, map[string]codeSignature, error) {
 	installed, err := in.Inspect(ctx, installedPath)
 	if err != nil {
 		return codeSignature{}, nil, fmt.Errorf("inspect the installed %s: %w", installedPath, err)
 	}
-	tree := make(map[string]codeSignature, len(rels))
-	for _, rel := range rels {
+	tree := make(map[string]codeSignature, len(set.MachOs))
+	for _, rel := range set.MachOs {
 		sig, err := in.Inspect(ctx, filepath.Join(dir, filepath.FromSlash(rel)))
 		if err != nil {
 			return codeSignature{}, nil, fmt.Errorf("inspect the staged %s: %w", rel, err)
