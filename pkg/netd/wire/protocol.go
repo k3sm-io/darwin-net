@@ -36,10 +36,10 @@ const DefaultSocketPath = "/var/lib/k3sm/run/netd.sock"
 // typed scalars.
 const DefaultMaxRequestBytes = 1 << 16
 
-// MaxApplyUpdateRequestBytes caps an ApplyUpdate request, whose manifest names
-// every file of the build set. The daemon reads every frame under the larger of
-// this and its configured request cap, then refuses any other verb whose frame
-// exceeds the configured cap, so only ApplyUpdate gets the room.
+// MaxApplyUpdateRequestBytes caps an ApplyUpdate request (the signed payload,
+// its signature and the signer certificate). The daemon reads every frame under
+// the larger of this and its configured request cap, then refuses any other verb
+// whose frame exceeds the configured cap, so only ApplyUpdate gets the room.
 const MaxApplyUpdateRequestBytes = 256 << 10
 
 // DefaultMaxPerConn bounds the aliases, mesh routes, and bound ports a single
@@ -57,29 +57,44 @@ const DefaultMaxPerConn = 253
 // reply carries the daemon's own version, and a client sends a newer verb only to
 // a daemon that reported a minor that understands it: an older daemon does not
 // decode strictly, so it would silently drop a field it does not know. Minor 3
-// adds ApplyUpdate with Response.Phase and Response.Log.
+// added ApplyUpdate with Response.Phase and Response.Log. Minor 4 replaces the
+// ApplyUpdate request with a server-signed payload and the archive path
+// (ApplyUpdateArgs); a minor-3 request shape is no longer accepted.
 const (
 	ProtocolVersionMajor = 1
-	ProtocolVersionMinor = 3
+	ProtocolVersionMinor = 4
 )
 
 // MinorInterconnect is the first minor version that understands Hello and the
 // interconnect alias verbs.
 const MinorInterconnect = 2
 
-// MinorApplyUpdate is the first minor version that understands ApplyUpdate.
-const MinorApplyUpdate = 3
+// MinorApplyUpdate is the first minor version that understands the signed
+// ApplyUpdate request. A minor-3 daemon speaks a withdrawn request shape, so a
+// client treats it as too old for the verb.
+const MinorApplyUpdate = 4
 
 // UpdateInstallTimeout bounds the one installer run ApplyUpdate makes. The
 // daemon kills the installer's whole process group when it expires.
 const UpdateInstallTimeout = 20 * time.Minute
 
-// MaxUpdateSetBytes caps the total size of the regular files in an ApplyUpdate
-// set (2 GiB). A larger set is refused while it is copied.
+// MaxUpdateSetBytes caps the bytes an ApplyUpdate archive may unpack to (2 GiB),
+// counting the members the daemon reads past. A larger archive is refused while
+// it is extracted.
 const MaxUpdateSetBytes int64 = 2 << 30
 
-// MaxUpdateManifestEntries caps the files an ApplyUpdate manifest may name.
-const MaxUpdateManifestEntries = 4096
+// MaxUpdateArchiveBytes caps the release archive an ApplyUpdate names (512 MiB).
+const MaxUpdateArchiveBytes int64 = 512 << 20
+
+// MaxUpdateArchiveMembers caps the entries an ApplyUpdate archive may hold.
+const MaxUpdateArchiveMembers = 4096
+
+// UpdateSignerCommonName and UpdateSignerOrganization are the subject an
+// ApplyUpdate signer certificate must carry, under the cluster CA.
+const (
+	UpdateSignerCommonName   = "k3sm:update-signer"
+	UpdateSignerOrganization = "k3sm:update-signers"
+)
 
 // Sentinel errors. Compare with errors.Is, never by string match.
 var (
@@ -230,16 +245,16 @@ const (
 	// every slot 1..7 alias. The slot bound (0..7) bounds bridge0 at 8
 	// interconnect aliases per node. Minor 2.
 	VerbRemoveInterconnectAlias Verb = "RemoveInterconnectAlias"
-	// VerbApplyUpdate installs a k3sm build set the unprivileged agent staged
-	// and verified the provenance of. It is the one verb that carries a
-	// filesystem path, and the daemon only reads from it: every directory and
-	// file under it must be owned by the service uid, a symlink anywhere refuses
-	// the set, and the daemon copies the set into a fresh root-only directory
-	// under the install staging root, checks every copied file against the
-	// manifest's sha256, and only then runs the copied k3sm's
-	// `install --from-staging`, the one binary of the set it ever runs. The
-	// daemon never downloads anything. The reply is a stream of frames, one per
-	// UpdatePhase, ending in Done or Failed. Minor 3.
+	// VerbApplyUpdate installs a k3sm release the cluster's update signer
+	// authorised. The request carries the signed payload, its signature, the
+	// signer certificate and the path of the release archive the unprivileged
+	// agent downloaded. The daemon verifies the certificate against the cluster
+	// CA and the signature over the payload, hashes the archive against the
+	// payload's sha256, extracts it itself into a fresh root-only directory,
+	// applies the code-signing and downgrade policy, and only then runs the
+	// staged k3sm's `install --from-staging`, the one binary of the set it ever
+	// runs. The daemon never downloads anything. The reply is a stream of
+	// frames, one per UpdatePhase, ending in Done or Failed. Minor 4.
 	VerbApplyUpdate Verb = "ApplyUpdate"
 )
 
@@ -248,10 +263,10 @@ type UpdatePhase string
 
 // The ApplyUpdate phases, in the order they are reported.
 const (
-	// UpdatePhaseVerifying: the daemon is copying the set and checking every
-	// copied file against the manifest.
+	// UpdatePhaseVerifying: the daemon is checking the signature, the archive
+	// digest, the extracted set and its code signatures.
 	UpdatePhaseVerifying UpdatePhase = "Verifying"
-	// UpdatePhaseInstalling: every digest matched and the installer is running.
+	// UpdatePhaseInstalling: every check passed and the installer is running.
 	UpdatePhaseInstalling UpdatePhase = "Installing"
 	// UpdatePhaseRestarting is never sent by the daemon. The client reports it
 	// when the stream ends after Installing with no final frame: the installer
@@ -316,22 +331,24 @@ type InterconnectAliasArgs struct {
 	Slot int `json:"slot"`
 }
 
-// ApplyUpdateArgs carries one managed update. SourceDir is an absolute, clean
-// path to the directory the agent prepared (the build set: k3sm,
-// k3sm-execshim, k3sm-vmhost, the two shim dylibs and cp-payload/). Manifest
-// maps the slash-separated path of every regular file in the set, relative to
-// SourceDir, to its lowercase hex sha256; a file missing from the set, a file
-// the manifest does not name, or a mismatch refuses the update. Version is the
-// release tag being installed, used for the log only: the installer reads the
-// version from the staged binary itself. AllowDowngrade and
-// RequireTeamSignature pass through to the installer as --allow-downgrade and
-// --require-team-signature.
+// ApplyUpdateArgs carries one managed update.
+//
+// ArchivePath is the absolute, clean path of the release archive (a gzip tar)
+// the unprivileged agent downloaded: a regular file the service uid owns, at
+// most MaxUpdateArchiveBytes. Payload is the canonical payload JSON exactly as
+// the update controller wrote it on the Node
+// ({"version","url","sha256","signature","allowDowngrade"}); the daemon takes
+// the release tag, the archive digest, the code-signing policy and the
+// downgrade permission from it and from nothing else. Signature is a
+// DER-encoded ECDSA signature over the SHA-256 of Payload, and SignerCert the
+// PEM certificate of the key that made it, which must chain to the cluster CA
+// the daemon was started with and carry the subject UpdateSignerCommonName,
+// UpdateSignerOrganization.
 type ApplyUpdateArgs struct {
-	SourceDir            string            `json:"sourceDir"`
-	Manifest             map[string]string `json:"manifest"`
-	Version              string            `json:"version"`
-	AllowDowngrade       bool              `json:"allowDowngrade,omitempty"`
-	RequireTeamSignature bool              `json:"requireTeamSignature,omitempty"`
+	ArchivePath string `json:"archivePath"`
+	Payload     []byte `json:"payload"`
+	Signature   []byte `json:"signature"`
+	SignerCert  []byte `json:"signerCert"`
 }
 
 // BindPortArgs requests a listening socket on a node address and port. A specific

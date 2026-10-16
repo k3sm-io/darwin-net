@@ -17,6 +17,7 @@ limitations under the License.
 package wire
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -78,11 +79,12 @@ func (d *updateDaemon) open(context.Context) (io.ReadWriteCloser, error) {
 
 // TestClientApplyUpdate pins the client half of ApplyUpdate: the phase stream
 // in order, Failed as an error carrying the log, the end of the stream after
-// Installing as Restarting (the installer restarted the helper), and nothing
-// beyond Hello sent to a helper older than minor 3.
+// Installing as Restarting (the installer restarted the helper), the signed
+// request carried verbatim, and nothing beyond Hello sent to a helper older
+// than minor 4 (a minor-3 helper speaks the withdrawn request shape).
 func TestClientApplyUpdate(t *testing.T) {
-	args := ApplyUpdateArgs{SourceDir: "/var/lib/k3sm/update/v0.2.0", Manifest: map[string]string{"k3sm": "ab"},
-		Version: "v0.2.0", AllowDowngrade: true, RequireTeamSignature: true}
+	args := ApplyUpdateArgs{ArchivePath: "/var/lib/k3sm/update/k3sm-darwin-arm64.tar.gz",
+		Payload: []byte(`{"version":"v0.2.0"}`), Signature: []byte{0x30, 0x01, 0xff}, SignerCert: []byte("-----BEGIN CERTIFICATE-----\n")}
 	phase := func(p UpdatePhase, ok bool) Response { return Response{OK: ok, Phase: p} }
 	cases := []struct {
 		name      string
@@ -131,6 +133,13 @@ func TestClientApplyUpdate(t *testing.T) {
 			wantVerbs: []Verb{VerbHello, VerbApplyUpdate},
 		},
 		{
+			name:      "a minor-3 helper",
+			minor:     3,
+			wantErr:   true,
+			wantOld:   true,
+			wantVerbs: []Verb{VerbHello},
+		},
+		{
 			name:      "a minor-2 helper",
 			minor:     MinorInterconnect,
 			wantErr:   true,
@@ -156,7 +165,8 @@ func TestClientApplyUpdate(t *testing.T) {
 				t.Fatalf("verbs sent = %v, want %v", d.verbs, tc.wantVerbs)
 			}
 			if tc.wantVerbs[len(tc.wantVerbs)-1] == VerbApplyUpdate {
-				if d.args == nil || d.args.SourceDir != args.SourceDir || !d.args.AllowDowngrade || !d.args.RequireTeamSignature || d.args.Manifest["k3sm"] != "ab" {
+				if d.args == nil || d.args.ArchivePath != args.ArchivePath || !bytes.Equal(d.args.Payload, args.Payload) ||
+					!bytes.Equal(d.args.Signature, args.Signature) || !bytes.Equal(d.args.SignerCert, args.SignerCert) {
 					t.Fatalf("the daemon received %+v, want %+v", d.args, args)
 				}
 			}
@@ -164,14 +174,14 @@ func TestClientApplyUpdate(t *testing.T) {
 	}
 }
 
-// TestApplyUpdateIsMinorThree pins the 1.2 -> 1.3 bump and that a reply to any
-// other verb carries neither of the new fields.
-func TestApplyUpdateIsMinorThree(t *testing.T) {
-	if v := CurrentVersion(); v.Minor != MinorApplyUpdate || !v.SupportsApplyUpdate() || !v.SupportsInterconnect() {
-		t.Fatalf("CurrentVersion = %+v, want 1.3 supporting ApplyUpdate and the interconnect verbs", v)
+// TestApplyUpdateIsMinorFour pins the 1.3 -> 1.4 bump (the signed request)
+// and that a reply to any other verb carries neither of the update fields.
+func TestApplyUpdateIsMinorFour(t *testing.T) {
+	if v := CurrentVersion(); v.Minor != 4 || MinorApplyUpdate != 4 || !v.SupportsApplyUpdate() || !v.SupportsInterconnect() {
+		t.Fatalf("CurrentVersion = %+v, want 1.4 supporting ApplyUpdate and the interconnect verbs", v)
 	}
-	if (Version{Major: 1, Minor: 2}).SupportsApplyUpdate() || (Version{Major: 2, Minor: 9}).SupportsApplyUpdate() {
-		t.Fatal("a 1.2 daemon or another major must not be treated as supporting ApplyUpdate")
+	if (Version{Major: 1, Minor: 3}).SupportsApplyUpdate() || (Version{Major: 2, Minor: 9}).SupportsApplyUpdate() {
+		t.Fatal("a 1.3 daemon (the withdrawn request shape) or another major must not be treated as supporting ApplyUpdate")
 	}
 	b, err := json.Marshal(Response{Version: CurrentVersion(), OK: true})
 	if err != nil {

@@ -18,6 +18,7 @@ package netd
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -118,6 +119,11 @@ type Config struct {
 	// a restart's reconcile removes every one of this node's derived interconnect
 	// aliases (k3sm ensures them again).
 	InterconnectStatePath string
+	// ClusterCAPath is the cluster CA certificate (PEM) an ApplyUpdate signer
+	// certificate must chain to (`k3sm netd --cluster-ca`). It is read once, in
+	// NewServer. When it is empty or unreadable every ApplyUpdate is refused;
+	// the other verbs are unaffected.
+	ClusterCAPath string
 	// ServiceCIDR, when valid, additionally admits an EnsureAlias for a Service VIP
 	// (the proxy's ClusterIPs live here, outside the pod aggregate). Optional.
 	ServiceCIDR netip.Prefix
@@ -196,6 +202,20 @@ type Server struct {
 	stagingRoot string
 	// runInstaller is ApplyUpdate's one exec (execInstaller); tests replace it.
 	runInstaller installerRunner
+	// clusterCA is the pool an ApplyUpdate signer must chain to, nil when
+	// Config.ClusterCAPath was empty or did not load (clusterCAErr says why).
+	clusterCA    *x509.CertPool
+	clusterCAErr error
+	// inspector reads code signatures (codesignTool); tests replace it.
+	inspector codeInspector
+	// installedK3sm is the installed binary the signing and downgrade policy
+	// compare against (DefaultInstalledK3sm).
+	installedK3sm string
+	// installedVersion reads installedK3sm's release (probeInstalledVersion);
+	// tests replace it.
+	installedVersion installedVersionFunc
+	// now is the clock the signer certificate's validity is checked against.
+	now func() time.Time
 }
 
 // NewServer constructs a Server from cfg, filling defaults: the cluster aggregate
@@ -299,6 +319,14 @@ func NewServer(cfg Config) *Server {
 		icOwned:           make(map[int]netip.Addr),
 		stagingRoot:       DefaultUpdateStagingRoot,
 		runInstaller:      execInstaller,
+		inspector:         codesignTool{},
+		installedK3sm:     DefaultInstalledK3sm,
+		installedVersion:  probeInstalledVersion,
+		now:               time.Now,
+	}
+	s.clusterCA, s.clusterCAErr = loadClusterCA(cfg.ClusterCAPath)
+	if s.clusterCAErr != nil && cfg.ClusterCAPath != "" {
+		cfg.Logger.Error("netd: the cluster CA did not load; every applyUpdate will be refused", "path", cfg.ClusterCAPath, "err", s.clusterCAErr)
 	}
 	// Remove this node's derived interconnect aliases that the daemon does not
 	// own (see reconcileInterconnectAtStart); bounded like the sweeps above.

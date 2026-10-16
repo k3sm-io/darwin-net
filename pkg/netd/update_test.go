@@ -17,62 +17,277 @@ limitations under the License.
 package netd
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 
 	"k3sm.io/darwin-net/pkg/netd/wire"
 )
 
-// updateSetFiles is a build set's shape: the five binaries and a cp-payload.
-var updateSetFiles = map[string]string{
-	"k3sm":                           "staged k3sm\n",
-	"k3sm-execshim":                  "execshim\n",
-	"k3sm-vmhost":                    "vmhost\n",
-	"libk3sm_getaddrinfo_shim.dylib": "gai shim\n",
-	"libk3sm_pathrebase_shim.dylib":  "rebase shim\n",
-	"cp-payload/manifest.json":       "{}\n",
-	"cp-payload/charts/a.tgz":        "chart\n",
+// machO is a Mach-O 64 little-endian magic, the prefix every fake binary
+// carries so the policy treats it as a Mach-O.
+const machO = "\xcf\xfa\xed\xfe"
+
+// testPKI is a cluster CA and an update signer under it.
+type testPKI struct {
+	caKey     *ecdsa.PrivateKey
+	caCert    *x509.Certificate
+	caPEM     []byte
+	signerKey *ecdsa.PrivateKey
+	signerPEM []byte
 }
 
-// writeUpdateSet writes the build set into a fresh directory and returns it
-// with its manifest.
-func writeUpdateSet(t *testing.T) (string, map[string]string) {
+func newKey(t *testing.T) *ecdsa.PrivateKey {
 	t.Helper()
-	src := filepath.Join(t.TempDir(), "set")
-	manifest := map[string]string{}
-	for rel, body := range updateSetFiles {
-		p := filepath.Join(src, filepath.FromSlash(rel))
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		mode := os.FileMode(0o644)
-		if !strings.Contains(rel, "/") && !strings.HasSuffix(rel, ".dylib") {
-			mode = 0o755
-		}
-		if err := os.WriteFile(p, []byte(body), mode); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(p, mode); err != nil {
-			t.Fatal(err)
-		}
-		sum := sha256.Sum256([]byte(body))
-		manifest[rel] = hex.EncodeToString(sum[:])
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return src, manifest
+	return k
+}
+
+var serialMu sync.Mutex
+var serial int64
+
+func nextSerial() *big.Int {
+	serialMu.Lock()
+	defer serialMu.Unlock()
+	serial++
+	return big.NewInt(serial)
+}
+
+// newCA makes a self-signed ECDSA CA.
+func newCA(t *testing.T, cn string) (*ecdsa.PrivateKey, *x509.Certificate, []byte) {
+	t.Helper()
+	key := newKey(t)
+	tmpl := &x509.Certificate{
+		SerialNumber:          nextSerial(),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key, cert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// leaf issues a leaf certificate for key under the CA.
+func leaf(t *testing.T, caKey *ecdsa.PrivateKey, ca *x509.Certificate, pub any, subj pkix.Name, notAfter time.Time) []byte {
+	t.Helper()
+	tmpl := &x509.Certificate{
+		SerialNumber: nextSerial(),
+		Subject:      subj,
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, pub, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+var signerSubject = pkix.Name{CommonName: wire.UpdateSignerCommonName, Organization: []string{wire.UpdateSignerOrganization}}
+
+func newTestPKI(t *testing.T) *testPKI {
+	t.Helper()
+	p := &testPKI{signerKey: newKey(t)}
+	p.caKey, p.caCert, p.caPEM = newCA(t, "k3sm-cluster-ca")
+	p.signerPEM = leaf(t, p.caKey, p.caCert, &p.signerKey.PublicKey, signerSubject, time.Now().Add(12*time.Hour))
+	return p
+}
+
+// sign is a DER ECDSA signature over sha256(payload).
+func sign(t *testing.T, key *ecdsa.PrivateKey, payload []byte) []byte {
+	t.Helper()
+	d := sha256.Sum256(payload)
+	sig, err := ecdsa.SignASN1(rand.Reader, key, d[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sig
+}
+
+// tarMember is one archive entry.
+type tarMember struct {
+	name     string
+	body     string
+	mode     int64
+	typeflag byte
+	linkname string
+	size     int64 // a header-only size, written without a body, when set
+}
+
+// releaseMembers is a release archive's shape: the five binaries (ad-hoc
+// signed per the fake inspector), the cp-payload tree with a Mach-O and a
+// marker, and the members the extraction reads past.
+func releaseMembers(sig string) []tarMember {
+	bin := func(name string) tarMember {
+		return tarMember{name: name, body: machO + name + "\n" + sig, mode: 0o755}
+	}
+	return []tarMember{
+		{name: "LICENSE", body: "license\n", mode: 0o644},
+		{name: "NOTICE", body: "notice\n", mode: 0o644},
+		bin("k3sm"),
+		bin("k3sm-netd"),
+		bin("k3sm-execshim"),
+		bin("k3sm-vmhost"),
+		bin("libk3sm_getaddrinfo_shim.dylib"),
+		bin("libk3sm_pathrebase_shim.dylib"),
+		{name: "cp-payload/", typeflag: tar.TypeDir, mode: 0o755},
+		bin("cp-payload/kine"),
+		{name: "cp-payload/kube.version", body: "v1.37.1\n", mode: 0o644},
+		bin("cp-payload/bin/helm"),
+	}
+}
+
+// buildArchive encodes members as a gzip tar.
+func buildArchive(t *testing.T, members []tarMember) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(zw)
+	for _, m := range members {
+		tf := m.typeflag
+		if tf == 0 {
+			tf = tar.TypeReg
+		}
+		size := int64(len(m.body))
+		if m.size != 0 {
+			size = m.size
+		}
+		if tf != tar.TypeReg {
+			size = 0
+		}
+		hdr := &tar.Header{Name: m.name, Mode: m.mode, Typeflag: tf, Linkname: m.linkname, Size: size, ModTime: time.Unix(1700000000, 0)}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if m.size != 0 {
+			// A header that claims more than is written: the extraction must
+			// refuse on the header alone. Stop here, leaving the stream short.
+			_ = tw.Flush()
+			_ = zw.Close()
+			return buf.Bytes()
+		}
+		if tf == tar.TypeReg {
+			if _, err := tw.Write([]byte(m.body)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// fakeInspector reads the last line of a file as its signature: ADHOC is a
+// valid ad-hoc signature, TEAM:<id> a valid team signature, anything else an
+// invalid one.
+type fakeInspector struct {
+	mu    sync.Mutex
+	paths []string
+}
+
+func (f *fakeInspector) Inspect(_ context.Context, p string) (codeSignature, error) {
+	f.mu.Lock()
+	f.paths = append(f.paths, p)
+	f.mu.Unlock()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return codeSignature{}, err
+	}
+	s := string(b)
+	last := s[strings.LastIndex(s, "\n")+1:]
+	switch {
+	case last == "ADHOC":
+		return codeSignature{Valid: true}, nil
+	case strings.HasPrefix(last, "TEAM:"):
+		return codeSignature{Valid: true, TeamID: strings.TrimPrefix(last, "TEAM:")}, nil
+	}
+	return codeSignature{}, nil
+}
+
+func (f *fakeInspector) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.paths)
+}
+
+// fakeInstaller records the one exec ApplyUpdate makes and what was on disk
+// when it was made.
+type fakeInstaller struct {
+	calls    int
+	argv     []string
+	dir      string
+	staged   map[string]string // relative path -> content, at exec time
+	topLevel []string          // the staging directory's entries at exec time
+	logLines string            // written to the log before returning
+	err      error
+}
+
+func (f *fakeInstaller) run(_ context.Context, r installerRun) error {
+	f.calls++
+	f.argv = slices.Clone(r.Argv)
+	f.dir = r.Dir
+	if entries, err := os.ReadDir(r.Dir); err == nil {
+		for _, e := range entries {
+			f.topLevel = append(f.topLevel, e.Name())
+		}
+	}
+	f.staged = map[string]string{}
+	_ = filepath.WalkDir(r.Dir, func(p string, d os.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() && d.Name() != updateLogName {
+			b, _ := os.ReadFile(p)
+			rel, _ := filepath.Rel(r.Dir, p)
+			f.staged[filepath.ToSlash(rel)] = string(b)
+		}
+		return nil
+	})
+	if f.logLines != "" {
+		_, _ = r.Log.WriteString(f.logLines)
+	}
+	return f.err
 }
 
 // socketPair returns the two ends of a connected unix stream socket. The peer
@@ -97,64 +312,63 @@ func socketPair(t *testing.T) (*net.UnixConn, *net.UnixConn) {
 	return conns[0], conns[1]
 }
 
-// fakeInstaller records the one exec ApplyUpdate makes and what was on disk
-// when it was made.
-type fakeInstaller struct {
-	calls     int
-	argv      []string
-	dir       string
-	stagedSum map[string]string // sha256 of every staged set file at exec time
-	topLevel  []string          // the staging directory's entries at exec time
-	logLines  string            // written to the log before returning
-	err       error
-}
-
-func (f *fakeInstaller) run(_ context.Context, r installerRun) error {
-	f.calls++
-	f.argv = slices.Clone(r.Argv)
-	f.dir = r.Dir
-	if entries, err := os.ReadDir(r.Dir); err == nil {
-		for _, e := range entries {
-			f.topLevel = append(f.topLevel, e.Name())
-		}
-	}
-	f.stagedSum = map[string]string{}
-	for rel := range updateSetFiles {
-		b, err := os.ReadFile(filepath.Join(r.Dir, filepath.FromSlash(rel)))
-		if err == nil {
-			sum := sha256.Sum256(b)
-			f.stagedSum[rel] = hex.EncodeToString(sum[:])
-		}
-	}
-	if f.logLines != "" {
-		_, _ = r.Log.WriteString(f.logLines)
-	}
-	return f.err
-}
-
-// updateHarness is a Server with a temp staging root and a fake installer, and
-// a connection whose peer is this test's uid.
+// updateHarness is a Server with a cluster CA, a temp staging root, a fake
+// installer, code inspector and installed version, and a connection whose
+// peer is this test's uid.
 type updateHarness struct {
-	s      *Server
-	inst   *fakeInstaller
-	st     *connState
-	phases []wire.UpdatePhase
-	root   string
+	t         *testing.T
+	pki       *testPKI
+	s         *Server
+	inst      *fakeInstaller
+	insp      *fakeInspector
+	st        *connState
+	phases    []wire.UpdatePhase
+	root      string
+	installed string // the installed k3sm's path
+	version   string // what the installed k3sm reports
+	probes    int
 }
 
-func newUpdateHarness(t *testing.T, serviceUID uint32) *updateHarness {
+type harnessOpt func(*Config)
+
+func newUpdateHarness(t *testing.T, serviceUID uint32, opts ...harnessOpt) *updateHarness {
 	t.Helper()
-	s := NewServer(Config{
-		NodePodCIDR: netip.MustParsePrefix(identityBootCIDR),
-		ServiceUID:  serviceUID,
-		Privileged:  &recordingPriv{},
-		Logger:      slog.New(slog.DiscardHandler),
-	})
-	h := &updateHarness{s: s, inst: &fakeInstaller{}, root: filepath.Join(t.TempDir(), "k3sm.staging")}
+	pki := newTestPKI(t)
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "cluster-ca.crt")
+	if err := os.WriteFile(caPath, pki.caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		NodePodCIDR:   netip.MustParsePrefix(identityBootCIDR),
+		ServiceUID:    serviceUID,
+		ClusterCAPath: caPath,
+		Privileged:    &recordingPriv{},
+		Logger:        slog.New(slog.DiscardHandler),
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	s := NewServer(cfg)
+	h := &updateHarness{
+		t: t, pki: pki, s: s, inst: &fakeInstaller{}, insp: &fakeInspector{},
+		root: filepath.Join(dir, "k3sm.staging"), installed: filepath.Join(dir, "installed-k3sm"),
+		version: "v0.1.9",
+	}
+	h.setInstalled("ADHOC")
 	s.stagingRoot = h.root
 	s.runInstaller = h.inst.run
+	s.inspector = h.insp
+	s.installedK3sm = h.installed
+	s.installedVersion = func(_ context.Context, p string) (string, error) {
+		h.probes++
+		if p != h.installed {
+			return "", fmt.Errorf("probed %s, want %s", p, h.installed)
+		}
+		return h.version, nil
+	}
 	conn, _ := socketPair(t)
-	h.st = newConnState(defaultMaxPerConnForTest)
+	h.st = newConnState(wire.DefaultMaxPerConn)
 	h.st.conn = conn
 	h.st.emit = func(r wire.Response) error {
 		h.phases = append(h.phases, r.Phase)
@@ -163,8 +377,47 @@ func newUpdateHarness(t *testing.T, serviceUID uint32) *updateHarness {
 	return h
 }
 
-// defaultMaxPerConnForTest mirrors the server default.
-const defaultMaxPerConnForTest = wire.DefaultMaxPerConn
+// setInstalled writes the installed k3sm with the given fake signature.
+func (h *updateHarness) setInstalled(sig string) {
+	h.t.Helper()
+	if err := os.WriteFile(h.installed, []byte(machO+"installed\n"+sig), 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// writeArchive writes an archive into a fresh directory and returns its path
+// and its sha256.
+func (h *updateHarness) writeArchive(members []tarMember) (string, string) {
+	h.t.Helper()
+	b := buildArchive(h.t, members)
+	p := filepath.Join(h.t.TempDir(), "k3sm-darwin-arm64.tar.gz")
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		h.t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	return p, hex.EncodeToString(sum[:])
+}
+
+// payload is the canonical payload JSON.
+func payloadJSON(t *testing.T, version, sum, policy string, allowDowngrade bool) []byte {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{
+		"version": version, "url": "https://github.com/k3sm-io/k3sm/releases/download/" + version + "/k3sm-darwin-arm64.tar.gz",
+		"sha256": sum, "signature": policy, "allowDowngrade": allowDowngrade,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// request is a signed request for members.
+func (h *updateHarness) request(members []tarMember, version, policy string, allowDowngrade bool) *wire.ApplyUpdateArgs {
+	h.t.Helper()
+	p, sum := h.writeArchive(members)
+	payload := payloadJSON(h.t, version, sum, policy, allowDowngrade)
+	return &wire.ApplyUpdateArgs{ArchivePath: p, Payload: payload, Signature: sign(h.t, h.pki.signerKey, payload), SignerCert: h.pki.signerPEM}
+}
 
 // apply runs one ApplyUpdate and records the final phase after the streamed ones.
 func (h *updateHarness) apply(args *wire.ApplyUpdateArgs) wire.Response {
@@ -175,20 +428,38 @@ func (h *updateHarness) apply(args *wire.ApplyUpdateArgs) wire.Response {
 
 // stagingLeftovers lists what remains under the staging root (the lock file
 // sits beside it, not in it).
-func (h *updateHarness) stagingLeftovers(t *testing.T) []string {
-	t.Helper()
+func (h *updateHarness) stagingLeftovers() []string {
+	h.t.Helper()
 	entries, err := os.ReadDir(h.root)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
 	var out []string
 	for _, e := range entries {
 		out = append(out, e.Name())
 	}
 	return out
+}
+
+// mustRefuse asserts a Failed reply naming want, with no exec, no Installing
+// phase and nothing left in the staging root.
+func (h *updateHarness) mustRefuse(resp wire.Response, want string) {
+	h.t.Helper()
+	if resp.OK || resp.Phase != wire.UpdatePhaseFailed || !strings.Contains(resp.Error, want) {
+		h.t.Fatalf("resp = %+v, want Failed containing %q", resp, want)
+	}
+	if h.inst.calls != 0 {
+		h.t.Fatalf("the installer ran %d times on a refused update", h.inst.calls)
+	}
+	if slices.Contains(h.phases, wire.UpdatePhaseInstalling) {
+		h.t.Fatalf("phases = %v: Installing reported on a refused update", h.phases)
+	}
+	if left := h.stagingLeftovers(); len(left) != 0 {
+		h.t.Fatalf("a refused update left %v in the staging root", left)
+	}
 }
 
 // serveOne serves one connection with handleConn, writes payload as one frame,
@@ -227,19 +498,37 @@ func (h *updateHarness) serveOne(t *testing.T, payload []byte) ([]wire.Response,
 
 func selfUID() uint32 { return uint32(os.Getuid()) }
 
-// TestApplyUpdateVerifiesBeforeInstall is the B598 root-helper gate: the copy
-// refuses a symlink (and every other unsafe or unlisted entry), a digest
-// mismatch refuses before any exec, the one exec sees the staged path and the
-// requested flags and no token file, the phases are reported in order, and an
-// ApplyUpdate request may exceed the other verbs' 64 KiB cap up to 256 KiB.
+// withMember returns members with the named one replaced (or appended when
+// absent); a zero replacement drops it.
+func withMember(members []tarMember, name string, m *tarMember) []tarMember {
+	out := make([]tarMember, 0, len(members)+1)
+	found := false
+	for _, x := range members {
+		if x.name == name {
+			found = true
+			if m != nil {
+				out = append(out, *m)
+			}
+			continue
+		}
+		out = append(out, x)
+	}
+	if !found && m != nil {
+		out = append(out, *m)
+	}
+	return out
+}
+
+// TestApplyUpdateVerifiesBeforeInstall is the B598 root-helper gate: root
+// verifies the signer certificate against the cluster CA, the signature over
+// the payload, the archive digest, the extracted set, the code signatures and
+// the downgrade rule, each before the next step and all before the one exec;
+// the exec sees the staged path and the payload's flags; the phases arrive in
+// order, also through a real frame on a socket.
 func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
-	t.Run("installs a verified set with the staged path and the flags", func(t *testing.T) {
+	t.Run("installs a verified release with the staged path", func(t *testing.T) {
 		h := newUpdateHarness(t, selfUID())
-		src, manifest := writeUpdateSet(t)
-		resp := h.apply(&wire.ApplyUpdateArgs{
-			SourceDir: src, Manifest: manifest, Version: "v0.2.0",
-			AllowDowngrade: true, RequireTeamSignature: true,
-		})
+		resp := h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "if-signed", false))
 		if !resp.OK || resp.Phase != wire.UpdatePhaseDone {
 			t.Fatalf("resp = %+v, want OK Done", resp)
 		}
@@ -254,136 +543,268 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 		if filepath.Dir(dir) != h.root || !strings.HasPrefix(filepath.Base(dir), updateDirPrefix) {
 			t.Fatalf("staging dir %s is not a fresh directory directly under %s", dir, h.root)
 		}
-		wantArgv := []string{filepath.Join(dir, "k3sm"), "install", "--from-staging", dir,
-			"--allow-downgrade", "--require-team-signature"}
+		wantArgv := []string{filepath.Join(dir, "k3sm"), "install", "--from-staging", dir}
 		if !slices.Equal(h.inst.argv, wantArgv) {
 			t.Fatalf("argv = %q, want %q", h.inst.argv, wantArgv)
 		}
 		wantTop := []string{"cp-payload", updateLogName, "k3sm", "k3sm-execshim", "k3sm-vmhost",
 			"libk3sm_getaddrinfo_shim.dylib", "libk3sm_pathrebase_shim.dylib"}
 		if !slices.Equal(h.inst.topLevel, wantTop) {
-			t.Fatalf("staging dir at exec time = %v, want the set and the log only (no token file) %v", h.inst.topLevel, wantTop)
+			t.Fatalf("staging dir at exec time = %v, want the set and the log only %v", h.inst.topLevel, wantTop)
 		}
-		for rel, sum := range manifest {
-			if h.inst.stagedSum[rel] != sum {
-				t.Errorf("staged %s sha256 = %q at exec time, want %q", rel, h.inst.stagedSum[rel], sum)
+		for _, m := range releaseMembers("ADHOC") {
+			if m.typeflag == tar.TypeDir || slices.Contains(updateSkippedFiles, m.name) {
+				continue
+			}
+			if h.inst.staged[m.name] != m.body {
+				t.Errorf("staged %s = %q at exec time, want %q", m.name, h.inst.staged[m.name], m.body)
 			}
 		}
-		if left := h.stagingLeftovers(t); len(left) != 0 {
+		if len(h.inst.staged) != 8 {
+			t.Errorf("staged files = %d (%v), want the eight set files", len(h.inst.staged), h.inst.staged)
+		}
+		if h.probes != 1 {
+			t.Errorf("installed version probed %d times, want 1", h.probes)
+		}
+		if left := h.stagingLeftovers(); len(left) != 0 {
 			t.Fatalf("staging root still holds %v after the install returned", left)
 		}
+		fi, err := os.Stat(h.root)
+		if err != nil || fi.Mode().Perm() != 0o700 {
+			t.Fatalf("staging root %v err %v, want mode 0700", fi.Mode(), err)
+		}
 	})
 
-	t.Run("passes no optional flag unless asked", func(t *testing.T) {
+	t.Run("passes --allow-downgrade when the payload allows it and installs below the installed tag", func(t *testing.T) {
 		h := newUpdateHarness(t, selfUID())
-		src, manifest := writeUpdateSet(t)
-		if resp := h.apply(&wire.ApplyUpdateArgs{SourceDir: src, Manifest: manifest, Version: "v0.2.0"}); !resp.OK {
+		h.version = "v0.3.0"
+		resp := h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "", true))
+		if !resp.OK {
 			t.Fatalf("resp = %+v", resp)
 		}
-		if n := len(h.inst.argv); n != 4 || slices.Contains(h.inst.argv, "--allow-downgrade") || slices.Contains(h.inst.argv, "--require-team-signature") {
-			t.Fatalf("argv = %q, want the four install arguments only", h.inst.argv)
+		if want := []string{filepath.Join(h.inst.dir, "k3sm"), "install", "--from-staging", h.inst.dir, "--allow-downgrade"}; !slices.Equal(h.inst.argv, want) {
+			t.Fatalf("argv = %q, want %q", h.inst.argv, want)
+		}
+		if h.probes != 0 {
+			t.Fatalf("installed version probed %d times; an allowed downgrade needs no probe", h.probes)
 		}
 	})
 
-	refusals := []struct {
-		name   string
-		mutate func(t *testing.T, src string, manifest map[string]string)
-		want   string
+	t.Run("refuses a signer outside the cluster CA before any read of the archive", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		otherKey, otherCA, _ := newCA(t, "k3sm-cluster-ca")
+		key := newKey(t)
+		args := h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)
+		args.SignerCert = leaf(t, otherKey, otherCA, &key.PublicKey, signerSubject, time.Now().Add(time.Hour))
+		args.Signature = sign(t, key, args.Payload)
+		args.ArchivePath = filepath.Join(t.TempDir(), "absent.tar.gz") // a read would fail differently
+		h.mustRefuse(h.apply(args), "does not chain to the cluster CA")
+		if _, err := os.Lstat(h.root); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the staging root exists (%v): the refusal came after the archive step", err)
+		}
+	})
+
+	t.Run("refuses a self-signed signer that names the signer subject", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		key := newKey(t)
+		tmpl := &x509.Certificate{SerialNumber: nextSerial(), Subject: signerSubject, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		args := h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)
+		args.SignerCert = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		args.Signature = sign(t, key, args.Payload)
+		h.mustRefuse(h.apply(args), "does not chain to the cluster CA")
+	})
+
+	subjects := []struct {
+		name string
+		subj pkix.Name
 	}{
-		{"a symlink in the set", func(t *testing.T, src string, _ map[string]string) {
-			if err := os.Symlink("/etc/master.passwd", filepath.Join(src, "cp-payload", "link")); err != nil {
-				t.Fatal(err)
-			}
-		}, "is a symlink"},
-		{"a symlinked binary", func(t *testing.T, src string, _ map[string]string) {
-			p := filepath.Join(src, "k3sm-vmhost")
-			if err := os.Remove(p); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Symlink("/bin/sh", p); err != nil {
-				t.Fatal(err)
-			}
-		}, "is a symlink"},
-		{"a digest mismatch", func(t *testing.T, _ string, manifest map[string]string) {
-			manifest["k3sm-vmhost"] = strings.Repeat("0", 64)
-		}, "the manifest says"},
-		{"a changed staged k3sm", func(t *testing.T, src string, _ map[string]string) {
-			if err := os.WriteFile(filepath.Join(src, "k3sm"), []byte("tampered\n"), 0o755); err != nil {
-				t.Fatal(err)
-			}
-		}, "the manifest says"},
-		{"a file the manifest does not name", func(t *testing.T, src string, _ map[string]string) {
-			if err := os.WriteFile(filepath.Join(src, "extra"), []byte("x"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-		}, "not in the manifest"},
-		{"a manifest file missing from the set", func(t *testing.T, src string, _ map[string]string) {
-			if err := os.Remove(filepath.Join(src, "k3sm-execshim")); err != nil {
-				t.Fatal(err)
-			}
-		}, "not in the set"},
-		{"a setuid file", func(t *testing.T, src string, _ map[string]string) {
-			p := filepath.Join(src, "k3sm-execshim")
-			if err := unix.Chmod(p, 0o4755); err != nil {
-				t.Fatal(err)
-			}
-			fi, err := os.Lstat(p)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if fi.Mode()&os.ModeSetuid == 0 {
-				// A sandbox (sandbox-exec) or the filesystem can drop a set-id
-				// bit on chmod; without it this fixture would not exercise the
-				// refusal.
-				t.Skip("the set-id bit did not stick after chmod 4755 (dropped by the sandbox or the filesystem)")
-			}
-		}, "set-id"},
-		{"a fifo", func(t *testing.T, src string, _ map[string]string) {
-			if err := unix.Mkfifo(filepath.Join(src, "cp-payload", "fifo"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-		}, "not a regular file or directory"},
-		{"a set over 2 GiB", func(t *testing.T, src string, manifest map[string]string) {
-			p := filepath.Join(src, "cp-payload", "huge")
-			f, err := os.Create(p)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := f.Truncate(wire.MaxUpdateSetBytes + 1); err != nil {
-				t.Fatal(err)
-			}
-			_ = f.Close()
-			manifest["cp-payload/huge"] = strings.Repeat("0", 64)
-		}, "larger than"},
-		{"a manifest path that climbs out", func(t *testing.T, _ string, manifest map[string]string) {
-			manifest["../k3sm"] = strings.Repeat("0", 64)
-		}, "not a clean relative path"},
+		{"a wrong CN", pkix.Name{CommonName: "system:node:worker", Organization: []string{wire.UpdateSignerOrganization}}},
+		{"a wrong O", pkix.Name{CommonName: wire.UpdateSignerCommonName, Organization: []string{"system:nodes"}}},
 	}
-	for _, tc := range refusals {
-		t.Run("refuses "+tc.name+" before any exec", func(t *testing.T) {
+	for _, tc := range subjects {
+		t.Run("refuses a valid chain with "+tc.name, func(t *testing.T) {
 			h := newUpdateHarness(t, selfUID())
-			src, manifest := writeUpdateSet(t)
-			tc.mutate(t, src, manifest)
-			resp := h.apply(&wire.ApplyUpdateArgs{SourceDir: src, Manifest: manifest, Version: "v0.2.0"})
-			if resp.OK || resp.Phase != wire.UpdatePhaseFailed || !strings.Contains(resp.Error, tc.want) {
-				t.Fatalf("resp = %+v, want Failed containing %q", resp, tc.want)
+			key := newKey(t)
+			args := h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)
+			args.SignerCert = leaf(t, h.pki.caKey, h.pki.caCert, &key.PublicKey, tc.subj, time.Now().Add(time.Hour))
+			args.Signature = sign(t, key, args.Payload)
+			h.mustRefuse(h.apply(args), "the signer certificate names")
+		})
+	}
+
+	t.Run("refuses an expired signer", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		h.s.now = func() time.Time { return time.Now().Add(13 * time.Hour) }
+		h.mustRefuse(h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)), "does not chain to the cluster CA")
+	})
+
+	t.Run("refuses every update when no cluster CA is configured", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID(), func(c *Config) { c.ClusterCAPath = "" })
+		h.mustRefuse(h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)), "started without --cluster-ca")
+	})
+
+	t.Run("refuses every update when the cluster CA file holds no CA", func(t *testing.T) {
+		bad := filepath.Join(t.TempDir(), "ca.crt")
+		if err := os.WriteFile(bad, []byte("not pem"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		h := newUpdateHarness(t, selfUID(), func(c *Config) { c.ClusterCAPath = bad })
+		h.mustRefuse(h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)), "holds no PEM certificate")
+	})
+
+	t.Run("fails the signature on a tampered payload byte", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		args := h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)
+		args.Payload = bytes.Replace(args.Payload, []byte(`"allowDowngrade":false`), []byte(`"allowDowngrade":true `), 1)
+		h.mustRefuse(h.apply(args), "the payload signature does not verify")
+	})
+
+	t.Run("fails a signature made by another key", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		args := h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)
+		args.Signature = sign(t, newKey(t), args.Payload)
+		h.mustRefuse(h.apply(args), "the payload signature does not verify")
+	})
+
+	payloads := []struct {
+		name, payload, want string
+	}{
+		{"a version outside the tag grammar", `{"version":"v0.2.0;rm","url":"","sha256":"` + strings.Repeat("a", 64) + `","signature":""}`, "not a release tag"},
+		{"a version without the v", `{"version":"0.2.0","url":"","sha256":"` + strings.Repeat("a", 64) + `","signature":""}`, "not a release tag"},
+		{"an unknown field", `{"version":"v0.2.0","url":"","sha256":"` + strings.Repeat("a", 64) + `","signature":"","sourceDir":"/"}`, "not valid JSON"},
+		{"an unknown policy", `{"version":"v0.2.0","url":"","sha256":"` + strings.Repeat("a", 64) + `","signature":"never"}`, "unknown signature policy"},
+		{"an uppercase digest", `{"version":"v0.2.0","url":"","sha256":"` + strings.Repeat("A", 64) + `","signature":""}`, "lowercase hex"},
+	}
+	for _, tc := range payloads {
+		t.Run("refuses a signed payload with "+tc.name, func(t *testing.T) {
+			h := newUpdateHarness(t, selfUID())
+			args := h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)
+			args.Payload = []byte(tc.payload)
+			args.Signature = sign(t, h.pki.signerKey, args.Payload)
+			h.mustRefuse(h.apply(args), tc.want)
+		})
+	}
+
+	t.Run("fails a digest mismatch before extraction", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		args := h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)
+		if err := os.WriteFile(args.ArchivePath, buildArchive(t, releaseMembers("TEAM:EVIL000000")), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		h.mustRefuse(h.apply(args), "the signed payload says")
+		if h.insp.calls() != 0 {
+			t.Fatalf("code signatures were inspected %d times: the extraction ran", h.insp.calls())
+		}
+	})
+
+	t.Run("refuses an archive path that is a symlink", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		args := h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)
+		link := filepath.Join(t.TempDir(), "link.tar.gz")
+		if err := os.Symlink(args.ArchivePath, link); err != nil {
+			t.Fatal(err)
+		}
+		args.ArchivePath = link
+		h.mustRefuse(h.apply(args), "open the archive")
+	})
+
+	t.Run("refuses an archive path that is not clean", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		args := h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)
+		args.ArchivePath = filepath.Dir(args.ArchivePath) + "/./" + filepath.Base(args.ArchivePath)
+		h.mustRefuse(h.apply(args), "not a clean absolute path")
+	})
+
+	sym := tarMember{name: "cp-payload/kine", typeflag: tar.TypeSymlink, linkname: "/bin/sh", mode: 0o777}
+	hard := tarMember{name: "k3sm-vmhost", typeflag: tar.TypeLink, linkname: "k3sm"}
+	members := []struct {
+		name    string
+		members []tarMember
+		want    string
+	}{
+		{"a symlink member", withMember(releaseMembers("ADHOC"), "cp-payload/kine", &sym), "is a link"},
+		{"a hard link member", withMember(releaseMembers("ADHOC"), "k3sm-vmhost", &hard), "is a link"},
+		{"an unlisted member", withMember(releaseMembers("ADHOC"), "evil", &tarMember{name: "evil", body: "x", mode: 0o755}), "not in the build set"},
+		{"an unlisted directory", withMember(releaseMembers("ADHOC"), "bin/", &tarMember{name: "bin/", typeflag: tar.TypeDir, mode: 0o755}), "not in the build set"},
+		{"an absolute member", withMember(releaseMembers("ADHOC"), "/k3sm", &tarMember{name: "/k3sm", body: "x", mode: 0o755}), "not a clean relative path"},
+		{"a climbing member", withMember(releaseMembers("ADHOC"), "cp-payload/../../k3sm", &tarMember{name: "cp-payload/../../k3sm", body: "x", mode: 0o755}), "not a clean relative path"},
+		{"a missing binary", withMember(releaseMembers("ADHOC"), "k3sm-vmhost", nil), "does not carry k3sm-vmhost"},
+		{"a duplicate member", append(releaseMembers("ADHOC"), tarMember{name: "k3sm", body: machO + "again\nADHOC", mode: 0o755}), "names k3sm twice"},
+		{"a fifo member", withMember(releaseMembers("ADHOC"), "cp-payload/fifo", &tarMember{name: "cp-payload/fifo", typeflag: tar.TypeFifo}), "not a regular file"},
+		{"a skipped member over 2 GiB", append([]tarMember{{name: "LICENSE", mode: 0o644, size: wire.MaxUpdateSetBytes + 1}}, releaseMembers("ADHOC")...), "unpacks to more than"},
+	}
+	for _, tc := range members {
+		t.Run("refuses "+tc.name+" before the exec", func(t *testing.T) {
+			h := newUpdateHarness(t, selfUID())
+			h.mustRefuse(h.apply(h.request(tc.members, "v0.2.0", "", false)), tc.want)
+		})
+	}
+
+	team := func(id string) []tarMember { return releaseMembers("TEAM:" + id) }
+	mixed := withMember(releaseMembers("ADHOC"), "k3sm-vmhost", &tarMember{name: "k3sm-vmhost", body: machO + "vmhost\nTEAM:ABCDE12345", mode: 0o755})
+	signing := []struct {
+		name      string
+		installed string
+		members   []tarMember
+		policy    string
+		want      string // "" accepts
+	}{
+		{"a foreign team on a team-signed install", "TEAM:ABCDE12345", team("ZZZZZ99999"), "", "signed by team ABCDE12345 and the staged"},
+		{"an ad-hoc tree on a team-signed install", "TEAM:ABCDE12345", releaseMembers("ADHOC"), "", "signed by team ABCDE12345 and the staged"},
+		{"a mixed tree on an ad-hoc install", "ADHOC", mixed, "", "mixes signers"},
+		{"an ad-hoc tree under signature: required", "ADHOC", releaseMembers("ADHOC"), "required", "requires a team signature"},
+		{"an invalidly signed staged Mach-O", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/kine", &tarMember{name: "cp-payload/kine", body: machO + "kine\nBROKEN", mode: 0o755}), "", "is not validly signed"},
+		{"an installed k3sm whose signature does not verify", "BROKEN", releaseMembers("ADHOC"), "", "installed k3sm's code signature does not verify"},
+		{"a staged k3sm that is not a Mach-O", "ADHOC", withMember(releaseMembers("ADHOC"), "k3sm", &tarMember{name: "k3sm", body: "#!/bin/sh\nADHOC", mode: 0o755}), "", "not a Mach-O"},
+		{"the installed team on a team-signed install", "TEAM:ABCDE12345", team("ABCDE12345"), "required", ""},
+		{"one team on an ad-hoc install", "ADHOC", team("ABCDE12345"), "", ""},
+	}
+	for _, tc := range signing {
+		t.Run("code signing: "+tc.name, func(t *testing.T) {
+			h := newUpdateHarness(t, selfUID())
+			h.setInstalled(tc.installed)
+			resp := h.apply(h.request(tc.members, "v0.2.0", tc.policy, false))
+			if tc.want == "" {
+				if !resp.OK || h.inst.calls != 1 {
+					t.Fatalf("resp = %+v calls %d, want an install", resp, h.inst.calls)
+				}
+				return
 			}
-			if h.inst.calls != 0 {
-				t.Fatalf("the installer ran %d times on a refused set", h.inst.calls)
+			h.mustRefuse(resp, tc.want)
+		})
+	}
+
+	versions := []struct {
+		name, installed, version, want string
+	}{
+		{"refuses a downgrade without the flag", "v0.2.1", "v0.2.0", "below the installed v0.2.1"},
+		{"refuses a prerelease of the installed tag", "v0.2.0", "v0.2.0-rc.1", "below the installed v0.2.0"},
+		{"refuses an installed dev build without the flag", "dev", "v0.2.0", "cannot be ordered"},
+		{"accepts a reinstall of the installed tag", "v0.2.0", "v0.2.0", ""},
+		{"accepts an upgrade past a prerelease", "v0.2.0-rc.2", "v0.2.0", ""},
+	}
+	for _, tc := range versions {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newUpdateHarness(t, selfUID())
+			h.version = tc.installed
+			resp := h.apply(h.request(releaseMembers("ADHOC"), tc.version, "", false))
+			if tc.want == "" {
+				if !resp.OK {
+					t.Fatalf("resp = %+v, want an install", resp)
+				}
+				return
 			}
-			if slices.Contains(h.phases, wire.UpdatePhaseInstalling) {
-				t.Fatalf("phases = %v: Installing reported on a refused set", h.phases)
-			}
-			if left := h.stagingLeftovers(t); len(left) != 0 {
-				t.Fatalf("a refused set left %v in the staging root", left)
-			}
+			h.mustRefuse(resp, tc.want)
 		})
 	}
 
 	t.Run("refuses a caller that is not the service uid", func(t *testing.T) {
 		h := newUpdateHarness(t, selfUID()+1)
-		src, manifest := writeUpdateSet(t)
-		resp := h.apply(&wire.ApplyUpdateArgs{SourceDir: src, Manifest: manifest, Version: "v0.2.0"})
+		resp := h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "", false))
 		if resp.OK || resp.Phase != wire.UpdatePhaseFailed || !strings.Contains(resp.Error, ErrPeerUnauthorized.Error()) {
 			t.Fatalf("resp = %+v, want a Failed peer refusal", resp)
 		}
@@ -394,8 +815,7 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 
 	t.Run("refuses a request with no connection to check", func(t *testing.T) {
 		h := newUpdateHarness(t, selfUID())
-		src, manifest := writeUpdateSet(t)
-		resp := h.s.handleApplyUpdate(context.Background(), newConnState(1), &wire.ApplyUpdateArgs{SourceDir: src, Manifest: manifest, Version: "v0.2.0"})
+		resp := h.s.handleApplyUpdate(context.Background(), newConnState(1), h.request(releaseMembers("ADHOC"), "v0.2.0", "", false))
 		if resp.OK || h.inst.calls != 0 {
 			t.Fatalf("resp = %+v, calls = %d", resp, h.inst.calls)
 		}
@@ -409,8 +829,7 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 			fmt.Fprintf(&lines, "line %d\n", i)
 		}
 		h.inst.logLines = lines.String()
-		src, manifest := writeUpdateSet(t)
-		resp := h.apply(&wire.ApplyUpdateArgs{SourceDir: src, Manifest: manifest, Version: "v0.2.0"})
+		resp := h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "", false))
 		want := []wire.UpdatePhase{wire.UpdatePhaseVerifying, wire.UpdatePhaseInstalling, wire.UpdatePhaseFailed}
 		if resp.OK || !slices.Equal(h.phases, want) {
 			t.Fatalf("resp = %+v phases = %v, want %v", resp, h.phases, want)
@@ -421,88 +840,108 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 		}
 	})
 
-	t.Run("refuses a source not owned by the service uid", func(t *testing.T) {
-		if os.Getuid() == 0 {
-			t.Skip("the test runs as root, which owns everything it writes")
-		}
+	t.Run("works through a real frame on a socket", func(t *testing.T) {
 		h := newUpdateHarness(t, selfUID())
-		manifest := map[string]string{"k3sm": strings.Repeat("0", 64)}
-		resp := h.apply(&wire.ApplyUpdateArgs{SourceDir: "/usr/bin", Manifest: manifest, Version: "v0.2.0"})
-		if resp.OK || !strings.Contains(resp.Error, "not the service uid") || h.inst.calls != 0 {
-			t.Fatalf("resp = %+v calls = %d, want an ownership refusal", resp, h.inst.calls)
+		raw, err := json.Marshal(wire.Request{Version: wire.CurrentVersion(), Verb: wire.VerbApplyUpdate,
+			ApplyUpdate: h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		frames, err := h.serveOne(t, raw)
+		if err != nil {
+			t.Fatalf("frames %+v: %v", frames, err)
+		}
+		var got []wire.UpdatePhase
+		for _, f := range frames {
+			got = append(got, f.Phase)
+		}
+		want := []wire.UpdatePhase{wire.UpdatePhaseVerifying, wire.UpdatePhaseInstalling, wire.UpdatePhaseDone}
+		if !slices.Equal(got, want) || !frames[len(frames)-1].OK {
+			t.Fatalf("frames = %+v, want %v", frames, want)
+		}
+		if h.inst.calls != 1 || h.inst.argv[0] != filepath.Join(h.inst.dir, "k3sm") {
+			t.Fatalf("installer calls %d argv %q", h.inst.calls, h.inst.argv)
 		}
 	})
 
-	t.Run("admits an ApplyUpdate request over 64 KiB and up to 256 KiB, and no other verb", func(t *testing.T) {
+	t.Run("keeps the 64 KiB cap for other verbs and closes a frame over 256 KiB", func(t *testing.T) {
 		h := newUpdateHarness(t, selfUID())
-		src, manifest := writeUpdateSet(t)
-		for i := range 1800 {
-			manifest[fmt.Sprintf("cp-payload/pad/file-%04d", i)] = strings.Repeat("a", 64)
+		pad := strings.Repeat("x", wire.DefaultMaxRequestBytes)
+		other := []byte(fmt.Sprintf(`{"version":{"major":1,"minor":4},"verb":"EnsureAlias","ensureAlias":{"ip":"100.64.0.5"},"pad":%q}`, pad))
+		frames, err := h.serveOne(t, other)
+		if err != nil || len(frames) != 1 || frames[0].OK || !strings.Contains(frames[0].Error, "exceeds the 65536-byte cap") {
+			t.Fatalf("frames = %+v err = %v, want an EnsureAlias over 64 KiB refused", frames, err)
 		}
-		big, _ := json.Marshal(wire.Request{Version: wire.CurrentVersion(), Verb: wire.VerbApplyUpdate,
-			ApplyUpdate: &wire.ApplyUpdateArgs{SourceDir: src, Manifest: manifest, Version: "v0.2.0"}})
-		if n := len(big); n <= wire.DefaultMaxRequestBytes || n > wire.MaxApplyUpdateRequestBytes {
-			t.Fatalf("the test request is %d bytes, want between %d and %d", n, wire.DefaultMaxRequestBytes, wire.MaxApplyUpdateRequestBytes)
-		}
-		frames, err := h.serveOne(t, big)
-		if err != nil {
-			t.Fatalf("the large ApplyUpdate got no reply: %v", err)
-		}
-		last := frames[len(frames)-1]
-		if frames[0].Phase != wire.UpdatePhaseVerifying || last.Phase != wire.UpdatePhaseFailed || !strings.Contains(last.Error, "not in the set") {
-			t.Fatalf("frames = %+v, want the verb to run and refuse the padded manifest's absent files", frames)
+		args := h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)
+		args.SignerCert = bytes.Repeat([]byte("y"), wire.MaxApplyUpdateRequestBytes)
+		huge, _ := json.Marshal(wire.Request{Version: wire.CurrentVersion(), Verb: wire.VerbApplyUpdate, ApplyUpdate: args})
+		if _, err := h.serveOne(t, huge); err == nil {
+			t.Fatal("a frame over 256 KiB was answered, want the connection closed")
 		}
 		if h.inst.calls != 0 {
 			t.Fatalf("the installer ran %d times", h.inst.calls)
 		}
-
-		pad := strings.Repeat("x", wire.DefaultMaxRequestBytes)
-		other := []byte(fmt.Sprintf(`{"version":{"major":1,"minor":3},"verb":"EnsureAlias","ensureAlias":{"ip":"100.64.0.5"},"pad":%q}`, pad))
-		frames, err = h.serveOne(t, other)
-		if err != nil || len(frames) != 1 || frames[0].OK || !strings.Contains(frames[0].Error, "exceeds the 65536-byte cap") {
-			t.Fatalf("frames = %+v err = %v, want an EnsureAlias over 64 KiB refused", frames, err)
-		}
-
-		huge, _ := json.Marshal(wire.Request{Version: wire.CurrentVersion(), Verb: wire.VerbApplyUpdate,
-			ApplyUpdate: &wire.ApplyUpdateArgs{SourceDir: src + "/" + strings.Repeat("y", wire.MaxApplyUpdateRequestBytes), Manifest: manifest, Version: "v0.2.0"}})
-		if _, err := h.serveOne(t, huge); err == nil {
-			t.Fatal("a frame over 256 KiB was answered, want the connection closed")
-		}
 	})
+}
 
-	t.Run("streams the phase frames on the connection", func(t *testing.T) {
-		h := newUpdateHarness(t, selfUID())
-		src, manifest := writeUpdateSet(t)
-		client, server := socketPair(t)
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			h.s.handleConn(ctx, server)
-		}()
-		raw, _ := json.Marshal(wire.Request{Version: wire.CurrentVersion(), Verb: wire.VerbApplyUpdate,
-			ApplyUpdate: &wire.ApplyUpdateArgs{SourceDir: src, Manifest: manifest, Version: "v0.2.0"}})
-		if err := wire.WriteFrame(client, raw); err != nil {
-			t.Fatal(err)
+// TestOpenUpdateArchive pins the archive open: a file the service uid does not
+// own, a directory, and an archive over the size cap are refused.
+func TestOpenUpdateArchive(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "a.tar.gz")
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := openUpdateArchive(p, selfUID()); err != nil {
+		t.Fatalf("open own archive: %v", err)
+	} else {
+		_ = f.Close()
+	}
+	if _, err := openUpdateArchive(p, selfUID()+1); err == nil || !strings.Contains(err.Error(), "not the service uid") {
+		t.Fatalf("foreign owner: err = %v", err)
+	}
+	if _, err := openUpdateArchive(dir, selfUID()); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("directory: err = %v", err)
+	}
+	big := filepath.Join(dir, "big.tar.gz")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(wire.MaxUpdateArchiveBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if _, err := openUpdateArchive(big, selfUID()); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("oversize: err = %v", err)
+	}
+}
+
+// TestCompareReleases pins the semver ordering the downgrade rule uses.
+func TestCompareReleases(t *testing.T) {
+	cases := []struct {
+		a, b string
+		cmp  int
+		ok   bool
+	}{
+		{"v0.2.0", "v0.2.0", 0, true},
+		{"v0.2.0", "v0.10.0", -1, true},
+		{"v1.0.0", "v0.99.99", 1, true},
+		{"v0.2.0-rc.1", "v0.2.0", -1, true},
+		{"v0.2.0-rc.2", "v0.2.0-rc.10", -1, true},
+		{"v0.2.0-alpha", "v0.2.0-1", 1, true},
+		{"v0.2.0", "dev", 0, false},
+		{"v0.2.0", "v0.2.1-0.20261015120000-0123456789ab", 0, false},
+	}
+	for _, tc := range cases {
+		if cmp, ok := compareReleases(tc.a, tc.b); cmp != tc.cmp || ok != tc.ok {
+			t.Errorf("compareReleases(%q, %q) = %d, %t; want %d, %t", tc.a, tc.b, cmp, ok, tc.cmp, tc.ok)
 		}
-		var got []wire.UpdatePhase
-		for len(got) == 0 || !got[len(got)-1].Terminal() {
-			b, err := wire.ReadFrame(client, wire.DefaultMaxRequestBytes)
-			if err != nil {
-				t.Fatalf("read frame after %v: %v", got, err)
-			}
-			var resp wire.Response
-			if err := json.Unmarshal(b, &resp); err != nil {
-				t.Fatal(err)
-			}
-			got = append(got, resp.Phase)
-		}
-		want := []wire.UpdatePhase{wire.UpdatePhaseVerifying, wire.UpdatePhaseInstalling, wire.UpdatePhaseDone}
-		if !slices.Equal(got, want) {
-			t.Fatalf("frames = %v, want %v", got, want)
-		}
-		_ = client.Close()
-		<-done
-	})
+	}
+	if v, err := parseVersionOutput("k3sm v0.2.0\n  commit: abc\n"); err != nil || v != "v0.2.0" {
+		t.Errorf("parseVersionOutput = %q, %v", v, err)
+	}
+	if _, err := parseVersionOutput("something else\n"); err == nil {
+		t.Error("parseVersionOutput accepted a foreign first line")
+	}
 }
