@@ -59,6 +59,15 @@ limitations under the License.
 //     SO_RCVBUF zero as that case, closes the descriptor and asks again on a
 //     fresh connection (each BindPort binds a fresh socket, and the closed one no
 //     longer holds the port), and fails with wire.ErrFlushedSocket after three.
+//   - A specific-address UDP bind coexists with a wildcard. BindPort sets
+//     SO_REUSEADDR (never SO_REUSEPORT) on a UDP socket bound to a specific
+//     address, because macOS's Internet Sharing resolver (mDNSResponder for the
+//     vm network bridge, running whenever a vm pod runs on the Mac) holds the
+//     wildcard *:53 and the stack otherwise refuses the DNS VIP 10.43.0.10:53
+//     with EADDRINUSE, a race against whichever starts first. The specific socket
+//     is the more specific match, so it receives the VIP's datagrams. A wildcard
+//     UDP bind and every TCP bind are unchanged (Go already sets SO_REUSEADDR on
+//     a TCP listener).
 //   - Per-connection resource caps and an allocation-bounded decoder that never
 //     panics on malformed input (it returns an error response).
 //
