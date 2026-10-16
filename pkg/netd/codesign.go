@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -45,12 +46,59 @@ const (
 	codesignOutputBytes = 64 << 10
 )
 
+// developerIDAnchor is the Developer ID requirement: a chain anchored at
+// Apple through the Developer ID intermediate (certificate 1 carries
+// 1.2.840.113635.100.6.2.6) to a Developer ID Application leaf (which carries
+// 1.2.840.113635.100.6.1.13). An Apple-signed system binary, an Apple
+// Development or Mac App Store signature, an ad-hoc signature and a chain to
+// any other anchor all fail it.
+const developerIDAnchor = `anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists`
+
+// teamIDLen is the length of an Apple Team ID.
+const teamIDLen = 10
+
+// validTeamID reports whether id has the shape of an Apple Team ID: ten
+// characters from A-Z and 0-9.
+func validTeamID(id string) bool {
+	if len(id) != teamIDLen {
+		return false
+	}
+	for _, c := range id {
+		if (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// developerIDRequirement is developerIDAnchor narrowed to a leaf issued to
+// team, the requirement the k3sm installer checks a staged build against. team
+// must be a validTeamID, so it needs no quoting.
+func developerIDRequirement(team string) string {
+	return developerIDAnchor + ` and certificate leaf[subject.OU] = "` + team + `"`
+}
+
 // codeSignature is what the code-signing policy needs to know of one Mach-O.
 type codeSignature struct {
 	// Valid is true when `codesign --verify --strict` accepted the file.
 	Valid bool
-	// TeamID is the signing team, empty for an ad-hoc signature or none.
+	// TeamID is the TeamIdentifier `codesign -dv` reports, empty for an
+	// ad-hoc signature or none. On its own it proves nothing: see team.
 	TeamID string
+	// DeveloperID is true when the file also satisfies
+	// developerIDRequirement(TeamID).
+	DeveloperID bool
+}
+
+// team is the signing team the policy counts: TeamID when the signature is
+// valid and satisfies the Developer ID requirement for it, and "" (no team)
+// otherwise. A file that verifies but is ad hoc, Apple-signed, signed with a
+// non-Developer ID certificate or anchored anywhere but Apple has no team.
+func (c codeSignature) team() string {
+	if c.Valid && c.DeveloperID && validTeamID(c.TeamID) {
+		return c.TeamID
+	}
+	return ""
 }
 
 // codeInspector reads a Mach-O's code signature. It is the seam the unit tests
@@ -61,9 +109,12 @@ type codeInspector interface {
 	Inspect(ctx context.Context, path string) (codeSignature, error)
 }
 
-// codesignTool is the production codeInspector: `codesign --verify --strict`
-// and, on a valid signature, `codesign -dv` for the Team ID, each with a fixed
-// argv, an empty environment but a fixed PATH, a timeout, and bounded output.
+// codesignTool is the production codeInspector: `codesign --verify --strict`;
+// on a valid signature `codesign -dv` for the Team ID; and, when that is a
+// Team ID, `codesign --verify --strict -R=<developerIDRequirement(team)>`, so
+// a team counts only behind a Developer ID signature issued to it. Each run
+// has a fixed argv, an empty environment but a fixed PATH, a timeout, and
+// bounded output.
 type codesignTool struct{}
 
 // Inspect implements codeInspector.
@@ -79,7 +130,15 @@ func (codesignTool) Inspect(ctx context.Context, path string) (codeSignature, er
 	if err != nil || !ok {
 		return codeSignature{}, err
 	}
-	return codeSignature{Valid: true, TeamID: parseCodesignTeam(out)}, nil
+	sig := codeSignature{Valid: true, TeamID: parseCodesignTeam(out)}
+	if validTeamID(sig.TeamID) {
+		ok, _, err := runCodesign(ctx, "--verify", "--strict", "-R="+developerIDRequirement(sig.TeamID), path)
+		if err != nil {
+			return codeSignature{}, err
+		}
+		sig.DeveloperID = ok
+	}
+	return sig, nil
 }
 
 // runCodesign runs systemCodesign with args and reports whether it exited 0
@@ -130,9 +189,28 @@ func (b *capBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// machOMagics are the first four bytes of a Mach-O or a universal binary, in
-// either byte order.
-var machOMagics = []uint32{0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe, 0xcafebabe, 0xbebafeca}
+// machOMagics are the first four bytes of a Mach-O (MH_MAGIC, MH_MAGIC_64) or
+// a universal binary (FAT_MAGIC, FAT_MAGIC_64), in either byte order: the set
+// the k3sm installer's isMachOMagic recognises.
+var machOMagics = []uint32{
+	0xfeedface, 0xcefaedfe, // MH_MAGIC
+	0xfeedfacf, 0xcffaedfe, // MH_MAGIC_64
+	0xcafebabe, 0xbebafeca, // FAT_MAGIC
+	0xcafebabf, 0xbfbafeca, // FAT_MAGIC_64
+}
+
+// updatePayloadMarkers are the cp-payload files that are data, not code: the
+// version markers the k3sm installer copies beside the payload and never
+// executes or loads. They are the only staged files that may be something
+// other than a Mach-O. The installer's signing scan skips every non-Mach-O
+// file; netd skips only these, and checks one of them like any other member
+// when it is a Mach-O.
+var updatePayloadMarkers = []string{
+	updatePayloadDir + "/etcd.version",
+	updatePayloadDir + "/etcdutl.version",
+	updatePayloadDir + "/kine.version",
+	updatePayloadDir + "/kube.version",
+}
 
 // isMachO reports whether the regular file at p starts with a Mach-O magic.
 func isMachO(p string) (bool, error) {
@@ -157,49 +235,72 @@ func isMachO(p string) (bool, error) {
 	return false, nil
 }
 
-// stagedMachOs lists, sorted, the slash-separated relative paths of the Mach-O
-// files under dir. The staged k3sm must be one of them.
-func stagedMachOs(dir string) ([]string, error) {
+// stagedSigningSet lists, sorted, the slash-separated relative paths of the
+// staged files the signing policy checks: every regular file under dir (the
+// updateSetFiles at the top and the whole cp-payload tree), each of which must
+// be a Mach-O. A file that is not one refuses before any signature is read,
+// except an updatePayloadMarkers file, which is skipped. Anything under dir
+// that is neither a directory nor a regular file refuses.
+func stagedSigningSet(dir string) ([]string, error) {
 	var out []string
+	var refusal error
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !d.Type().IsRegular() {
+		if d.IsDir() {
 			return nil
-		}
-		ok, err := isMachO(p)
-		if err != nil || !ok {
-			return err
 		}
 		rel, err := filepath.Rel(dir, p)
 		if err != nil {
 			return err
 		}
-		out = append(out, filepath.ToSlash(rel))
+		rel = filepath.ToSlash(rel)
+		if !d.Type().IsRegular() {
+			refusal = fmt.Errorf("%w: the staged %s is not a regular file", errUpdateRefused, rel)
+			return fs.SkipAll
+		}
+		ok, err := isMachO(p)
+		switch {
+		case err != nil:
+			return err
+		case ok:
+			out = append(out, rel)
+		case slices.Contains(updatePayloadMarkers, rel):
+		default:
+			refusal = fmt.Errorf("%w: the staged %s is not a Mach-O, and every member of the build set must be one", errUpdateRefused, rel)
+			return fs.SkipAll
+		}
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list the staged Mach-O files: %w", err)
+		return nil, fmt.Errorf("list the staged build set: %w", err)
+	}
+	if refusal != nil {
+		return nil, refusal
 	}
 	sort.Strings(out)
-	if i := sort.SearchStrings(out, "k3sm"); i == len(out) || out[i] != "k3sm" {
-		return nil, fmt.Errorf("%w: the staged k3sm is not a Mach-O", errUpdateRefused)
+	for _, m := range updateSetFiles {
+		if i := sort.SearchStrings(out, m); i == len(out) || out[i] != m {
+			return nil, fmt.Errorf("%w: the staged set carries no Mach-O %s", errUpdateRefused, m)
+		}
 	}
 	return out, nil
 }
 
 // checkCodeSigning applies the update code-signing policy to the staged tree
-// (the signature of every staged Mach-O, by relative path) against the
-// installed k3sm's signature:
+// (the signature of every member of stagedSigningSet, by relative path)
+// against the installed k3sm's signature. A team is a Developer ID team
+// (codeSignature.team): a TeamIdentifier without a Developer ID signature
+// issued to it counts as no team, on the installed k3sm and in the tree.
 //
-//   - every staged Mach-O must be validly signed;
-//   - a team-signed install requires every staged Mach-O to carry that team;
-//   - an ad-hoc install accepts an all-ad-hoc tree or a tree signed throughout
-//     by one team;
+//   - every staged member must be validly signed;
+//   - a team-signed install requires every staged member to carry that team;
+//   - an install with no team accepts a tree with no team throughout or a
+//     tree signed throughout by one team;
 //   - requireTeam (the payload's signature: required) refuses a tree without a
 //     team;
-//   - a tree that mixes teams, or a team with ad-hoc, is refused.
+//   - a tree that mixes teams, or a team with no team, is refused.
 func checkCodeSigning(installed codeSignature, tree map[string]codeSignature, requireTeam bool) error {
 	if !installed.Valid {
 		return fmt.Errorf("%w: the installed k3sm's code signature does not verify, so no signing policy applies", errUpdateRefused)
@@ -215,38 +316,42 @@ func checkCodeSigning(installed codeSignature, tree map[string]codeSignature, re
 		if !sig.Valid {
 			return fmt.Errorf("%w: the staged %s is not validly signed", errUpdateRefused, rel)
 		}
-		if installed.TeamID != "" && sig.TeamID != installed.TeamID {
-			return fmt.Errorf("%w: the installed k3sm is signed by team %s and the staged %s by %s", errUpdateRefused, installed.TeamID, rel, teamName(sig.TeamID))
+		if want := installed.team(); want != "" && sig.team() != want {
+			return fmt.Errorf("%w: the installed k3sm is signed by team %s and the staged %s by %s", errUpdateRefused, want, rel, signerName(sig))
 		}
-		if _, ok := teams[sig.TeamID]; !ok {
-			teams[sig.TeamID] = rel
+		if _, ok := teams[sig.team()]; !ok {
+			teams[sig.team()] = rel
 		}
 	}
 	if len(teams) > 1 {
 		names := make([]string, 0, len(teams))
-		for team, rel := range teams {
-			names = append(names, rel+" by "+teamName(team))
+		for _, rel := range teams {
+			names = append(names, rel+" by "+signerName(tree[rel]))
 		}
 		sort.Strings(names)
 		return fmt.Errorf("%w: the staged tree mixes signers (%s)", errUpdateRefused, strings.Join(names, ", "))
 	}
 	if _, adhoc := teams[""]; requireTeam && adhoc {
-		return fmt.Errorf("%w: the payload requires a team signature and the staged tree carries none", errUpdateRefused)
+		return fmt.Errorf("%w: the payload requires a team signature (Developer ID) and the staged %s carries none (%s)", errUpdateRefused, teams[""], signerName(tree[teams[""]]))
 	}
 	return nil
 }
 
-// teamName renders a Team ID for a message.
-func teamName(team string) string {
-	if team == "" {
-		return "no team (ad hoc)"
+// signerName renders a signature's counted signer for a message.
+func signerName(sig codeSignature) string {
+	switch {
+	case sig.team() != "":
+		return "team " + sig.team()
+	case sig.TeamID != "":
+		return "no team (" + sig.TeamID + " without a Developer ID signature)"
 	}
-	return "team " + team
+	return "no team (ad hoc or not Developer ID)"
 }
 
-// inspectStagedTree inspects every staged Mach-O and the installed k3sm.
+// inspectStagedTree inspects every member of stagedSigningSet and the
+// installed k3sm.
 func inspectStagedTree(ctx context.Context, in codeInspector, dir, installedPath string) (codeSignature, map[string]codeSignature, error) {
-	rels, err := stagedMachOs(dir)
+	rels, err := stagedSigningSet(dir)
 	if err != nil {
 		return codeSignature{}, nil, err
 	}

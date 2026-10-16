@@ -161,8 +161,10 @@ func execInstaller(ctx context.Context, run installerRun) error {
 //     service uid owns, and the bytes netd copies out of it into a root-only
 //     file hash to the payload's sha256;
 //  4. netd extracts that copy itself into a fresh root-only staging directory;
-//  5. the code-signing policy against the installed k3sm, then the downgrade
-//     check;
+//  5. every member of the staged set is a Mach-O (the cp-payload version
+//     markers aside) and passes the code-signing policy against the installed
+//     k3sm, where a team counts only behind a Developer ID signature; then the
+//     downgrade check;
 //  6. Installing: the one exec of the staged k3sm, then Done or Failed.
 //
 // Nothing from the archive runs before every check passed, and nothing but the
@@ -326,11 +328,13 @@ func (s *Server) updateFailed(err error, tail string) wire.Response {
 }
 
 // verifyUpdatePayload checks the request's chain of trust and returns the
-// payload it authorises: the cluster CA is configured, the signer certificate
+// payload it authorises: the cluster CA is configured and loads (re-read while
+// none is loaded), the signer certificate
 // chains to it (the system roots excluded) within its validity, carries the
 // Code Signing extended key usage and names the update signer, the ECDSA signature verifies over sha256(Payload), and the
 // payload parses with a release tag, a sha256 and a known signing policy.
 func (s *Server) verifyUpdatePayload(a *wire.ApplyUpdateArgs) (updatePayload, error) {
+	s.loadClusterCALocked()
 	if s.clusterCA == nil {
 		return updatePayload{}, fmt.Errorf("%w: no cluster CA is configured (%v), so no update can be verified", errUpdateRefused, s.clusterCAErr)
 	}
@@ -364,6 +368,24 @@ func (s *Server) verifyUpdatePayload(a *wire.ApplyUpdateArgs) (updatePayload, er
 		return updatePayload{}, fmt.Errorf("%w: the payload signature does not verify", errUpdateRefused)
 	}
 	return parseUpdatePayload(a.Payload)
+}
+
+// loadClusterCALocked re-reads Config.ClusterCAPath when no cluster CA is
+// loaded yet: a fresh server install starts this daemon before the cluster PKI
+// exists, and the first update after the CA appears must not need a restart.
+// A loaded CA is kept and never re-read. An empty path is not retried. The
+// caller holds updateMu.
+func (s *Server) loadClusterCALocked() {
+	if s.clusterCA != nil || s.cfg.ClusterCAPath == "" {
+		return
+	}
+	pool, err := loadClusterCA(s.cfg.ClusterCAPath)
+	if err != nil {
+		s.clusterCAErr = err
+		return
+	}
+	s.clusterCA, s.clusterCAErr = pool, nil
+	s.log.Info("netd: loaded the cluster CA for applyUpdate", "path", s.cfg.ClusterCAPath)
 }
 
 // parseSignerCert decodes the one PEM certificate the request carries.
