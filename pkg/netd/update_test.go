@@ -231,8 +231,9 @@ func buildArchive(t *testing.T, members []tarMember) []byte {
 }
 
 // fakeInspector reads the last line of a file as its signature: ADHOC is a
-// valid ad-hoc signature, TEAM:<id> a valid team signature, anything else an
-// invalid one.
+// valid ad-hoc signature, TEAM:<id> a valid Developer ID signature from team
+// id, NODEVID:<id> a valid signature whose TeamIdentifier is id but which fails
+// the Developer ID requirement, anything else an invalid one.
 type fakeInspector struct {
 	mu    sync.Mutex
 	paths []string
@@ -252,7 +253,9 @@ func (f *fakeInspector) Inspect(_ context.Context, p string) (codeSignature, err
 	case last == "ADHOC":
 		return codeSignature{Valid: true}, nil
 	case strings.HasPrefix(last, "TEAM:"):
-		return codeSignature{Valid: true, TeamID: strings.TrimPrefix(last, "TEAM:")}, nil
+		return codeSignature{Valid: true, TeamID: strings.TrimPrefix(last, "TEAM:"), DeveloperID: true}, nil
+	case strings.HasPrefix(last, "NODEVID:"):
+		return codeSignature{Valid: true, TeamID: strings.TrimPrefix(last, "NODEVID:")}, nil
 	}
 	return codeSignature{}, nil
 }
@@ -675,6 +678,31 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 		h.mustRefuse(h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)), "started without --cluster-ca")
 	})
 
+	t.Run("re-reads an absent cluster CA lazily: refuses while absent, admits once it appears", func(t *testing.T) {
+		caPath := filepath.Join(t.TempDir(), "pki", "cluster-ca.crt")
+		h := newUpdateHarness(t, selfUID(), func(c *Config) { c.ClusterCAPath = caPath })
+		h.mustRefuse(h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)), "no such file or directory")
+		h.mustRefuse(h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)), "no cluster CA is configured")
+		if err := os.MkdirAll(filepath.Dir(caPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(caPath, h.pki.caPEM, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		h.phases = nil
+		resp := h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "", false))
+		if !resp.OK || resp.Phase != wire.UpdatePhaseDone || h.inst.calls != 1 {
+			t.Fatalf("resp = %+v calls %d, want an install once the CA file exists", resp, h.inst.calls)
+		}
+		// A loaded CA is kept: removing the file does not unload it.
+		if err := os.Remove(caPath); err != nil {
+			t.Fatal(err)
+		}
+		if resp := h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)); !resp.OK {
+			t.Fatalf("resp = %+v, want the loaded CA kept", resp)
+		}
+	})
+
 	t.Run("refuses every update when the cluster CA file holds no CA", func(t *testing.T) {
 		bad := filepath.Join(t.TempDir(), "ca.crt")
 		if err := os.WriteFile(bad, []byte("not pem"), 0o600); err != nil {
@@ -789,6 +817,15 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 		{"an installed k3sm whose signature does not verify", "BROKEN", releaseMembers("ADHOC"), "", "installed k3sm's code signature does not verify"},
 		{"a staged k3sm that is not a Mach-O", "ADHOC", withMember(releaseMembers("ADHOC"), "k3sm", &tarMember{name: "k3sm", body: "#!/bin/sh\nADHOC", mode: 0o755}), "", "not a Mach-O"},
 		{"the installed team on a team-signed install", "TEAM:ABCDE12345", team("ABCDE12345"), "required", ""},
+		{"a team string without the Developer ID requirement under signature: required", "ADHOC", releaseMembers("NODEVID:ABCDE12345"), "required", "requires a team signature"},
+		{"a team string without the Developer ID requirement on a team-signed install", "TEAM:ABCDE12345", releaseMembers("NODEVID:ABCDE12345"), "", "signed by team ABCDE12345 and the staged"},
+		{"a non-Mach-O k3sm-execshim", "ADHOC", withMember(releaseMembers("ADHOC"), "k3sm-execshim", &tarMember{name: "k3sm-execshim", body: "#!/bin/sh\nADHOC", mode: 0o755}), "", "the staged k3sm-execshim is not a Mach-O"},
+		{"a non-Mach-O dylib", "ADHOC", withMember(releaseMembers("ADHOC"), "libk3sm_getaddrinfo_shim.dylib", &tarMember{name: "libk3sm_getaddrinfo_shim.dylib", body: "text\nADHOC", mode: 0o644}), "", "the staged libk3sm_getaddrinfo_shim.dylib is not a Mach-O"},
+		{"a non-Mach-O cp-payload executable", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/kine", &tarMember{name: "cp-payload/kine", body: "#!/bin/sh\nADHOC", mode: 0o755}), "", "the staged cp-payload/kine is not a Mach-O"},
+		{"a non-Mach-O file named like a marker below cp-payload/bin", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/bin/kube.version", &tarMember{name: "cp-payload/bin/kube.version", body: "v1\n", mode: 0o644}), "", "the staged cp-payload/bin/kube.version is not a Mach-O"},
+		{"a cp-payload marker that is an invalidly signed Mach-O", "ADHOC", withMember(releaseMembers("ADHOC"), "cp-payload/kube.version", &tarMember{name: "cp-payload/kube.version", body: machO + "marker\nBROKEN", mode: 0o644}), "", "the staged cp-payload/kube.version is not validly signed"},
+		{"a FAT64 universal k3sm-vmhost", "ADHOC", withMember(releaseMembers("ADHOC"), "k3sm-vmhost", &tarMember{name: "k3sm-vmhost", body: "\xca\xfe\xba\xbfvmhost\nADHOC", mode: 0o755}), "", ""},
+		{"a byte-swapped FAT64 universal k3sm", "ADHOC", withMember(releaseMembers("ADHOC"), "k3sm", &tarMember{name: "k3sm", body: "\xbf\xba\xfe\xcak3sm\nADHOC", mode: 0o755}), "", ""},
 		{"one team on an ad-hoc install", "ADHOC", team("ABCDE12345"), "", ""},
 	}
 	for _, tc := range signing {

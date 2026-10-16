@@ -120,9 +120,11 @@ type Config struct {
 	// aliases (k3sm ensures them again).
 	InterconnectStatePath string
 	// ClusterCAPath is the cluster CA certificate (PEM) an ApplyUpdate signer
-	// certificate must chain to (`k3sm netd --cluster-ca`). It is read once, in
-	// NewServer. When it is empty or unreadable every ApplyUpdate is refused;
-	// the other verbs are unaffected.
+	// certificate must chain to (`k3sm netd --cluster-ca`). It is read in
+	// NewServer and, while no CA is loaded, again by each ApplyUpdate (a fresh
+	// server install starts this daemon before the cluster PKI exists). When it
+	// is empty, absent or unreadable that ApplyUpdate is refused; the other
+	// verbs are unaffected.
 	ClusterCAPath string
 	// ServiceCIDR, when valid, additionally admits an EnsureAlias for a Service VIP
 	// (the proxy's ClusterIPs live here, outside the pod aggregate). Optional.
@@ -204,6 +206,9 @@ type Server struct {
 	runInstaller installerRunner
 	// clusterCA is the pool an ApplyUpdate signer must chain to, nil when
 	// Config.ClusterCAPath was empty or did not load (clusterCAErr says why).
+	// NewServer sets both; afterwards they are read and written only under
+	// updateMu (loadClusterCALocked), so the lazy re-read needs no lock of
+	// its own.
 	clusterCA    *x509.CertPool
 	clusterCAErr error
 	// inspector reads code signatures (codesignTool); tests replace it.
@@ -326,7 +331,7 @@ func NewServer(cfg Config) *Server {
 	}
 	s.clusterCA, s.clusterCAErr = loadClusterCA(cfg.ClusterCAPath)
 	if s.clusterCAErr != nil && cfg.ClusterCAPath != "" {
-		cfg.Logger.Error("netd: the cluster CA did not load; every applyUpdate will be refused", "path", cfg.ClusterCAPath, "err", s.clusterCAErr)
+		cfg.Logger.Warn("netd: the cluster CA did not load; each applyUpdate re-reads it and is refused until it loads", "path", cfg.ClusterCAPath, "err", s.clusterCAErr)
 	}
 	// Remove this node's derived interconnect aliases that the daemon does not
 	// own (see reconcileInterconnectAtStart); bounded like the sweeps above.

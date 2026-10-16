@@ -82,7 +82,10 @@ limitations under the License.
 // under the cluster CA nor a signature by one. The server, as the CA holder, is
 // already root-equivalent on every node it manages, which is the k3s posture;
 // this verb gives it no authority it did not have. A daemon started without a
-// cluster CA, or with one that does not load, refuses every ApplyUpdate.
+// cluster CA refuses every ApplyUpdate. One whose CA file is absent or does not
+// load re-reads it on each ApplyUpdate until it loads (a fresh server install
+// starts this daemon before the cluster PKI exists) and refuses until then; a
+// loaded CA is kept.
 //
 // The steps run in this order, each refusal is a Failed frame with the reason,
 // and no step runs after a refusal:
@@ -107,12 +110,25 @@ limitations under the License.
 //     k3sm-execshim, k3sm-vmhost, the two shim dylibs and cp-payload/**, with
 //     LICENSE, NOTICE and k3sm-netd read past and any other name refused, and at
 //     most wire.MaxUpdateSetBytes (2 GiB) unpacked, skipped members counted.
-//  5. The code-signing policy, through /usr/bin/codesign (`--verify --strict`
-//     and `-dv` for the Team ID): every staged Mach-O must be validly signed; a
-//     team-signed installed /Library/k3sm/k3sm requires that team throughout;
-//     an ad-hoc install accepts an all-ad-hoc tree or one team throughout; the
-//     payload's signature: required refuses a tree without a team; a mixed tree
-//     is refused. Then, unless the payload allows a downgrade, a version below
+//  5. The code-signing policy. Every regular file of the staged set must be a
+//     Mach-O (thin or universal, FAT_MAGIC_64 included, either byte order):
+//     k3sm, k3sm-execshim, k3sm-vmhost, the two shim dylibs and every file
+//     under cp-payload/, except the four version markers there
+//     (etcd.version, etcdutl.version, kine.version, kube.version), which the
+//     installer copies as data and never runs; anything else that is not a
+//     Mach-O is refused before a signature is read. Each Mach-O then goes
+//     through /usr/bin/codesign: `--verify --strict`, `-dv` for the Team ID,
+//     and, for a Team ID, `--verify --strict -R=` the Developer ID requirement
+//     (`anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6]
+//     exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists`,
+//     with the leaf's subject OU equal to that team). A team counts only when
+//     that requirement passes: an ad-hoc, Apple-signed, non-Developer ID or
+//     non-Apple-anchored signature that verifies counts as no team. Every
+//     member must be validly signed; a team-signed installed
+//     /Library/k3sm/k3sm requires that team throughout; an install with no
+//     team accepts a tree with no team throughout or one team throughout; the
+//     payload's signature: required refuses a tree without a team; a mixed
+//     tree is refused. Then, unless the payload allows a downgrade, a version below
 //     the installed binary's (`/Library/k3sm/k3sm version`), or one that cannot
 //     be ordered against it, is refused.
 //  6. Installing. A root-owned log is created beside the set and the staged
