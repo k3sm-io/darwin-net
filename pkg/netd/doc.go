@@ -122,10 +122,14 @@ limitations under the License.
 //  5. The code-signing policy. Every regular file of the staged set must be a
 //     Mach-O (thin or universal, FAT_MAGIC_64 included, either byte order):
 //     k3sm, k3sm-execshim, k3sm-vmhost, the two shim dylibs and every file
-//     under cp-payload/, except the four version markers there
-//     (etcd.version, etcdutl.version, kine.version, kube.version), which the
-//     installer copies as data and never runs; anything else that is not a
-//     Mach-O is refused before a signature is read. Each Mach-O then goes
+//     under cp-payload/, except the version markers there, which the
+//     installer copies as data and never runs (etcd.version, kine.version,
+//     zot.version and any later one). A marker is known by its shape, not a
+//     list of names: a regular file directly under cp-payload/ whose name ends
+//     in .version, smaller than 4 KiB, holding only printable ASCII and
+//     newlines. A .version file that is a Mach-O is checked like any other
+//     member; anything else that is not a Mach-O, a .version file deeper in
+//     cp-payload/ included, is refused before a signature is read. Each Mach-O then goes
 //     through /usr/bin/codesign: `--verify --strict`, `-dv` for the Team ID,
 //     and, for a Team ID, `--verify --strict -R=` the Developer ID requirement
 //     (`anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6]
