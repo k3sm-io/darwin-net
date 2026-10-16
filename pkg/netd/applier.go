@@ -28,6 +28,9 @@ import (
 	"os/exec"
 	"slices"
 	"sync"
+	"syscall"
+
+	"golang.org/x/sys/unix"
 
 	"k3sm.io/darwin-net/pkg/mesh"
 	"k3sm.io/darwin-net/pkg/podnet"
@@ -632,7 +635,7 @@ func (a *darwinApplier) RemoveMesh(ctx context.Context) error {
 // server can pass the descriptor to the client over SCM_RIGHTS. The original
 // listener is closed after the descriptor is duplicated; the kernel keeps the
 // socket alive while the passed descriptor is open.
-func (a *darwinApplier) BindPort(_ context.Context, network string, addr netip.AddrPort) (*os.File, error) {
+func (a *darwinApplier) BindPort(ctx context.Context, network string, addr netip.AddrPort) (*os.File, error) {
 	switch network {
 	case "tcp":
 		ln, err := net.ListenTCP("tcp", net.TCPAddrFromAddrPort(addr))
@@ -646,9 +649,23 @@ func (a *darwinApplier) BindPort(_ context.Context, network string, addr netip.A
 		}
 		return f, nil
 	case "udp":
-		c, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(addr))
+		// A specific-address UDP bind sets SO_REUSEADDR (and never SO_REUSEPORT).
+		// macOS's Internet Sharing resolver (mDNSResponder serving the vm network
+		// bridge, up whenever a vm pod runs on the Mac) holds the wildcard *:53;
+		// without the option the BSD stack matches that wildcard and refuses
+		// 10.43.0.10:53 with EADDRINUSE. With it the lookup is exact-address only,
+		// so the specific socket coexists with the wildcard and, being the more
+		// specific match, receives the datagrams sent to the VIP. A wildcard bind
+		// stays as before: it must not share a port another wildcard holds.
+		lc := net.ListenConfig{Control: udpBindControl(addr.Addr(), setReuseAddr)}
+		pc, err := lc.ListenPacket(ctx, "udp", addr.String())
 		if err != nil {
 			return nil, fmt.Errorf("listen udp %s: %w", addr, err)
+		}
+		c, ok := pc.(*net.UDPConn)
+		if !ok {
+			_ = pc.Close()
+			return nil, fmt.Errorf("listen udp %s: unexpected packet conn %T", addr, pc)
 		}
 		f, err := c.File()
 		_ = c.Close()
@@ -659,6 +676,31 @@ func (a *darwinApplier) BindPort(_ context.Context, network string, addr netip.A
 	default:
 		return nil, fmt.Errorf("bind port: unsupported network %q", network)
 	}
+}
+
+// udpBindControl returns the ListenConfig.Control hook for a UDP bind on addr:
+// nil for an unspecified (wildcard) address, so that bind is unchanged, and for a
+// specific address a hook that sets SO_REUSEADDR on the socket through set before
+// bind(2). set is the seam the unit test fakes.
+func udpBindControl(addr netip.Addr, set func(fd int) error) func(network, address string, c syscall.RawConn) error {
+	if addr.IsUnspecified() {
+		return nil
+	}
+	return func(_, address string, c syscall.RawConn) error {
+		var serr error
+		if err := c.Control(func(fd uintptr) { serr = set(int(fd)) }); err != nil {
+			return fmt.Errorf("control udp socket %s: %w", address, err)
+		}
+		if serr != nil {
+			return fmt.Errorf("set SO_REUSEADDR on %s: %w", address, serr)
+		}
+		return nil
+	}
+}
+
+// setReuseAddr sets SO_REUSEADDR on fd.
+func setReuseAddr(fd int) error {
+	return unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
 }
 
 // runOutput runs a command and returns its standard output.
