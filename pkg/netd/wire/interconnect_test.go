@@ -200,10 +200,11 @@ func TestClientNeverSendsInterconnectVerbsToOldHelper(t *testing.T) {
 	})
 }
 
-// TestInterconnectIsMinorTwo pins the 1.1 -> 1.2 bump and its additive fields.
+// TestInterconnectIsMinorTwo pins the 1.1 -> 1.2 bump and its additive fields
+// (a later minor still supports them).
 func TestInterconnectIsMinorTwo(t *testing.T) {
-	if v := CurrentVersion(); v.Minor != MinorInterconnect || !v.SupportsInterconnect() {
-		t.Fatalf("CurrentVersion = %+v, want 1.2 supporting interconnect", v)
+	if v := CurrentVersion(); MinorInterconnect != 2 || v.Minor < MinorInterconnect || !v.SupportsInterconnect() {
+		t.Fatalf("CurrentVersion = %+v, want 1.2 or later supporting interconnect", v)
 	}
 	if (Version{Major: 1, Minor: 1}).SupportsInterconnect() || (Version{Major: 2, Minor: 9}).SupportsInterconnect() {
 		t.Fatal("a 1.1 daemon or another major must not be treated as supporting the interconnect verbs")

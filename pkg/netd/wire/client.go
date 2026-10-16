@@ -19,6 +19,7 @@ package wire
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -338,4 +339,93 @@ func (c *Client) BindPort(ctx context.Context, network string, addr netip.AddrPo
 		},
 	})
 	return file, err
+}
+
+// applyUpdateSlack is the client's allowance beyond UpdateInstallTimeout for
+// the copy and digest check that come before the installer runs.
+const applyUpdateSlack = 10 * time.Minute
+
+// UpdateResult is the outcome of an ApplyUpdate as this client saw it: the last
+// phase (Done, Failed, or Restarting when the stream ended after Installing),
+// and the installer's last lines when the daemon sent them.
+type UpdateResult struct {
+	Phase UpdatePhase
+	Log   string
+}
+
+// ApplyUpdate asks the daemon to install the build set the agent prepared at
+// args.SourceDir (see ApplyUpdateArgs and VerbApplyUpdate). progress, when not
+// nil, is called with each phase the daemon reports, in order. It sends Hello
+// first on the same connection and, against a helper older than minor 3, sends
+// nothing more and returns ErrHelperTooOld.
+//
+// A Failed phase is returned as an error wrapping nothing named, with the
+// result carrying the phase and the installer's log. A stream that ends after
+// Installing with no final frame is not an error: the installer restarts this
+// helper, so the result is Restarting and the outcome is the restarted node's
+// version. When ctx carries no deadline the call is bounded by
+// UpdateInstallTimeout plus a fixed allowance for the copy.
+func (c *Client) ApplyUpdate(ctx context.Context, args ApplyUpdateArgs, progress func(UpdatePhase)) (UpdateResult, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, UpdateInstallTimeout+applyUpdateSlack)
+		defer cancel()
+	}
+	conn, err := c.open(ctx)
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	defer conn.Close()
+	hello, err := c.exchange(conn, Request{Version: CurrentVersion(), Verb: VerbHello})
+	if !hello.Version.SupportsApplyUpdate() {
+		if err != nil && hello.Version == (Version{}) {
+			return UpdateResult{}, err
+		}
+		return UpdateResult{}, fmt.Errorf("%w: %s needs minor %d, the helper speaks %d.%d",
+			ErrHelperTooOld, VerbApplyUpdate, MinorApplyUpdate, hello.Version.Major, hello.Version.Minor)
+	}
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	payload, err := json.Marshal(Request{Version: CurrentVersion(), Verb: VerbApplyUpdate, ApplyUpdate: &args})
+	if err != nil {
+		return UpdateResult{}, fmt.Errorf("encode %s request: %w", VerbApplyUpdate, err)
+	}
+	if err := WriteFrame(conn, payload); err != nil {
+		return UpdateResult{}, fmt.Errorf("send %s request: %w", VerbApplyUpdate, err)
+	}
+	var last UpdatePhase
+	for {
+		raw, err := ReadFrame(conn, c.maxResp)
+		if err != nil {
+			if last == UpdatePhaseInstalling && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+				if progress != nil {
+					progress(UpdatePhaseRestarting)
+				}
+				return UpdateResult{Phase: UpdatePhaseRestarting}, nil
+			}
+			return UpdateResult{Phase: last}, fmt.Errorf("read %s response: %w", VerbApplyUpdate, err)
+		}
+		var resp Response
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return UpdateResult{Phase: last}, fmt.Errorf("decode %s response: %w", VerbApplyUpdate, err)
+		}
+		c.observe(resp.Version)
+		if resp.Phase == "" {
+			// A rejection before any phase (a decode or version refusal).
+			return UpdateResult{Phase: UpdatePhaseFailed}, fmt.Errorf("netd %s rejected: %s", VerbApplyUpdate, resp.Error)
+		}
+		last = resp.Phase
+		if progress != nil {
+			progress(resp.Phase)
+		}
+		if !resp.Phase.Terminal() {
+			continue
+		}
+		res := UpdateResult{Phase: resp.Phase, Log: resp.Log}
+		if resp.Phase == UpdatePhaseFailed || !resp.OK {
+			return res, fmt.Errorf("netd %s failed: %s", VerbApplyUpdate, resp.Error)
+		}
+		return res, nil
+	}
 }

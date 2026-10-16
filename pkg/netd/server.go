@@ -124,7 +124,8 @@ type Config struct {
 	// ServiceUID is the authorized unprivileged service uid (the default
 	// PeerVerifier admits only this peer uid).
 	ServiceUID uint32
-	// MaxRequestBytes caps a single framed request (default DefaultMaxRequestBytes).
+	// MaxRequestBytes caps a single framed request (default DefaultMaxRequestBytes),
+	// except an ApplyUpdate, which may be up to wire.MaxApplyUpdateRequestBytes.
 	MaxRequestBytes int
 	// MaxPerConn caps the live aliases / mesh routes / bound ports one connection
 	// may drive (default DefaultMaxPerConn, ≈ a node's /24 pod capacity).
@@ -187,6 +188,14 @@ type Server struct {
 	icOwned           map[int]netip.Addr
 	meshRoutes        int
 	meshUp            bool
+
+	// updateMu admits one ApplyUpdate at a time; it is taken with TryLock, so a
+	// second request is refused rather than queued.
+	updateMu sync.Mutex
+	// stagingRoot is where ApplyUpdate stages a set (DefaultUpdateStagingRoot).
+	stagingRoot string
+	// runInstaller is ApplyUpdate's one exec (execInstaller); tests replace it.
+	runInstaller installerRunner
 }
 
 // NewServer constructs a Server from cfg, filling defaults: the cluster aggregate
@@ -288,6 +297,8 @@ func NewServer(cfg Config) *Server {
 		identityConfirmed: restoredOK,
 		aliases:           make(map[netip.Addr]struct{}),
 		icOwned:           make(map[int]netip.Addr),
+		stagingRoot:       DefaultUpdateStagingRoot,
+		runInstaller:      execInstaller,
 	}
 	// Remove this node's derived interconnect aliases that the daemon does not
 	// own (see reconcileInterconnectAtStart); bounded like the sweeps above.
@@ -484,6 +495,8 @@ func (s *Server) handleConn(ctx context.Context, conn *net.UnixConn) {
 	s.log.Debug("netd: peer accepted")
 
 	st := newConnState(s.cfg.MaxPerConn)
+	st.conn = conn
+	st.emit = func(resp wire.Response) error { return s.writeResponse(conn, resp) }
 	for {
 		select {
 		case <-ctx.Done():
@@ -494,7 +507,7 @@ func (s *Server) handleConn(ctx context.Context, conn *net.UnixConn) {
 			s.log.Debug("netd: arming read deadline", "err", err)
 			return
 		}
-		payload, err := wire.ReadFrame(conn, s.cfg.MaxRequestBytes)
+		payload, err := wire.ReadFrame(conn, s.frameCap())
 		if err != nil {
 			switch {
 			case errors.Is(err, os.ErrDeadlineExceeded):
@@ -520,6 +533,13 @@ func (s *Server) handleConn(ctx context.Context, conn *net.UnixConn) {
 	}
 }
 
+// frameCap is the read cap for one request frame: the larger of the configured
+// cap and the ApplyUpdate cap, because the verb is known only after the decode.
+// dispatch then holds every other verb to the configured cap.
+func (s *Server) frameCap() int {
+	return max(s.cfg.MaxRequestBytes, wire.MaxApplyUpdateRequestBytes)
+}
+
 // dispatch decodes one request payload and routes it to its handler. A decode
 // failure, an incompatible major version, or an unknown verb yields an error
 // response (never a panic). The returned *os.File is non-nil only for a successful
@@ -528,6 +548,12 @@ func (s *Server) dispatch(ctx context.Context, st *connState, payload []byte) (w
 	var req wire.Request
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return s.errResp(fmt.Sprintf("decode request: %v", err)), nil
+	}
+	if len(payload) > s.cfg.MaxRequestBytes && req.Verb != wire.VerbApplyUpdate {
+		return s.errResp(fmt.Sprintf("%v: a %q request of %d bytes exceeds the %d-byte cap", ErrPolicy, req.Verb, len(payload), s.cfg.MaxRequestBytes)), nil
+	}
+	if len(payload) > wire.MaxApplyUpdateRequestBytes {
+		return s.errResp(fmt.Sprintf("%v: a %q request of %d bytes exceeds the %d-byte cap", ErrPolicy, req.Verb, len(payload), wire.MaxApplyUpdateRequestBytes)), nil
 	}
 	if !req.Version.Compatible() {
 		return s.errResp(fmt.Sprintf("incompatible protocol major: client %d.%d, server %d.%d",
@@ -550,6 +576,8 @@ func (s *Server) dispatch(ctx context.Context, st *connState, payload []byte) (w
 		return s.handleEnsureInterconnectAlias(ctx, req.EnsureInterconnectAlias), nil
 	case wire.VerbRemoveInterconnectAlias:
 		return s.handleRemoveInterconnectAlias(ctx, req.RemoveInterconnectAlias), nil
+	case wire.VerbApplyUpdate:
+		return s.handleApplyUpdate(ctx, st, req.ApplyUpdate), nil
 	default:
 		return s.errResp(fmt.Sprintf("unknown verb %q", req.Verb)), nil
 	}
@@ -959,6 +987,13 @@ type connState struct {
 	aliases map[netip.Addr]struct{}
 	bound   int
 	routes  int
+
+	// conn is the connection, for the verb that re-reads its peer credential
+	// (ApplyUpdate); nil when a request is dispatched with no connection.
+	conn *net.UnixConn
+	// emit sends an intermediate response frame on conn (ApplyUpdate's phase
+	// stream); nil with no connection.
+	emit func(wire.Response) error
 }
 
 // newConnState returns per-connection accounting capped at max.
