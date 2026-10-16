@@ -51,7 +51,14 @@ limitations under the License.
 //     derived aliases that it does not own.
 //   - fd-out only. The sole descriptor that ever crosses the socket is the
 //     listening socket BindPort returns to the client via SCM_RIGHTS; no inbound fd
-//     is ever accepted.
+//     is ever accepted. The daemon closes its copy right after the send, and the
+//     client checks every socket it receives: the darwin unix-socket garbage
+//     collector can run while the descriptor is in flight, sorflush it (receive
+//     buffer limit zero, can no longer receive) and still deliver it, which
+//     leaves a socket bound to the port that never reads. The client treats
+//     SO_RCVBUF zero as that case, closes the descriptor and asks again on a
+//     fresh connection (each BindPort binds a fresh socket, and the closed one no
+//     longer holds the port), and fails with wire.ErrFlushedSocket after three.
 //   - Per-connection resource caps and an allocation-bounded decoder that never
 //     panics on malformed input (it returns an error response).
 //

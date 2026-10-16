@@ -92,6 +92,10 @@ var (
 	// ErrNoFD is returned by the fd-receiving client path when the daemon's response
 	// carried no file descriptor.
 	ErrNoFD = errors.New("netd/wire: response carried no file descriptor")
+	// ErrFlushedSocket means the daemon's handed-over socket arrived flushed
+	// (SO_RCVBUF zero: the darwin unix-socket garbage collector ran on it in
+	// flight) on every attempt the client makes; see Client.
+	ErrFlushedSocket = errors.New("netd handed over a socket the kernel had flushed")
 	// ErrHelperTooOld is returned, without anything sent, by a client method whose
 	// verb the daemon on the current connection does not understand (it reported a
 	// minor below the verb's).

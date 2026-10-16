@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -43,12 +44,32 @@ const defaultRPCTimeout = 10 * time.Second
 //
 // Client is safe for concurrent use: each call opens its own connection; the one
 // piece of shared state, the daemon version last reported, is guarded by mu.
+//
+// Every socket the daemon hands over (BindPort) is checked before it is
+// returned, because the darwin unix-socket garbage collector can ruin a
+// descriptor in flight: when it runs between the daemon's close of its copy and
+// this client's recvmsg, it can treat the queued SCM_RIGHTS socket as
+// unreachable, sorflush it (the receive buffer limit drops to zero and the
+// socket can no longer receive) and still deliver it. Such a socket binds the
+// port but never reads a datagram or accepts a connection, so a reader on it
+// spins or waits forever. The client reads SO_RCVBUF on every received
+// descriptor; zero means flushed, and the descriptor is closed and the verb
+// re-issued on a fresh connection (the daemon binds a fresh socket each time),
+// up to flushedSocketAttempts times before the call fails with ErrFlushedSocket.
 type Client struct {
 	socketPath string
 	maxResp    int
 	// open dials one framed (non-fd) connection: c.dial in production, an
 	// in-memory pipe in the unit tests.
 	open func(ctx context.Context) (io.ReadWriteCloser, error)
+	// exchangeFD performs one fd-carrying exchange on its own connection and
+	// returns with that connection closed: c.roundTripFD in production, a fake
+	// descriptor source in the unit tests.
+	exchangeFD func(ctx context.Context, req Request) (Response, *os.File, error)
+	// inspect reads a received socket's state: inspectSocket in production.
+	inspect func(fd int) (socketState, error)
+	// log receives the flushed-socket warning; nil means slog.Default().
+	log *slog.Logger
 
 	mu         sync.Mutex
 	helper     Version
@@ -77,9 +98,18 @@ func NewClient(socketPath string) *Client {
 	if socketPath == "" {
 		socketPath = DefaultSocketPath
 	}
-	c := &Client{socketPath: socketPath, maxResp: DefaultMaxRequestBytes}
+	c := &Client{socketPath: socketPath, maxResp: DefaultMaxRequestBytes, inspect: inspectSocket}
 	c.open = func(ctx context.Context) (io.ReadWriteCloser, error) { return c.dial(ctx) }
+	c.exchangeFD = c.roundTripFD
 	return c
+}
+
+// logger returns the client's logger, slog.Default() when none was set.
+func (c *Client) logger() *slog.Logger {
+	if c.log != nil {
+		return c.log
+	}
+	return slog.Default()
 }
 
 // dial opens a connection to the daemon and arms it with a deadline derived from
@@ -254,6 +284,72 @@ func (c *Client) roundTripFD(ctx context.Context, req Request) (Response, *os.Fi
 	return resp, file, nil
 }
 
+// flushedSocketAttempts bounds how many handed-over sockets one call accepts
+// and discards as flushed before it gives up. The race is rare (about one
+// handover in thousands under load), so three in a row means something other
+// than the race is wrong. ErrFlushedSocket's final message says "three times";
+// keep the two together.
+const flushedSocketAttempts = 3
+
+// socketState is what the client reads from a received socket: SO_RCVBUF, the
+// pending SO_ERROR, and the local address, for the flushed check and its log.
+type socketState struct {
+	rcvBuf int
+	soErr  int
+	local  string
+}
+
+// inspectSocket reads fd's state. Only SO_RCVBUF is required; the error and
+// the local address are best effort, for the log line.
+func inspectSocket(fd int) (socketState, error) {
+	rcv, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF)
+	if err != nil {
+		return socketState{}, fmt.Errorf("read SO_RCVBUF: %w", err)
+	}
+	st := socketState{rcvBuf: rcv}
+	if v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ERROR); err == nil {
+		st.soErr = v
+	}
+	if sa, err := unix.Getsockname(fd); err == nil {
+		switch a := sa.(type) {
+		case *unix.SockaddrInet4:
+			st.local = netip.AddrPortFrom(netip.AddrFrom4(a.Addr), uint16(a.Port)).String()
+		case *unix.SockaddrInet6:
+			st.local = netip.AddrPortFrom(netip.AddrFrom16(a.Addr), uint16(a.Port)).String()
+		}
+	}
+	return st, nil
+}
+
+// roundTripSocket performs an fd-carrying verb and returns a socket the kernel
+// has not flushed in flight (see Client). A flushed descriptor is closed and
+// the request re-issued on a new connection; the previous exchange's
+// connection is already closed by then and the daemon closed its own copy
+// right after sending, so the port is free for the daemon's fresh bind.
+func (c *Client) roundTripSocket(ctx context.Context, req Request, what string) (Response, *os.File, error) {
+	for attempt := 1; ; attempt++ {
+		resp, file, err := c.exchangeFD(ctx, req)
+		if err != nil {
+			return resp, nil, err
+		}
+		st, err := c.inspect(int(file.Fd()))
+		if err != nil {
+			_ = file.Close()
+			return resp, nil, fmt.Errorf("netd %s %s: inspect the handed-over socket: %w", req.Verb, what, err)
+		}
+		if st.rcvBuf != 0 {
+			return resp, file, nil
+		}
+		c.logger().Warn("netd: handed-over socket was flushed by the kernel in flight; retrying",
+			"verb", req.Verb, "target", what, "local", st.local, "rcvbuf", st.rcvBuf,
+			"soError", st.soErr, "attempt", attempt, "maxAttempts", flushedSocketAttempts)
+		_ = file.Close()
+		if attempt == flushedSocketAttempts {
+			return resp, nil, fmt.Errorf("netd %s %s: %w, three times", req.Verb, what, ErrFlushedSocket)
+		}
+	}
+}
+
 // firstFD parses the first file descriptor out of an SCM_RIGHTS control message,
 // closing any extras, and wraps it in an *os.File. It returns nil (never panics)
 // when oob carries no descriptor.
@@ -328,8 +424,12 @@ func (c *Client) RemoveMesh(ctx context.Context) error {
 // BindPort asks the daemon to bind a listening socket on the specific addr and
 // return it via SCM_RIGHTS. The returned *os.File owns the descriptor; wrap it with
 // net.FileListener (TCP) and close the *os.File afterward.
+//
+// A socket the kernel flushed in flight (see Client) is never returned: BindPort
+// closes it and asks again, and after three flushed sockets in a row returns an
+// error wrapping ErrFlushedSocket.
 func (c *Client) BindPort(ctx context.Context, network string, addr netip.AddrPort) (*os.File, error) {
-	_, file, err := c.roundTripFD(ctx, Request{
+	_, file, err := c.roundTripSocket(ctx, Request{
 		Version: CurrentVersion(),
 		Verb:    VerbBindPort,
 		BindPort: &BindPortArgs{
@@ -337,7 +437,7 @@ func (c *Client) BindPort(ctx context.Context, network string, addr netip.AddrPo
 			NodeAddr: addr.Addr().String(),
 			Protocol: network,
 		},
-	})
+	}, network+" "+addr.String())
 	return file, err
 }
 
