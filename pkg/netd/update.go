@@ -17,24 +17,31 @@ limitations under the License.
 package netd
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
-	"sort"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 
+	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
 	"k3sm.io/darwin-net/pkg/netd/wire"
 )
 
@@ -56,13 +63,50 @@ const updateDirPrefix = "netd-update-"
 // installer's StagingLockPath (/Library/k3sm.staging.lock).
 const stagingLockSuffix = ".lock"
 
-// Bounds on the set and the reply.
+// DefaultInstalledK3sm is the installed k3sm binary whose code signature and
+// version the update policy compares the staged build against.
+const DefaultInstalledK3sm = "/Library/k3sm/k3sm"
+
+// Bounds on the request, the reply and the installed-version probe.
 const (
-	maxUpdateDepth     = 16
-	updateLogTailLines = 40
-	updateLogTailBytes = 8 << 10
-	maxVersionLen      = 128
+	updateLogTailLines   = 40
+	updateLogTailBytes   = 8 << 10
+	maxVersionLen        = 128
+	maxClusterCABytes    = 1 << 20
+	versionProbeTimeout  = 30 * time.Second
+	versionProbeMaxBytes = 4 << 10
 )
+
+// releaseTagGrammar is the release tag a signed payload may name.
+var releaseTagGrammar = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`)
+
+// updatePayload is the signed payload the update controller wrote on the Node.
+// Every decision ApplyUpdate takes from the request comes from here, after the
+// signature over its bytes verified.
+type updatePayload struct {
+	// Version is the release tag being installed.
+	Version string `json:"version"`
+	// URL is where the agent downloaded the archive from. The daemon fetches
+	// nothing and does not read it.
+	URL string `json:"url"`
+	// SHA256 is the archive's lowercase hex sha256.
+	SHA256 string `json:"sha256"`
+	// Signature is the code-signing policy: if-signed (also when empty) or
+	// required.
+	Signature updatesv1alpha1.UpdateSignaturePolicy `json:"signature"`
+	// AllowDowngrade permits a tag below the installed build.
+	AllowDowngrade bool `json:"allowDowngrade,omitempty"`
+}
+
+// requireTeam reports whether the payload refuses a tree without a team
+// signature.
+func (p updatePayload) requireTeam() bool {
+	return p.Signature == updatesv1alpha1.UpdateSignatureRequired
+}
+
+// installedVersionFunc reports the release version of the installed k3sm at
+// path. It is the seam the unit tests replace.
+type installedVersionFunc func(ctx context.Context, path string) (string, error)
 
 // errUpdateRefused is the base error every ApplyUpdate refusal wraps.
 var errUpdateRefused = errors.New("applyUpdate refused")
@@ -105,15 +149,26 @@ func execInstaller(ctx context.Context, run installerRun) error {
 	return cmd.Run()
 }
 
-// handleApplyUpdate serves VerbApplyUpdate. The steps run in a fixed order and
-// each is reported: the caller check, Verifying (the copy into a fresh
-// root-only directory and the digest check of every copied file), the log
-// file, Installing (the one exec of the staged k3sm), then Done or
-// Failed. Nothing in the set is executed before every digest matched, and
-// nothing but the staged k3sm is ever executed.
+// handleApplyUpdate serves VerbApplyUpdate. The steps run in a fixed order,
+// each refusal is a Failed frame with the reason, and no step runs after a
+// refusal:
 //
-// The reply is a stream: emit sends the intermediate phases and the returned
-// response is the final frame. emit is nil when no connection is attached.
+//  1. the caller is the service uid;
+//  2. Verifying: the signer certificate chains to the cluster CA and names the
+//     update signer, the signature over the payload verifies, and the payload
+//     parses with a release tag;
+//  3. the archive, opened without following a symlink, is a regular file the
+//     service uid owns, and the bytes netd copies out of it into a root-only
+//     file hash to the payload's sha256;
+//  4. netd extracts that copy itself into a fresh root-only staging directory;
+//  5. the code-signing policy against the installed k3sm, then the downgrade
+//     check;
+//  6. Installing: the one exec of the staged k3sm, then Done or Failed.
+//
+// Nothing from the archive runs before every check passed, and nothing but the
+// staged k3sm ever runs. The reply is a stream: emit sends the intermediate
+// phases and the returned response is the final frame. emit is nil when no
+// connection is attached.
 func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wire.ApplyUpdateArgs) wire.Response {
 	if err := s.authorizeUpdatePeer(st); err != nil {
 		s.log.Warn("netd: applyUpdate caller rejected", "err", err)
@@ -126,11 +181,20 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 		return s.updateFailed(fmt.Errorf("%w: another update is running in this helper", errUpdateRefused), "")
 	}
 	defer s.updateMu.Unlock()
-	if err := validateUpdateArgs(args); err != nil {
+	st.emitPhase(s, wire.UpdatePhaseVerifying)
+
+	payload, err := s.verifyUpdatePayload(args)
+	if err != nil {
+		s.log.Warn("netd: update payload refused", "err", err)
 		return s.updateFailed(err, "")
 	}
-	log := s.log.With("version", args.Version)
-	st.emitPhase(s, wire.UpdatePhaseVerifying)
+	log := s.log.With("version", payload.Version)
+	archive, err := openUpdateArchive(args.ArchivePath, s.cfg.ServiceUID)
+	if err != nil {
+		log.Warn("netd: update archive refused", "archive", args.ArchivePath, "err", err)
+		return s.updateFailed(err, "")
+	}
+	defer archive.Close()
 
 	root := s.stagingRoot
 	if err := ensureStagingRoot(root); err != nil {
@@ -150,6 +214,14 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 		}
 	}()
 	sweepUpdateDirs(root, log)
+
+	copied, err := copyVerifiedArchive(archive, root, payload.SHA256)
+	if err != nil {
+		log.Warn("netd: update archive refused", "archive", args.ArchivePath, "err", err)
+		return s.updateFailed(err, "")
+	}
+	defer copied.Close()
+
 	dir, err := os.MkdirTemp(root, updateDirPrefix)
 	if err != nil {
 		return s.updateFailed(fmt.Errorf("create a staging directory in %s: %w", root, err), "")
@@ -164,15 +236,25 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 	if err := ownRootOnly(dir); err != nil {
 		return s.updateFailed(err, "")
 	}
-
-	got, err := copyUpdateSet(args.SourceDir, dir, s.cfg.ServiceUID, args.Manifest)
-	if err != nil {
-		log.Warn("netd: update set refused", "source", args.SourceDir, "err", err)
+	if err := extractUpdateArchive(copied, dir); err != nil {
+		log.Warn("netd: update archive refused", "archive", args.ArchivePath, "err", err)
 		return s.updateFailed(err, "")
 	}
-	if err := checkManifest(args.Manifest, got); err != nil {
-		log.Warn("netd: update set refused", "source", args.SourceDir, "err", err)
+	_ = copied.Close()
+
+	installed, tree, err := inspectStagedTree(ctx, s.inspector, dir, s.installedK3sm)
+	if err == nil {
+		err = checkCodeSigning(installed, tree, payload.requireTeam())
+	}
+	if err != nil {
+		log.Warn("netd: update code signing refused", "err", err)
 		return s.updateFailed(err, "")
+	}
+	if !payload.AllowDowngrade {
+		if err := s.checkNotDowngrade(ctx, payload.Version); err != nil {
+			log.Warn("netd: update refused as a downgrade", "err", err)
+			return s.updateFailed(err, "")
+		}
 	}
 
 	logPath := filepath.Join(dir, updateLogName)
@@ -187,11 +269,8 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 	}()
 
 	argv := []string{filepath.Join(dir, "k3sm"), "install", "--from-staging", dir}
-	if args.AllowDowngrade {
+	if payload.AllowDowngrade {
 		argv = append(argv, "--allow-downgrade")
-	}
-	if args.RequireTeamSignature {
-		argv = append(argv, "--require-team-signature")
 	}
 	st.emitPhase(s, wire.UpdatePhaseInstalling)
 	log.Info("netd: running the staged installer", "dir", dir)
@@ -246,48 +325,353 @@ func (s *Server) updateFailed(err error, tail string) wire.Response {
 	return resp
 }
 
-// validateUpdateArgs checks the shape of the request before anything is
-// touched: a clean absolute source, a non-empty manifest of clean relative
-// paths and sha256 digests that names the staged k3sm, and a plain version.
-func validateUpdateArgs(a *wire.ApplyUpdateArgs) error {
-	if !filepath.IsAbs(a.SourceDir) || filepath.Clean(a.SourceDir) != a.SourceDir {
-		return fmt.Errorf("%w: sourceDir %q is not a clean absolute path", errUpdateRefused, a.SourceDir)
+// verifyUpdatePayload checks the request's chain of trust and returns the
+// payload it authorises: the cluster CA is configured, the signer certificate
+// chains to it (the system roots excluded) within its validity, carries the
+// Code Signing extended key usage and names the update signer, the ECDSA signature verifies over sha256(Payload), and the
+// payload parses with a release tag, a sha256 and a known signing policy.
+func (s *Server) verifyUpdatePayload(a *wire.ApplyUpdateArgs) (updatePayload, error) {
+	if s.clusterCA == nil {
+		return updatePayload{}, fmt.Errorf("%w: no cluster CA is configured (%v), so no update can be verified", errUpdateRefused, s.clusterCAErr)
 	}
-	if a.Version == "" || len(a.Version) > maxVersionLen || strings.ContainsFunc(a.Version, func(r rune) bool { return r <= ' ' || r == 0x7f }) {
-		return fmt.Errorf("%w: version %q is empty, too long or holds a control or space character", errUpdateRefused, a.Version)
+	signer, err := parseSignerCert(a.SignerCert)
+	if err != nil {
+		return updatePayload{}, err
 	}
-	if len(a.Manifest) == 0 || len(a.Manifest) > wire.MaxUpdateManifestEntries {
-		return fmt.Errorf("%w: the manifest names %d files (1..%d)", errUpdateRefused, len(a.Manifest), wire.MaxUpdateManifestEntries)
+	if _, err := signer.Verify(x509.VerifyOptions{
+		Roots:       s.clusterCA,
+		CurrentTime: s.now(),
+		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning},
+	}); err != nil {
+		return updatePayload{}, fmt.Errorf("%w: the signer certificate does not chain to the cluster CA: %w", errUpdateRefused, err)
 	}
-	if _, ok := a.Manifest["k3sm"]; !ok {
-		return fmt.Errorf("%w: the manifest does not name k3sm", errUpdateRefused)
+	// x509.Verify treats a leaf with no extended key usage as valid for any
+	// usage, so the Code Signing EKU is required of the leaf explicitly: a
+	// client certificate under the same CA can never stand in for the signer.
+	if !slices.Contains(signer.ExtKeyUsage, x509.ExtKeyUsageCodeSigning) {
+		return updatePayload{}, fmt.Errorf("%w: the signer certificate does not carry the Code Signing extended key usage", errUpdateRefused)
 	}
-	for rel, sum := range a.Manifest {
-		if !validSetPath(rel) {
-			return fmt.Errorf("%w: manifest path %q is not a clean relative path", errUpdateRefused, rel)
+	if signer.Subject.CommonName != wire.UpdateSignerCommonName || !slices.Contains(signer.Subject.Organization, wire.UpdateSignerOrganization) {
+		return updatePayload{}, fmt.Errorf("%w: the signer certificate names CN=%q O=%q, not CN=%q O=%q", errUpdateRefused,
+			signer.Subject.CommonName, signer.Subject.Organization, wire.UpdateSignerCommonName, wire.UpdateSignerOrganization)
+	}
+	pub, ok := signer.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return updatePayload{}, fmt.Errorf("%w: the signer key is %T, not ECDSA", errUpdateRefused, signer.PublicKey)
+	}
+	digest := sha256.Sum256(a.Payload)
+	if !ecdsa.VerifyASN1(pub, digest[:], a.Signature) {
+		return updatePayload{}, fmt.Errorf("%w: the payload signature does not verify", errUpdateRefused)
+	}
+	return parseUpdatePayload(a.Payload)
+}
+
+// parseSignerCert decodes the one PEM certificate the request carries.
+func parseSignerCert(raw []byte) (*x509.Certificate, error) {
+	block, rest := pem.Decode(raw)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, fmt.Errorf("%w: the signer certificate is not a PEM CERTIFICATE", errUpdateRefused)
+	}
+	if len(bytes.TrimSpace(rest)) != 0 {
+		return nil, fmt.Errorf("%w: the signer certificate PEM holds more than one block", errUpdateRefused)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse the signer certificate: %w", errUpdateRefused, err)
+	}
+	return cert, nil
+}
+
+// parseUpdatePayload decodes the verified payload strictly and checks its
+// fields.
+func parseUpdatePayload(raw []byte) (updatePayload, error) {
+	var p updatePayload
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&p); err != nil {
+		return updatePayload{}, fmt.Errorf("%w: the payload is not valid JSON: %w", errUpdateRefused, err)
+	}
+	if dec.More() {
+		return updatePayload{}, fmt.Errorf("%w: the payload holds more than one JSON value", errUpdateRefused)
+	}
+	if len(p.Version) > maxVersionLen || !releaseTagGrammar.MatchString(p.Version) {
+		return updatePayload{}, fmt.Errorf("%w: the payload version %q is not a release tag", errUpdateRefused, p.Version)
+	}
+	if len(p.SHA256) != sha256.Size*2 || strings.ToLower(p.SHA256) != p.SHA256 {
+		return updatePayload{}, fmt.Errorf("%w: the payload sha256 is not a lowercase hex sha256", errUpdateRefused)
+	}
+	if _, err := hex.DecodeString(p.SHA256); err != nil {
+		return updatePayload{}, fmt.Errorf("%w: the payload sha256 is not a lowercase hex sha256", errUpdateRefused)
+	}
+	switch p.Signature {
+	case "", updatesv1alpha1.UpdateSignatureIfSigned, updatesv1alpha1.UpdateSignatureRequired:
+	default:
+		return updatePayload{}, fmt.Errorf("%w: unknown signature policy %q", errUpdateRefused, p.Signature)
+	}
+	return p, nil
+}
+
+// loadClusterCA reads the cluster CA certificates (PEM) at path into a pool.
+// Every certificate in the file must be a CA.
+func loadClusterCA(path string) (*x509.CertPool, error) {
+	if path == "" {
+		return nil, errors.New("netd was started without --cluster-ca")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open the cluster CA: %w", err)
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxClusterCABytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read the cluster CA %s: %w", path, err)
+	}
+	if len(raw) > maxClusterCABytes {
+		return nil, fmt.Errorf("the cluster CA %s is larger than %d bytes", path, maxClusterCABytes)
+	}
+	pool := x509.NewCertPool()
+	n := 0
+	for {
+		var block *pem.Block
+		block, raw = pem.Decode(raw)
+		if block == nil {
+			break
 		}
-		if len(sum) != sha256.Size*2 || strings.ToLower(sum) != sum {
-			return fmt.Errorf("%w: manifest digest for %q is not a lowercase hex sha256", errUpdateRefused, rel)
+		if block.Type != "CERTIFICATE" {
+			continue
 		}
-		if _, err := hex.DecodeString(sum); err != nil {
-			return fmt.Errorf("%w: manifest digest for %q is not a lowercase hex sha256", errUpdateRefused, rel)
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse the cluster CA %s: %w", path, err)
 		}
+		if !cert.BasicConstraintsValid || !cert.IsCA {
+			return nil, fmt.Errorf("the cluster CA %s holds a certificate that is not a CA (%s)", path, cert.Subject)
+		}
+		pool.AddCert(cert)
+		n++
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("the cluster CA %s holds no PEM certificate", path)
+	}
+	return pool, nil
+}
+
+// openUpdateArchive opens the archive without following a final symlink and
+// requires a clean absolute path, a regular file, the service uid as owner,
+// and at most wire.MaxUpdateArchiveBytes.
+func openUpdateArchive(p string, uid uint32) (*os.File, error) {
+	if !filepath.IsAbs(p) || filepath.Clean(p) != p {
+		return nil, fmt.Errorf("%w: the archive path %q is not a clean absolute path", errUpdateRefused, p)
+	}
+	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("%w: open the archive %s: %w", errUpdateRefused, p, err)
+	}
+	f := os.NewFile(uintptr(fd), p)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: stat the archive %s: %w", errUpdateRefused, p, err)
+	}
+	switch {
+	case st.Mode&unix.S_IFMT != unix.S_IFREG:
+		err = fmt.Errorf("%w: the archive %s is not a regular file", errUpdateRefused, p)
+	case st.Uid != uid:
+		err = fmt.Errorf("%w: the archive %s is owned by uid %d, not the service uid %d", errUpdateRefused, p, st.Uid, uid)
+	case st.Size > wire.MaxUpdateArchiveBytes:
+		err = fmt.Errorf("%w: the archive %s is larger than %d bytes", errUpdateRefused, p, wire.MaxUpdateArchiveBytes)
+	}
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// copyVerifiedArchive copies the archive into an unlinked root-only file
+// under root, hashing the bytes as it writes them, and returns that copy at
+// offset 0 when they hash to want. The extraction then reads the copy, so the
+// service uid, which owns the original, cannot change the bytes after they
+// were hashed.
+func copyVerifiedArchive(archive *os.File, root, want string) (*os.File, error) {
+	tmp, err := os.CreateTemp(root, updateDirPrefix+"archive-")
+	if err != nil {
+		return nil, fmt.Errorf("create the archive copy in %s: %w", root, err)
+	}
+	if err := os.Remove(tmp.Name()); err != nil {
+		_ = tmp.Close()
+		return nil, fmt.Errorf("unlink the archive copy %s: %w", tmp.Name(), err)
+	}
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(archive, wire.MaxUpdateArchiveBytes+1))
+	switch {
+	case err != nil:
+		err = fmt.Errorf("%w: read the archive: %w", errUpdateRefused, err)
+	case n > wire.MaxUpdateArchiveBytes:
+		err = fmt.Errorf("%w: the archive is larger than %d bytes", errUpdateRefused, wire.MaxUpdateArchiveBytes)
+	default:
+		if got := hex.EncodeToString(h.Sum(nil)); got != want {
+			err = fmt.Errorf("%w: the archive has sha256 %s, the signed payload says %s", errUpdateRefused, got, want)
+		}
+	}
+	if err == nil {
+		_, err = tmp.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		_ = tmp.Close()
+		return nil, err
+	}
+	return tmp, nil
+}
+
+// checkNotDowngrade refuses a version below the installed k3sm's, and refuses
+// when the two cannot be ordered (an installed dev build, say): without
+// allowDowngrade the daemon installs only what it can prove is not older.
+func (s *Server) checkNotDowngrade(ctx context.Context, version string) error {
+	installed, err := s.installedVersion(ctx, s.installedK3sm)
+	if err != nil {
+		return fmt.Errorf("%w: read the installed version: %w", errUpdateRefused, err)
+	}
+	cmp, ok := compareReleases(version, installed)
+	switch {
+	case !ok:
+		return fmt.Errorf("%w: %s cannot be ordered against the installed %q; the payload must allow a downgrade", errUpdateRefused, version, installed)
+	case cmp < 0:
+		return fmt.Errorf("%w: %s is below the installed %s and the payload does not allow a downgrade", errUpdateRefused, version, installed)
 	}
 	return nil
 }
 
-// validSetPath reports whether rel is a clean, slash-separated relative path
-// with no "." or ".." component.
-func validSetPath(rel string) bool {
-	if rel == "" || strings.HasPrefix(rel, "/") || strings.ContainsRune(rel, 0) || path.Clean(rel) != rel {
-		return false
+// probeInstalledVersion is the production installedVersionFunc: it runs
+// `<path> version` with a fixed argv and environment, bounded in time and
+// output, and returns the tag of its first line ("k3sm <tag>").
+func probeInstalledVersion(ctx context.Context, path string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, versionProbeTimeout)
+	defer cancel()
+	out := &capBuffer{max: versionProbeMaxBytes}
+	cmd := exec.CommandContext(ctx, path, "version")
+	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
+	cmd.Stdout = out
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("run %s version: %w", path, err)
 	}
-	for _, c := range strings.Split(rel, "/") {
-		if c == "." || c == ".." {
-			return false
+	return parseVersionOutput(out.String())
+}
+
+// parseVersionOutput reads the tag from `k3sm version` output.
+func parseVersionOutput(out string) (string, error) {
+	first, _, _ := strings.Cut(out, "\n")
+	name, tag, ok := strings.Cut(strings.TrimSpace(first), " ")
+	if !ok || name != "k3sm" || tag == "" || strings.ContainsAny(tag, " \t") {
+		return "", fmt.Errorf("unexpected version output %q", first)
+	}
+	return tag, nil
+}
+
+// releaseSemver matches MAJOR.MINOR.PATCH, an optional prerelease and optional
+// build metadata (ignored for ordering), with an optional leading "v".
+var releaseSemver = regexp.MustCompile(`^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$`)
+
+// pseudoPrerelease is the tail of a Go pseudo-version prerelease: a build of
+// an untagged commit, which is not a release.
+var pseudoPrerelease = regexp.MustCompile(`(^|\.)\d{14}-[0-9a-f]{12}$`)
+
+// releaseVersion is a parsed release version.
+type releaseVersion struct {
+	core [3]uint64
+	pre  []string
+}
+
+// parseRelease parses a tagged release version, or false for anything else (a
+// dev build, a pseudo-version, garbage).
+func parseRelease(s string) (releaseVersion, bool) {
+	m := releaseSemver.FindStringSubmatch(s)
+	if m == nil {
+		return releaseVersion{}, false
+	}
+	var v releaseVersion
+	for i := range 3 {
+		n, err := strconv.ParseUint(m[i+1], 10, 64)
+		if err != nil {
+			return releaseVersion{}, false
+		}
+		v.core[i] = n
+	}
+	if m[4] != "" {
+		if pseudoPrerelease.MatchString(m[4]) {
+			return releaseVersion{}, false
+		}
+		v.pre = strings.Split(m[4], ".")
+	}
+	return v, true
+}
+
+// compareReleases orders two release versions by semver precedence: -1, 0 or
+// 1 as a sorts before, with or after b; ok is false when either is not a
+// tagged release. Ported from k3sm's pkg/version CompareReleases (Apache-2.0,
+// The k3sm Authors).
+func compareReleases(a, b string) (int, bool) {
+	va, okA := parseRelease(a)
+	vb, okB := parseRelease(b)
+	if !okA || !okB {
+		return 0, false
+	}
+	for i := range 3 {
+		if va.core[i] != vb.core[i] {
+			if va.core[i] < vb.core[i] {
+				return -1, true
+			}
+			return 1, true
 		}
 	}
-	return true
+	return comparePrerelease(va.pre, vb.pre), true
+}
+
+// comparePrerelease orders two prerelease lists (semver §11): none sorts after
+// any, numeric identifiers compare numerically and before alphanumeric ones,
+// and a shorter prefix sorts first.
+func comparePrerelease(a, b []string) int {
+	switch {
+	case len(a) == 0 && len(b) == 0:
+		return 0
+	case len(a) == 0:
+		return 1
+	case len(b) == 0:
+		return -1
+	}
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if c := comparePreIdent(a[i], b[i]); c != 0 {
+			return c
+		}
+	}
+	switch {
+	case len(a) < len(b):
+		return -1
+	case len(a) > len(b):
+		return 1
+	}
+	return 0
+}
+
+// comparePreIdent orders two prerelease identifiers.
+func comparePreIdent(a, b string) int {
+	na, errA := strconv.ParseUint(a, 10, 64)
+	nb, errB := strconv.ParseUint(b, 10, 64)
+	switch {
+	case errA == nil && errB == nil:
+		switch {
+		case na < nb:
+			return -1
+		case na > nb:
+			return 1
+		}
+		return 0
+	case errA == nil:
+		return -1
+	case errB == nil:
+		return 1
+	}
+	return strings.Compare(a, b)
 }
 
 // ensureStagingRoot creates the staging root when it is absent (0700) and
@@ -349,7 +733,8 @@ func lockStaging(lockPath string) (*os.File, error) {
 }
 
 // sweepUpdateDirs removes the staging directories an earlier ApplyUpdate left
-// when this daemon was stopped under its installer. It runs under the staging
+// when this daemon was stopped under its installer (and an archive copy a
+// crash left before it was unlinked). It runs under the staging
 // lock, which a still-running installer holds, so a live directory is never
 // removed. Only real directories with the ApplyUpdate prefix are touched.
 func sweepUpdateDirs(root string, log *slog.Logger) {
@@ -358,7 +743,7 @@ func sweepUpdateDirs(root string, log *slog.Logger) {
 		return
 	}
 	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), updateDirPrefix) || e.Type()&os.ModeType != os.ModeDir {
+		if !strings.HasPrefix(e.Name(), updateDirPrefix) || (e.Type()&os.ModeType != os.ModeDir && !e.Type().IsRegular()) {
 			continue
 		}
 		p := filepath.Join(root, e.Name())
@@ -366,182 +751,6 @@ func sweepUpdateDirs(root string, log *slog.Logger) {
 			log.Warn("netd: removing a stale update staging directory failed", "dir", p, "err", err)
 		}
 	}
-}
-
-// copyUpdateSet copies the set at src into dst, which exists and is empty, and
-// returns the sha256 of every regular file it wrote, by relative path. It never
-// follows a symlink: every directory is opened relative to its parent with
-// O_NOFOLLOW and every entry is judged by an lstat and again on its open
-// descriptor. It refuses a symlink, a special file, a set-id file, an entry not
-// owned by uid, a file the manifest does not name, and a set over
-// wire.MaxUpdateSetBytes. Permission bits are kept, less group and other write,
-// which the installer refuses.
-func copyUpdateSet(src, dst string, uid uint32, manifest map[string]string) (map[string]string, error) {
-	fd, err := unix.Open(src, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, fmt.Errorf("%w: open the set %s: %w", errUpdateRefused, src, err)
-	}
-	c := &setCopier{uid: uid, manifest: manifest, sums: make(map[string]string)}
-	if err := c.dir(fd, src, dst, "", 0); err != nil {
-		return nil, err
-	}
-	return c.sums, nil
-}
-
-// setCopier carries one copy's running state.
-type setCopier struct {
-	uid      uint32
-	manifest map[string]string
-	total    int64
-	sums     map[string]string
-}
-
-// dir copies the directory open at fd (closing fd) into dstDir. rel is its
-// path inside the set ("" for the set itself).
-func (c *setCopier) dir(fd int, srcName, dstDir, rel string, depth int) error {
-	f := os.NewFile(uintptr(fd), srcName)
-	defer f.Close()
-	if depth > maxUpdateDepth {
-		return fmt.Errorf("%w: %s is nested deeper than %d", errUpdateRefused, srcName, maxUpdateDepth)
-	}
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return fmt.Errorf("%w: stat %s: %w", errUpdateRefused, srcName, err)
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
-		return fmt.Errorf("%w: %s is not a directory", errUpdateRefused, srcName)
-	}
-	if st.Uid != c.uid {
-		return fmt.Errorf("%w: %s is owned by uid %d, not the service uid %d", errUpdateRefused, srcName, st.Uid, c.uid)
-	}
-	names, err := f.Readdirnames(-1)
-	if err != nil {
-		return fmt.Errorf("%w: list %s: %w", errUpdateRefused, srcName, err)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		childRel := name
-		if rel != "" {
-			childRel = rel + "/" + name
-		}
-		if err := c.entry(fd, srcName, dstDir, name, childRel, depth); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// entry copies one directory entry of the directory open at parent.
-func (c *setCopier) entry(parent int, parentName, dstDir, name, rel string, depth int) error {
-	srcName := filepath.Join(parentName, name)
-	var lst unix.Stat_t
-	if err := unix.Fstatat(parent, name, &lst, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return fmt.Errorf("%w: lstat %s: %w", errUpdateRefused, srcName, err)
-	}
-	switch lst.Mode & unix.S_IFMT {
-	case unix.S_IFLNK:
-		return fmt.Errorf("%w: %s is a symlink", errUpdateRefused, srcName)
-	case unix.S_IFDIR:
-		fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if err != nil {
-			return fmt.Errorf("%w: open %s: %w", errUpdateRefused, srcName, err)
-		}
-		dst := filepath.Join(dstDir, name)
-		if err := os.Mkdir(dst, 0o700); err != nil {
-			_ = unix.Close(fd)
-			return fmt.Errorf("create %s: %w", dst, err)
-		}
-		if err := c.dir(fd, srcName, dst, rel, depth+1); err != nil {
-			return err
-		}
-		return os.Chmod(dst, setMode(lst.Mode))
-	case unix.S_IFREG:
-		return c.file(parent, srcName, filepath.Join(dstDir, name), name, rel)
-	default:
-		return fmt.Errorf("%w: %s is not a regular file or directory", errUpdateRefused, srcName)
-	}
-}
-
-// file copies one regular file, hashing the bytes it writes.
-func (c *setCopier) file(parent int, srcName, dst, name, rel string) error {
-	if _, ok := c.manifest[rel]; !ok {
-		return fmt.Errorf("%w: %s is not in the manifest", errUpdateRefused, rel)
-	}
-	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
-	if err != nil {
-		return fmt.Errorf("%w: open %s: %w", errUpdateRefused, srcName, err)
-	}
-	in := os.NewFile(uintptr(fd), srcName)
-	defer in.Close()
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return fmt.Errorf("%w: stat %s: %w", errUpdateRefused, srcName, err)
-	}
-	switch {
-	case st.Mode&unix.S_IFMT != unix.S_IFREG:
-		return fmt.Errorf("%w: %s is not a regular file", errUpdateRefused, srcName)
-	case st.Uid != c.uid:
-		return fmt.Errorf("%w: %s is owned by uid %d, not the service uid %d", errUpdateRefused, srcName, st.Uid, c.uid)
-	case st.Mode&(unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) != 0:
-		return fmt.Errorf("%w: %s carries a set-id or sticky bit", errUpdateRefused, srcName)
-	}
-	room := wire.MaxUpdateSetBytes - c.total
-	if st.Size > room {
-		return fmt.Errorf("%w: the set is larger than %d bytes", errUpdateRefused, wire.MaxUpdateSetBytes)
-	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW, 0o600)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", dst, err)
-	}
-	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(out, h), io.LimitReader(in, room+1))
-	if err == nil && n > room {
-		err = fmt.Errorf("%w: the set is larger than %d bytes", errUpdateRefused, wire.MaxUpdateSetBytes)
-	}
-	if err == nil {
-		err = out.Chmod(setMode(st.Mode))
-	}
-	if cerr := out.Close(); err == nil && cerr != nil {
-		err = cerr
-	}
-	if err != nil {
-		return fmt.Errorf("copy %s: %w", srcName, err)
-	}
-	c.total += n
-	c.sums[rel] = hex.EncodeToString(h.Sum(nil))
-	return nil
-}
-
-// setMode is the permission a staged copy carries: the source's permission
-// bits without group or other write.
-func setMode(mode uint16) os.FileMode {
-	return os.FileMode(mode) & 0o755
-}
-
-// checkManifest compares the digests of the copied files with the manifest:
-// every manifest file must have been copied, and with the same digest. (A
-// copied file the manifest does not name was refused during the copy.)
-func checkManifest(manifest, got map[string]string) error {
-	rels := make([]string, 0, len(manifest))
-	for rel := range manifest {
-		rels = append(rels, rel)
-	}
-	sort.Strings(rels)
-	for _, rel := range rels {
-		sum, ok := got[rel]
-		if !ok {
-			return fmt.Errorf("%w: %s is in the manifest but not in the set", errUpdateRefused, rel)
-		}
-		if sum != manifest[rel] {
-			return fmt.Errorf("%w: %s has sha256 %s, the manifest says %s", errUpdateRefused, rel, sum, manifest[rel])
-		}
-	}
-	for rel := range got {
-		if _, ok := manifest[rel]; !ok {
-			return fmt.Errorf("%w: %s is not in the manifest", errUpdateRefused, rel)
-		}
-	}
-	return nil
 }
 
 // logTail returns the last updateLogTailLines lines of the installer log, from

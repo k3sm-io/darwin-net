@@ -53,11 +53,20 @@ The protocol (`pkg/netd/wire`) is a closed, versioned set of verbs: `EnsureAlias
 `RemoveAlias`, `ConfigureMesh`, `RemoveMesh`, `BindPort`, `Hello`, `EnsureInterconnectAlias`,
 `RemoveInterconnectAlias` and `ApplyUpdate`. Each carries only typed scalars (an IP, a port, a
 slot, a typed peer list). It never accepts raw route, `pf`, or WireGuard configuration text.
-`ApplyUpdate` is the one verb that names a filesystem path: a build set the unprivileged agent
-prepared, which the daemon only reads (every entry owned by the service user, no symlinks), copies
-into a fresh root-only staging directory, checks file by file against the request's sha256
-manifest, and only then installs by running the staged `k3sm install --from-staging`, the one
-binary of the set it ever runs. The daemon never downloads anything. The daemon does not trust its caller:
+`ApplyUpdate` is the one verb that names a filesystem path: the release archive the unprivileged
+agent downloaded. It installs only what the cluster's update signer authorised. The request
+carries the payload the update controller wrote on the Node (version, archive sha256, signing
+policy, downgrade permission), an ECDSA signature over it, and the signer's certificate, which
+must chain to the cluster CA the daemon was started with (`--cluster-ca`, system roots excluded)
+and name the update signer with the Code Signing extended key usage. Only the server holds that CA's key, so a node writing its own
+annotation, or a process running as the service user with a tarball of its own, cannot authorise
+an update; the server is already root-equivalent on every node it manages, as in k3s. The daemon
+then hashes the archive itself (opened without following symlinks, owned by the service user)
+against the signed digest, extracts it itself into a fresh root-only staging directory (regular
+files of the known build set only), checks every staged Mach-O's code signature against the
+installed binary's team with `/usr/bin/codesign`, refuses a downgrade the payload does not allow,
+and only then runs the staged `k3sm install --from-staging`, the one binary of the set it ever
+runs. The daemon never downloads anything. The daemon does not trust its caller:
 it re-derives and re-validates every parameter (CIDR containment, route sets, port authorization)
 against the same logic in `pkg/podnet` and `pkg/mesh`, then renders the privileged artifacts
 itself. Every connection is authenticated at accept time by peer credential (`LOCAL_PEERCRED`)

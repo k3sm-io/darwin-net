@@ -36,8 +36,8 @@ limitations under the License.
 //     anything else is logged and closed (PeerVerifier). See peercred.go for the
 //     defense-in-depth code-identity TODO.
 //   - A closed verb set carrying only typed scalars. The protocol never accepts
-//     route/pf/wireguard-UAPI text, and no filesystem path except the one
-//     ApplyUpdate reads from (below). The daemon RE-DERIVES and
+//     route/pf/wireguard-UAPI text, and no filesystem path except the archive
+//     ApplyUpdate reads (below), whose content is bound to a signed payload. The daemon RE-DERIVES and
 //     RE-VALIDATES every parameter (CIDR containment via pkg/podnet, the route set
 //     via pkg/mesh.RouteSet/ValidatePlan, the port policy) and RENDERS the UAPI
 //     itself, reusing the existing pkg/podnet and pkg/mesh logic rather
@@ -64,32 +64,69 @@ limitations under the License.
 //
 // # ApplyUpdate: the managed update's root step
 //
-// ApplyUpdate (protocol minor 3) installs a k3sm build set the unprivileged
-// agent downloaded and checked. The daemon never fetches anything itself. The
-// steps run in this order, and the reply streams one frame per phase:
+// ApplyUpdate (protocol minor 4) installs a k3sm release the cluster's update
+// signer authorised. The unprivileged agent downloads the release archive and
+// passes its path with the payload the update controller wrote on the Node,
+// that payload's signature, and the signer certificate. The daemon fetches
+// nothing itself, and nothing the caller computed is trusted: every decision
+// comes from the signed payload and from bytes the daemon read itself.
+//
+// Chain of trust. The archive digest, the release tag, the code-signing policy
+// and the downgrade permission are all in the payload, and the payload is
+// signed by a key whose certificate (CN k3sm:update-signer, O
+// k3sm:update-signers, the Code Signing extended key usage) must chain to the cluster CA the daemon was started with
+// (Config.ClusterCAPath, `k3sm netd --cluster-ca`), the system roots excluded.
+// Only the server holds that CA's key. So a node that writes its own Node
+// annotation, or a process running as the service uid with a tarball of its
+// own, cannot authorise an update: it can produce neither a signer certificate
+// under the cluster CA nor a signature by one. The server, as the CA holder, is
+// already root-equivalent on every node it manages, which is the k3s posture;
+// this verb gives it no authority it did not have. A daemon started without a
+// cluster CA, or with one that does not load, refuses every ApplyUpdate.
+//
+// The steps run in this order, each refusal is a Failed frame with the reason,
+// and no step runs after a refusal:
 //
 //  1. The caller check. The verb re-reads the peer credential and requires the
 //     service uid, whatever PeerVerifier admitted the connection.
-//  2. Verifying. The set is copied into a fresh root:wheel 0700 directory
-//     directly under DefaultUpdateStagingRoot (/Library/k3sm.staging), under
-//     the installer's staging lock. Every directory is opened relative to its
-//     parent with O_NOFOLLOW; a symlink, a special file, a set-id file, an entry
-//     not owned by the service uid, a file the manifest does not name, or a set
-//     over wire.MaxUpdateSetBytes (2 GiB) refuses the update. Permission bits
-//     are kept, less group and other write. Every copied file's sha256 must
-//     match the manifest, and every manifest file must be present.
-//  3. A root-owned log is created beside the set.
-//  4. Installing. The staged k3sm, and nothing else from the set, is executed:
-//     `<staging>/k3sm install --from-staging <staging>`, plus --allow-downgrade and --require-team-signature when asked. It runs in
-//     its own session with its output in the log, holds an inherited copy of
-//     the staging lock, and is killed after wire.UpdateInstallTimeout (20 min).
-//  5. Done on exit 0, Failed with the log's last lines otherwise; a refusal at
-//     any earlier step is Failed with the reason.
+//  2. Verifying. The signer certificate parses, chains to the cluster CA
+//     within its validity, carries the Code Signing extended key usage (a
+//     client certificate under the same CA is refused), and names the update
+//     signer; the ECDSA signature
+//     verifies over sha256 of the payload bytes; the payload decodes strictly
+//     and its version is a release tag (v<major>.<minor>.<patch>[-<pre>]).
+//  3. The archive is opened with O_NOFOLLOW and must be a regular file the
+//     service uid owns, at most wire.MaxUpdateArchiveBytes (512 MiB). Under the
+//     installer's staging lock the daemon copies it into an unlinked root-only
+//     file, hashing what it writes, and refuses unless that equals the
+//     payload's sha256; everything after reads the copy, so the owner of the
+//     original cannot change the bytes once they are hashed.
+//  4. The daemon extracts the copy itself into a fresh root:wheel 0700
+//     directory directly under DefaultUpdateStagingRoot (/Library/k3sm.staging):
+//     regular files only, no links, no absolute or ".." paths, the names k3sm,
+//     k3sm-execshim, k3sm-vmhost, the two shim dylibs and cp-payload/**, with
+//     LICENSE, NOTICE and k3sm-netd read past and any other name refused, and at
+//     most wire.MaxUpdateSetBytes (2 GiB) unpacked, skipped members counted.
+//  5. The code-signing policy, through /usr/bin/codesign (`--verify --strict`
+//     and `-dv` for the Team ID): every staged Mach-O must be validly signed; a
+//     team-signed installed /Library/k3sm/k3sm requires that team throughout;
+//     an ad-hoc install accepts an all-ad-hoc tree or one team throughout; the
+//     payload's signature: required refuses a tree without a team; a mixed tree
+//     is refused. Then, unless the payload allows a downgrade, a version below
+//     the installed binary's (`/Library/k3sm/k3sm version`), or one that cannot
+//     be ordered against it, is refused.
+//  6. Installing. A root-owned log is created beside the set and the staged
+//     k3sm, and nothing else from the set, is executed:
+//     `<staging>/k3sm install --from-staging <staging>`, plus --allow-downgrade
+//     when the payload allows it. The staged installer keeps its own checks as
+//     defense in depth; the daemon's are the ones that count. It runs in its
+//     own session with its output in the log, holds an inherited copy of the
+//     staging lock, and is killed after wire.UpdateInstallTimeout (20 min).
+//  7. Done on exit 0, Failed with the log's last lines otherwise.
 //
 // An in-place update needs no join token, so none is staged. An ApplyUpdate
-// request may be up to wire.MaxApplyUpdateRequestBytes (256 KiB), so a large
-// manifest is never why an update fails; every other verb keeps the
-// Config.MaxRequestBytes cap.
+// request may be up to wire.MaxApplyUpdateRequestBytes (256 KiB); every other
+// verb keeps the Config.MaxRequestBytes cap.
 //
 // The installer restarts this daemon, so the connection usually closes during
 // Installing; the client reports that as Restarting and the restarted node's

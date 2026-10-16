@@ -442,7 +442,7 @@ func (c *Client) BindPort(ctx context.Context, network string, addr netip.AddrPo
 }
 
 // applyUpdateSlack is the client's allowance beyond UpdateInstallTimeout for
-// the copy and digest check that come before the installer runs.
+// the verification and extraction that come before the installer runs.
 const applyUpdateSlack = 10 * time.Minute
 
 // UpdateResult is the outcome of an ApplyUpdate as this client saw it: the last
@@ -453,10 +453,10 @@ type UpdateResult struct {
 	Log   string
 }
 
-// ApplyUpdate asks the daemon to install the build set the agent prepared at
-// args.SourceDir (see ApplyUpdateArgs and VerbApplyUpdate). progress, when not
-// nil, is called with each phase the daemon reports, in order. It sends Hello
-// first on the same connection and, against a helper older than minor 3, sends
+// ApplyUpdate asks the daemon to verify and install the signed release in args
+// (see ApplyUpdateArgs and VerbApplyUpdate). progress, when not nil, is called
+// with each phase the daemon reports, in order. It sends Hello first on the
+// same connection and, against a helper older than MinorApplyUpdate, sends
 // nothing more and returns ErrHelperTooOld.
 //
 // A Failed phase is returned as an error wrapping nothing named, with the
@@ -464,7 +464,7 @@ type UpdateResult struct {
 // Installing with no final frame is not an error: the installer restarts this
 // helper, so the result is Restarting and the outcome is the restarted node's
 // version. When ctx carries no deadline the call is bounded by
-// UpdateInstallTimeout plus a fixed allowance for the copy.
+// UpdateInstallTimeout plus a fixed allowance for the verification.
 func (c *Client) ApplyUpdate(ctx context.Context, args ApplyUpdateArgs, progress func(UpdatePhase)) (UpdateResult, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
