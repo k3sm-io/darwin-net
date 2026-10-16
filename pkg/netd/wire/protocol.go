@@ -90,7 +90,8 @@ const MaxUpdateArchiveBytes int64 = 512 << 20
 const MaxUpdateArchiveMembers = 4096
 
 // UpdateSignerCommonName and UpdateSignerOrganization are the subject an
-// ApplyUpdate signer certificate must carry, under the cluster CA.
+// ApplyUpdate signer certificate must carry, under the cluster CA, together
+// with the Code Signing extended key usage.
 const (
 	UpdateSignerCommonName   = "k3sm:update-signer"
 	UpdateSignerOrganization = "k3sm:update-signers"
@@ -342,8 +343,8 @@ type InterconnectAliasArgs struct {
 // downgrade permission from it and from nothing else. Signature is a
 // DER-encoded ECDSA signature over the SHA-256 of Payload, and SignerCert the
 // PEM certificate of the key that made it, which must chain to the cluster CA
-// the daemon was started with and carry the subject UpdateSignerCommonName,
-// UpdateSignerOrganization.
+// the daemon was started with, carry the Code Signing extended key usage, and
+// name the subject UpdateSignerCommonName, UpdateSignerOrganization.
 type ApplyUpdateArgs struct {
 	ArchivePath string `json:"archivePath"`
 	Payload     []byte `json:"payload"`

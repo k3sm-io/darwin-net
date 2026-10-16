@@ -58,7 +58,7 @@ agent downloaded. It installs only what the cluster's update signer authorised. 
 carries the payload the update controller wrote on the Node (version, archive sha256, signing
 policy, downgrade permission), an ECDSA signature over it, and the signer's certificate, which
 must chain to the cluster CA the daemon was started with (`--cluster-ca`, system roots excluded)
-and name the update signer. Only the server holds that CA's key, so a node writing its own
+and name the update signer with the Code Signing extended key usage. Only the server holds that CA's key, so a node writing its own
 annotation, or a process running as the service user with a tarball of its own, cannot authorise
 an update; the server is already root-equivalent on every node it manages, as in k3s. The daemon
 then hashes the archive itself (opened without following symlinks, owned by the service user)

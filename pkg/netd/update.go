@@ -327,8 +327,8 @@ func (s *Server) updateFailed(err error, tail string) wire.Response {
 
 // verifyUpdatePayload checks the request's chain of trust and returns the
 // payload it authorises: the cluster CA is configured, the signer certificate
-// chains to it (the system roots excluded) within its validity and names the
-// update signer, the ECDSA signature verifies over sha256(Payload), and the
+// chains to it (the system roots excluded) within its validity, carries the
+// Code Signing extended key usage and names the update signer, the ECDSA signature verifies over sha256(Payload), and the
 // payload parses with a release tag, a sha256 and a known signing policy.
 func (s *Server) verifyUpdatePayload(a *wire.ApplyUpdateArgs) (updatePayload, error) {
 	if s.clusterCA == nil {
@@ -341,11 +341,15 @@ func (s *Server) verifyUpdatePayload(a *wire.ApplyUpdateArgs) (updatePayload, er
 	if _, err := signer.Verify(x509.VerifyOptions{
 		Roots:       s.clusterCA,
 		CurrentTime: s.now(),
-		// The signer identity is its subject under the cluster CA; no
-		// extended key usage is required of it.
-		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning},
 	}); err != nil {
 		return updatePayload{}, fmt.Errorf("%w: the signer certificate does not chain to the cluster CA: %w", errUpdateRefused, err)
+	}
+	// x509.Verify treats a leaf with no extended key usage as valid for any
+	// usage, so the Code Signing EKU is required of the leaf explicitly: a
+	// client certificate under the same CA can never stand in for the signer.
+	if !slices.Contains(signer.ExtKeyUsage, x509.ExtKeyUsageCodeSigning) {
+		return updatePayload{}, fmt.Errorf("%w: the signer certificate does not carry the Code Signing extended key usage", errUpdateRefused)
 	}
 	if signer.Subject.CommonName != wire.UpdateSignerCommonName || !slices.Contains(signer.Subject.Organization, wire.UpdateSignerOrganization) {
 		return updatePayload{}, fmt.Errorf("%w: the signer certificate names CN=%q O=%q, not CN=%q O=%q", errUpdateRefused,

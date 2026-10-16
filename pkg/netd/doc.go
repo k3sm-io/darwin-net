@@ -74,7 +74,7 @@ limitations under the License.
 // Chain of trust. The archive digest, the release tag, the code-signing policy
 // and the downgrade permission are all in the payload, and the payload is
 // signed by a key whose certificate (CN k3sm:update-signer, O
-// k3sm:update-signers) must chain to the cluster CA the daemon was started with
+// k3sm:update-signers, the Code Signing extended key usage) must chain to the cluster CA the daemon was started with
 // (Config.ClusterCAPath, `k3sm netd --cluster-ca`), the system roots excluded.
 // Only the server holds that CA's key. So a node that writes its own Node
 // annotation, or a process running as the service uid with a tarball of its
@@ -90,7 +90,9 @@ limitations under the License.
 //  1. The caller check. The verb re-reads the peer credential and requires the
 //     service uid, whatever PeerVerifier admitted the connection.
 //  2. Verifying. The signer certificate parses, chains to the cluster CA
-//     within its validity, and names the update signer; the ECDSA signature
+//     within its validity, carries the Code Signing extended key usage (a
+//     client certificate under the same CA is refused), and names the update
+//     signer; the ECDSA signature
 //     verifies over sha256 of the payload bytes; the payload decodes strictly
 //     and its version is a release tag (v<major>.<minor>.<patch>[-<pre>]).
 //  3. The archive is opened with O_NOFOLLOW and must be a regular file the

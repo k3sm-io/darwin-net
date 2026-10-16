@@ -105,8 +105,17 @@ func newCA(t *testing.T, cn string) (*ecdsa.PrivateKey, *x509.Certificate, []byt
 	return key, cert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
+// codeSigning is the extended key usage an update signer carries.
+var codeSigning = []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning}
+
 // leaf issues a leaf certificate for key under the CA.
 func leaf(t *testing.T, caKey *ecdsa.PrivateKey, ca *x509.Certificate, pub any, subj pkix.Name, notAfter time.Time) []byte {
+	t.Helper()
+	return leafEKU(t, caKey, ca, pub, subj, notAfter, codeSigning)
+}
+
+// leafEKU is leaf with the given extended key usages (none when nil).
+func leafEKU(t *testing.T, caKey *ecdsa.PrivateKey, ca *x509.Certificate, pub any, subj pkix.Name, notAfter time.Time, eku []x509.ExtKeyUsage) []byte {
 	t.Helper()
 	tmpl := &x509.Certificate{
 		SerialNumber: nextSerial(),
@@ -114,7 +123,7 @@ func leaf(t *testing.T, caKey *ecdsa.PrivateKey, ca *x509.Certificate, pub any, 
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		ExtKeyUsage:  eku,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, pub, caKey)
 	if err != nil {
@@ -633,6 +642,25 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 			args.SignerCert = leaf(t, h.pki.caKey, h.pki.caCert, &key.PublicKey, tc.subj, time.Now().Add(time.Hour))
 			args.Signature = sign(t, key, args.Payload)
 			h.mustRefuse(h.apply(args), "the signer certificate names")
+		})
+	}
+
+	ekus := []struct {
+		name string
+		eku  []x509.ExtKeyUsage
+		want string
+	}{
+		{"only the client auth EKU", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "does not chain to the cluster CA"},
+		{"no EKU at all", nil, "does not carry the Code Signing extended key usage"},
+	}
+	for _, tc := range ekus {
+		t.Run("refuses a valid chain with the signer CN and O but "+tc.name, func(t *testing.T) {
+			h := newUpdateHarness(t, selfUID())
+			key := newKey(t)
+			args := h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)
+			args.SignerCert = leafEKU(t, h.pki.caKey, h.pki.caCert, &key.PublicKey, signerSubject, time.Now().Add(time.Hour), tc.eku)
+			args.Signature = sign(t, key, args.Payload)
+			h.mustRefuse(h.apply(args), tc.want)
 		})
 	}
 
