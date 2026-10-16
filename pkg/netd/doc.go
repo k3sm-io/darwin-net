@@ -36,7 +36,8 @@ limitations under the License.
 //     anything else is logged and closed (PeerVerifier). See peercred.go for the
 //     defense-in-depth code-identity TODO.
 //   - A closed verb set carrying only typed scalars. The protocol never accepts
-//     route/pf/wireguard-UAPI text or a filesystem path. The daemon RE-DERIVES and
+//     route/pf/wireguard-UAPI text, and no filesystem path except the one
+//     ApplyUpdate reads from (below). The daemon RE-DERIVES and
 //     RE-VALIDATES every parameter (CIDR containment via pkg/podnet, the route set
 //     via pkg/mesh.RouteSet/ValidatePlan, the port policy) and RENDERS the UAPI
 //     itself, reusing the existing pkg/podnet and pkg/mesh logic rather
@@ -53,6 +54,39 @@ limitations under the License.
 //     is ever accepted.
 //   - Per-connection resource caps and an allocation-bounded decoder that never
 //     panics on malformed input (it returns an error response).
+//
+// # ApplyUpdate: the managed update's root step
+//
+// ApplyUpdate (protocol minor 3) installs a k3sm build set the unprivileged
+// agent downloaded and checked. The daemon never fetches anything itself. The
+// steps run in this order, and the reply streams one frame per phase:
+//
+//  1. The caller check. The verb re-reads the peer credential and requires the
+//     service uid, whatever PeerVerifier admitted the connection.
+//  2. Verifying. The set is copied into a fresh root:wheel 0700 directory
+//     directly under DefaultUpdateStagingRoot (/Library/k3sm.staging), under
+//     the installer's staging lock. Every directory is opened relative to its
+//     parent with O_NOFOLLOW; a symlink, a special file, a set-id file, an entry
+//     not owned by the service uid, a file the manifest does not name, or a set
+//     over wire.MaxUpdateSetBytes (2 GiB) refuses the update. Permission bits
+//     are kept, less group and other write. Every copied file's sha256 must
+//     match the manifest, and every manifest file must be present.
+//  3. A one-time token file (mode 0600) and a root-owned log are written beside
+//     the set.
+//  4. Installing. The staged k3sm, and nothing else from the set, is executed:
+//     `<staging>/k3sm install --from-staging <staging> --token-file <token>`,
+//     plus --allow-downgrade and --require-team-signature when asked. It runs in
+//     its own session with its output in the log, holds an inherited copy of
+//     the staging lock, and is killed after wire.UpdateInstallTimeout (20 min).
+//  5. Done on exit 0, Failed with the log's last lines otherwise; a refusal at
+//     any earlier step is Failed with the reason.
+//
+// The installer restarts this daemon, so the connection usually closes during
+// Installing; the client reports that as Restarting and the restarted node's
+// version is the outcome. The staging directory is removed once the installer
+// has returned, or, when the daemon was stopped under it, by the next
+// ApplyUpdate (under the staging lock, which a running installer still holds)
+// or the uninstall.
 //
 // # Selection seam
 //

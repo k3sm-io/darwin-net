@@ -187,6 +187,14 @@ type Server struct {
 	icOwned           map[int]netip.Addr
 	meshRoutes        int
 	meshUp            bool
+
+	// updateMu admits one ApplyUpdate at a time; it is taken with TryLock, so a
+	// second request is refused rather than queued.
+	updateMu sync.Mutex
+	// stagingRoot is where ApplyUpdate stages a set (DefaultUpdateStagingRoot).
+	stagingRoot string
+	// runInstaller is ApplyUpdate's one exec (execInstaller); tests replace it.
+	runInstaller installerRunner
 }
 
 // NewServer constructs a Server from cfg, filling defaults: the cluster aggregate
@@ -288,6 +296,8 @@ func NewServer(cfg Config) *Server {
 		identityConfirmed: restoredOK,
 		aliases:           make(map[netip.Addr]struct{}),
 		icOwned:           make(map[int]netip.Addr),
+		stagingRoot:       DefaultUpdateStagingRoot,
+		runInstaller:      execInstaller,
 	}
 	// Remove this node's derived interconnect aliases that the daemon does not
 	// own (see reconcileInterconnectAtStart); bounded like the sweeps above.
@@ -484,6 +494,8 @@ func (s *Server) handleConn(ctx context.Context, conn *net.UnixConn) {
 	s.log.Debug("netd: peer accepted")
 
 	st := newConnState(s.cfg.MaxPerConn)
+	st.conn = conn
+	st.emit = func(resp wire.Response) error { return s.writeResponse(conn, resp) }
 	for {
 		select {
 		case <-ctx.Done():
@@ -550,6 +562,8 @@ func (s *Server) dispatch(ctx context.Context, st *connState, payload []byte) (w
 		return s.handleEnsureInterconnectAlias(ctx, req.EnsureInterconnectAlias), nil
 	case wire.VerbRemoveInterconnectAlias:
 		return s.handleRemoveInterconnectAlias(ctx, req.RemoveInterconnectAlias), nil
+	case wire.VerbApplyUpdate:
+		return s.handleApplyUpdate(ctx, st, req.ApplyUpdate), nil
 	default:
 		return s.errResp(fmt.Sprintf("unknown verb %q", req.Verb)), nil
 	}
@@ -959,6 +973,13 @@ type connState struct {
 	aliases map[netip.Addr]struct{}
 	bound   int
 	routes  int
+
+	// conn is the connection, for the verb that re-reads its peer credential
+	// (ApplyUpdate); nil when a request is dispatched with no connection.
+	conn *net.UnixConn
+	// emit sends an intermediate response frame on conn (ApplyUpdate's phase
+	// stream); nil with no connection.
+	emit func(wire.Response) error
 }
 
 // newConnState returns per-connection accounting capped at max.

@@ -37,5 +37,7 @@ limitations under the License.
 // peer list). The daemon re-derives and re-validates every parameter and RENDERS
 // the privileged artifacts (UAPI, pf rules) itself. The only file descriptor that
 // ever crosses the socket is the listening socket BindPort returns to the client
-// via SCM_RIGHTS; the protocol accepts no inbound fd and no filesystem path.
+// via SCM_RIGHTS; the protocol accepts no inbound fd. ApplyUpdate is the one verb
+// that carries a filesystem path: a directory the daemon only reads, under the
+// ownership and no-symlink rules its doc comment states.
 package wire

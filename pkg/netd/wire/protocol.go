@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 )
 
 // DefaultSocketPath is the unix socket the k3sm-netd daemon listens on and the
@@ -49,15 +50,30 @@ const DefaultMaxPerConn = 253
 // RemoveInterconnectAlias) with Response.Reason and Response.InterconnectIP. Every
 // reply carries the daemon's own version, and a client sends a newer verb only to
 // a daemon that reported a minor that understands it: an older daemon does not
-// decode strictly, so it would silently drop a field it does not know.
+// decode strictly, so it would silently drop a field it does not know. Minor 3
+// adds ApplyUpdate with Response.Phase and Response.Log.
 const (
 	ProtocolVersionMajor = 1
-	ProtocolVersionMinor = 2
+	ProtocolVersionMinor = 3
 )
 
 // MinorInterconnect is the first minor version that understands Hello and the
 // interconnect alias verbs.
 const MinorInterconnect = 2
+
+// MinorApplyUpdate is the first minor version that understands ApplyUpdate.
+const MinorApplyUpdate = 3
+
+// UpdateInstallTimeout bounds the one installer run ApplyUpdate makes. The
+// daemon kills the installer's whole process group when it expires.
+const UpdateInstallTimeout = 20 * time.Minute
+
+// MaxUpdateSetBytes caps the total size of the regular files in an ApplyUpdate
+// set (2 GiB). A larger set is refused while it is copied.
+const MaxUpdateSetBytes int64 = 2 << 30
+
+// MaxUpdateManifestEntries caps the files an ApplyUpdate manifest may name.
+const MaxUpdateManifestEntries = 4096
 
 // Sentinel errors. Compare with errors.Is, never by string match.
 var (
@@ -158,6 +174,12 @@ func (v Version) SupportsInterconnect() bool {
 	return v.Major == ProtocolVersionMajor && v.Minor >= MinorInterconnect
 }
 
+// SupportsApplyUpdate reports whether a daemon reporting v understands
+// ApplyUpdate.
+func (v Version) SupportsApplyUpdate() bool {
+	return v.Major == ProtocolVersionMajor && v.Minor >= MinorApplyUpdate
+}
+
 // Compatible reports whether a peer speaking v can interoperate with this build:
 // the MAJOR must match (an incompatible-major skew is rejected); any MINOR is
 // accepted because minor revisions are additive/compatible.
@@ -198,7 +220,47 @@ const (
 	// every slot 1..7 alias. The slot bound (0..7) bounds bridge0 at 8
 	// interconnect aliases per node. Minor 2.
 	VerbRemoveInterconnectAlias Verb = "RemoveInterconnectAlias"
+	// VerbApplyUpdate installs a k3sm build set the unprivileged agent staged
+	// and verified the provenance of. It is the one verb that carries a
+	// filesystem path, and the daemon only reads from it: every directory and
+	// file under it must be owned by the service uid, a symlink anywhere refuses
+	// the set, and the daemon copies the set into a fresh root-only directory
+	// under the install staging root, checks every copied file against the
+	// manifest's sha256, and only then runs the copied k3sm's
+	// `install --from-staging`, the one binary of the set it ever runs. The
+	// daemon never downloads anything. The reply is a stream of frames, one per
+	// UpdatePhase, ending in Done or Failed. Minor 3.
+	VerbApplyUpdate Verb = "ApplyUpdate"
 )
+
+// UpdatePhase names one step of an ApplyUpdate, as the daemon reports it.
+type UpdatePhase string
+
+// The ApplyUpdate phases, in the order they are reported.
+const (
+	// UpdatePhaseVerifying: the daemon is copying the set and checking every
+	// copied file against the manifest.
+	UpdatePhaseVerifying UpdatePhase = "Verifying"
+	// UpdatePhaseInstalling: every digest matched and the installer is running.
+	UpdatePhaseInstalling UpdatePhase = "Installing"
+	// UpdatePhaseRestarting is never sent by the daemon. The client reports it
+	// when the stream ends after Installing with no final frame: the installer
+	// restarts the daemon itself, which closes the connection mid-install. The
+	// install continues in its own session; the restarted node's version is the
+	// outcome.
+	UpdatePhaseRestarting UpdatePhase = "Restarting"
+	// UpdatePhaseDone: the installer exited 0.
+	UpdatePhaseDone UpdatePhase = "Done"
+	// UpdatePhaseFailed: the set was refused or the installer failed;
+	// Response.Error says why and Response.Log carries the installer's last
+	// lines when it ran.
+	UpdatePhaseFailed UpdatePhase = "Failed"
+)
+
+// Terminal reports whether p ends an ApplyUpdate stream.
+func (p UpdatePhase) Terminal() bool {
+	return p == UpdatePhaseDone || p == UpdatePhaseFailed
+}
 
 // EnsureAliasArgs carries the host IP to alias on lo0 as a /32 (no prefix text —
 // the daemon appends /32 after validating containment).
@@ -244,6 +306,24 @@ type InterconnectAliasArgs struct {
 	Slot int `json:"slot"`
 }
 
+// ApplyUpdateArgs carries one managed update. SourceDir is an absolute, clean
+// path to the directory the agent prepared (the build set: k3sm,
+// k3sm-execshim, k3sm-vmhost, the two shim dylibs and cp-payload/). Manifest
+// maps the slash-separated path of every regular file in the set, relative to
+// SourceDir, to its lowercase hex sha256; a file missing from the set, a file
+// the manifest does not name, or a mismatch refuses the update. Version is the
+// release tag being installed, used for the log only: the installer reads the
+// version from the staged binary itself. AllowDowngrade and
+// RequireTeamSignature pass through to the installer as --allow-downgrade and
+// --require-team-signature.
+type ApplyUpdateArgs struct {
+	SourceDir            string            `json:"sourceDir"`
+	Manifest             map[string]string `json:"manifest"`
+	Version              string            `json:"version"`
+	AllowDowngrade       bool              `json:"allowDowngrade,omitempty"`
+	RequireTeamSignature bool              `json:"requireTeamSignature,omitempty"`
+}
+
 // BindPortArgs requests a listening socket on a node address and port. A specific
 // address is the norm. A wildcard address is accepted only for a privileged
 // (<1024) port and only when the daemon's port authorizer grants it; a wildcard on
@@ -266,6 +346,8 @@ type Request struct {
 
 	EnsureInterconnectAlias *InterconnectAliasArgs `json:"ensureInterconnectAlias,omitempty"`
 	RemoveInterconnectAlias *InterconnectAliasArgs `json:"removeInterconnectAlias,omitempty"`
+
+	ApplyUpdate *ApplyUpdateArgs `json:"applyUpdate,omitempty"`
 }
 
 // Response is the daemon's reply. Version is the DAEMON's protocol version, on
@@ -273,7 +355,9 @@ type Request struct {
 // from any exchange. For VerbBindPort an fd accompanies the response out-of-band
 // via SCM_RIGHTS when FDPassed is true. For the interconnect verbs,
 // InterconnectIP is the address the daemon derived, and Reason names the refusal
-// (one of the Reason* constants) when the rejection is a named one.
+// (one of the Reason* constants) when the rejection is a named one. For
+// VerbApplyUpdate, Phase names the step each frame reports and Log, on the final
+// frame, carries the installer's last lines.
 type Response struct {
 	Version        Version `json:"version"`
 	OK             bool    `json:"ok"`
@@ -282,6 +366,9 @@ type Response struct {
 	FDPassed       bool    `json:"fdPassed,omitempty"`
 	BoundAddr      string  `json:"boundAddr,omitempty"`
 	InterconnectIP string  `json:"interconnectIP,omitempty"`
+
+	Phase UpdatePhase `json:"phase,omitempty"`
+	Log   string      `json:"log,omitempty"`
 }
 
 // Frame returns payload prefixed with its 4-byte big-endian length. It is the

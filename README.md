@@ -49,10 +49,15 @@ re-execs itself in a "netd" mode and imports `netd.Server` to run it. Everything
 `pkg/podnet`, `pkg/proxy`, `pkg/mesh`, `pkg/ingress` — runs as an unprivileged user and reaches the
 daemon over a Unix socket when it needs a privileged operation.
 
-The protocol (`pkg/netd/wire`) is a closed, versioned set of five verbs — `EnsureAlias`,
-`RemoveAlias`, `ConfigureMesh`, `RemoveMesh`, `BindPort` — each carrying only typed
-scalars (an IP, a port, a typed peer list). It never accepts raw route, `pf`, or WireGuard
-configuration text, and it never accepts a filesystem path. The daemon does not trust its caller:
+The protocol (`pkg/netd/wire`) is a closed, versioned set of verbs: `EnsureAlias`,
+`RemoveAlias`, `ConfigureMesh`, `RemoveMesh`, `BindPort`, `Hello`, `EnsureInterconnectAlias`,
+`RemoveInterconnectAlias` and `ApplyUpdate`. Each carries only typed scalars (an IP, a port, a
+slot, a typed peer list). It never accepts raw route, `pf`, or WireGuard configuration text.
+`ApplyUpdate` is the one verb that names a filesystem path: a build set the unprivileged agent
+prepared, which the daemon only reads (every entry owned by the service user, no symlinks), copies
+into a fresh root-only staging directory, checks file by file against the request's sha256
+manifest, and only then installs by running the staged `k3sm install --from-staging`, the one
+binary of the set it ever runs. The daemon never downloads anything. The daemon does not trust its caller:
 it re-derives and re-validates every parameter (CIDR containment, route sets, port authorization)
 against the same logic in `pkg/podnet` and `pkg/mesh`, then renders the privileged artifacts
 itself. Every connection is authenticated at accept time by peer credential (`LOCAL_PEERCRED`)
