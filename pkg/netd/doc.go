@@ -71,15 +71,18 @@ limitations under the License.
 //     over wire.MaxUpdateSetBytes (2 GiB) refuses the update. Permission bits
 //     are kept, less group and other write. Every copied file's sha256 must
 //     match the manifest, and every manifest file must be present.
-//  3. A one-time token file (mode 0600) and a root-owned log are written beside
-//     the set.
+//  3. A root-owned log is created beside the set.
 //  4. Installing. The staged k3sm, and nothing else from the set, is executed:
-//     `<staging>/k3sm install --from-staging <staging> --token-file <token>`,
-//     plus --allow-downgrade and --require-team-signature when asked. It runs in
+//     `<staging>/k3sm install --from-staging <staging>`, plus --allow-downgrade and --require-team-signature when asked. It runs in
 //     its own session with its output in the log, holds an inherited copy of
 //     the staging lock, and is killed after wire.UpdateInstallTimeout (20 min).
 //  5. Done on exit 0, Failed with the log's last lines otherwise; a refusal at
 //     any earlier step is Failed with the reason.
+//
+// An in-place update needs no join token, so none is staged. An ApplyUpdate
+// request may be up to wire.MaxApplyUpdateRequestBytes (256 KiB), so a large
+// manifest is never why an update fails; every other verb keeps the
+// Config.MaxRequestBytes cap.
 //
 // The installer restarts this daemon, so the connection usually closes during
 // Installing; the client reports that as Restarting and the restarted node's

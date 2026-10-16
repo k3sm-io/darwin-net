@@ -36,6 +36,12 @@ const DefaultSocketPath = "/var/lib/k3sm/run/netd.sock"
 // typed scalars.
 const DefaultMaxRequestBytes = 1 << 16
 
+// MaxApplyUpdateRequestBytes caps an ApplyUpdate request, whose manifest names
+// every file of the build set. The daemon reads every frame under the larger of
+// this and its configured request cap, then refuses any other verb whose frame
+// exceeds the configured cap, so only ApplyUpdate gets the room.
+const MaxApplyUpdateRequestBytes = 256 << 10
+
 // DefaultMaxPerConn bounds the aliases, mesh routes, and bound ports a single
 // connection may drive. It is ≈ a node's /24 pod capacity (253 usable hosts), so
 // one connection's blast radius is capped at one node's worth of state.

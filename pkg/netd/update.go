@@ -18,7 +18,6 @@ package netd
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -44,12 +43,10 @@ import (
 // `k3sm install --from-staging` accepts.
 const DefaultUpdateStagingRoot = "/Library/k3sm.staging"
 
-// The names ApplyUpdate gives its own files inside a staging directory. A
-// manifest may not name either.
-const (
-	updateTokenName = "update-token"
-	updateLogName   = "install.log"
-)
+// updateLogName is the installer log ApplyUpdate writes beside the set. It is
+// created with O_EXCL, so a set that already holds a file of that name is
+// refused before the exec.
+const updateLogName = "install.log"
 
 // updateDirPrefix names the staging directories ApplyUpdate creates, so a later
 // ApplyUpdate removes only its own leftovers.
@@ -110,8 +107,8 @@ func execInstaller(ctx context.Context, run installerRun) error {
 
 // handleApplyUpdate serves VerbApplyUpdate. The steps run in a fixed order and
 // each is reported: the caller check, Verifying (the copy into a fresh
-// root-only directory and the digest check of every copied file), the token
-// and log files, Installing (the one exec of the staged k3sm), then Done or
+// root-only directory and the digest check of every copied file), the log
+// file, Installing (the one exec of the staged k3sm), then Done or
 // Failed. Nothing in the set is executed before every digest matched, and
 // nothing but the staged k3sm is ever executed.
 //
@@ -178,10 +175,6 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 		return s.updateFailed(err, "")
 	}
 
-	token := filepath.Join(dir, updateTokenName)
-	if err := writeUpdateToken(token); err != nil {
-		return s.updateFailed(err, "")
-	}
 	logPath := filepath.Join(dir, updateLogName)
 	logf, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
@@ -193,7 +186,7 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 		}
 	}()
 
-	argv := []string{filepath.Join(dir, "k3sm"), "install", "--from-staging", dir, "--token-file", token}
+	argv := []string{filepath.Join(dir, "k3sm"), "install", "--from-staging", dir}
 	if args.AllowDowngrade {
 		argv = append(argv, "--allow-downgrade")
 	}
@@ -272,9 +265,6 @@ func validateUpdateArgs(a *wire.ApplyUpdateArgs) error {
 	for rel, sum := range a.Manifest {
 		if !validSetPath(rel) {
 			return fmt.Errorf("%w: manifest path %q is not a clean relative path", errUpdateRefused, rel)
-		}
-		if rel == updateTokenName || rel == updateLogName {
-			return fmt.Errorf("%w: manifest path %q is reserved", errUpdateRefused, rel)
 		}
 		if len(sum) != sha256.Size*2 || strings.ToLower(sum) != sum {
 			return fmt.Errorf("%w: manifest digest for %q is not a lowercase hex sha256", errUpdateRefused, rel)
@@ -550,29 +540,6 @@ func checkManifest(manifest, got map[string]string) error {
 		if _, ok := manifest[rel]; !ok {
 			return fmt.Errorf("%w: %s is not in the manifest", errUpdateRefused, rel)
 		}
-	}
-	return nil
-}
-
-// writeUpdateToken writes a fresh one-time token, mode 0600, at path.
-func writeUpdateToken(path string) error {
-	var b [32]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Errorf("mint the update token: %w", err)
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW, 0o600)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", path, err)
-	}
-	err = f.Chmod(0o600)
-	if err == nil {
-		_, err = f.Write([]byte(hex.EncodeToString(b[:]) + "\n"))
-	}
-	if cerr := f.Close(); err == nil && cerr != nil {
-		err = cerr
-	}
-	if err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
 }

@@ -103,9 +103,8 @@ type fakeInstaller struct {
 	calls     int
 	argv      []string
 	dir       string
-	tokenMode os.FileMode
-	tokenErr  error
 	stagedSum map[string]string // sha256 of every staged set file at exec time
+	topLevel  []string          // the staging directory's entries at exec time
 	logLines  string            // written to the log before returning
 	err       error
 }
@@ -114,13 +113,9 @@ func (f *fakeInstaller) run(_ context.Context, r installerRun) error {
 	f.calls++
 	f.argv = slices.Clone(r.Argv)
 	f.dir = r.Dir
-	for i, a := range r.Argv {
-		if a == "--token-file" && i+1 < len(r.Argv) {
-			fi, err := os.Lstat(r.Argv[i+1])
-			f.tokenErr = err
-			if err == nil {
-				f.tokenMode = fi.Mode()
-			}
+	if entries, err := os.ReadDir(r.Dir); err == nil {
+		for _, e := range entries {
+			f.topLevel = append(f.topLevel, e.Name())
 		}
 	}
 	f.stagedSum = map[string]string{}
@@ -196,13 +191,47 @@ func (h *updateHarness) stagingLeftovers(t *testing.T) []string {
 	return out
 }
 
+// serveOne serves one connection with handleConn, writes payload as one frame,
+// and reads frames until a terminal one (a reply with no phase is terminal).
+func (h *updateHarness) serveOne(t *testing.T, payload []byte) ([]wire.Response, error) {
+	t.Helper()
+	client, server := socketPair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.s.handleConn(ctx, server)
+	}()
+	defer func() {
+		_ = client.Close()
+		<-done
+	}()
+	go func() { _ = wire.WriteFrame(client, payload) }()
+	var out []wire.Response
+	for {
+		b, err := wire.ReadFrame(client, wire.DefaultMaxRequestBytes)
+		if err != nil {
+			return out, err
+		}
+		var resp wire.Response
+		if err := json.Unmarshal(b, &resp); err != nil {
+			return out, err
+		}
+		out = append(out, resp)
+		if resp.Phase == "" || resp.Phase.Terminal() {
+			return out, nil
+		}
+	}
+}
+
 func selfUID() uint32 { return uint32(os.Getuid()) }
 
 // TestApplyUpdateVerifiesBeforeInstall is the B598 root-helper gate: the copy
 // refuses a symlink (and every other unsafe or unlisted entry), a digest
 // mismatch refuses before any exec, the one exec sees the staged path and the
-// requested flags, the phases are reported in order, and the token file is
-// mode 0600.
+// requested flags and no token file, the phases are reported in order, and an
+// ApplyUpdate request may exceed the other verbs' 64 KiB cap up to 256 KiB.
 func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 	t.Run("installs a verified set with the staged path and the flags", func(t *testing.T) {
 		h := newUpdateHarness(t, selfUID())
@@ -225,14 +254,15 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 		if filepath.Dir(dir) != h.root || !strings.HasPrefix(filepath.Base(dir), updateDirPrefix) {
 			t.Fatalf("staging dir %s is not a fresh directory directly under %s", dir, h.root)
 		}
-		token := filepath.Join(dir, updateTokenName)
-		wantArgv := []string{filepath.Join(dir, "k3sm"), "install", "--from-staging", dir, "--token-file", token,
+		wantArgv := []string{filepath.Join(dir, "k3sm"), "install", "--from-staging", dir,
 			"--allow-downgrade", "--require-team-signature"}
 		if !slices.Equal(h.inst.argv, wantArgv) {
 			t.Fatalf("argv = %q, want %q", h.inst.argv, wantArgv)
 		}
-		if h.inst.tokenErr != nil || h.inst.tokenMode != 0o600 {
-			t.Fatalf("token file: mode %v err %v, want a regular file mode 0600", h.inst.tokenMode, h.inst.tokenErr)
+		wantTop := []string{"cp-payload", updateLogName, "k3sm", "k3sm-execshim", "k3sm-vmhost",
+			"libk3sm_getaddrinfo_shim.dylib", "libk3sm_pathrebase_shim.dylib"}
+		if !slices.Equal(h.inst.topLevel, wantTop) {
+			t.Fatalf("staging dir at exec time = %v, want the set and the log only (no token file) %v", h.inst.topLevel, wantTop)
 		}
 		for rel, sum := range manifest {
 			if h.inst.stagedSum[rel] != sum {
@@ -250,8 +280,8 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 		if resp := h.apply(&wire.ApplyUpdateArgs{SourceDir: src, Manifest: manifest, Version: "v0.2.0"}); !resp.OK {
 			t.Fatalf("resp = %+v", resp)
 		}
-		if n := len(h.inst.argv); n != 6 || slices.Contains(h.inst.argv, "--allow-downgrade") || slices.Contains(h.inst.argv, "--require-team-signature") {
-			t.Fatalf("argv = %q, want the six install arguments only", h.inst.argv)
+		if n := len(h.inst.argv); n != 4 || slices.Contains(h.inst.argv, "--allow-downgrade") || slices.Contains(h.inst.argv, "--require-team-signature") {
+			t.Fatalf("argv = %q, want the four install arguments only", h.inst.argv)
 		}
 	})
 
@@ -317,9 +347,6 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 		{"a manifest path that climbs out", func(t *testing.T, _ string, manifest map[string]string) {
 			manifest["../k3sm"] = strings.Repeat("0", 64)
 		}, "not a clean relative path"},
-		{"a manifest naming the token file", func(t *testing.T, _ string, manifest map[string]string) {
-			manifest[updateTokenName] = strings.Repeat("0", 64)
-		}, "reserved"},
 	}
 	for _, tc := range refusals {
 		t.Run("refuses "+tc.name+" before any exec", func(t *testing.T) {
@@ -392,6 +419,43 @@ func TestApplyUpdateVerifiesBeforeInstall(t *testing.T) {
 		resp := h.apply(&wire.ApplyUpdateArgs{SourceDir: "/usr/bin", Manifest: manifest, Version: "v0.2.0"})
 		if resp.OK || !strings.Contains(resp.Error, "not the service uid") || h.inst.calls != 0 {
 			t.Fatalf("resp = %+v calls = %d, want an ownership refusal", resp, h.inst.calls)
+		}
+	})
+
+	t.Run("admits an ApplyUpdate request over 64 KiB and up to 256 KiB, and no other verb", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		src, manifest := writeUpdateSet(t)
+		for i := range 1800 {
+			manifest[fmt.Sprintf("cp-payload/pad/file-%04d", i)] = strings.Repeat("a", 64)
+		}
+		big, _ := json.Marshal(wire.Request{Version: wire.CurrentVersion(), Verb: wire.VerbApplyUpdate,
+			ApplyUpdate: &wire.ApplyUpdateArgs{SourceDir: src, Manifest: manifest, Version: "v0.2.0"}})
+		if n := len(big); n <= wire.DefaultMaxRequestBytes || n > wire.MaxApplyUpdateRequestBytes {
+			t.Fatalf("the test request is %d bytes, want between %d and %d", n, wire.DefaultMaxRequestBytes, wire.MaxApplyUpdateRequestBytes)
+		}
+		frames, err := h.serveOne(t, big)
+		if err != nil {
+			t.Fatalf("the large ApplyUpdate got no reply: %v", err)
+		}
+		last := frames[len(frames)-1]
+		if frames[0].Phase != wire.UpdatePhaseVerifying || last.Phase != wire.UpdatePhaseFailed || !strings.Contains(last.Error, "not in the set") {
+			t.Fatalf("frames = %+v, want the verb to run and refuse the padded manifest's absent files", frames)
+		}
+		if h.inst.calls != 0 {
+			t.Fatalf("the installer ran %d times", h.inst.calls)
+		}
+
+		pad := strings.Repeat("x", wire.DefaultMaxRequestBytes)
+		other := []byte(fmt.Sprintf(`{"version":{"major":1,"minor":3},"verb":"EnsureAlias","ensureAlias":{"ip":"100.64.0.5"},"pad":%q}`, pad))
+		frames, err = h.serveOne(t, other)
+		if err != nil || len(frames) != 1 || frames[0].OK || !strings.Contains(frames[0].Error, "exceeds the 65536-byte cap") {
+			t.Fatalf("frames = %+v err = %v, want an EnsureAlias over 64 KiB refused", frames, err)
+		}
+
+		huge, _ := json.Marshal(wire.Request{Version: wire.CurrentVersion(), Verb: wire.VerbApplyUpdate,
+			ApplyUpdate: &wire.ApplyUpdateArgs{SourceDir: src + "/" + strings.Repeat("y", wire.MaxApplyUpdateRequestBytes), Manifest: manifest, Version: "v0.2.0"}})
+		if _, err := h.serveOne(t, huge); err == nil {
+			t.Fatal("a frame over 256 KiB was answered, want the connection closed")
 		}
 	})
 

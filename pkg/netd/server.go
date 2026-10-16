@@ -124,7 +124,8 @@ type Config struct {
 	// ServiceUID is the authorized unprivileged service uid (the default
 	// PeerVerifier admits only this peer uid).
 	ServiceUID uint32
-	// MaxRequestBytes caps a single framed request (default DefaultMaxRequestBytes).
+	// MaxRequestBytes caps a single framed request (default DefaultMaxRequestBytes),
+	// except an ApplyUpdate, which may be up to wire.MaxApplyUpdateRequestBytes.
 	MaxRequestBytes int
 	// MaxPerConn caps the live aliases / mesh routes / bound ports one connection
 	// may drive (default DefaultMaxPerConn, ≈ a node's /24 pod capacity).
@@ -506,7 +507,7 @@ func (s *Server) handleConn(ctx context.Context, conn *net.UnixConn) {
 			s.log.Debug("netd: arming read deadline", "err", err)
 			return
 		}
-		payload, err := wire.ReadFrame(conn, s.cfg.MaxRequestBytes)
+		payload, err := wire.ReadFrame(conn, s.frameCap())
 		if err != nil {
 			switch {
 			case errors.Is(err, os.ErrDeadlineExceeded):
@@ -532,6 +533,13 @@ func (s *Server) handleConn(ctx context.Context, conn *net.UnixConn) {
 	}
 }
 
+// frameCap is the read cap for one request frame: the larger of the configured
+// cap and the ApplyUpdate cap, because the verb is known only after the decode.
+// dispatch then holds every other verb to the configured cap.
+func (s *Server) frameCap() int {
+	return max(s.cfg.MaxRequestBytes, wire.MaxApplyUpdateRequestBytes)
+}
+
 // dispatch decodes one request payload and routes it to its handler. A decode
 // failure, an incompatible major version, or an unknown verb yields an error
 // response (never a panic). The returned *os.File is non-nil only for a successful
@@ -540,6 +548,12 @@ func (s *Server) dispatch(ctx context.Context, st *connState, payload []byte) (w
 	var req wire.Request
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return s.errResp(fmt.Sprintf("decode request: %v", err)), nil
+	}
+	if len(payload) > s.cfg.MaxRequestBytes && req.Verb != wire.VerbApplyUpdate {
+		return s.errResp(fmt.Sprintf("%v: a %q request of %d bytes exceeds the %d-byte cap", ErrPolicy, req.Verb, len(payload), s.cfg.MaxRequestBytes)), nil
+	}
+	if len(payload) > wire.MaxApplyUpdateRequestBytes {
+		return s.errResp(fmt.Sprintf("%v: a %q request of %d bytes exceeds the %d-byte cap", ErrPolicy, req.Verb, len(payload), wire.MaxApplyUpdateRequestBytes)), nil
 	}
 	if !req.Version.Compatible() {
 		return s.errResp(fmt.Sprintf("incompatible protocol major: client %d.%d, server %d.%d",
