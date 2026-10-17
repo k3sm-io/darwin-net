@@ -255,7 +255,9 @@ const (
 	// applies the code-signing and downgrade policy, and only then runs the
 	// staged k3sm's `install --from-staging`, the one binary of the set it ever
 	// runs. The daemon never downloads anything. The reply is a stream of
-	// frames, one per UpdatePhase, ending in Done or Failed. Minor 4.
+	// frames, one per UpdatePhase, ending in Done or Failed; the client
+	// acknowledges the Installing frame with a Hello request before the daemon
+	// runs the installer (see UpdatePhaseInstalling). Minor 4.
 	VerbApplyUpdate Verb = "ApplyUpdate"
 )
 
@@ -267,10 +269,15 @@ const (
 	// UpdatePhaseVerifying: the daemon is checking the signature, the archive
 	// digest, the extracted set and its code signatures.
 	UpdatePhaseVerifying UpdatePhase = "Verifying"
-	// UpdatePhaseInstalling: every check passed and the installer is running.
+	// UpdatePhaseInstalling: every check passed and the installer is about to
+	// run. The client acknowledges this frame with a Hello request on the same
+	// connection; the daemon runs the installer once the ack arrives, or after
+	// a short bound without it.
 	UpdatePhaseInstalling UpdatePhase = "Installing"
-	// UpdatePhaseRestarting is never sent by the daemon. The client reports it
-	// when the stream ends after Installing with no final frame: the installer
+	// UpdatePhaseRestarting is never sent by the daemon. The k3sm node writes
+	// it early, on the Installing frame and before its acknowledgement, because
+	// the installer stops the node's daemon. The client also reports it when
+	// the stream ends after Installing with no final frame: the installer
 	// restarts the daemon itself, which closes the connection mid-install. The
 	// install continues in its own session; the restarted node's version is the
 	// outcome.

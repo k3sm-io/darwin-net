@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"sync/atomic"
 	"testing"
 )
 
@@ -37,6 +38,11 @@ type updateDaemon struct {
 	verbs  []Verb
 	args   *ApplyUpdateArgs
 	done   chan struct{}
+	// installingSeen is set by the test's progress callback when it returns
+	// from Installing; ackAfterProgress records whether it was set when the
+	// ack arrived.
+	installingSeen   *atomic.Bool
+	ackAfterProgress bool
 }
 
 func (d *updateDaemon) open(context.Context) (io.ReadWriteCloser, error) {
@@ -69,6 +75,18 @@ func (d *updateDaemon) open(context.Context) (io.ReadWriteCloser, error) {
 					if WriteFrame(server, b) != nil {
 						return
 					}
+					if f.Phase == UpdatePhaseInstalling {
+						// The client's acknowledgement, read as the helper does
+						// before it runs the installer.
+						raw, err := ReadFrame(server, DefaultMaxRequestBytes)
+						if err != nil {
+							return
+						}
+						var ack Request
+						_ = json.Unmarshal(raw, &ack)
+						d.verbs = append(d.verbs, ack.Verb)
+						d.ackAfterProgress = d.installingSeen != nil && d.installingSeen.Load()
+					}
 				}
 				return
 			}
@@ -79,7 +97,8 @@ func (d *updateDaemon) open(context.Context) (io.ReadWriteCloser, error) {
 
 // TestClientApplyUpdate pins the client half of ApplyUpdate: the phase stream
 // in order, Failed as an error carrying the log, the end of the stream after
-// Installing as Restarting (the installer restarted the helper), the signed
+// Installing as Restarting (the installer restarted the helper), the
+// Installing frame acknowledged with a Hello once progress returned, the signed
 // request carried verbatim, and nothing beyond Hello sent to a helper older
 // than minor 4 (a minor-3 helper speaks the withdrawn request shape).
 func TestClientApplyUpdate(t *testing.T) {
@@ -103,7 +122,7 @@ func TestClientApplyUpdate(t *testing.T) {
 				{OK: true, Phase: UpdatePhaseDone, Log: "installed"}},
 			want:      UpdateResult{Phase: UpdatePhaseDone, Log: "installed"},
 			wantSeen:  []UpdatePhase{UpdatePhaseVerifying, UpdatePhaseInstalling, UpdatePhaseDone},
-			wantVerbs: []Verb{VerbHello, VerbApplyUpdate},
+			wantVerbs: []Verb{VerbHello, VerbApplyUpdate, VerbHello},
 		},
 		{
 			name:  "failed",
@@ -121,7 +140,7 @@ func TestClientApplyUpdate(t *testing.T) {
 			frames:    []Response{phase(UpdatePhaseVerifying, true), phase(UpdatePhaseInstalling, true)},
 			want:      UpdateResult{Phase: UpdatePhaseRestarting},
 			wantSeen:  []UpdatePhase{UpdatePhaseVerifying, UpdatePhaseInstalling, UpdatePhaseRestarting},
-			wantVerbs: []Verb{VerbHello, VerbApplyUpdate},
+			wantVerbs: []Verb{VerbHello, VerbApplyUpdate, VerbHello},
 		},
 		{
 			name:      "the stream ends before the install",
@@ -149,12 +168,20 @@ func TestClientApplyUpdate(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			d := &updateDaemon{minor: tc.minor, frames: tc.frames}
+			d := &updateDaemon{minor: tc.minor, frames: tc.frames, installingSeen: &atomic.Bool{}}
 			c := NewClient("/nonexistent/netd.sock")
 			c.open = d.open
 			var seen []UpdatePhase
-			got, err := c.ApplyUpdate(context.Background(), args, func(p UpdatePhase) { seen = append(seen, p) })
+			got, err := c.ApplyUpdate(context.Background(), args, func(p UpdatePhase) {
+				seen = append(seen, p)
+				if p == UpdatePhaseInstalling {
+					d.installingSeen.Store(true)
+				}
+			})
 			<-d.done
+			if slices.Contains(tc.wantSeen, UpdatePhaseInstalling) && !d.ackAfterProgress {
+				t.Fatal("the Installing ack was sent before the progress callback returned")
+			}
 			if (err != nil) != tc.wantErr || errors.Is(err, ErrHelperTooOld) != tc.wantOld {
 				t.Fatalf("err = %v, wantErr %t wantOld %t", err, tc.wantErr, tc.wantOld)
 			}

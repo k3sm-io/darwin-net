@@ -530,6 +530,7 @@ func (s *Server) handleConn(ctx context.Context, conn *net.UnixConn) {
 	st := newConnState(s.cfg.MaxPerConn)
 	st.conn = conn
 	st.emit = func(resp wire.Response) error { return s.writeResponse(conn, resp) }
+	st.awaitAck = func(d time.Duration) error { return s.readUpdateAck(conn, d) }
 	for {
 		select {
 		case <-ctx.Done():
@@ -1027,6 +1028,9 @@ type connState struct {
 	// emit sends an intermediate response frame on conn (ApplyUpdate's phase
 	// stream); nil with no connection.
 	emit func(wire.Response) error
+	// awaitAck reads the client's acknowledgement of ApplyUpdate's Installing
+	// frame from conn within the given bound; nil with no connection.
+	awaitAck func(time.Duration) error
 }
 
 // newConnState returns per-connection accounting capped at max.

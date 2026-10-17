@@ -459,6 +459,12 @@ type UpdateResult struct {
 // same connection and, against a helper older than MinorApplyUpdate, sends
 // nothing more and returns ErrHelperTooOld.
 //
+// On the Installing frame the client acknowledges, once progress has
+// returned, with a Hello request on the same connection: the daemon holds the
+// installer, which stops the caller's daemon, until that ack arrives or
+// updateAckTimeout (in netd) expires. A caller that records the step inside
+// progress therefore has it recorded before the installer starts.
+//
 // A Failed phase is returned as an error wrapping nothing named, with the
 // result carrying the phase and the installer's log. A stream that ends after
 // Installing with no final frame is not an error: the installer restarts this
@@ -519,6 +525,9 @@ func (c *Client) ApplyUpdate(ctx context.Context, args ApplyUpdateArgs, progress
 		if progress != nil {
 			progress(resp.Phase)
 		}
+		if resp.Phase == UpdatePhaseInstalling {
+			c.ackInstalling(conn)
+		}
 		if !resp.Phase.Terminal() {
 			continue
 		}
@@ -527,5 +536,18 @@ func (c *Client) ApplyUpdate(ctx context.Context, args ApplyUpdateArgs, progress
 			return res, fmt.Errorf("netd %s failed: %s", VerbApplyUpdate, resp.Error)
 		}
 		return res, nil
+	}
+}
+
+// ackInstalling sends the acknowledgement of the Installing frame, a Hello
+// request. A failed send is logged and ignored: the daemon runs the installer
+// after its bound either way, and the stream's end is read as before.
+func (c *Client) ackInstalling(conn io.Writer) {
+	payload, err := json.Marshal(Request{Version: CurrentVersion(), Verb: VerbHello})
+	if err == nil {
+		err = WriteFrame(conn, payload)
+	}
+	if err != nil {
+		c.logger().Debug("netd: acknowledging Installing failed", "err", err)
 	}
 }
