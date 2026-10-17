@@ -24,9 +24,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"slices"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // updateDaemon answers Hello as a daemon of minor would, then answers an
@@ -221,4 +223,169 @@ func TestApplyUpdateIsMinorFour(t *testing.T) {
 			t.Fatalf("a non-update reply carries %s: %s", k, b)
 		}
 	}
+}
+
+// silentDaemon answers Hello, reads the ApplyUpdate request, sends Verifying
+// and then goes silent, reading until the client's side of the connection
+// closes; readErr is what that final read returned.
+type silentDaemon struct {
+	done    chan struct{}
+	readErr error
+}
+
+func (d *silentDaemon) open(context.Context) (io.ReadWriteCloser, error) {
+	client, server := net.Pipe()
+	d.done = make(chan struct{})
+	go func() {
+		defer close(d.done)
+		defer server.Close()
+		v := CurrentVersion()
+		for range 2 { // Hello, then ApplyUpdate.
+			raw, err := ReadFrame(server, DefaultMaxRequestBytes)
+			if err != nil {
+				d.readErr = err
+				return
+			}
+			var req Request
+			_ = json.Unmarshal(raw, &req)
+			resp := Response{Version: v, OK: true}
+			if req.Verb == VerbApplyUpdate {
+				resp.Phase = UpdatePhaseVerifying
+			}
+			b, _ := json.Marshal(resp)
+			if err := WriteFrame(server, b); err != nil {
+				d.readErr = err
+				return
+			}
+		}
+		_, d.readErr = ReadFrame(server, DefaultMaxRequestBytes)
+	}()
+	return client, nil
+}
+
+// cancelOnEOF cancels a context the moment its connection reads the
+// helper's end of stream, before the read returns, so the client sees the
+// EOF and a done context together.
+type cancelOnEOF struct {
+	io.ReadWriteCloser
+	cancel context.CancelFunc
+}
+
+func (c cancelOnEOF) Read(p []byte) (int, error) {
+	n, err := c.ReadWriteCloser.Read(p)
+	if errors.Is(err, io.EOF) {
+		c.cancel()
+	}
+	return n, err
+}
+
+// settledGoroutines waits up to a second for the goroutine count to fall to
+// at most want and returns the last count seen.
+func settledGoroutines(want int) int {
+	n := runtime.NumGoroutine()
+	for deadline := time.Now().Add(time.Second); n > want && time.Now().Before(deadline); n = runtime.NumGoroutine() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	return n
+}
+
+// TestApplyUpdateReadStopsOnContextCancel pins that ApplyUpdate obeys its
+// context: a cancel while a frame read is blocked ends the call within a
+// second with an error wrapping context.Canceled, the connection closed (the
+// helper reads EOF) and no goroutine left behind; a cancel that arrives with
+// the stream's end after Installing still returns Restarting, and one that
+// arrives once the Done frame was read leaves the normal result in place.
+func TestApplyUpdateReadStopsOnContextCancel(t *testing.T) {
+	args := ApplyUpdateArgs{ArchivePath: "/var/lib/k3sm/update/k3sm-darwin-arm64.tar.gz"}
+	type outcome struct {
+		res UpdateResult
+		err error
+	}
+	t.Run("a cancel during a blocked read", func(t *testing.T) {
+		before := runtime.NumGoroutine()
+		d := &silentDaemon{}
+		c := NewClient("/nonexistent/netd.sock")
+		c.open = d.open
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		verifying := make(chan struct{})
+		out := make(chan outcome, 1)
+		go func() {
+			res, err := c.ApplyUpdate(ctx, args, func(p UpdatePhase) {
+				if p == UpdatePhaseVerifying {
+					close(verifying)
+				}
+			})
+			out <- outcome{res, err}
+		}()
+		select {
+		case <-verifying:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the Verifying frame never arrived")
+		}
+		cancel()
+		var got outcome
+		select {
+		case got = <-out:
+		case <-time.After(time.Second):
+			t.Fatal("ApplyUpdate still blocked a second after its context was cancelled")
+		}
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("err = %v, want one wrapping context.Canceled", got.err)
+		}
+		if got.res.Phase != UpdatePhaseVerifying {
+			t.Fatalf("result phase = %q, want the last phase read (%q)", got.res.Phase, UpdatePhaseVerifying)
+		}
+		select {
+		case <-d.done:
+		case <-time.After(time.Second):
+			t.Fatal("the helper never saw the connection close")
+		}
+		if !errors.Is(d.readErr, io.EOF) {
+			t.Fatalf("the helper's read ended with %v, want EOF", d.readErr)
+		}
+		if n := settledGoroutines(before); n > before {
+			t.Fatalf("%d goroutines after the call, %d before", n, before)
+		}
+	})
+	t.Run("a cancel racing the stream's end after Installing", func(t *testing.T) {
+		d := &updateDaemon{minor: MinorApplyUpdate, frames: []Response{{OK: true, Phase: UpdatePhaseVerifying},
+			{OK: true, Phase: UpdatePhaseInstalling}}}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		c := NewClient("/nonexistent/netd.sock")
+		c.open = func(ctx context.Context) (io.ReadWriteCloser, error) {
+			conn, err := d.open(ctx)
+			return cancelOnEOF{conn, cancel}, err
+		}
+		var seen []UpdatePhase
+		res, err := c.ApplyUpdate(ctx, args, func(p UpdatePhase) { seen = append(seen, p) })
+		<-d.done
+		if ctx.Err() == nil {
+			t.Fatal("the context was not cancelled by the stream's end; the case tests nothing")
+		}
+		if err != nil || res != (UpdateResult{Phase: UpdatePhaseRestarting}) {
+			t.Fatalf("ApplyUpdate = %+v, %v; want Restarting and no error", res, err)
+		}
+		if want := []UpdatePhase{UpdatePhaseVerifying, UpdatePhaseInstalling, UpdatePhaseRestarting}; !slices.Equal(seen, want) {
+			t.Fatalf("seen %v, want %v", seen, want)
+		}
+	})
+	t.Run("a cancel after the Done frame", func(t *testing.T) {
+		d := &updateDaemon{minor: MinorApplyUpdate, frames: []Response{{OK: true, Phase: UpdatePhaseVerifying},
+			{OK: true, Phase: UpdatePhaseInstalling}, {OK: true, Phase: UpdatePhaseDone, Log: "installed"}}}
+		c := NewClient("/nonexistent/netd.sock")
+		c.open = d.open
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		res, err := c.ApplyUpdate(ctx, args, func(p UpdatePhase) {
+			if p == UpdatePhaseDone {
+				cancel() // the frame is read; the cancel races only the return
+			}
+		})
+		<-d.done
+		if err != nil || res != (UpdateResult{Phase: UpdatePhaseDone, Log: "installed"}) {
+			t.Fatalf("ApplyUpdate = %+v, %v; want Done with its log and no error", res, err)
+		}
+	})
 }
