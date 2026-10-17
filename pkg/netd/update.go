@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,6 +77,13 @@ const (
 	versionProbeTimeout  = 30 * time.Second
 	versionProbeMaxBytes = 4 << 10
 )
+
+// updateAckTimeout bounds the wait, after the Installing frame and before the
+// exec, for the client's acknowledgement: the node writes its Restarting phase
+// on that frame and then acknowledges, so the installer, which stops the node's
+// daemon, starts only after that write landed. A missing ack costs this much
+// and no more; the exec then goes ahead.
+const updateAckTimeout = 3 * time.Second
 
 // releaseTagGrammar is the release tag a signed payload may name.
 var releaseTagGrammar = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`)
@@ -174,7 +182,11 @@ func execInstaller(ctx context.Context, run installerRun) error {
 //     by shape, aside) and passes the code-signing policy against the installed
 //     k3sm, where a team counts only behind a Developer ID signature; then the
 //     downgrade check;
-//  6. Installing: the one exec of the staged k3sm, then Done or Failed.
+//  6. Installing: the client's acknowledgement of that frame, awaited for at
+//     most updateAckTimeout; a daemon stop during that wait is a Failed frame
+//     and no exec (the stop cannot be the update's own restart, which only the
+//     installer performs); then the one exec of the staged k3sm, then Done or
+//     Failed.
 //
 // Nothing from the archive runs before every check passed, and nothing but the
 // staged k3sm ever runs. The reply is a stream: emit sends the intermediate
@@ -298,6 +310,17 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 		argv = append(argv, "--allow-downgrade")
 	}
 	st.emitPhase(s, wire.UpdatePhaseInstalling)
+	if err := st.awaitUpdateAck(); err != nil {
+		log.Warn("netd: the client did not acknowledge Installing; running the installer anyway",
+			"bound", updateAckTimeout, "err", err)
+	}
+	// A daemon stop during the wait must not start the installer. The stop
+	// cannot be the update's own restart of this daemon: the installer, which
+	// performs that restart, has not run yet.
+	if err := ctx.Err(); err != nil {
+		log.Info("netd: stopping before the installer ran; the update is not applied", "dir", dir)
+		return s.updateFailed(fmt.Errorf("the helper is stopping; the installer did not run: %w", err), "")
+	}
 	log.Info("netd: running the staged installer", "dir", dir, "argv", argv)
 
 	// The installer restarts this daemon, so its run must not end with this
@@ -840,4 +863,52 @@ func (c *connState) emitPhase(s *Server, phase wire.UpdatePhase) {
 	if err := c.emit(resp); err != nil {
 		s.log.Debug("netd: sending an applyUpdate phase failed", "phase", phase, "err", err)
 	}
+}
+
+// maxAckVerbLog caps the bytes of a peer-chosen verb that reach a log line
+// when a frame read as the acknowledgement is not one.
+const maxAckVerbLog = 64
+
+// errNotUpdateAck is returned by readUpdateAck for a frame that is not the
+// acknowledgement.
+var errNotUpdateAck = errors.New("the frame is not an acknowledgement")
+
+// awaitUpdateAck waits, bounded by updateAckTimeout, for the client's
+// acknowledgement of the Installing frame. It returns nil at once when no
+// connection is attached, and the reason otherwise when no ack arrived: the
+// bound expired, the client closed its end, or it sent something else (which
+// is consumed and not answered).
+func (c *connState) awaitUpdateAck() error {
+	if c == nil || c.awaitAck == nil {
+		return nil
+	}
+	return c.awaitAck(updateAckTimeout)
+}
+
+// readUpdateAck reads one frame from conn within d and requires it to be the
+// acknowledgement: a Hello request of a compatible major. The frame is held to
+// the configured request cap. The connection loop re-arms its own read
+// deadline before the next request, so the one set here does not outlive the
+// verb.
+func (s *Server) readUpdateAck(conn *net.UnixConn, d time.Duration) error {
+	if err := conn.SetReadDeadline(time.Now().Add(d)); err != nil {
+		return fmt.Errorf("arm the acknowledgement deadline: %w", err)
+	}
+	payload, err := wire.ReadFrame(conn, s.cfg.MaxRequestBytes)
+	if err != nil {
+		return fmt.Errorf("read the acknowledgement: %w", err)
+	}
+	var req wire.Request
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return fmt.Errorf("%w: decode: %w", errNotUpdateAck, err)
+	}
+	if !req.Version.Compatible() || req.Verb != wire.VerbHello {
+		verb := string(req.Verb)
+		if len(verb) > maxAckVerbLog {
+			verb = verb[:maxAckVerbLog] + "..."
+		}
+		return fmt.Errorf("%w: a %q request of protocol %d.%d, want %q", errNotUpdateAck,
+			verb, req.Version.Major, req.Version.Minor, wire.VerbHello)
+	}
+	return nil
 }
