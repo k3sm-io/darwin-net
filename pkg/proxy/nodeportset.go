@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"sync"
 
+	"k3sm.io/darwin-net/pkg/netbind"
 	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
@@ -78,13 +79,35 @@ func bindAddrs(addrs []netip.Addr, nodePort int32) []string {
 	return out
 }
 
+// nodePortNetwork is the network a NodePort binds address (a bindAddrs entry)
+// on. NodePort listeners are IPv4 only (ResolveNodePortAddresses), so the
+// wildcard ":port" is the IPv4 wildcard, an address is classified by
+// netbind.Family, and an address that does not parse keeps the IPv4-only
+// contract ("tcp4"; the bind itself then reports the bad address). Binding IPv4-only is what lets the bind see an IPv4-only
+// process already holding the port: on macOS the dual-stack "tcp" wildcard
+// binds beside it.
+func nodePortNetwork(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return "tcp4"
+	}
+	if host == "" {
+		return netbind.Family("tcp", netip.IPv4Unspecified())
+	}
+	a, err := netip.ParseAddr(host)
+	if err != nil {
+		return "tcp4"
+	}
+	return netbind.Family("tcp", a)
+}
+
 // bindAll binds every address in want, all or nothing: on a failure the
 // listeners already opened are closed before it returns. Each listener clamps
 // its TCP segment size.
 func (s *nodePortSet) bindAll(want []string) (map[string]net.Listener, error) {
 	out := make(map[string]net.Listener, len(want))
 	for _, addr := range want {
-		raw, err := s.listen("tcp", addr)
+		raw, err := s.listen(nodePortNetwork(addr), addr)
 		if err != nil {
 			closeListeners(out)
 			return nil, fmt.Errorf("listen nodePort %s: %w", addr, err)

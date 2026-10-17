@@ -196,10 +196,13 @@ func (s *Server) Run(ctx context.Context) error {
 // bind opens one listener on cfg.Addr:port through the binder seam and wraps it
 // with the TCP segment clamp, so responses to a client pod (connected over lo0)
 // are sent in mesh-sized segments. The https listener wraps TLS around this one,
-// leaving the clamp on the raw socket where it can reach the descriptor.
+// leaving the clamp on the raw socket where it can reach the descriptor. An IPv4
+// address (the wildcard included) binds IPv4-only (netbind.Family), so the bind
+// sees an IPv4-only process already holding the port; netbind.Netd maps the
+// family back to the wire's "tcp".
 func (s *Server) bind(ctx context.Context, port uint16) (net.Listener, error) {
 	ap := netip.AddrPortFrom(s.cfg.Addr, port)
-	ln, err := s.binder.Listen(ctx, "tcp", ap)
+	ln, err := s.binder.Listen(ctx, netbind.Family("tcp", s.cfg.Addr), ap)
 	if err != nil {
 		return nil, fmt.Errorf("%w %s: %w", ErrBind, ap, err)
 	}

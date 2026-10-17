@@ -68,6 +68,10 @@ limitations under the License.
 // net.Listen); they never go through the root netd helper — a >=1024 port needs
 // no privilege, so there is no helper NodePort path.
 //
+// Every IPv4 listener (NodePort, ClusterIP, the vm pod relay) is IPv4-only
+// (netbind.Family: "tcp4"/"udp4"), because on macOS a dual-stack wildcard binds
+// beside an IPv4-only process already holding the port and so cannot detect it.
+//
 // The NodePort path is externalTrafficPolicy: Cluster and is a distinct selector from
 // the ClusterIP path: it calls RoutingTable.PickStickyCluster (the external scope of
 // the shared activePool), which routes to every Ready backend and ignores

@@ -164,9 +164,10 @@ type Proxy struct {
 	listenUDP func(ap netip.AddrPort) (udpVIPConn, error)
 	// listenNodePort binds one NodePort stream listener (the default is
 	// net.Listen). It is not binder: a binder binds one specific alias address
-	// through the netd helper, while a NodePort binds the wildcard ":port" (both
-	// address families) or, under WithNodePortAddresses, each configured address
-	// "a.b.c.d:port", none of which needs privilege (a NodePort is >=1024).
+	// through the netd helper, while a NodePort binds the IPv4 wildcard ":port" or,
+	// under WithNodePortAddresses, each configured address "a.b.c.d:port", none of
+	// which needs privilege (a NodePort is >=1024). Every NodePort bind is
+	// IPv4-only ("tcp4", see nodePortNetwork).
 	listenNodePort func(network, address string) (net.Listener, error)
 	// dialBackend dials a backend through the dialer dialerFor selected (the default
 	// is d.DialContext with a background context, the dialer's own Timeout bounding
@@ -435,10 +436,16 @@ func New(table *RoutingTable, opts ...Option) *Proxy {
 }
 
 // listenUDPVIP is the production ClusterIP datagram bind: net.ListenUDP on the
-// specific VIP address. A failed bind returns a nil interface, never a typed-nil
-// *net.UDPConn boxed in one.
+// specific VIP address, IPv4-only for an IPv4 VIP (netbind.Family). A failed
+// bind returns a nil interface, never a typed-nil *net.UDPConn boxed in one.
 func listenUDPVIP(ap netip.AddrPort) (udpVIPConn, error) {
-	c, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(ap))
+	return listenUDPVIPWith(net.ListenUDP, ap)
+}
+
+// listenUDPVIPWith is listenUDPVIP over the bind call listen (net.ListenUDP in
+// production), the seam the unit test fakes to read the network it is given.
+func listenUDPVIPWith(listen func(network string, laddr *net.UDPAddr) (*net.UDPConn, error), ap netip.AddrPort) (udpVIPConn, error) {
+	c, err := listen(netbind.Family("udp", ap.Addr()), net.UDPAddrFromAddrPort(ap))
 	if err != nil {
 		return nil, err
 	}
@@ -905,7 +912,7 @@ func (p *Proxy) openListener(key PortKey, port *netv1.ServicePort) (*listener, e
 	// default; under WithNetdHelper a privileged (<1024) VIP port is bound by the
 	// root daemon and the socket is passed back over SCM_RIGHTS.
 	clusterAP := netip.AddrPortFrom(ip, uint16(port.Port))
-	rawCL, err := p.binder.Listen(ctx, "tcp", clusterAP)
+	rawCL, err := p.binder.Listen(ctx, netbind.Family("tcp", ip), clusterAP)
 	if err != nil {
 		_ = p.alias.Remove(ctx, ip)
 		return nil, fmt.Errorf("listen clusterIP %s: %w", clusterAP, err)

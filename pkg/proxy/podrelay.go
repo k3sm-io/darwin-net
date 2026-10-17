@@ -27,6 +27,7 @@ import (
 	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/netbind"
 	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
@@ -360,7 +361,7 @@ func (m *podRelays) open(ctx context.Context, r *podRelay, port uint16) error {
 	bctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 	ap := netip.AddrPortFrom(r.published, port)
-	raw, err := m.p.binder.Listen(bctx, "tcp", ap)
+	raw, err := m.p.binder.Listen(bctx, netbind.Family("tcp", r.published), ap)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", ap, err)
 	}
