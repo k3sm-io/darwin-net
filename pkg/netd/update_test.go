@@ -1196,6 +1196,124 @@ func TestUpdateHelperWaitsForTheRestartingAck(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("a daemon stop during the wait: no exec, a Failed frame", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		waited := false
+		h.st.awaitAck = func(d time.Duration) error {
+			if d != updateAckTimeout {
+				t.Errorf("ack bound %v, want %v", d, updateAckTimeout)
+			}
+			waited = slices.Contains(h.phases, wire.UpdatePhaseInstalling)
+			cancel()
+			return context.Canceled
+		}
+		resp := h.s.handleApplyUpdate(ctx, h.st, h.request(releaseMembers("ADHOC"), "v0.2.0", "", false))
+		if !waited {
+			t.Fatal("the wait ran before Installing was sent")
+		}
+		if resp.OK || resp.Phase != wire.UpdatePhaseFailed || !strings.Contains(resp.Error, "the helper is stopping") {
+			t.Fatalf("resp = %+v, want Failed naming the stop", resp)
+		}
+		if h.inst.calls != 0 {
+			t.Fatalf("the installer ran %d times after the stop", h.inst.calls)
+		}
+		if left := h.stagingLeftovers(); len(left) != 0 {
+			t.Fatalf("the stopped update left %v in the staging root", left)
+		}
+	})
+
+	t.Run("a frame other than Hello is dropped, not dispatched or answered", func(t *testing.T) {
+		logs := &syncBuffer{}
+		priv := &recordingPriv{}
+		h := newUpdateHarness(t, selfUID(), func(c *Config) {
+			c.Privileged = priv
+			c.Logger = slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		})
+		raw, err := json.Marshal(wire.Request{Version: wire.CurrentVersion(), Verb: wire.VerbApplyUpdate,
+			ApplyUpdate: h.request(releaseMembers("ADHOC"), "v0.2.0", "", false)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		notAck, err := json.Marshal(wire.Request{Version: wire.CurrentVersion(), Verb: wire.VerbRemoveMesh})
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, server := socketPair(t)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			h.s.handleConn(context.Background(), server)
+		}()
+		defer func() {
+			_ = client.Close()
+			<-done
+		}()
+		if err := wire.WriteFrame(client, raw); err != nil {
+			t.Fatal(err)
+		}
+		var phases []wire.UpdatePhase
+		for {
+			b, err := wire.ReadFrame(client, wire.DefaultMaxRequestBytes)
+			if err != nil {
+				t.Fatalf("read a frame after %v: %v", phases, err)
+			}
+			var resp wire.Response
+			if err := json.Unmarshal(b, &resp); err != nil {
+				t.Fatal(err)
+			}
+			phases = append(phases, resp.Phase)
+			if resp.Phase == wire.UpdatePhaseInstalling {
+				if err := wire.WriteFrame(client, notAck); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if resp.Phase == "" || resp.Phase.Terminal() {
+				break
+			}
+		}
+		want := []wire.UpdatePhase{wire.UpdatePhaseVerifying, wire.UpdatePhaseInstalling, wire.UpdatePhaseDone}
+		if !slices.Equal(phases, want) {
+			t.Fatalf("phases = %v, want %v", phases, want)
+		}
+		if err := client.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		if b, err := wire.ReadFrame(client, wire.DefaultMaxRequestBytes); err == nil {
+			t.Fatalf("the dropped frame was answered: %s", b)
+		}
+		_ = client.Close()
+		<-done
+		if priv.served {
+			t.Fatal("the frame read as the ack was dispatched (RemoveMesh reached the privileged backend)")
+		}
+		if h.inst.calls != 1 {
+			t.Fatalf("the installer ran %d times, want 1", h.inst.calls)
+		}
+		if n := strings.Count(logs.String(), "netd: the client did not acknowledge Installing"); n != 1 {
+			t.Fatalf("the missing-ack line was logged %d times, want once:\n%s", n, logs.String())
+		}
+	})
+}
+
+// TestReadUpdateAckCapsTheVerb pins that a peer-chosen verb reaches the
+// missing-ack log line at most maxAckVerbLog bytes long.
+func TestReadUpdateAckCapsTheVerb(t *testing.T) {
+	h := newUpdateHarness(t, selfUID())
+	client, server := socketPair(t)
+	long := strings.Repeat("v", 4096)
+	go func() {
+		_ = wire.WriteFrame(client, []byte(fmt.Sprintf(`{"version":{"major":1,"minor":4},"verb":%q}`, long)))
+	}()
+	err := h.s.readUpdateAck(server, time.Second)
+	if !errors.Is(err, errNotUpdateAck) {
+		t.Fatalf("err = %v, want errNotUpdateAck", err)
+	}
+	if strings.Contains(err.Error(), strings.Repeat("v", maxAckVerbLog+1)) || !strings.Contains(err.Error(), strings.Repeat("v", maxAckVerbLog)+"...") {
+		t.Fatalf("err = %.200s..., want the verb capped at %d bytes", err, maxAckVerbLog)
+	}
 }
 
 // TestOpenUpdateArchive pins the archive open: a file the service uid does not

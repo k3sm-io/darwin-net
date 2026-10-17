@@ -183,7 +183,9 @@ func execInstaller(ctx context.Context, run installerRun) error {
 //     k3sm, where a team counts only behind a Developer ID signature; then the
 //     downgrade check;
 //  6. Installing: the client's acknowledgement of that frame, awaited for at
-//     most updateAckTimeout, then the one exec of the staged k3sm, then Done or
+//     most updateAckTimeout; a daemon stop during that wait is a Failed frame
+//     and no exec (the stop cannot be the update's own restart, which only the
+//     installer performs); then the one exec of the staged k3sm, then Done or
 //     Failed.
 //
 // Nothing from the archive runs before every check passed, and nothing but the
@@ -311,6 +313,13 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 	if err := st.awaitUpdateAck(); err != nil {
 		log.Warn("netd: the client did not acknowledge Installing; running the installer anyway",
 			"bound", updateAckTimeout, "err", err)
+	}
+	// A daemon stop during the wait must not start the installer. The stop
+	// cannot be the update's own restart of this daemon: the installer, which
+	// performs that restart, has not run yet.
+	if err := ctx.Err(); err != nil {
+		log.Info("netd: stopping before the installer ran; the update is not applied", "dir", dir)
+		return s.updateFailed(fmt.Errorf("the helper is stopping; the installer did not run: %w", err), "")
 	}
 	log.Info("netd: running the staged installer", "dir", dir, "argv", argv)
 
@@ -856,6 +865,10 @@ func (c *connState) emitPhase(s *Server, phase wire.UpdatePhase) {
 	}
 }
 
+// maxAckVerbLog caps the bytes of a peer-chosen verb that reach a log line
+// when a frame read as the acknowledgement is not one.
+const maxAckVerbLog = 64
+
 // errNotUpdateAck is returned by readUpdateAck for a frame that is not the
 // acknowledgement.
 var errNotUpdateAck = errors.New("the frame is not an acknowledgement")
@@ -890,8 +903,12 @@ func (s *Server) readUpdateAck(conn *net.UnixConn, d time.Duration) error {
 		return fmt.Errorf("%w: decode: %w", errNotUpdateAck, err)
 	}
 	if !req.Version.Compatible() || req.Verb != wire.VerbHello {
+		verb := string(req.Verb)
+		if len(verb) > maxAckVerbLog {
+			verb = verb[:maxAckVerbLog] + "..."
+		}
 		return fmt.Errorf("%w: a %q request of protocol %d.%d, want %q", errNotUpdateAck,
-			req.Verb, req.Version.Major, req.Version.Minor, wire.VerbHello)
+			verb, req.Version.Major, req.Version.Minor, wire.VerbHello)
 	}
 	return nil
 }
