@@ -60,8 +60,9 @@ type Privileged interface {
 	// live; an executor that cannot serve the new CIDR returns an error and the
 	// adoption is refused.
 	SetNodePodCIDR(ctx context.Context, cidr netip.Prefix) error
-	// BindPort binds a listening socket on the specific addr and returns it; the
-	// caller passes the fd to the client and closes this copy.
+	// BindPort binds a listening socket on the specific addr (IPv4-only for an
+	// IPv4 addr) and returns it; the caller passes the fd to the client and
+	// closes this copy.
 	BindPort(ctx context.Context, network string, addr netip.AddrPort) (*os.File, error)
 	// InterconnectAddrs reads bridge0's IPv4 addresses with each one's prefix
 	// length (-1 when unknown). A host without bridge0 yields an error wrapping
@@ -634,11 +635,12 @@ func (a *darwinApplier) RemoveMesh(ctx context.Context) error {
 // BindPort binds a listening socket on addr and returns it as an *os.File so the
 // server can pass the descriptor to the client over SCM_RIGHTS. The original
 // listener is closed after the descriptor is duplicated; the kernel keeps the
-// socket alive while the passed descriptor is open.
+// socket alive while the passed descriptor is open. An IPv4 address, the
+// wildcard 0.0.0.0 included, binds an IPv4-only socket (bindFamily).
 func (a *darwinApplier) BindPort(ctx context.Context, network string, addr netip.AddrPort) (*os.File, error) {
 	switch network {
 	case "tcp":
-		ln, err := net.ListenTCP("tcp", net.TCPAddrFromAddrPort(addr))
+		ln, err := net.ListenTCP(bindFamily(network, addr.Addr()), net.TCPAddrFromAddrPort(addr))
 		if err != nil {
 			return nil, fmt.Errorf("listen tcp %s: %w", addr, err)
 		}
@@ -658,7 +660,7 @@ func (a *darwinApplier) BindPort(ctx context.Context, network string, addr netip
 		// specific match, receives the datagrams sent to the VIP. A wildcard bind
 		// stays as before: it must not share a port another wildcard holds.
 		lc := net.ListenConfig{Control: udpBindControl(addr.Addr(), setReuseAddr)}
-		pc, err := lc.ListenPacket(ctx, "udp", addr.String())
+		pc, err := lc.ListenPacket(ctx, bindFamily(network, addr.Addr()), addr.String())
 		if err != nil {
 			return nil, fmt.Errorf("listen udp %s: %w", addr, err)
 		}
@@ -676,6 +678,19 @@ func (a *darwinApplier) BindPort(ctx context.Context, network string, addr netip
 	default:
 		return nil, fmt.Errorf("bind port: unsupported network %q", network)
 	}
+}
+
+// bindFamily returns the network to bind addr on: "tcp4"/"udp4" for an IPv4 (or
+// IPv4-mapped) address, else network unchanged ("tcp"/"udp", which Go binds as IPv6 for
+// an IPv6 address). On macOS Go binds 0.0.0.0 under "tcp"/"udp" as a dual-stack
+// AF_INET6 socket on [::], and that socket binds beside an IPv4-only process
+// already holding *:port, so the conflict would go unseen; an AF_INET socket is
+// refused with EADDRINUSE.
+func bindFamily(network string, addr netip.Addr) string {
+	if addr.Unmap().Is4() {
+		return network + "4"
+	}
+	return network
 }
 
 // udpBindControl returns the ListenConfig.Control hook for a UDP bind on addr:
