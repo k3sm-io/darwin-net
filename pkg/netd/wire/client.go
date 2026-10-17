@@ -471,6 +471,12 @@ type UpdateResult struct {
 // helper, so the result is Restarting and the outcome is the restarted node's
 // version. When ctx carries no deadline the call is bounded by
 // UpdateInstallTimeout plus a fixed allowance for the verification.
+//
+// When ctx ends before a terminal frame was read, the connection is closed,
+// which ends a blocked read at once, and the error wraps ctx.Err(); the result
+// carries the last phase read. A terminal frame read before ctx ended is
+// returned as is, and so is a stream end after Installing (Restarting) that
+// the read saw before the close.
 func (c *Client) ApplyUpdate(ctx context.Context, args ApplyUpdateArgs, progress func(UpdatePhase)) (UpdateResult, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -482,33 +488,51 @@ func (c *Client) ApplyUpdate(ctx context.Context, args ApplyUpdateArgs, progress
 		return UpdateResult{}, err
 	}
 	defer conn.Close()
+	// The connection's deadline is the only bound the frame reads otherwise
+	// obey, and it is the whole install timeout away. Closing the connection
+	// when ctx ends unblocks a pending read or write at once; AfterFunc starts
+	// no goroutine unless ctx ends, and stop deregisters it on every return.
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	canceled := func(err error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return fmt.Errorf("%s: %w", VerbApplyUpdate, cerr)
+		}
+		return err
+	}
 	hello, err := c.exchange(conn, Request{Version: CurrentVersion(), Verb: VerbHello})
 	if !hello.Version.SupportsApplyUpdate() {
 		if err != nil && hello.Version == (Version{}) {
-			return UpdateResult{}, err
+			return UpdateResult{}, canceled(err)
 		}
 		return UpdateResult{}, fmt.Errorf("%w: %s needs minor %d, the helper speaks %d.%d",
 			ErrHelperTooOld, VerbApplyUpdate, MinorApplyUpdate, hello.Version.Major, hello.Version.Minor)
 	}
 	if err != nil {
-		return UpdateResult{}, err
+		return UpdateResult{}, canceled(err)
 	}
 	payload, err := json.Marshal(Request{Version: CurrentVersion(), Verb: VerbApplyUpdate, ApplyUpdate: &args})
 	if err != nil {
 		return UpdateResult{}, fmt.Errorf("encode %s request: %w", VerbApplyUpdate, err)
 	}
 	if err := WriteFrame(conn, payload); err != nil {
-		return UpdateResult{}, fmt.Errorf("send %s request: %w", VerbApplyUpdate, err)
+		return UpdateResult{}, canceled(fmt.Errorf("send %s request: %w", VerbApplyUpdate, err))
 	}
 	var last UpdatePhase
 	for {
 		raw, err := ReadFrame(conn, c.maxResp)
 		if err != nil {
+			// The stream's own end after Installing is checked before ctx, so
+			// a cancel or the default timeout racing it does not hide
+			// Restarting.
 			if last == UpdatePhaseInstalling && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
 				if progress != nil {
 					progress(UpdatePhaseRestarting)
 				}
 				return UpdateResult{Phase: UpdatePhaseRestarting}, nil
+			}
+			if cerr := canceled(nil); cerr != nil {
+				return UpdateResult{Phase: last}, cerr
 			}
 			return UpdateResult{Phase: last}, fmt.Errorf("read %s response: %w", VerbApplyUpdate, err)
 		}
