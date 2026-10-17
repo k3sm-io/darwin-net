@@ -218,3 +218,20 @@ func TestNodePortAddressSetSwaps(t *testing.T) {
 		}
 	})
 }
+
+// TestNodePortNetwork proves every NodePort bind address is bound IPv4-only:
+// the wildcard ":port" as the IPv4 wildcard, an IPv4 address by family.
+func TestNodePortNetwork(t *testing.T) {
+	for _, tc := range []struct{ address, want string }{
+		{":30080", "tcp4"},
+		{"127.0.0.1:30080", "tcp4"},
+		{"192.0.2.10:30080", "tcp4"},
+		{"[::1]:30080", "tcp"},
+		{"30080", "tcp4"},
+		{"node.example:30080", "tcp4"},
+	} {
+		if got := nodePortNetwork(tc.address); got != tc.want {
+			t.Errorf("nodePortNetwork(%q) = %q, want %q", tc.address, got, tc.want)
+		}
+	}
+}

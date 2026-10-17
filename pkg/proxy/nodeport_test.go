@@ -222,11 +222,12 @@ func TestNodePortBindsWildcard(t *testing.T) {
 			t.Fatal("the NodePort listener was never bound")
 		}
 		// The ClusterIP binds the specific VIP; the NodePort binds the wildcard.
-		if want := netip.AddrPortFrom(vip, clusterPort).String(); clusterLn.network != "tcp" || clusterLn.address != want {
-			t.Fatalf("ClusterIP listener = %s %s, want tcp %s", clusterLn.network, clusterLn.address, want)
+		// Both are IPv4, so both bind IPv4-only ("tcp4").
+		if want := netip.AddrPortFrom(vip, clusterPort).String(); clusterLn.network != "tcp4" || clusterLn.address != want {
+			t.Fatalf("ClusterIP listener = %s %s, want tcp4 %s", clusterLn.network, clusterLn.address, want)
 		}
-		if nodeLn.network != "tcp" || nodeLn.address != wantNodeAddr {
-			t.Fatalf("NodePort listener = %s %q, want tcp %q (the wildcard)", nodeLn.network, nodeLn.address, wantNodeAddr)
+		if nodeLn.network != "tcp4" || nodeLn.address != wantNodeAddr {
+			t.Fatalf("NodePort listener = %s %q, want tcp4 %q (the IPv4 wildcard)", nodeLn.network, nodeLn.address, wantNodeAddr)
 		}
 
 		// The NodePort listener fans out across both ready backends.

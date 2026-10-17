@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 
 	"k3sm.io/darwin-net/pkg/netd/wire"
 )
@@ -58,14 +59,26 @@ func (Direct) Listen(_ context.Context, network string, addr netip.AddrPort) (ne
 // <1024 wildcard its authorizer confirms. This is the ONE
 // SCM_RIGHTS fd-adoption path in the module — consumers wanting a local-bind
 // fast path for unprivileged ports wrap it (see pkg/proxy) rather than copying it.
+//
+// The wire names only "tcp" and "udp"; Listen maps a family-specific network
+// ("tcp4", "udp6", ...) to its wire name, and the daemon picks the family from
+// the address itself (an IPv4 address binds IPv4-only there too).
 type Netd struct {
 	// Client is the netd wire client the bind is requested through.
 	Client *wire.Client
+
+	// bindPort is the wire call; nil means Client.BindPort. It is the seam the
+	// unit test fakes.
+	bindPort func(ctx context.Context, network string, addr netip.AddrPort) (*os.File, error)
 }
 
 // Listen requests the bind for addr from the daemon and adopts the returned fd.
 func (b *Netd) Listen(ctx context.Context, network string, addr netip.AddrPort) (net.Listener, error) {
-	f, err := b.Client.BindPort(ctx, network, addr)
+	bind := b.bindPort
+	if bind == nil {
+		bind = b.Client.BindPort
+	}
+	f, err := bind(ctx, wireNetwork(network), addr)
 	if err != nil {
 		return nil, fmt.Errorf("netd bind %s %s: %w", network, addr, err)
 	}
@@ -75,4 +88,30 @@ func (b *Netd) Listen(ctx context.Context, network string, addr netip.AddrPort) 
 		return nil, fmt.Errorf("adopt netd socket for %s: %w", addr, err)
 	}
 	return ln, nil
+}
+
+// Family returns the network to bind addr on: network+"4" ("tcp4", "udp4") for
+// an IPv4 or IPv4-mapped address, else network unchanged. On macOS Go binds an
+// IPv4 address under "tcp"/"udp" on a dual-stack AF_INET6 socket (0.0.0.0 becomes
+// [::]), and that socket binds beside an IPv4-only process already holding the
+// port, so the conflict goes unseen; an AF_INET socket is refused with
+// EADDRINUSE. network is "tcp" or "udp".
+func Family(network string, addr netip.Addr) string {
+	if addr.Unmap().Is4() {
+		return network + "4"
+	}
+	return network
+}
+
+// wireNetwork maps a family-specific network to the name the netd wire carries:
+// "tcp4"/"tcp6" to "tcp", "udp4"/"udp6" to "udp". Any other name passes
+// unchanged, for the daemon to refuse.
+func wireNetwork(network string) string {
+	switch network {
+	case "tcp4", "tcp6":
+		return "tcp"
+	case "udp4", "udp6":
+		return "udp"
+	}
+	return network
 }
