@@ -106,6 +106,34 @@ type relayHarness struct {
 // binder and dials through dial; Run is stopped and joined at cleanup.
 func newRelayHarness(t *testing.T, vmnet netip.Prefix, dial func(*tcpseg.Dialer, string, string) (net.Conn, error), opts ...Option) *relayHarness {
 	t.Helper()
+	h := buildRelayHarness(vmnet, dial, opts...)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = h.p.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	return h
+}
+
+// newSettledRelayHarness builds the same Proxy as newRelayHarness but never starts
+// Run, so no background reconcile pass races the test: every pass is one the test
+// drives with settle. A test that asserts on what a pass logs needs this, because a
+// background pass can claim a throttled Warn's slot and still be emitting it when
+// the test reads the log. The relays are shut down at cleanup.
+func newSettledRelayHarness(t *testing.T, vmnet netip.Prefix, dial func(*tcpseg.Dialer, string, string) (net.Conn, error), opts ...Option) *relayHarness {
+	t.Helper()
+	h := buildRelayHarness(vmnet, dial, opts...)
+	t.Cleanup(h.p.relays.shutdown)
+	return h
+}
+
+// buildRelayHarness constructs the harness Proxy without running it.
+func buildRelayHarness(vmnet netip.Prefix, dial func(*tcpseg.Dialer, string, string) (net.Conn, error), opts ...Option) *relayHarness {
 	tbl := NewRoutingTable(netip.Prefix{})
 	b := newRecordingBinder()
 	base := []Option{
@@ -116,16 +144,6 @@ func newRelayHarness(t *testing.T, vmnet netip.Prefix, dial func(*tcpseg.Dialer,
 		WithLogger(slog.New(slog.DiscardHandler)),
 	}
 	p := New(tbl, append(base, opts...)...)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = p.Run(ctx)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
 	return &relayHarness{p: p, tbl: tbl, b: b}
 }
 
@@ -511,7 +529,7 @@ func TestPodRelayPortCap(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := &captureHandler{}
-			h := newRelayHarness(t, netip.MustParsePrefix("192.168.64.0/24"), newRelayBackends().dial, WithLogger(slog.New(logs)))
+			h := newSettledRelayHarness(t, netip.MustParsePrefix("192.168.64.0/24"), newRelayBackends().dial, WithLogger(slog.New(logs)))
 			if tc.service {
 				h.tbl.SetEndpoints(PortKey{ClusterIP: "10.43.0.20", Port: 80, Protocol: netv1.ProtocolTCP},
 					[]netv1.Endpoint{{IP: published.String(), Port: 9090, Ready: true}})
