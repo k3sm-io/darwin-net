@@ -36,7 +36,10 @@ around.
 | [`pkg/dns`](pkg/dns) | Pod DNS: the pure-Go reference resolver (`ndots`/search-domain expansion) that the `getaddrinfo` shim mirrors, the per-pod DNS config the shim consumes, and `/etc/resolv.conf` rendering for Linux VM guests. |
 | [`pkg/ingress`](pkg/ingress) | An in-process L7 HTTP(S) reverse proxy fronting the ClusterIP VIPs the Service proxy already owns — host/path routing, in-memory-only TLS termination, no bundled Traefik or nginx binary. |
 | [`pkg/netbind`](pkg/netbind) | The shared listener-bind seam used by the Service proxy and the ingress proxy: bind directly, or ask the root daemon to bind and adopt the resulting socket over `SCM_RIGHTS`. |
-| [`pkg/netd`](pkg/netd) | The logic of the root network daemon: `lo0` alias management, the WireGuard `utun` and its routes, and privileged port binds. See "Privilege split" below. |
+| [`pkg/netd`](pkg/netd) | The logic of the root network daemon: `lo0` alias management, the WireGuard `utun` and its routes, and privileged port binds, plus the interconnect aliases on `bridge0`. See "Privilege split" below. |
+| [`pkg/linkenum`](pkg/linkenum) | Enumerates a Mac's Thunderbolt ports for the interconnect reporter: each receptacle, the network interface it presents as, the domain at each end of a cable, and the RDMA device a port carries. Unprivileged, exec-only, no cgo. |
+| [`pkg/linkwatch`](pkg/linkwatch) | Reports network-interface link changes (up, down, vanished), so a Thunderbolt cable plugged or pulled is noticed without waiting for a periodic resync. A 2-second unprivileged poll is the mandatory source. |
+| [`pkg/tcpseg`](pkg/tcpseg) | Clamps the TCP maximum segment size of connections opened and accepted toward pod and Service addresses, so a flow negotiated over the loopback cannot carry loopback-sized segments onto a smaller link. |
 | [`shim/getaddrinfo_shim.c`](shim/getaddrinfo_shim.c) | A `DYLD_INSERT_LIBRARIES` dylib, built with `clang` rather than cgo, that interposes `getaddrinfo`, `bind`, and `connect` inside a pod process: it resolves cluster names against the in-process cluster resolver, rewrites a wildcard bind onto the pod's own IP, and pins an outbound connection's source address for mesh-egress traffic. |
 
 ## Privilege split
