@@ -64,7 +64,7 @@ golang.org/x/tools v0.49.0 # 2026-08-13T14:53:26Z
 golang.org/x/tools/go/expect v0.1.0-deprecated # 2025-06-12T15:17:39Z
 golang.org/x/tools/go/packages/packagestest v0.1.1-deprecated # 2025-06-13T18:44:18Z
 golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 # 2023-01-26T15:27:24Z
-golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446 # 2026-05-22T21:04:24Z
+golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f # 2026-10-06T16:45:05Z
 google.golang.org/genproto/googleapis/rpc v0.0.0-20260618152121-87f3d3e198d3 # 2026-06-18T15:21:21Z
 google.golang.org/grpc v1.83.2 # 2026-08-25T15:47:16Z
 google.golang.org/protobuf v1.36.12 # 2026-08-10T13:29:45Z
