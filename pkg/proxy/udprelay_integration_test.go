@@ -188,7 +188,7 @@ func TestUDPDatagramRelayRoundTripReal(t *testing.T) {
 // the in-flight reply: it reaps the flow — closing the upstream socket, killing
 // that flow's reader — before the echo comes back, and the round-trip times out
 // through no fault of the relay. That is what a loaded box does to a 200ms idle
-// window, and it is the failure captured under B207. A GC test must not make its
+// window, and it is the failure captured in stress runs. A GC test must not make its
 // own round-trip the thing being GC'd. The reap is then forced through
 // sweepExpired, the seam factored out for exactly this, with a clock past the
 // threshold — deterministic, no polling, no clock luck.
@@ -280,7 +280,7 @@ func udpRoundTrip(t *testing.T, c *net.UDPConn, payload string, timeout time.Dur
 	// correlation, and udpRoundTripRetry deliberately re-sends its payload until one
 	// reply arrives — so a slow relay can leave extra echoes of the previous phase
 	// queued on this socket. Reading the first datagram unconditionally attributes a
-	// stale echo to this send (B207: "got \"hello-udp\", want \"world-udp\"").
+	// stale echo to this send (seen as "got \"hello-udp\", want \"world-udp\"").
 	// A genuinely wrong reply still fails, on the deadline, naming what was seen.
 	var last string
 	for time.Now().Before(deadline) {

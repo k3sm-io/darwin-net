@@ -225,9 +225,9 @@ func expectClosed(t *testing.T, c net.Conn) {
 	}
 }
 
-// TestPublishedVMPodAddressRelaysToLive is the B440 gate: a vm pod's PUBLISHED
+// TestPublishedVMPodAddressRelaysToLive is the gate: a vm pod's PUBLISHED
 // address (::1 here) is served on the pod's node and every accepted connection is
-// relayed to its LIVE lease address (127.0.0.1) on the same port. Before B440 the
+// relayed to its LIVE lease address (127.0.0.1) on the same port. Before this fix the
 // published address was live on no interface and nothing listened on it, so a
 // dial was refused.
 func TestPublishedVMPodAddressRelaysToLive(t *testing.T) {

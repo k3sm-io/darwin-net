@@ -43,7 +43,7 @@ import (
 // gate paragraph requires: local- and remote-destination dials IN FLIGHT together
 // through one shared Proxy. The containment being proven is a per-connection
 // shared-state property — a sequential round trip cannot exercise it, and the
-// pre-M14.2 shape (one dialer whose LocalAddr is written per destination) would
+// earlier shape (one dialer whose LocalAddr is written per destination) would
 // both trip the race detector here and non-deterministically apply one
 // connection's source to another's dial.
 //

@@ -92,7 +92,7 @@ func machoArches(t *testing.T, path string) []macho.Cpu {
 // hack/build-shim.sh actually produces.
 //
 // It reads the artifact and never greps the build script, on purpose: the bug
-// this gate fixes (B166) was the script's comment promising "arm64 + x86_64 fat
+// this gate fixes was the script's comment promising "arm64 + x86_64 fat
 // dylib" while its flags passed only -arch arm64. A script-grep gate would have
 // passed for the whole life of that bug, and would pass again the moment someone
 // edits the comment back. The artifact cannot lie.

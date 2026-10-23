@@ -168,7 +168,7 @@ func sortedAddrs(set map[netip.Addr]bool) []netip.Addr {
 	return out
 }
 
-// TestUTUNAliasPlumbing pins B453's fix on the executor: every pod address of the
+// TestUTUNAliasPlumbing pins the fix on the executor: every pod address of the
 // node /24 aliased on lo0 is also a point-to-point /32 alias on the mesh utun with
 // the utun's own link address as destination, so a reply the kernel generates
 // for a packet that arrived on the utun (a RST for a closed port, an echo reply)

@@ -2,11 +2,11 @@
 #
 # darwin-net B216 acceptance gate — the bind() interpose in the pod shim.
 #
-# THE ITEM (B216): extend shim/getaddrinfo_shim.c with
+# THE ITEM: extend shim/getaddrinfo_shim.c with
 # an interposed bind() that rewrites a pod's WILDCARD bind onto the pod's own
 # /32, so two same-node Pods can both hold :8080 instead of colliding with
-# EADDRINUSE. Every branch of that interpose is a BINDING resolution of the plan
-# or of the B215 probe wave, and this gate asserts each one separately.
+# EADDRINUSE. Every branch of that interpose is a fixed decision of the design
+# or of its recorded probe measurements, and this gate asserts each one separately.
 #
 # WHAT IT PROVES, AND HOW. A table of sockaddr shapes (pkg/podnet/testdata/
 # bindcases.c) is bound with and without the shim injected, and the verdict for
@@ -20,12 +20,12 @@
 #                     dyld hard-terminates a process whose inserted library lacks
 #                     its arch), and the case harness builds.
 #   b216.2  BLOCKING  the REWRITE branches: AF_INET wildcard, an AF_INET wildcard
-#                     UDP socket (B215 P1b), and Go's in6addr_any dual-stack
-#                     socket rewritten to the v4-mapped form (B215 P2) — each
+#                     UDP socket, and Go's in6addr_any dual-stack
+#                     socket rewritten to the v4-mapped form — each
 #                     landing on the pod address AND carrying SO_REUSEADDR
-#                     (B215 P1a, the amendment that made it unconditional).
+#                     (the amendment that made it unconditional).
 #   b216.3  BLOCKING  the PASSTHROUGH branches, each for its own recorded reason:
-#                     IPV6_V6ONLY=1 (P2-v6only), ports below the floor (P1c's
+#                     IPV6_V6ONLY=1, ports below the floor (the
 #                     privilege inversion), an ephemeral bind, a specific local
 #                     address, a FOREIGN address (the documented trust-domain
 #                     honesty), AF_UNIX, and a short addrlen — the last two
@@ -44,8 +44,8 @@
 # nonetheless HERMETIC and ROOTLESS: K3SM_POD_IP is 127.0.0.1, an address that
 # already exists on every host, so no lo0 alias (hence no root) is needed. What
 # the interpose keys on is "specific vs wildcard", which 127.0.0.1 satisfies; the
-# live 100.64/10 pod-address behaviour is B215's recorded lab evidence and B217's
-# two-pod e2e gate, not this one's job.
+# live 100.64/10 pod-address behaviour is covered by the recorded lab evidence and the
+# two-pod end-to-end gate, not this one's job.
 #
 # RED BEFORE THE WORK: on main (no bind interpose) the enabled arm is identical
 # to the control, so every b216.2 assertion fails and b216.4e (non-vacuity)
@@ -91,7 +91,7 @@ DYLIB="$WORK/libk3sm_getaddrinfo_shim.dylib"
 # The artifact, never the build flags: the flags are what drifted from their own
 # comment last time (the sibling assertion pkg/dns TestShimIsUniversalBinary
 # makes for the same reason). dyld HARD-TERMINATES a process whose inserted
-# library has no slice for its architecture, and B215 recorded exactly that trap
+# library has no slice for its architecture, and an earlier probe recorded exactly that trap
 # on this class of host (the Go toolchain reports amd64 under Rosetta).
 ARCHES="$(lipo -archs "$DYLIB" 2>/dev/null || echo "")"
 if printf '%s' "$ARCHES" | grep -qw arm64 && printf '%s' "$ARCHES" | grep -qw x86_64; then
@@ -179,27 +179,27 @@ trace() {
 
 # ==== b216.2 — the REWRITE branches ========================================
 expect b216.2a enabled af_inet_wildcard LOCAL "$POD_IP:$BASE" "an AF_INET wildcard bind lands on the pod address"
-expect b216.2a enabled af_inet_wildcard REUSE 1 "SO_REUSEADDR is set on the rewritten socket (B215 P1a, unconditional)"
-expect b216.2b enabled af_inet_udp_wildcard LOCAL "$POD_IP:$((BASE + 1))" "a UDP wildcard bind is rewritten too (B215 P1b: the claim is not TCP-scoped)"
+expect b216.2a enabled af_inet_wildcard REUSE 1 "SO_REUSEADDR is set on the rewritten socket (unconditional)"
+expect b216.2b enabled af_inet_udp_wildcard LOCAL "$POD_IP:$((BASE + 1))" "a UDP wildcard bind is rewritten too (the claim is not TCP-scoped)"
 expect b216.2b enabled af_inet_udp_wildcard REUSE 1 "Go sets SO_REUSEADDR on stream listeners only, so UDP needs it from the shim"
-expect b216.2c enabled af_inet6_any_dual LOCAL "[::ffff:$POD_IP]:$((BASE + 7))" "Go's in6addr_any dual-stack socket is rewritten to the v4-mapped pod address (B215 P2)"
+expect b216.2c enabled af_inet6_any_dual LOCAL "[::ffff:$POD_IP]:$((BASE + 7))" "Go's in6addr_any dual-stack socket is rewritten to the v4-mapped pod address"
 expect b216.2c enabled af_inet6_any_dual REUSE 1 "the v6 rewrite path sets SO_REUSEADDR as well"
 trace b216.2d enabled "AF_INET wildcard :$BASE -> REWRITE $POD_IP:$BASE" "the v4 rewrite branch must announce itself"
 trace b216.2e enabled "(v6only=0) -> REWRITE [::ffff:$POD_IP]:$((BASE + 7))" "the v6 rewrite branch must announce itself, and only after the V6ONLY check"
 
 # ==== b216.3 — the PASSTHROUGH branches ====================================
-expect b216.3a enabled af_inet6_any_v6only LOCAL "[::]:$((BASE + 8))" "an IPV6_V6ONLY=1 socket is left untouched (B215 P2-v6only)"
+expect b216.3a enabled af_inet6_any_v6only LOCAL "[::]:$((BASE + 8))" "an IPV6_V6ONLY=1 socket is left untouched (IPV6_V6ONLY)"
 expect b216.3a enabled af_inet6_any_v6only REUSE 0 "a passed-through socket must not gain SO_REUSEADDR either"
 trace b216.3a enabled "IPV6_V6ONLY=1 -> PASSTHROUGH-V6ONLY" "the v6-only escape is silent by construction; the trace is its only diagnostic"
 
-expect b216.3b enabled af_inet_lowport LOCAL "0.0.0.0:$LOW" "a wildcard bind below the floor stays wildcard (B215 P1c: a specific low bind is EACCES for a non-root uid)"
+expect b216.3b enabled af_inet_lowport LOCAL "0.0.0.0:$LOW" "a wildcard bind below the floor stays wildcard (a specific low bind is EACCES for a non-root uid)"
 expect b216.3b enabled af_inet6_any_lowport LOCAL "[::]:$LOW" "the low-port carve applies on the v6 arm too"
 trace b216.3b enabled "AF_INET wildcard :$LOW -> PASSTHROUGH-LOWPORT" "the low-port carve must announce itself"
 
 EPH="$(val enabled af_inet_ephemeral LOCAL)"
 case "$EPH" in
 0.0.0.0:*) ladder ok "b216.3c af_inet_ephemeral LOCAL=$EPH — an ephemeral (port 0) bind is not source-pinned" ;;
-*) ladder no "b216.3c af_inet_ephemeral LOCAL=${EPH:-<case absent>}, want 0.0.0.0:<ephemeral> — pinning a client socket's source is the B218 rung's job, not bind()'s" ;;
+*) ladder no "b216.3c af_inet_ephemeral LOCAL=${EPH:-<case absent>}, want 0.0.0.0:<ephemeral> — pinning a client socket's source is the connect rung's job, not bind()'s" ;;
 esac
 
 expect b216.3d enabled af_inet_specific_local LOCAL "$POD_IP:$((BASE + 4))" "an explicit specific bind is the caller's choice and is preserved"

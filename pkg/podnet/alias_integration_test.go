@@ -55,7 +55,7 @@ func lo0HasAddr(t *testing.T, ip netip.Addr) bool {
 	return strings.Contains(string(out), "inet "+ip.String()+" ")
 }
 
-// TestLo0AliasIdempotentLeakFree maps to acceptance M2.1-a2: lo0 alias
+// TestLo0AliasIdempotentLeakFree maps to the acceptance criterion: lo0 alias
 // create/teardown is idempotent and leak-free. It Ensures the same address twice
 // (idempotent create), confirms it is present on lo0, Removes it twice (idempotent
 // + leak-free teardown), and confirms it is gone. Mirrors the proxy's identical
@@ -131,7 +131,7 @@ func TestLo0AliasChurn(t *testing.T) {
 }
 
 // TestPodNetworkSetupTeardownOnRealLo0 is the seam-level integration for
-// acceptance M2.1-a2: Network.Setup plumbs a real lo0 alias and returns a bindable
+// the acceptance criterion: Network.Setup plumbs a real lo0 alias and returns a bindable
 // IP (a process can bind it), Teardown removes it, and the whole cycle leaks no
 // alias. It drives the production Network with the real lo0AliasManager over a
 // loopback test CIDR (127.0.0.0/24) so the assertion does not depend on the host's

@@ -57,7 +57,7 @@ func TestPodDNSConfig(t *testing.T) {
 }
 
 // TestDefaultClusterDomain pins the canonical cluster DNS domain default that
-// single-sources the open-coded "cluster.local" literal (B42): the const value
+// single-sources the open-coded "cluster.local" literal: the const value
 // itself, plus the darwin-net defaulting path that must consume it —
 // PodDNSConfig's empty-clusterDomain branch. It guards the const against
 // drifting from the conventional value k3sm's --cluster-domain config supplies,

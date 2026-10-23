@@ -40,7 +40,7 @@ func podResolver(t *testing.T, ns string, stub *fakeDNS) *Resolver {
 	return r
 }
 
-// TestInPodKubernetesAndCrossNamespaceResolution maps to acceptance M2.2-a1: it
+// TestInPodKubernetesAndCrossNamespaceResolution maps to the acceptance criterion: it
 // proves the in-pod-API name kubernetes.default.svc (and its FQDN form) resolve
 // through the resolver's candidate-name expansion to the apiserver-auto-created
 // kubernetes ClusterIP, that a cross-namespace <svc>.<ns> form resolves to the
@@ -49,10 +49,10 @@ func podResolver(t *testing.T, ns string, stub *fakeDNS) *Resolver {
 // FQDNs, so a resolver that skipped search expansion — or one that wrongly
 // searched every namespace — would fail these cases.
 //
-// This is the darwin-net half of M2.2: the resolution logic itself. The full
+// This is the darwin-net half of that criterion: the resolution logic itself. The full
 // in-pod path additionally requires runtimed's NON-platform exec-shim backend,
 // because Apple's sandbox-exec strips DYLD_* (so the getaddrinfo shim only loads
-// there) — see doc.go and docs/PHASES.md M2.2 for that documented constraint.
+// there) — see doc.go for that documented constraint.
 func TestInPodKubernetesAndCrossNamespaceResolution(t *testing.T) {
 	t.Parallel()
 
@@ -154,7 +154,7 @@ func TestInPodKubernetesAndCrossNamespaceResolution(t *testing.T) {
 }
 
 // TestCandidateNamesCrossNamespaceContract documents, at the pure-expansion
-// layer, the Kubernetes DNS namespace contract M2.2 relies on: kubernetes.default.svc
+// layer, the Kubernetes DNS namespace contract the in-pod resolver relies on: kubernetes.default.svc
 // and a cross-namespace <svc>.<ns> each expand to their canonical
 // *.svc.cluster.local FQDN, while a BARE name only ever expands within the pod's
 // OWN namespace — it never produces a candidate in another namespace.

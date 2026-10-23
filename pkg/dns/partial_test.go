@@ -18,7 +18,7 @@ package dns
 
 import "testing"
 
-// TestCompletePartialName is the B243 darwin-net gate: the classifier the
+// TestCompletePartialName is the gate: the classifier the
 // per-node resolver applies before its zone switch, over every verdict shape,
 // opted-in vs not, plus the reserved-suffix set netd consults before it
 // registers a namespace as a host match domain.

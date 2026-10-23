@@ -125,7 +125,7 @@ func (f *fakeListener) Accept() (net.Conn, error) { return nil, errors.New("fake
 func (f *fakeListener) Close() error              { return nil }
 func (f *fakeListener) Addr() net.Addr            { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: f.port} }
 
-// TestStubDNSSurvivesABusyTCPPort is the B329 gate: the stubs' bind must ride
+// TestStubDNSSurvivesABusyTCPPort is the gate: the stubs' bind must ride
 // out a TCP port that is already taken instead of reddening the package.
 func TestStubDNSSurvivesABusyTCPPort(t *testing.T) {
 	// newUDP binds real loopback UDP sockets (cheap, and never the contended

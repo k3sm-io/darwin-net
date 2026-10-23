@@ -153,7 +153,7 @@ func readBackendID(t *testing.T, l *fakeListener, n int) string {
 	return string(buf)
 }
 
-// TestNodePortBindsWildcard is the M3.2 acceptance, run on in-memory listeners
+// TestNodePortBindsWildcard is the NodePort acceptance, run on in-memory listeners
 // and dialers: a NodePort Service yields a node-wide NodePort TCP listener bound to
 // the WILDCARD (address ":<NodePort>", so every interface and both address
 // families answer) that load-balances to the same ready backends as the ClusterIP,

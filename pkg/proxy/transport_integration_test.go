@@ -122,7 +122,7 @@ func TestTransportOverrideDialTarget(t *testing.T) {
 		key := PortKey{ClusterIP: "10.43.2.2", Port: 80, Protocol: netv1.ProtocolTCP}
 		table.SetEndpoints(key, []netv1.Endpoint{be.endpoint()})
 
-		// No override map has ever been installed: the pre-M11.3 shape exactly.
+		// No override map has ever been installed: the earlier shape exactly.
 		if !handleVIP(t, p, key, src) {
 			t.Errorf("host-process backend must be reached with no overrides installed")
 		}

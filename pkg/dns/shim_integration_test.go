@@ -83,7 +83,7 @@ func buildProbe(t *testing.T) string {
 	return bin
 }
 
-// TestGetaddrinfoShimResolvesViaStub maps to acceptance M1.2-a1 (proven in
+// TestGetaddrinfoShimResolvesViaStub maps to the acceptance criterion (proven in
 // isolation): with the shim injected and pointed at a local stub CoreDNS, a
 // probe process resolves a SHORT Service name via search expansion; without the
 // shim, the same probe does NOT resolve it. This is the in-repo proof the DYLD

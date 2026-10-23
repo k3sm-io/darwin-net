@@ -20,7 +20,7 @@ hack/verify-boilerplate.sh
 # for. A NON-ZERO exit (broken go.mod, unresolvable dependency, bad GOWORK, absent
 # toolchain) is a HARD ERROR: the old `[ -n "$(go list ./... 2>/dev/null)" ]` could
 # not tell the two apart, so it silently skipped vet/build/test and still reported
-# green — a gate that cannot even enumerate its packages must go RED (B168).
+# green — a gate that cannot even enumerate its packages must go RED.
 golist_err="$(mktemp)"
 trap 'rm -f "$golist_err"' EXIT
 if ! go_pkgs="$(CGO_ENABLED=$CGO go list ./... 2>"$golist_err")"; then

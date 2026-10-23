@@ -37,7 +37,7 @@ func stdConfig() netv1.DNSConfig {
 	}
 }
 
-// TestCandidateNamesSearchExpansion maps to acceptance M1.2-a1's resolver core:
+// TestCandidateNamesSearchExpansion maps to the acceptance criterion's resolver core:
 // it asserts the ndots/search expansion, with the load-bearing case that a SHORT
 // name like "web" is expanded through the search list FIRST (the tell for a
 // correct ndots loop — a skipped loop would query "web" as absolute and fail).

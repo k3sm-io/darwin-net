@@ -16,7 +16,7 @@ limitations under the License.
 
 package mesh
 
-// B68 regression-guard gate. The wireguard swap boundary is the pkg/mesh PACKAGE,
+// Regression-guard gate. The wireguard swap boundary is the pkg/mesh PACKAGE,
 // not a single file: the wireguard-go module (golang.zx2c4.com/wireguard/{conn,
 // device,tun}) is imported ONLY by pkg/mesh/device_wireguard.go, one of two Device
 // impls behind the wireguard-free Device interface (device.go). The second impl,
@@ -81,7 +81,7 @@ func importsWG(importPath string) bool {
 	return importPath == wgModulePath || strings.HasPrefix(importPath, wgModulePath+"/")
 }
 
-// TestWireguardImportsConfinedAndDeviceFaked is the B68 gate. It has two halves that
+// TestWireguardImportsConfinedAndDeviceFaked is the gate. It has two halves that
 // fail independently: a module-wide lexical import lint that keeps wireguard-go
 // confined to the pkg/mesh package (subtests A and B), and a fake-device reconcile
 // proof that the peer ADD/REMOVE datapath converges through the Device seam with no
@@ -162,7 +162,7 @@ func TestWireguardImportsConfinedAndDeviceFaked(t *testing.T) {
 	// Subtest A: the confinement invariant — no wireguard import outside pkg/mesh.
 	t.Run("imports_confined", func(t *testing.T) {
 		for _, o := range offenders {
-			t.Errorf("%s imports %q directly — the wireguard-go module is confined to the pkg/mesh package (route the privileged datapath through the Device seam / pkg/netd/wire instead; B68)", o.file, o.importPath)
+			t.Errorf("%s imports %q directly — the wireguard-go module is confined to the pkg/mesh package (route the privileged datapath through the Device seam / pkg/netd/wire instead)", o.file, o.importPath)
 		}
 	})
 

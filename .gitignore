@@ -19,5 +19,5 @@ go.work.sum
 .idea/
 .vscode/
 
-# B350 lab-tier recurrence evidence is operator-held, never committed (hack/lab/runs/README.md).
+# Lab-tier recurrence evidence is held by the maintainer, never committed (hack/lab/runs/README.md).
 hack/acceptance/.b350-evidence/

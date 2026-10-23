@@ -24,7 +24,7 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 )
 
-// TestSearchNormalizationLockstep pins the invariant B47 is justified by: the three
+// TestSearchNormalizationLockstep pins the invariant the sanitizer is justified by: the three
 // SearchDomains encoders that go through normalizeSearch — the host-process shim env
 // (ConfigToEnv), the vm-guest /etc/resolv.conf (GuestResolvConf), and the Go
 // reference resolver (candidateNames) — agree EXACTLY on the effective search list
@@ -101,11 +101,11 @@ func TestSearchNormalizationLockstep(t *testing.T) {
 	}
 }
 
-// TestSanitizeSearchRFC1123Allowlist is the B50 gate: sanitizeSearch drops any entry
+// TestSanitizeSearchRFC1123Allowlist is the gate: sanitizeSearch drops any entry
 // holding a byte outside the RFC-1123 subdomain charset [a-zA-Z0-9.-] (a positive
-// allowlist), which is strictly STRONGER than B47's whitespace+control blocklist. The
+// allowlist), which is strictly STRONGER than the earlier whitespace+control blocklist. The
 // separator cases below (';' '#' ':' '/' '@') are the proof of "stronger, not just
-// equal": B47's blocklist ADMITS them (none is whitespace or control), so on main
+// equal": the earlier blocklist ADMITS them (none is whitespace or control), so on main
 // those assertions fail — this gate is non-vacuous. The trailing-dot case proves the
 // scan is a FLAT charset scan, not a label decomposition (the '.' is in the charset,
 // so an FQDN's trailing dot is kept, not treated as an empty trailing label).
@@ -119,7 +119,7 @@ func TestSanitizeSearchRFC1123Allowlist(t *testing.T) {
 		in   string
 		want []string
 	}{
-		// Non-whitespace separators the B47 blocklist ADMITTED are now DROPPED. On main
+		// Non-whitespace separators the earlier blocklist ADMITTED are now DROPPED. On main
 		// (whitespace+control blocklist) each of these is KEPT, so the assertion FAILS
 		// there — this is what makes the gate non-vacuous and proves subsume-and-exceed.
 		{"semicolon (resolv.conf comment) dropped", "evil;comment", nil},
@@ -128,7 +128,7 @@ func TestSanitizeSearchRFC1123Allowlist(t *testing.T) {
 		{"slash dropped", "a/b", nil},
 		{"at-sign dropped", "u@h", nil},
 
-		// Whitespace / control still dropped — regression parity with B47's blocklist.
+		// Whitespace / control still dropped — regression parity with the earlier blocklist.
 		{"interior space dropped", "foo bar", nil},
 		{"interior tab dropped", "a\tb", nil},
 		{"interior newline dropped", "x\ny", nil},

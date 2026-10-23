@@ -870,7 +870,7 @@ func goVerdictsPerCandidate(t *testing.T, stub *templateDNS, name string, mc mul
 	return out
 }
 
-// TestDNSWireClassificationDifferential is the B126 gate: it feeds each golden
+// TestDNSWireClassificationDifferential is the gate: it feeds each golden
 // response template through BOTH resolvers and asserts they reach the SAME
 // three-way verdict — the property the constant-level drift guards in
 // env_test.go cannot express.

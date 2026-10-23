@@ -22,7 +22,7 @@ import (
 	"testing"
 )
 
-// TestNodeCIDRCarveCollisionFree maps to acceptance M2.1-a1 (the per-node /24
+// TestNodeCIDRCarveCollisionFree maps to the acceptance criterion (the per-node /24
 // carve is collision-free): distinct node indices yield disjoint /24s out of the
 // cluster CIDR, and out-of-range indices fail fast. Table-driven over the cluster
 // default 100.64.0.0/10.
@@ -77,7 +77,7 @@ func TestNodeCIDRCarveCollisionFree(t *testing.T) {
 	}
 }
 
-// TestNodeCIDRStableAcrossRestart maps to acceptance M2.1-a1 (the per-node /24 is
+// TestNodeCIDRStableAcrossRestart maps to the acceptance criterion (the per-node /24 is
 // stable across restart): the same node index always derives the same /24, so a
 // daemon restart re-derives the identical block without persisting it.
 func TestNodeCIDRStableAcrossRestart(t *testing.T) {
@@ -99,7 +99,7 @@ func TestNodeCIDRStableAcrossRestart(t *testing.T) {
 	}
 }
 
-// TestAllocatorUniqueNoDoubleAllocation maps to acceptance M2.1-a1 (allocate
+// TestAllocatorUniqueNoDoubleAllocation maps to the acceptance criterion (allocate
 // unique IPs from the CIDR; no double-allocation): draining the pool yields every
 // usable host exactly once, all inside the /24 and excluding the network,
 // broadcast, and mesh-egress reserved addresses, then the pool is exhausted.
@@ -142,7 +142,7 @@ func TestAllocatorUniqueNoDoubleAllocation(t *testing.T) {
 	}
 }
 
-// TestAllocatorReleaseLeakFree maps to acceptance M2.1-a1 (release is leak-free):
+// TestAllocatorReleaseLeakFree maps to the acceptance criterion (release is leak-free):
 // after a full drain, releasing every address returns the pool to empty and the
 // addresses are reusable; releasing an address twice or one never allocated is the
 // tolerated no-op the leak-free teardown relies on.
@@ -194,7 +194,7 @@ func TestAllocatorReleaseLeakFree(t *testing.T) {
 	}
 }
 
-// TestAllocatorChurnLeakFree maps to acceptance M2.1-a1 (leak-free + idempotent
+// TestAllocatorChurnLeakFree maps to the acceptance criterion (leak-free + idempotent
 // under churn): many allocate/release cycles must never grow the in-use set beyond
 // what is held and must return to empty when everything is released.
 func TestAllocatorChurnLeakFree(t *testing.T) {

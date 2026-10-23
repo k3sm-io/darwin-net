@@ -1,6 +1,6 @@
 /*
  * bindcases.c — the table-driven bind() case harness behind
- * hack/acceptance/B216.sh (the B216 gate).
+ * hack/acceptance/B216.sh.
  *
  * It walks a TABLE OF SOCKADDR SHAPES, calls bind(2) on each, and prints what
  * the kernel actually ended up with:
@@ -17,9 +17,9 @@
  * shim-injected and the control runs, so any difference between the two runs is
  * caused by the dylib and nothing else.
  *
- * MODES (B218 added the second). With three arguments the harness runs the BIND
- * table and nothing else, byte-for-byte as it did for B216 — that is a contract,
- * not a coincidence: the B216 gate diffs whole arms against each other, so a new
+ * MODES (the connect table is the second). With three arguments the harness runs the BIND
+ * table and nothing else, byte-for-byte as it did before the connect mode existed — that is a contract,
+ * not a coincidence: the bind acceptance gate diffs whole arms against each other, so a new
  * line in the default output would red a gate about a different rung. The
  * connect table runs only when it is asked for by name.
  *
@@ -36,7 +36,7 @@
  * copy of the in-scope/out-of-scope fact — the env it exports and the addresses
  * it dials cannot drift apart.
  *
- * The INTERCONNECT table (B522, run by pkg/podnet's
+ * The INTERCONNECT table (run by pkg/podnet's
  * TestInterconnectEnvPinsSourceInScope) takes the same approach with three
  * destinations: one inside K3SM_CLUSTER_CIDRS, one inside
  * K3SM_INTERCONNECT_CIDRS, one inside neither. ic-ip is the interconnect
@@ -222,7 +222,7 @@ static const size_t nconncases = sizeof conncases / sizeof conncases[0];
  * REUSE is printed because the connect rung deliberately does NOT set
  * SO_REUSEADDR (unlike the bind rung), and a gate can only assert that if the
  * harness reports it. PEER is what the ACCEPTING side sees, which is the exact
- * observation B215 P1d made about source fidelity.
+ * observation that established the source-fidelity problem.
  */
 static int run_connect_cases(const char *unixdir, const char *in_dst, const char *out_dst) {
     struct in_addr in_a, out_a;
@@ -448,8 +448,8 @@ int main(int argc, char **argv) {
     const char *unixdir = argv[3];
 
     /* The connect table REPLACES the bind table rather than following it: the
-     * B216 gate diffs whole arms of the default output, so the three-argument
-     * form must stay byte-identical to what it printed before B218. */
+     * the bind acceptance gate diffs whole arms of the default output, so the three-argument
+     * form must stay byte-identical to what it printed before the connect mode existed. */
     if (argc == 7) {
         return run_connect_cases(unixdir, argv[5], argv[6]);
     }

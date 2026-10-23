@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-// TestHeadlessAndSRVRecordSynthesis is the M10.1 / B81 gate: the pure
+// TestHeadlessAndSRVRecordSynthesis is the gate: the pure
 // record-synthesis library produces headless A / StatefulSet-identity A / SRV /
 // PTR sets per upstream kube-dns semantics, filters readiness, honors
 // publishNotReadyAddresses, and the dashed-IP pod decoder round-trips and

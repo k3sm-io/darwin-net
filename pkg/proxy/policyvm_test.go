@@ -54,7 +54,7 @@ func failOpenWarns(h *captureHandler) []slog.Record {
 	return out
 }
 
-// TestPolicyVMNetUnknownSourceFailsClosed is the M11.3-d3a acceptance table: on a
+// TestPolicyVMNetUnknownSourceFailsClosed is the acceptance table: on a
 // vm-hosting node an unattributable source inside the vmnet segment is DENIED where
 // a policy selects the destination — and NOTHING else changes. Every row that
 // asserts the new deny is paired with a row that pins a case the deny must NOT
@@ -120,12 +120,12 @@ func TestPolicyVMNetUnknownSourceFailsClosed(t *testing.T) {
 		// Same node, same table, same policy-selected destination — only the source
 		// class differs. This is the row that proves the deny is scoped and not a
 		// cluster-wide deny-unknown: a pre-informer-sync race, an unseeded node
-		// address, or an off-cluster client must keep the M10.4 hint contract.
+		// address, or an off-cluster client must keep the network-policy hint contract.
 		if !pt.Allow(offSegment, selected, 8080) {
 			t.Fatalf("an unknown source OUTSIDE the vmnet prefix must still fail OPEN")
 		}
 		if n := len(failOpenWarns(h)); n != 1 {
-			t.Errorf("fail-open Warn count = %d, want 1 (the unchanged M10.4 signal)", n)
+			t.Errorf("fail-open Warn count = %d, want 1 (the unchanged network-policy hint signal)", n)
 		}
 		if n := len(vmDenyWarns(h)); n != 0 {
 			t.Errorf("the vm deny fired for a non-vmnet source %d times, want 0", n)

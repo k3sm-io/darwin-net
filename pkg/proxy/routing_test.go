@@ -30,7 +30,7 @@ func keyFor(clusterIP string, port int32) PortKey {
 	return PortKey{ClusterIP: clusterIP, Port: port, Protocol: netv1.ProtocolTCP}
 }
 
-// TestRoutingTableReadyFilter maps to acceptance M1.1-a1 (pure routing table):
+// TestRoutingTableReadyFilter maps to the acceptance criterion (pure routing table):
 // an unready endpoint is NEVER admitted to the table and therefore can never be
 // picked. This is the load-balancing safety invariant.
 func TestRoutingTableReadyFilter(t *testing.T) {
@@ -119,7 +119,7 @@ func TestRoutingTableReadyFilter(t *testing.T) {
 	}
 }
 
-// TestRoutingTablePickDistribution maps to acceptance M1.1-a1 (load-balances
+// TestRoutingTablePickDistribution maps to the acceptance criterion (load-balances
 // across endpoints): round-robin Pick fans out evenly and the explicit-index
 // PickAt is deterministic, so the distribution is table-assertable.
 func TestRoutingTablePickDistribution(t *testing.T) {
@@ -279,7 +279,7 @@ func TestRoutingTableLocality(t *testing.T) {
 	})
 }
 
-// TestInternalTrafficPolicyLocalFiltersToNodeLocal is the B21 gate: with
+// TestInternalTrafficPolicyLocalFiltersToNodeLocal is the gate: with
 // internalTrafficPolicy: Local the routing table steers only to node-local
 // backends under a valid podCIDR (dropping with ErrNoLocalBackends when none are
 // local), FAILS OPEN to all backends when the podCIDR makes locality unknowable
@@ -410,7 +410,7 @@ func TestInternalTrafficPolicyLocalFiltersToNodeLocal(t *testing.T) {
 	})
 }
 
-// TestNodePortIgnoresInternalTrafficPolicy is the B44 gate: internalTrafficPolicy:
+// TestNodePortIgnoresInternalTrafficPolicy is the gate: internalTrafficPolicy:
 // Local governs the ClusterIP (east-west) path ONLY (KEP-2086), so the *:NodePort
 // (external) selector PickStickyCluster must IGNORE it and route to ALL Ready backends,
 // while the ClusterIP selectors (Pick/PickSticky) still honor it and DROP when no
@@ -420,7 +420,7 @@ func TestInternalTrafficPolicyLocalFiltersToNodeLocal(t *testing.T) {
 // (affinityConfig{}), so PickStickyCluster is exactly the old PickCluster it replaced:
 // plain round-robin over the external (Cluster) scope.
 //
-// Non-vacuity: before B44 the *:NodePort listener shared the ClusterIP's key and used
+// Non-vacuity: before this fix the *:NodePort listener shared the ClusterIP's key and used
 // PickSticky, so it returned ErrNoLocalBackends and DROPPED the external connection.
 // Asserting PickStickyCluster SUCCEEDS where Pick/PickSticky DROP is red under the old
 // shared-key behavior and green only once the external path selects the Cluster pool.
@@ -429,7 +429,7 @@ func TestNodePortIgnoresInternalTrafficPolicy(t *testing.T) {
 	key := keyFor("10.43.0.10", 80)
 	const cidr = "100.64.0.0/24"
 	// All-REMOTE backends: every IP is outside the /24, so LocalityRemote — ZERO
-	// node-local backends under a VALID podCIDR (mirrors the B21 drop fixture).
+	// node-local backends under a VALID podCIDR (mirrors the drop fixture).
 	remoteEps := []netv1.Endpoint{
 		{IP: "100.64.1.5", Port: 8080, Ready: true}, // out /24 -> remote
 		{IP: "100.64.1.6", Port: 8080, Ready: true}, // out /24 -> remote

@@ -2,12 +2,12 @@
 #
 # darwin-net B218 acceptance gate — the connect() source-pinning rung.
 #
-# THE ITEM (B218): a /32 lo0 alias installs a host route whose
+# THE ITEM: a /32 lo0 alias installs a host route whose
 # rt_ifa IS that alias, so XNU source-selects the DESTINATION's own address for an
-# UNBOUND dial to another pod. B215 cell P1d measured it: a pod holding
+# UNBOUND dial to another pod. An earlier probe measured it: a pod holding
 # K3SM_POD_IP=100.64.99.8 dialling 100.64.99.7 was seen by the ACCEPTING side as
 # peer=100.64.99.7 — the callee's own IP — so nothing keyed on the source address
-# can tell one caller from another. P1d.6 measured the fix: bind(podIP:0) before
+# can tell one caller from another. The probe measured the fix: bind(podIP:0) before
 # connect(). This rung is that bind, fired ONLY for a destination inside
 # K3SM_CLUSTER_CIDRS so an en0-routed external dial is never pinned onto a
 # loopback source.
@@ -30,7 +30,7 @@
 #                     lands on the pod address where the kernel would have chosen
 #                     the outbound interface's; a TCP dial into the scope still
 #                     COMPLETES and the accepting side sees the pod address as
-#                     the peer (the P1d observation, inverted); and the pinned
+#                     the peer (that observation, inverted); and the pinned
 #                     socket does NOT gain SO_REUSEADDR (the deliberate
 #                     divergence from the bind rung, which does set it).
 #   b218.3  BLOCKING  the PASSTHROUGH branches, each for its own reason: a
@@ -244,7 +244,7 @@ expect b218.2b enabled connect_udp_in_cluster REUSE 0 "the connect rung does NOT
 trace b218.2c enabled "dst $IN_DST:9999 -> PIN source $POD_IP" "the pin branch must announce itself"
 
 # The live handshake: a pinned dial must still complete, and the ACCEPTING side
-# must see the pod address — the exact observation B215 P1d made, inverted.
+# must see the pod address — the exact observation that probe made, inverted.
 expect b218.2d enabled connect_tcp_in_cluster RC 0 "a pinned TCP dial completes a real handshake"
 expect_addr b218.2d enabled connect_tcp_in_cluster PEER "$POD_IP" "the accepting side sees the caller's own address — this is what a PolicyTable keyed on the source would read"
 trace b218.2e enabled "-> PIN source $POD_IP" "the TCP arm takes the same branch as the UDP one (no SOCK_TYPE special-casing)"

@@ -76,7 +76,7 @@ func testIngress(name, class, host string, backend networkingv1.IngressServiceBa
 	return ing
 }
 
-// TestIngressClassFilteredWatch is the M10.3 watcher gate: only the Ingress
+// TestIngressClassFilteredWatch is the watcher gate: only the Ingress
 // whose spec.ingressClassName matches Config.ClassName reconciles (a foreign
 // class and a nil class are ignored); the backend's named Service port
 // resolves through the Services store to the ClusterIP VIP + port number; and
