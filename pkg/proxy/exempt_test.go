@@ -25,7 +25,7 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 )
 
-// TestKubeDNSVIPExemptFromProxy is the M3.3 acceptance for the kube-dns VIP
+// TestKubeDNSVIPExemptFromProxy is the acceptance for the kube-dns VIP
 // exemption: with WithInfraVIPExemptions(10.43.0.10) the proxy takes NO ownership
 // of the kube-dns VIP for either 53/TCP or 53/UDP — no worker, no lo0 alias, no
 // routing entry — so per-node CoreDNS (which binds 10.43.0.10:53 directly) never

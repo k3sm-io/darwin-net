@@ -107,7 +107,7 @@ func TestMeshNewDerivesMeshIP(t *testing.T) {
 	}
 }
 
-// TestMeshReconcileEndpointChange is the M3.1 acceptance for continuous reconcile:
+// TestMeshReconcileEndpointChange is the acceptance for continuous reconcile:
 // a peer's endpoint change is reconciled (the applied config carries the new
 // endpoint), not ignored after the initial read. It drives the controller twice
 // with the same peer at two endpoints and asserts the device's last-applied plan

@@ -104,7 +104,7 @@ func hostPort(ip string, port int32) string {
 // Port windowing for freePort. Asking the kernel for :0 and immediately closing
 // the listener hands out a port that ANOTHER concurrently running copy of a test
 // binary can be handed too — and `go test ./...` runs one binary per package in
-// parallel, several of which bind loopback ports, while the B207 stress recipe
+// parallel, several of which bind loopback ports, while the stress recipe
 // runs several copies of this very binary at once. A collision then surfaces as a
 // listener that never comes up, or as waitClosed finding somebody else's socket on
 // a port this test just released.

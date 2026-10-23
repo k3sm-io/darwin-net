@@ -171,7 +171,7 @@ func newTestWatcher(t *testing.T) (*Watcher, *captureHandler) {
 	return w, h
 }
 
-// TestExternalTrafficPolicyLocalWarns proves the B56 datapath observability signal:
+// TestExternalTrafficPolicyLocalWarns proves the datapath observability signal:
 // externalTrafficPolicy:Local on a served NodePort emits exactly one throttled Warn
 // per contiguous episode, from the single-goroutine onService path, WITHOUT
 // perturbing routing (observability-only).
@@ -310,7 +310,7 @@ func TestExternalTrafficPolicyReadIsObservabilityOnly(t *testing.T) {
 	}
 
 	// Drive both through the real routing table and assert PickStickyCluster (the
-	// NodePort path since B55) fan-out is byte-identical — the eTP read left backend
+	// NodePort path since the fix) fan-out is byte-identical — the eTP read left backend
 	// selection untouched.
 	eps := []netv1.Endpoint{
 		{IP: "10.42.0.5", Port: 8080, Ready: true},
@@ -426,7 +426,7 @@ func assertNoBackends(t *testing.T, tbl *RoutingTable, key PortKey, settle time.
 	}
 }
 
-// TestSliceBeforeServiceIsNotLost is the B160 gate. onSlice silently returns when
+// TestSliceBeforeServiceIsNotLost is the gate. onSlice silently returns when
 // the slice's Service is not yet in the Service informer's store, and both
 // informers run with resyncPeriod 0, so that event is never re-delivered. The
 // question is whether the DROP is LOSSY — whether a Service whose slice was
@@ -601,7 +601,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 			// Re-read rather than index blind: Len and Backends are two separate lock
 			// acquisitions, so a regression that lets a stale empty reconcile land
 			// between them must report itself, not panic with an index-out-of-range
-			// that buries the diagnosis (B207).
+			// that buries the diagnosis.
 			got := tbl.Backends(key)
 			if len(got) != 1 {
 				t.Fatalf("iteration %d: backends = %d, want 1 (a stale reconcile overtook a fresh one)", i, len(got))
@@ -632,7 +632,7 @@ func TestSliceBeforeServiceIsNotLost(t *testing.T) {
 	})
 }
 
-// TestReconcileSnapshotIsNotOvertaken pins the B207 mechanism: reconcileService
+// TestReconcileSnapshotIsNotOvertaken pins the mechanism: reconcileService
 // reads the EndpointSlice cache and THEN delivers the resulting backend set to the
 // per-VIP worker, and those two steps run on two different informer goroutines. If
 // they are not serialized per Service, a goroutine descheduled between them lands

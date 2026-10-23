@@ -36,7 +36,7 @@ var (
 // TestVMPodSelectsVmnetPathAndAliasesPublished asserts both branches of the
 // path-selection fork: a vm guest gets a GuestNetwork (the NAT config) AND its
 // published /32 aliased on lo0 for the pod's lifetime — the address the node's
-// proxy relays from (B440: before it, a vm pod's status.podIP was live on no
+// proxy relays from (before this, a vm pod's status.podIP was live on no
 // interface and unreachable from anywhere) — while a host-process pod still gets
 // exactly one lo0 alias. Teardown removes the alias for both backends, so the
 // alias manager installs the address's blackhole for a vm pod exactly as for a

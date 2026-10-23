@@ -70,9 +70,9 @@ const maxUpdateArchiveDepth = 16
 // exclusively and never through a symlink, with their permission bits less
 // group and other write and any set-id bit.
 //
-// Ported from k3sm's pkg/update ExtractSet (Apache-2.0, The k3sm Authors),
-// whose rules this keeps; the cp-payload members are matched by prefix here
-// because the payload binary list lives in k3sm.
+// The rules mirror the payload layout the k3sm repository's pkg/install
+// defines (its cp-payload directory); the cp-payload members are matched by
+// prefix here because the payload binary list lives in k3sm.
 func extractUpdateArchive(r io.Reader, dst string) error {
 	zr, err := gzip.NewReader(r)
 	if err != nil {

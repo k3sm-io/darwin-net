@@ -26,7 +26,7 @@ func be(port uint16) Backend {
 	return Backend{VIP: netip.MustParseAddr("10.43.0.10"), Port: port}
 }
 
-// TestIngressRouteTablePrecedence is the M10.3 routing-core gate: the pathType
+// TestIngressRouteTablePrecedence is the routing-core gate: the pathType
 // precedence matrix (Exact vs Prefix, longest match, segment boundaries), the
 // host-specific-over-hostless tiering, the default backend, and the
 // router-level 404 (ok=false).

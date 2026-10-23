@@ -74,7 +74,7 @@ func endpointIPSet(eps []netv1.Endpoint) map[string]bool {
 	return s
 }
 
-// TestSessionAffinityClientIPSticky is the B22 gate: the userspace proxy's TCP path
+// TestSessionAffinityClientIPSticky is the gate: the userspace proxy's TCP path
 // honors ClientIP session affinity via RoutingTable.PickSticky. Each sub-case guards
 // a specific failure mode the pre-build critiques flagged:
 //
@@ -306,7 +306,7 @@ func TestSessionAffinityClientIPSticky(t *testing.T) {
 	})
 }
 
-// TestNodePortClientIPAffinity is the B55 gate: the *:NodePort (external) accept path
+// TestNodePortClientIPAffinity is the gate: the *:NodePort (external) accept path
 // honors ClientIP session affinity via RoutingTable.PickStickyCluster, over the CLUSTER
 // pool — externalTrafficPolicy:Cluster routes to ALL Ready backends and iTP:Local is
 // ignored (KEP-2086), so external stickiness is applied to the full Ready set and never
@@ -386,7 +386,7 @@ func TestNodePortClientIPAffinity(t *testing.T) {
 	// iTP:Local + all-REMOTE backends has ZERO node-local backends. The external path
 	// must still stick over the FULL cluster pool (external forces allSet), while the
 	// internal PickSticky DROPS with ErrNoLocalBackends — proving PickStickyCluster
-	// re-validates against allSet, never st.localSet, so eTP:Local/B56 is not conflated.
+	// re-validates against allSet, never st.localSet, so eTP:Local is not conflated.
 	t.Run("cluster-scope: iTP:Local all-remote sticks externally, drops internally", func(t *testing.T) {
 		t.Parallel()
 		cidr := netip.MustParsePrefix("100.64.0.0/24")
@@ -507,7 +507,7 @@ func TestNodePortClientIPAffinity(t *testing.T) {
 	})
 }
 
-// TestAffinityAggregateBoundAndEviction is the B51 gate: it hardens B22's ClientIP
+// TestAffinityAggregateBoundAndEviction is the gate: it hardens the ClientIP
 // affinity with a relay-GLOBAL aggregate binding ceiling and an O(1) eviction. It
 // asserts INVARIANTS (count-conservation, reachability), never a specific eviction
 // victim — the O(1) evict is pseudo-random (Go map iteration), so victim identity is

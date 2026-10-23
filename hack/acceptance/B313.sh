@@ -3,7 +3,7 @@
 # darwin-net B313 acceptance gate — pkg/proxy/doc.go's transport-override
 # feeder paragraph must describe reality, not the pre-M11 gap it once did.
 #
-# THE ITEM (B313): pkg/proxy/doc.go's "Published identity vs live transport"
+# THE ITEM: pkg/proxy/doc.go's "Published identity vs live transport"
 # section used to close with "The feeder is the k3sm assembler (from the guest
 # agent's Health lease report) and it does not exist yet, so no override is
 # installed today." That premise is stale: k3sm's provider now runs

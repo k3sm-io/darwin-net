@@ -81,7 +81,7 @@ func TestEnsureNodeAlias(t *testing.T) {
 	}
 }
 
-// TestNetworkSetupAllocatesAndAliases maps to acceptance M2.1-a2 (rootless leg):
+// TestNetworkSetupAllocatesAndAliases maps to the acceptance criterion (rootless leg):
 // Setup returns a bindable IP inside the node /24 and ensures exactly one lo0
 // alias for it; the IP is recorded for the pod.
 func TestNetworkSetupAllocatesAndAliases(t *testing.T) {
@@ -106,7 +106,7 @@ func TestNetworkSetupAllocatesAndAliases(t *testing.T) {
 	}
 }
 
-// TestNetworkSetupIdempotent maps to acceptance M2.1-a2: a repeated Setup for the
+// TestNetworkSetupIdempotent maps to the acceptance criterion: a repeated Setup for the
 // same pod returns the same IP and allocates no second address (a retried sandbox
 // creation must not leak). The alias is re-ensured (idempotent) on the retry.
 func TestNetworkSetupIdempotent(t *testing.T) {
@@ -156,7 +156,7 @@ func TestNetworkDistinctPodsDistinctIPs(t *testing.T) {
 	}
 }
 
-// TestNetworkTeardownReleasesAndRemoves maps to acceptance M2.1-a2: Teardown
+// TestNetworkTeardownReleasesAndRemoves maps to the acceptance criterion: Teardown
 // removes the lo0 alias, releases the IP back to the pool, and forgets the pod —
 // and the released address becomes reusable.
 func TestNetworkTeardownReleasesAndRemoves(t *testing.T) {
@@ -187,7 +187,7 @@ func TestNetworkTeardownReleasesAndRemoves(t *testing.T) {
 	}
 }
 
-// TestNetworkTeardownIdempotentLeakFree maps to acceptance M2.1-a2 (leak-free):
+// TestNetworkTeardownIdempotentLeakFree maps to the acceptance criterion (leak-free):
 // tearing down an unknown pod, or the same pod twice, is a no-op success — the
 // crash-recovery reconcile path.
 func TestNetworkTeardownIdempotentLeakFree(t *testing.T) {
@@ -210,7 +210,7 @@ func TestNetworkTeardownIdempotentLeakFree(t *testing.T) {
 	}
 }
 
-// TestNetworkSetupTeardownChurnLeakFree maps to acceptance M2.1-a2 (leak-free
+// TestNetworkSetupTeardownChurnLeakFree maps to the acceptance criterion (leak-free
 // under churn): repeated Setup/Teardown cycles never leak an IP or an alias, and
 // the pool always returns to empty.
 func TestNetworkSetupTeardownChurnLeakFree(t *testing.T) {

@@ -40,7 +40,7 @@ import (
 // registered yet) — and both watchers here run a 0 resync period, so nothing ever
 // recovers the lost event and the table never converges. Under parallel load the
 // gap widens from microseconds to seconds, which is exactly when the convergence
-// assertions were observed to fail (B207). cache.WaitForCacheSync is therefore NOT
+// assertions were observed to fail. cache.WaitForCacheSync is therefore NOT
 // a readiness signal for "a Create will be seen"; this is.
 type establishedWatches struct {
 	ready     <-chan struct{}

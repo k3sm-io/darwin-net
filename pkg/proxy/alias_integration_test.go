@@ -57,7 +57,7 @@ func lo0HasAddr(t *testing.T, ip netip.Addr) bool {
 	return strings.Contains(string(out), "inet "+ip.String()+" ")
 }
 
-// TestLo0AliasIdempotentLeakFree maps to acceptance M1.1-a2: lo0 alias
+// TestLo0AliasIdempotentLeakFree maps to the acceptance criterion: lo0 alias
 // create/teardown is idempotent and leak-free under churn. It Ensures the same
 // address twice (idempotent create), confirms it is present on lo0, Removes it
 // twice (idempotent + leak-free teardown), and confirms it is gone.

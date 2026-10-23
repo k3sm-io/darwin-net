@@ -24,7 +24,7 @@ import (
 	"testing"
 )
 
-// TestReattachPodRoundTrip is the M10.1 crash-reconcile gate (reattach half):
+// TestReattachPodRoundTrip is the crash-reconcile gate (reattach half):
 // a restarted daemon re-adopts a known podID->IP binding, a subsequent Setup
 // for the same pod returns the same address without a fresh allocation, and no
 // other pod can be handed that address.
@@ -119,7 +119,7 @@ func TestReattachPodRejects(t *testing.T) {
 	})
 }
 
-// TestSweepStaleRemovesExactlyOrphans is the M10.1 crash-reconcile gate (sweep
+// TestSweepStaleRemovesExactlyOrphans is the crash-reconcile gate (sweep
 // half): with orphaned aliases left on lo0 by a crashed previous daemon, the
 // sweep removes exactly the orphans — the known (reattached) pod's alias
 // survives and the reserved mesh-egress address is never touched.

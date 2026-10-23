@@ -101,8 +101,8 @@ func (s *Server) bridgeHas(ctx context.Context, addr netip.Addr) (bool, error) {
 }
 
 // AddInterconnectAlias puts addr on bridge0 with a bits-long netmask:
-// `ifconfig bridge0 inet <addr> netmask <mask> alias`, the form the B519 rig
-// proved. The interface is fixed; no route is added. It re-checks the server's
+// `ifconfig bridge0 inet <addr> netmask <mask> alias`, the form verified on
+// hardware. The interface is fixed; no route is added. It re-checks the server's
 // policy shape (an interconnect address, a /24 or /32) so no other address can
 // reach bridge0 through this call.
 func (a *darwinApplier) AddInterconnectAlias(ctx context.Context, addr netip.Addr, bits int) error {

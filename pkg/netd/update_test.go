@@ -548,7 +548,7 @@ func withMember(members []tarMember, name string, m *tarMember) []tarMember {
 	return out
 }
 
-// TestApplyUpdateVerifiesBeforeInstall is the B598 root-helper gate: root
+// TestApplyUpdateVerifiesBeforeInstall is the root-helper gate: root
 // verifies the signer certificate against the cluster CA, the signature over
 // the payload, the archive digest, the extracted set, the code signatures and
 // the downgrade rule, each before the next step and all before the one exec;
@@ -1063,7 +1063,7 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// TestUpdateHelperWaitsForTheRestartingAck is the B691 gate: after the
+// TestUpdateHelperWaitsForTheRestartingAck is the gate: after the
 // Installing frame and before the exec, the helper waits for the client's
 // acknowledgement (a Hello request on the same connection), bounded by
 // updateAckTimeout. The exec follows the ack when it arrives, follows the

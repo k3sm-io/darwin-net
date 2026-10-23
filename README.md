@@ -32,7 +32,7 @@ around.
 |---|---|
 | [`pkg/podnet`](pkg/podnet) | IP-per-pod allocation: carves each node's `/24` out of the cluster pod CIDR, hands out `/32` addresses, and plumbs them onto `lo0`. Implements `PodNetwork`, the seam the runtime calls on pod setup and teardown. Also selects the guest-networking path for VM-backed pods. |
 | [`pkg/proxy`](pkg/proxy) | The userspace Service proxy — one listening socket per ClusterIP:port, bound on a dedicated `lo0` alias, plus a NodePort listener where a port declares one. Load-balances to Ready backends from the Services and EndpointSlices APIs, with ClientIP session affinity and a NetworkPolicy L4 subset (see "NetworkPolicy" below). |
-| [`pkg/mesh`](pkg/mesh) | A WireGuard mesh over a root-created `utun` that routes (never NATs) pod traffic between nodes. Peers, endpoints, and pod CIDRs come from the `MeshPeer` CRD in `apis`, watched and reconciled continuously. |
+| [`pkg/mesh`](pkg/mesh) | A WireGuard mesh over a root-created `utun` that routes (never NATs) pod traffic between nodes. Peers, endpoints, and pod CIDRs come from the `MeshPeer` CRD in `apis`, watched and reconciled continuously. It also probes the peers on a direct Thunderbolt link with ICMP echoes (every 5 s, dead after 3 misses), so a cable whose far end sleeps or hangs is noticed. |
 | [`pkg/dns`](pkg/dns) | Pod DNS: the pure-Go reference resolver (`ndots`/search-domain expansion) that the `getaddrinfo` shim mirrors, the per-pod DNS config the shim consumes, and `/etc/resolv.conf` rendering for Linux VM guests. |
 | [`pkg/ingress`](pkg/ingress) | An in-process L7 HTTP(S) reverse proxy fronting the ClusterIP VIPs the Service proxy already owns — host/path routing, in-memory-only TLS termination, no bundled Traefik or nginx binary. |
 | [`pkg/netbind`](pkg/netbind) | The shared listener-bind seam used by the Service proxy and the ingress proxy: bind directly, or ask the root daemon to bind and adopt the resulting socket over `SCM_RIGHTS`. |
@@ -41,6 +41,8 @@ around.
 | [`pkg/linkwatch`](pkg/linkwatch) | Reports network-interface link changes (up, down, vanished), so a Thunderbolt cable plugged or pulled is noticed without waiting for a periodic resync. A 2-second unprivileged poll is the mandatory source. |
 | [`pkg/tcpseg`](pkg/tcpseg) | Clamps the TCP maximum segment size of connections opened and accepted toward pod and Service addresses, so a flow negotiated over the loopback cannot carry loopback-sized segments onto a smaller link. |
 | [`shim/getaddrinfo_shim.c`](shim/getaddrinfo_shim.c) | A `DYLD_INSERT_LIBRARIES` dylib, built with `clang` rather than cgo, that interposes `getaddrinfo`, `bind`, and `connect` inside a pod process: it resolves cluster names against the in-process cluster resolver, rewrites a wildcard bind onto the pod's own IP, and pins an outbound connection's source address for mesh-egress traffic. |
+
+[`docs/EGRESS-DATAPATH.md`](docs/EGRESS-DATAPATH.md) is a reference record of the egress datapath: the chain a pod's outbound request takes and the host-side addresses and listeners involved, cited from the code. It records the path; it enforces nothing.
 
 ## Privilege split
 
@@ -101,7 +103,7 @@ this policy subset.
 
 ## Build and test
 
-`darwin-net` is pure Go, built with `CGO_ENABLED=0`. It targets darwin/arm64 and Go 1.25.x.
+`darwin-net` is pure Go, built with `CGO_ENABLED=0`. It targets darwin/arm64 and Go 1.26.x.
 
 ```sh
 gofmt -l .                  # must print nothing

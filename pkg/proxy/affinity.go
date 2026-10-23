@@ -192,7 +192,7 @@ func (t *RoutingTable) PickStickyCluster(key PortKey, client netip.Addr, now tim
 //     only loses stickiness, never reachability.
 //   - Mesh-egress /32 collapse: cross-node mesh-forwarded NodePort traffic is
 //     re-originated from the peer node's mesh-egress /32 (the userspace splice does not
-//     preserve the external client's source IP — DESIGN §5b), so all such clients
+//     preserve the external client's source IP — the k3sm repository's docs/DESIGN.md §5b), so all such clients
 //     behind one peer collapse to a single binding — coarse stickiness. But that one
 //     binding is still re-validated against the live Cluster pool on every hit, so it
 //     always resolves to a Ready backend — coarse, never wrong-routing.

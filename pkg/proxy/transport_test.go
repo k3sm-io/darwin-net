@@ -31,7 +31,7 @@ import (
 var vmPublished = netip.MustParseAddr("100.64.0.7")
 
 // TestTransportOverrideResolution is the pure table over RoutingTable's
-// published-to-live transport map (M11.3-d2): the resolution itself, the
+// published-to-live transport map: the resolution itself, the
 // port-preservation contract, normalization, and the wholesale-swap lifecycle that
 // keeps a stale override from surviving a generation.
 func TestTransportOverrideResolution(t *testing.T) {

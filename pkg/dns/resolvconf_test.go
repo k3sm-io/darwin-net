@@ -25,7 +25,7 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 )
 
-// TestGuestResolvConfRender maps to the M5.2 deliverable: the rendered guest
+// TestGuestResolvConfRender maps to the deliverable: the rendered guest
 // /etc/resolv.conf points the nameserver at the cluster DNS VIP and carries the
 // search list + ndots from the pod DNSConfig (reusing the M1 DNSConfig data).
 func TestGuestResolvConfRender(t *testing.T) {
@@ -97,7 +97,7 @@ func TestGuestResolvConfRender(t *testing.T) {
 	})
 }
 
-// TestGuestResolvConfRejectsInjection is the B47 post-build hardening: the vm-guest
+// TestGuestResolvConfRejectsInjection is the post-build hardening: the vm-guest
 // /etc/resolv.conf is a LINE-structured file, so a search domain carrying an interior
 // newline is a directive-injection primitive on the UNTRUSTED tenant path. The classic
 // bypass splits the payload so no single entry holds a literal space/tab (defeating a

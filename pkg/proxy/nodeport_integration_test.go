@@ -37,10 +37,10 @@ import (
 )
 
 // TestNodePortBindsWildcardReal is the real-socket twin of
-// TestNodePortBindsWildcard, the M3.2 acceptance: a NodePort Service yields a
+// TestNodePortBindsWildcard, the NodePort acceptance: a NodePort Service yields a
 // node-wide *:NodePort TCP listener (bound to the wildcard so every interface
 // answers — dialed here via loopback) that load-balances to the same ready
-// backends as the ClusterIP. For UDP (B23) the ClusterIP datagram relay IS built,
+// backends as the ClusterIP. For UDP the ClusterIP datagram relay IS built,
 // but the UDP NodePort stays deferred — no datagram socket is bound on the
 // *:NodePort (a wildcard UDP reply would re-select its source on a multi-homed
 // node). The externalTrafficPolicy: Cluster semantics — the userspace L4 splice

@@ -62,8 +62,8 @@ func startProxy(t *testing.T, p *Proxy) {
 	t.Cleanup(func() { cancel(); <-runDone })
 }
 
-// TestProxyReconcileLoadBalances is the rootless rehearsal for acceptance
-// M1.1-a1: a ClusterIP VIP load-balances accepted TCP connections across two
+// TestProxyReconcileLoadBalances is the rootless rehearsal for the acceptance
+// criterion: a ClusterIP VIP load-balances accepted TCP connections across two
 // ready backends, with the unready third backend never selected. It runs the
 // full Proxy reconcile path with the noop alias manager: the VIP listener is
 // bound through the binder seam at exactly the VIP address, and every accepted
@@ -226,7 +226,7 @@ func waitNoWorker(t *testing.T, p *Proxy, key PortKey) {
 
 // boundedReconcile runs a Reconcile/ReconcileDelete-shaped call in its own
 // goroutine and fails the test if it has not returned within timeout — the
-// direct assertion for B208's defect: a delete that leaks its workers-map entry
+// direct assertion for the defect: a delete that leaks its workers-map entry
 // sends every later reconcile for the same key into the dead worker's unread,
 // 16-buffered channel, and the 17th such send blocks the caller (the informer
 // handler, in production) PERMANENTLY. A fixed timeout is the only way to assert
@@ -246,11 +246,11 @@ func boundedReconcile(t *testing.T, timeout time.Duration, label string, fn func
 	}
 }
 
-// TestWorkerMapCleanedOnDeleteThenRecreate is the B208 gate: runWorker's delete
+// TestWorkerMapCleanedOnDeleteThenRecreate is the gate: runWorker's delete
 // path (a nil-port portEvent) must remove its own entry from Proxy.workers
 // before it exits, so that a delete-then-recreate on the SAME ClusterIP:port
 // spawns a fresh worker rather than reaching the dead one via the stale map
-// entry. Filed from B207's builder observation (darwin-net#56): without the
+// entry. Found while stress-testing the proxy (darwin-net#56): without the
 // fix, worker() keeps returning the exited worker (it is still keyed in the
 // map), reconciles queue into its unread 16-buffered channel, and the 17th send
 // blocks the caller forever.
@@ -491,7 +491,7 @@ func TestProxyUDPClusterIPRelay(t *testing.T) {
 // It exists because the reconcile path writes the routing table BEFORE it opens
 // the listener (runWorker), so waitBackends is not a readiness signal for the
 // alias having been ensured — asserting the counter directly off waitBackends is
-// a lost race under load (B207).
+// a lost race under load.
 func waitAliasEnsured(t *testing.T, m *noopAliasManager, ip netip.Addr) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -506,7 +506,7 @@ func waitAliasEnsured(t *testing.T, m *noopAliasManager, ip netip.Addr) {
 
 // waitAliasRemoved blocks until the alias manager has been asked to remove ip.
 // Its counterpart to waitAliasEnsured: listener.Close closes the sockets before
-// it removes the alias, so waitClosed does not order the removal either (B207).
+// it removes the alias, so waitClosed does not order the removal either.
 func waitAliasRemoved(t *testing.T, m *noopAliasManager, ip netip.Addr) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

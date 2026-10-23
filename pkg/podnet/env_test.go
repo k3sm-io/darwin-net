@@ -123,8 +123,8 @@ func TestShimBindEnvNamesMatchC(t *testing.T) {
 
 // TestShimMinRewritablePortMatchesC binds the C shim's low-port carve to the Go
 // side's MinRewritablePort, the same way pkg/dns's TestShimMaxSearchMatchesC
-// binds the search cap. The carve is a BINDING resolution of the bind-discipline
-// plan (a specific-address bind below 1024 is EACCES for a non-root uid on
+// binds the search cap. The carve is a fixed decision of the bind-discipline
+// design (a specific-address bind below 1024 is EACCES for a non-root uid on
 // Darwin, so rewriting a low-port wildcard breaks a working workload); a drift
 // between the two copies would either reintroduce that breakage or silently
 // widen the shared-wildcard residual the docs describe.
@@ -306,16 +306,16 @@ func TestBindDisciplineEnvWithCIDRs(t *testing.T) {
 	}
 }
 
-// TestBindDisciplineEnvUnchangedByCIDRs pins the ADDITIVE half of the B218 ABI
+// TestBindDisciplineEnvUnchangedByCIDRs pins the ADDITIVE half of the connect-pinning ABI
 // extension: BindDisciplineEnv must keep its exact signature AND its exact
 // output, because k3sm's provider calls it directly (pkg/provider/translate.go)
 // and an existing caller that declares no cluster scope must keep getting the
-// pre-B218 behaviour — the shim pins no dial at all.
+// the earlier behaviour — the shim pins no dial at all.
 func TestBindDisciplineEnvUnchangedByCIDRs(t *testing.T) {
 	addr := netip.MustParseAddr("100.64.0.7")
 	base := BindDisciplineEnv(addr)
 	if !maps.Equal(base, map[string]string{EnvPodIP: "100.64.0.7"}) {
-		t.Fatalf("BindDisciplineEnv(%v) = %v; the pre-B218 output must not change", addr, base)
+		t.Fatalf("BindDisciplineEnv(%v) = %v; the earlier output must not change", addr, base)
 	}
 	if _, ok := base[EnvClusterCIDRs]; ok {
 		t.Errorf("BindDisciplineEnv emitted %s; the connect rung must stay off for callers that did not ask for it", EnvClusterCIDRs)

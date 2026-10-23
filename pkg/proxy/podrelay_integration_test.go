@@ -126,8 +126,8 @@ func expectRefused(t *testing.T, addr string) {
 	}
 }
 
-// TestPublishedVMPodAddressRelaysToLiveSockets is the real-socket twin of the B440
-// gate: a dial of the published address reaches the live guest, an undeclared
+// TestPublishedVMPodAddressRelaysToLiveSockets is the real-socket twin of the published-address
+// relay gate: a dial of the published address reaches the live guest, an undeclared
 // port and a refused override are not served, and dropping the override closes
 // the listener and the established connection before SetTransportOverrides
 // returns.

@@ -32,7 +32,7 @@ import (
 )
 
 // The addresses the interconnect gate uses. The pod IP is 127.0.0.1, which
-// exists on every host, exactly as the B216/B218 gates use it. The interconnect
+// exists on every host, exactly as the bind and connect acceptance gates use it. The interconnect
 // address is a lo0 /32 alias inside the interconnect range at a host octet
 // InterconnectSlotAddress never derives (it stops at 248), so it cannot collide
 // with a real slot on a cabled node. No packet is sent to any destination: every
@@ -78,10 +78,10 @@ func (a icArm) local(c string) string {
 	return v
 }
 
-// TestInterconnectEnvPinsSourceInScope is the B522 gate. It injects the REAL
+// TestInterconnectEnvPinsSourceInScope is the gate. It injects the REAL
 // shim (built by hack/build-shim.sh) into the bindcases harness's interconnect
 // table and reads every verdict from the socket (getsockname), asserting the
-// K3SM_BIND_DEBUG trace in addition, the B218 discipline.
+// K3SM_BIND_DEBUG trace in addition, the connect-pinning discipline.
 //
 // It needs root for one thing only: the interconnect address must exist on the
 // host to be bound, so the test adds it as a lo0 alias and removes it after.

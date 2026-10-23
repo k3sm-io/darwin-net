@@ -75,7 +75,7 @@ func (r *udpRelay) perSourceTotal() int {
 
 // liveTotal reports the budget's live upstream-flow count across all VIPs, read under
 // mu. It is a white-box test accessor (kept in the test file so it is not compiled
-// into the proxy binary) replacing the pre-B52 budget.n.Load(): total and bySource are
+// into the proxy binary) replacing the earlier budget.n.Load(): total and bySource are
 // now mutex-guarded, so a test reads them under mu to stay -race clean.
 func (b *udpBudget) liveTotal() int64 {
 	b.mu.Lock()
@@ -85,7 +85,7 @@ func (b *udpBudget) liveTotal() int64 {
 
 // liveSources reports how many distinct source IPs have live flows (len(bySource)),
 // read under mu. Post-teardown it MUST be zero — a positive residue is a leaked
-// per-source count, the B52 counter-conservation bug shape.
+// per-source count, the counter-conservation bug shape.
 func (b *udpBudget) liveSources() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -268,7 +268,7 @@ func TestUDPRelayIdleFlowGC(t *testing.T) {
 	})
 }
 
-// TestUDPRelayPerSourceFairShare is the B48 gate: it proves the per-source
+// TestUDPRelayPerSourceFairShare is the gate: it proves the per-source
 // fair-share sub-cap, the relay-GLOBAL fd budget, second-lock-authoritative
 // admission, and PURE counter accounting. It drives upstreamFor DIRECTLY with
 // fabricated client addresses (distinct 10.0.0.N source IPs) so the per-source
@@ -430,7 +430,7 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 	})
 }
 
-// TestUDPRelayPerSourceGlobalCap is the B52 gate: it proves the per-source-GLOBAL
+// TestUDPRelayPerSourceGlobalCap is the gate: it proves the per-source-GLOBAL
 // fair share in the shared udpBudget — one source IP is bounded to maxPerSource live
 // flows across ALL VIPs, not per VIP, so a pod fanning flows across N distinct UDP
 // VIPs cannot consume the whole relay-global budget and starve every other pod on
@@ -438,7 +438,7 @@ func TestUDPRelayPerSourceFairShare(t *testing.T) {
 // budget (maxTotal=8, maxPerSource=2), with fabricated client source IPs, on the
 // in-memory VIP and upstream fakes.
 //
-// Non-vacuity: B48's per-VIP-only per-source cap would let the SAME source IP hold
+// Non-vacuity: a per-VIP-only per-source cap would let the SAME source IP hold
 // maxPerSource flows on EACH VIP (2×maxPerSource across two VIPs); this gate asserts
 // the source is capped at maxPerSource TOTAL across both VIPs (the 3rd flow, on either
 // VIP, is dropped with rejectPerSourceGlobal), which is RED under a per-VIP-only cap.
@@ -481,7 +481,7 @@ func TestUDPRelayPerSourceGlobalCap(t *testing.T) {
 	}
 	// The 3rd S1 flow — on EITHER VIP — exceeds the per-source-GLOBAL cap and is
 	// dropped, even though neither VIP's own per-source count is at the per-VIP cap
-	// (100) and the global total (2) is far below maxTotal (8). Under B48's per-VIP-only
+	// (100) and the global total (2) is far below maxTotal (8). Under a per-VIP-only
 	// cap this 3rd flow would be ADMITTED (S1 has only 1 flow on VIP-A) — the red.
 	if up := relayA.upstreamFor(client(10, 1, 0, 1, 40002), &warnA); up != nil {
 		t.Fatalf("S1 3rd flow on VIP-A admitted past per-source-GLOBAL cap 2 (cap is per-VIP, not global)")
@@ -571,7 +571,7 @@ func (d *countingDialer) calls() int {
 	return d.count
 }
 
-// TestUDPRelayFirstLockPerSourceGlobalReject is the B54 gate: it proves the first-lock
+// TestUDPRelayFirstLockPerSourceGlobalReject is the gate: it proves the first-lock
 // early reject now PEEKS the shared budget (peekAtCap) so a new flow whose source is
 // already at its per-source-GLOBAL share, OR whose budget is fd-full, is dropped BEFORE
 // the Pick+dial — not after a wasted connect(2)+Close at the authoritative second lock.
@@ -581,7 +581,7 @@ func (d *countingDialer) calls() int {
 //
 // Non-vacuity: the "not capped" subtest reaches r.dial (count == 1), so a blanket
 // reject would fail it; without the peek the two capped subtests would dial once each
-// (the second lock rejects, but only AFTER the connect) — RED before B54.
+// (the second lock rejects, but only AFTER the connect) — RED before this fix.
 func TestUDPRelayFirstLockPerSourceGlobalReject(t *testing.T) {
 	t.Parallel()
 

@@ -67,7 +67,7 @@ func routePrefixes(rs []RouteSpec) []netip.Prefix {
 	return out
 }
 
-// TestMeshRoutesPerPeerNotAggregate is the M3.1 acceptance for the per-peer kernel
+// TestMeshRoutesPerPeerNotAggregate is the acceptance for the per-peer kernel
 // routes: the route set is exactly one route per peer podCIDR, and this node's own
 // /24 and the 100.64.0.0/10 cluster aggregate are NEVER in it (routing either to
 // the utun would steal same-node lo0 loopback traffic — wireguard-go installs no
@@ -116,7 +116,7 @@ func TestMeshRoutesPerPeerNotAggregate(t *testing.T) {
 	}
 }
 
-// TestMeshAllowedIPsEqualsCIDR is the M3.1 acceptance for the node /24 single
+// TestMeshAllowedIPsEqualsCIDR is the acceptance for the node /24 single
 // source of truth: per peer, AllowedIPs must EQUAL the podCIDR — equality, not
 // merely symmetry, because a symmetric-but-wrong AllowedIPs still blackholes.
 func TestMeshAllowedIPsEqualsCIDR(t *testing.T) {

@@ -28,7 +28,7 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 )
 
-// policyTestTimeout bounds every blocking read in the M10.4 gate so a regression
+// policyTestTimeout bounds every blocking read in the network-policy gate so a regression
 // hangs the subtest for at most this long instead of wedging the suite.
 const policyTestTimeout = 5 * time.Second
 
@@ -84,7 +84,7 @@ func podIPSet(addrs ...netip.Addr) map[netip.Addr]struct{} {
 	return out
 }
 
-// TestNetworkPolicyL4AllowDeny is the M10.4 acceptance gate (M10.4-a1): the
+// TestNetworkPolicyL4AllowDeny is the acceptance gate: the
 // NetworkPolicy L4 subset's allow/deny verdict is applied at the userspace-proxy
 // seam AFTER the backend pick — an allowed source reaches its backend, a denied
 // source is refused — per (source, picked-backend pod IP, backend port), with the
@@ -253,8 +253,8 @@ func TestNetworkPolicyL4AllowDeny(t *testing.T) {
 		table.SetEndpoints(key, []netv1.Endpoint{be.endpoint()})
 
 		// Direct pod-IP dial (per-pod /32 path, no VIP): succeeds DESPITE deny-all,
-		// and consults the verdict table zero times — M10.4 is a VIP-mediated hint,
-		// not isolation (the M10.1 causal link: per-pod /32s bypass the proxy).
+		// and consults the verdict table zero times — this is a VIP-mediated hint,
+		// not isolation (the causal link: per-pod /32s bypass the proxy).
 		conn, err := backends.dial(nil, "tcp", be.addrPort().String())
 		if err != nil {
 			t.Fatalf("direct pod-IP dial: %v", err)

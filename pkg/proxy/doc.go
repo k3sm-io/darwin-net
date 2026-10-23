@@ -115,8 +115,8 @@ limitations under the License.
 // NodePort is TCP only: the ClusterIP UDP datagram relay (below) is built, but the
 // UDP NodePort is deferred, because a wildcard *:NodePort UDP reply re-selects its
 // source by route lookup on a multi-homed node (the client would see the wrong
-// source IP and drop it). A reference workload's NodePort surface (VSCode SSH :22, the
-// snapshot gRPC range) is all TCP, so UDP NodePort is not claimed.
+// source IP and drop it). Typical SSH and gRPC NodePorts are TCP, so UDP
+// NodePort is not claimed.
 //
 // # Locality (load-bearing only for internalTrafficPolicy: Local)
 //
@@ -289,7 +289,7 @@ limitations under the License.
 //     and the NodePort path applies the same ClientIP affinity over the Cluster pool.
 //     But cross-node mesh-forwarded traffic is re-originated from the peer
 //     node's mesh-egress /32 (the userspace splice does not preserve the client src IP
-//     — DESIGN §5b), so all cross-node clients behind one peer collapse to a single,
+//     — the k3sm repository's docs/DESIGN.md §5b), so all cross-node clients behind one peer collapse to a single,
 //     coarse affinity binding (still re-validated to a Ready backend on every hit,
 //     never a wrong route). This is a userspace-L4 limitation, not a bug.
 //   - UDP affinity is deferred (TCP-only). The ClusterIP UDP relay reuses a

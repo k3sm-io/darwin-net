@@ -112,7 +112,7 @@ func TestConfigToEnv(t *testing.T) {
 	}
 }
 
-// TestConfigToEnvCapsAndSanitizes is the B47 gate: it proves ConfigToEnv defends the
+// TestConfigToEnvCapsAndSanitizes is the gate: it proves ConfigToEnv defends the
 // K3SM_DNS_SEARCH / K3SM_DNS_NDOTS wire values against a config that bypassed
 // admission (k3sm's validatePodDNSConfig). Every assertion here is a no-op for an
 // admission-valid config, so the live cluster-DNS keystone stays byte-identical; the

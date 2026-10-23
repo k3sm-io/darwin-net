@@ -49,8 +49,7 @@ const DefaultMaxPerConn = 253
 
 // Protocol version. A peer with a different MAJOR cannot interoperate (the daemon
 // rejects it); a higher MINOR is additive/compatible and is accepted. Minor 1
-// added the direct-link verbs (ConfigureLink, RemoveLink) and ConfigureMeshArgs.
-// DirectRoutes; they are withdrawn, and this daemon answers either verb "unknown
+// added the direct-link verbs (ConfigureLink, RemoveLink) and ConfigureMeshArgs.DirectRoutes; they are withdrawn, and this daemon answers either verb "unknown
 // verb", which a minor-1 client already treats as a mesh-only helper. Minor 2 adds
 // Hello and the interconnect verbs (EnsureInterconnectAlias,
 // RemoveInterconnectAlias) with Response.Reason and Response.InterconnectIP. Every

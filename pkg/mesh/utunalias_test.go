@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-// TestMeshEgressAliasedOntoUTUN pins B453's fix for the node's own mesh-egress
+// TestMeshEgressAliasedOntoUTUN pins the fix for the node's own mesh-egress
 // address: bring-up aliases it on lo0 (its home, whose host route keeps a local
 // dial on loopback) and then on the utun as a point-to-point /32 whose
 // destination is the utun's own link address, so a reply the kernel generates

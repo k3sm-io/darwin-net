@@ -130,7 +130,7 @@ limitations under the License.
 //
 // # Layering: the node resolver is the floor, the shim refines it
 //
-// Correction of record (B243): an earlier decision here pinned the in-pod-API
+// Correction of record: an earlier decision here pinned the in-pod-API
 // path to runtimed's non-platform exec-shim as "the one backend under which
 // DYLD_INSERT_LIBRARIES survives". That is false, measured on the live rig on
 // 2026-09-01 and again on 2026-09-26: dyld strips DYLD_* when it execs a

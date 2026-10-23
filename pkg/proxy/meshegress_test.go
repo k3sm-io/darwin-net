@@ -58,7 +58,7 @@ func defaultScope() egressScope {
 
 // scopeCases is the shared decision table: the SAME cases drive the pure
 // predicate, the TCP dialer selection, and the UDP relay's per-flow source, so
-// the two protocols cannot be proven to different standards (M14.2-d1 requires
+// the two protocols cannot be proven to different standards (it requires
 // identical scoping for both).
 func scopeCases() []scopeCase {
 	return []scopeCase{
@@ -166,7 +166,7 @@ func (c scopeCase) resolved() egressScope {
 	return defaultScope()
 }
 
-// TestEgressScopeSourceFor is the central scoping table (M14.2-d1): the
+// TestEgressScopeSourceFor is the central scoping table: the
 // mesh-egress source is bound ONLY for a destination inside the cluster pod
 // aggregate that is outside this node's own /24 (LocalityRemote). Every other
 // destination — same-node pod, loopback, node LAN, a Service VIP, upstream — and

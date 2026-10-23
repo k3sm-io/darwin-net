@@ -22,7 +22,7 @@ import (
 	"testing"
 )
 
-// TestMeshEgressSourceReserved is the M3.1 acceptance for the reserved mesh-egress
+// TestMeshEgressSourceReserved is the acceptance for the reserved mesh-egress
 // source address: the /32 is derived from the node podCIDR (it is the .1 first
 // host) AND it is excluded from the allocator — Allocate never hands it out, the
 // first pod IP is .2, and AllocateSpecific of the reserved address is rejected.

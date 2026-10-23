@@ -97,7 +97,7 @@ func handshake(t *testing.T, addr, sni string) ([]string, error) {
 	return state.PeerCertificates[0].DNSNames, nil
 }
 
-// TestIngressTLSSNIPerHostIsolation is the M10.3 TLS gate: SNI selects the
+// TestIngressTLSSNIPerHostIsolation is the TLS gate: SNI selects the
 // per-host certificate; a host whose Secret failed to parse is simply absent
 // and fails ONLY its own handshakes; an unknown (or empty) SNI closes the
 // handshake — no default certificate is invented; and a certificate-map swap
