@@ -38,6 +38,7 @@ limitations under the License.
 // the privileged artifacts (UAPI, pf rules) itself. The only file descriptor that
 // ever crosses the socket is the listening socket BindPort returns to the client
 // via SCM_RIGHTS; the protocol accepts no inbound fd. ApplyUpdate is the one verb
-// that carries a filesystem path: a directory the daemon only reads, under the
-// ownership and no-symlink rules its doc comment states.
+// that carries a filesystem path: the path of a release archive file
+// (ApplyUpdateArgs.ArchivePath) the daemon reads, under the ownership and
+// no-symlink rules its doc comment states.
 package wire

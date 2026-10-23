@@ -101,7 +101,7 @@ this policy subset.
 
 ## Build and test
 
-`darwin-net` is pure Go, built with `CGO_ENABLED=0`. It targets darwin/arm64 and Go 1.25.x.
+`darwin-net` is pure Go, built with `CGO_ENABLED=0`. It targets darwin/arm64 and Go 1.26.x.
 
 ```sh
 gofmt -l .                  # must print nothing

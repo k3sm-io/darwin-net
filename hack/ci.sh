@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."   # repo root
 
 CGO=0   # darwin-net is pure Go (utun/pf/lo0 via golang.org/x/sys/unix)
 STATICCHECK_VERSION=2026.2.1   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
-GOVULNCHECK_VERSION=v1.8.0   # the govulncheck the gate requires; keep equal across the k3sm repos and hack/etcd-wrapper.sh
+GOVULNCHECK_VERSION=v1.8.0   # the govulncheck the gate requires; keep equal across the k3sm repos and the k3sm repository's hack/etcd-wrapper.sh
 
 echo "==> [darwin-net] gofmt"
 fmt=$(gofmt -l .) || true
@@ -89,7 +89,7 @@ fi
 # replace discipline, and exact pins on every remote go install / go run. It
 # needs proxy.golang.org and api.osv.dev; there is no offline skip, because a
 # network failure there is RED by design. It runs only in the real module: the
-# k3sm repo's hack/acceptance/ci_guard_test.go runs this script in a throwaway
+# k3sm repository's hack/acceptance/ci_guard_test.go runs this script in a throwaway
 # module whose graph the lock could never describe.
 if grep -qx "module k3sm.io/darwin-net" go.mod 2>/dev/null; then
 	echo "==> [darwin-net] verify-deps (self-test)"

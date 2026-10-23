@@ -1064,7 +1064,7 @@ func (p *Proxy) logger() *slog.Logger {
 // Cross-node fidelity caveat: this is the source IP this proxy sees. Same-node
 // ClusterIP traffic arrives on loopback carrying the real pod lo0 IP, but cross-node
 // / NodePort traffic is re-originated from the peer node's mesh-egress /32 (the
-// splice does not preserve the client src IP — DESIGN §5b), so cross-node clients
+// splice does not preserve the client src IP — the k3sm repository's docs/DESIGN.md §5b), so cross-node clients
 // behind one peer collapse to a single affinity binding — a userspace-L4
 // limitation, not a bug.
 func clientAddr(remote net.Addr) netip.Addr {
