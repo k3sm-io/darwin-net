@@ -176,6 +176,19 @@ func (b *recordingBinder) boundAt(t *testing.T, addr string) *fakeListener {
 	}
 }
 
+// openAt reports how many listeners at addr the proxy has not closed.
+func (b *recordingBinder) openAt(addr string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, l := range b.ls {
+		if l.address == addr && !l.isClosed() {
+			n++
+		}
+	}
+	return n
+}
+
 // isClosed reports whether the proxy has closed l.
 func (l *fakeListener) isClosed() bool {
 	select {
@@ -243,18 +256,25 @@ func TestPublishedVMPodAddressRelaysToLive(t *testing.T) {
 // ports plus the ports a TCP Service targets at its published address, and on
 // nothing else: an undeclared non-Service port gets no listener (a dial is
 // refused), and a UDP Service port is not relayed.
+//
+// It drives every reconcile pass itself (newSettledRelayHarness): with Run's
+// background reconciler also live, a pass that loaded a snapshot still holding
+// the Service port could rebind it after the test's own pass closed it, and the
+// assertion would see that fresh listener. TestPodRelayStaleSnapshotReopenConverges
+// pins that interleaving deterministically.
 func TestPodRelayPortSet(t *testing.T) {
 	published := netip.MustParseAddr("100.64.0.7")
 	live := netip.MustParseAddr("192.168.64.5")
-	h := newRelayHarness(t, netip.MustParsePrefix("192.168.64.0/24"), newRelayBackends().dial)
+	h := newSettledRelayHarness(t, netip.MustParsePrefix("192.168.64.0/24"), newRelayBackends().dial)
 
 	h.tbl.SetEndpoints(PortKey{ClusterIP: "10.43.0.20", Port: 80, Protocol: netv1.ProtocolTCP},
 		[]netv1.Endpoint{{IP: published.String(), Port: 9090, Ready: true}})
 	h.tbl.SetEndpoints(PortKey{ClusterIP: "10.43.0.21", Port: 53, Protocol: netv1.ProtocolUDP},
 		[]netv1.Endpoint{{IP: published.String(), Port: 5353, Ready: true}})
 	h.tbl.SetTransportOverrides(map[netip.Addr]VMPodTransport{published: {Live: live, Ports: []uint16{8080}}})
+	h.settle(t)
 	h.b.boundAt(t, "100.64.0.7:8080")
-	h.b.boundAt(t, "100.64.0.7:9090")
+	svc := h.b.boundAt(t, "100.64.0.7:9090")
 	h.settle(t)
 
 	got := slices.Sorted(slices.Values(h.b.addrs()))
@@ -266,10 +286,58 @@ func TestPodRelayPortSet(t *testing.T) {
 	// A Service port that goes away takes its listener with it.
 	h.tbl.Delete(PortKey{ClusterIP: "10.43.0.20", Port: 80, Protocol: netv1.ProtocolTCP})
 	h.settle(t)
-	for _, l := range h.b.ls {
-		if l.address == "100.64.0.7:9090" && !l.isClosed() {
-			t.Fatal("the Service-targeted listener stayed open after its Service port was deleted")
-		}
+	if !svc.isClosed() {
+		t.Fatal("the Service-targeted listener stayed open after its Service port was deleted")
+	}
+	if n := h.b.openAt("100.64.0.7:9090"); n != 0 {
+		t.Fatalf("%d listeners open at the deleted Service port, want 0", n)
+	}
+}
+
+// TestPodRelayStaleSnapshotReopenConverges reproduces, with no timing dependence,
+// the interleaving that made TestPodRelayPortSet flaky when two reconcilers ran:
+// a pass holding a snapshot loaded BEFORE a Service port was deleted runs AFTER
+// the fresh pass closed that port's listener. The stale-snapshot guard compares
+// only the transport generation, and a Service-port Delete is not one, so the
+// stale pass rebinds the port. That reopen is a transient: every published
+// generation kicks the relay goroutine (podRelays.observe), so the Delete that
+// made the snapshot stale has already queued a fresh pass, and that pass closes
+// the port again; settle stands in for it here. The relay itself is unchanged by
+// this test. The n == 1 precondition below pins today's behaviour on purpose: if
+// the stale-snapshot guard in reconcile is ever widened from transportGen to the
+// full table generation, the stale pass binds nothing and this precondition
+// flips to 0 (then the test is updated with that fix, not deleted).
+func TestPodRelayStaleSnapshotReopenConverges(t *testing.T) {
+	published := netip.MustParseAddr("100.64.0.7")
+	live := netip.MustParseAddr("192.168.64.5")
+	svcKey := PortKey{ClusterIP: "10.43.0.20", Port: 80, Protocol: netv1.ProtocolTCP}
+	h := newSettledRelayHarness(t, netip.MustParsePrefix("192.168.64.0/24"), newRelayBackends().dial)
+
+	h.tbl.SetEndpoints(svcKey, []netv1.Endpoint{{IP: published.String(), Port: 9090, Ready: true}})
+	h.tbl.SetTransportOverrides(map[netip.Addr]VMPodTransport{published: {Live: live, Ports: []uint16{8080}}})
+	h.settle(t)
+	first := h.b.boundAt(t, "100.64.0.7:9090")
+
+	stale := h.tbl.load()
+	h.tbl.Delete(svcKey)
+	h.settle(t)
+	if !first.isClosed() {
+		t.Fatal("the Service-targeted listener stayed open after its Service port was deleted")
+	}
+
+	h.p.relays.reconcile(context.Background(), stale)
+	// The stale pass reopens the port today; this check proves the case
+	// reproduced the interleaving rather than passing vacuously.
+	if n := h.b.openAt("100.64.0.7:9090"); n != 1 {
+		t.Fatalf("stale pass left %d listeners open at the deleted Service port, want the 1 it rebinds", n)
+	}
+
+	h.settle(t)
+	if n := h.b.openAt("100.64.0.7:9090"); n != 0 {
+		t.Fatalf("%d listeners open at the deleted Service port after a fresh pass, want 0", n)
+	}
+	if n := h.b.openAt("100.64.0.7:8080"); n != 1 {
+		t.Fatalf("%d listeners open at the declared port, want 1", n)
 	}
 }
 
