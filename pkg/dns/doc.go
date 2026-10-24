@@ -55,6 +55,10 @@ limitations under the License.
 //     (a dated IANA TLD snapshot in the generated tlds_iana.go plus special-use
 //     names) a namespace may not claim as a host match domain. See the
 //     layering section below.
+//   - flatregistry.go — ResolveFlatRegistryName: the per-node resolver's answer
+//     for the flat registry name (registry-k3sm and every search-suffixed form a
+//     pod's search list produces) from any namespace, read from the resolver's
+//     Service view; the canonical FQDN stays an ordinary Service name.
 //   - merge.go — MergeDNSConfig / MaxSearchDomains: the pure ClusterFirst additive
 //     dnsConfig merge — a pod's search domains append to the cluster search list
 //     (cluster-first, deduped, capped) and its ndots overrides the cluster
