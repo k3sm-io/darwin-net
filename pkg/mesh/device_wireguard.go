@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
@@ -65,6 +66,8 @@ type wgLink struct {
 	// leaves the utun unwrapped.
 	nodePodCIDR netip.Prefix
 	allocated   func(netip.Addr) bool
+	// onUnreachable is DeviceConfig.OnPeerUnreachable.
+	onUnreachable func(nodeName string)
 }
 
 // DeviceConfig is the construction config for the production wireguard Device. It
@@ -100,6 +103,13 @@ type DeviceConfig struct {
 	// unsure. A nil Allocated turns the refusal off.
 	NodePodCIDR netip.Prefix
 	Allocated   func(netip.Addr) bool
+	// OnPeerUnreachable, when set, is called with a peer's node name after a send
+	// to that peer failed as unreachable (see WGDevice.refreshUnreachable), at most
+	// once per UnreachableRefreshInterval per endpoint. It asks whoever owns the
+	// MeshPeer registry to re-read it now rather than at its next periodic resync.
+	// It runs on the device's own refresh goroutine with no device lock held, and
+	// must not block.
+	OnPeerUnreachable func(nodeName string)
 }
 
 // WGDevice is the production Device: userspace wireguard (wireguard-go) over a
@@ -160,6 +170,20 @@ type WGDevice struct {
 	routes   map[netip.Prefix]RouteSpec
 	applied  AppliedEndpoints // endpoints this device last programmed, per peer key
 	lastUAPI string           // the peer update IpcSet last accepted; "" once the device is gone
+	// lastPlan is the plan the last successful Apply programmed: the registered
+	// endpoint of every peer, which a send failure re-applies. planned reports
+	// whether there is one since the last Up.
+	lastPlan Plan
+	planned  bool
+	// stopRefresh ends the refresh goroutine Up starts; nil while the device is down.
+	stopRefresh chan struct{}
+
+	// failures carries the destination of every unreachable send from the bind
+	// to the refresh goroutine. It is created once and never closed; the bind
+	// never blocks on it (a full channel already owes a refresh).
+	failures chan string
+	limiter  *refreshLimiter
+	now      func() time.Time
 }
 
 // wgControl is the slice of *device.Device the applier drives: the UAPI write,
@@ -175,6 +199,7 @@ type WGDevice struct {
 // that isn't the applier's own.
 type wgControl interface {
 	IpcSet(uapi string) error
+	IpcGet() (string, error)
 	Up() error
 	Close()
 }
@@ -204,6 +229,7 @@ func NewDevice(cfg DeviceConfig, log *slog.Logger) *WGDevice {
 		listenPort:    port,
 		nodePodCIDR:   cfg.NodePodCIDR,
 		allocated:     cfg.Allocated,
+		onUnreachable: cfg.OnPeerUnreachable,
 	}, log)
 }
 
@@ -221,6 +247,9 @@ func newWGDevice(cfg wgLink, log *slog.Logger) *WGDevice {
 		createTUN: tun.CreateTUN,
 		unsetenv:  os.Unsetenv,
 		routes:    make(map[netip.Prefix]RouteSpec),
+		failures:  make(chan string, 16),
+		limiter:   &refreshLimiter{interval: UnreachableRefreshInterval},
+		now:       time.Now,
 	}
 }
 
@@ -273,7 +302,8 @@ func (d *WGDevice) Up(ctx context.Context) error {
 	}
 
 	logger := device.NewLogger(device.LogLevelError, fmt.Sprintf("(%s) ", name))
-	dev := device.NewDevice(d.wrapTUN(tunDev, name), conn.NewDefaultBind(), logger)
+	bind := &sendWatchBind{Bind: conn.NewDefaultBind(), onUnreachable: d.noteUnreachable}
+	dev := device.NewDevice(d.wrapTUN(tunDev, name), bind, logger)
 	if err := dev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n", privHex, d.cfg.listenPort)); err != nil {
 		dev.Close()
 		return fmt.Errorf("configure wireguard private key: %w", err)
@@ -296,6 +326,9 @@ func (d *WGDevice) Up(ctx context.Context) error {
 	// programs every peer's CR endpoint.
 	d.applied = nil
 	d.lastUAPI = ""
+	d.planned = false
+	d.stopRefresh = make(chan struct{})
+	go d.refreshLoop(d.stopRefresh)
 	d.log.Info("mesh device up", "iface", name, "meshIP", d.cfg.meshIP.String(), "linkIP", d.cfg.linkIP.String(), "mtu", d.cfg.mtu, "listenPort", d.cfg.listenPort)
 	return nil
 }
@@ -404,13 +437,187 @@ func (d *WGDevice) Apply(ctx context.Context, plan Plan) error {
 		d.lastUAPI = uapi
 	}
 	d.applied = next
+	d.lastPlan = plan
+	d.planned = true
 
 	installed, err := d.reconcileRoutes(ctx, plan.Routes)
 	if err != nil {
 		return err
 	}
-	d.log.Info("mesh peers applied", "peers", len(plan.Peers), "written", written, "routes", installed, "skipped", len(plan.Skipped))
+	d.log.Info("mesh peers applied", "peers", len(plan.Peers), "written", written, "routes", installed, "skipped", len(plan.Skipped),
+		"handshakes", d.handshakeSummaryLocked())
 	return nil
+}
+
+// PeerStatus reports every wireguard peer as the device holds it now: the
+// endpoint it sends to and the time of its last completed handshake, with the
+// node name from the last applied plan. It returns nil before Up.
+func (d *WGDevice) PeerStatus() ([]PeerStatus, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.peerStatusLocked()
+}
+
+// peerStatusLocked is PeerStatus for a caller that holds mu.
+func (d *WGDevice) peerStatusLocked() ([]PeerStatus, error) {
+	if d.dev == nil {
+		return nil, nil
+	}
+	raw, err := d.dev.IpcGet()
+	if err != nil {
+		return nil, fmt.Errorf("read wireguard peer status: %w", err)
+	}
+	peers, err := parsePeerStatus(raw)
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[string]string, len(d.lastPlan.Peers))
+	for _, pc := range d.lastPlan.Peers {
+		names[pc.PublicKeyHex] = pc.NodeName
+	}
+	for i := range peers {
+		peers[i].NodeName = names[peers[i].PublicKeyHex]
+	}
+	return peers, nil
+}
+
+// handshakeSummaryLocked renders each peer's last-handshake age for the apply
+// log line ("nodeB=12s", "nodeB=never"), the mesh's status in the netd log on
+// every resync. A failed read is reported in the summary rather than failing an
+// apply that has already programmed the device.
+func (d *WGDevice) handshakeSummaryLocked() []string {
+	peers, err := d.peerStatusLocked()
+	if err != nil {
+		return []string{"unavailable: " + err.Error()}
+	}
+	now := d.now()
+	out := make([]string, len(peers))
+	for i, p := range peers {
+		out[i] = p.format(now)
+	}
+	return out
+}
+
+// sendWatchBind is the wireguard bind with one addition: a send that fails as
+// unreachable (isUnreachable) reports its destination. Every other method is the
+// wrapped bind's own. The report must not block: Send runs on wireguard-go's
+// send goroutines, and a peer removal in IpcSet waits for those.
+type sendWatchBind struct {
+	conn.Bind
+	onUnreachable func(dst string)
+}
+
+// Send sends through the wrapped bind and reports an unreachable destination.
+func (b *sendWatchBind) Send(bufs [][]byte, ep conn.Endpoint) error {
+	err := b.Bind.Send(bufs, ep)
+	if err != nil && b.onUnreachable != nil && isUnreachable(err) {
+		b.onUnreachable(ep.DstToString())
+	}
+	return err
+}
+
+// noteUnreachable queues dst for the refresh goroutine without blocking. A full
+// queue already owes refreshes, and the limiter would drop most repeats anyway.
+func (d *WGDevice) noteUnreachable(dst string) {
+	select {
+	case d.failures <- dst:
+	default:
+	}
+}
+
+// refreshLoop runs refreshUnreachable for every queued destination until stop
+// is closed (Down). It is the only goroutine the device starts.
+func (d *WGDevice) refreshLoop(stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		case dst := <-d.failures:
+			d.refreshUnreachable(dst)
+		}
+	}
+}
+
+// refreshUnreachable handles a send to dst that failed as unreachable, at most
+// once per UnreachableRefreshInterval per destination.
+//
+// The peer sending to dst is found from the device's own view (the endpoint it
+// sends to, roamed or registered). When that differs from the peer's registered
+// endpoint in the last applied plan, the registered one is written back at once:
+// wireguard roamed onto an address that is now dead, and the registry is the
+// better answer. When they are the same the device already sends where the
+// registry says, so there is nothing to rewrite locally. Either way the owner of
+// the registry is then asked to re-read it (DeviceConfig.OnPeerUnreachable),
+// because a peer that moved publishes its new address there.
+func (d *WGDevice) refreshUnreachable(dst string) {
+	if !d.limiter.allow(dst, d.now()) {
+		return
+	}
+	node, registered, rewrote, err := d.reapplyRegistered(dst)
+	switch {
+	case err != nil:
+		d.log.Warn("mesh peer unreachable; re-applying its registered endpoint failed", "endpoint", dst, "err", err)
+	case node == "":
+		return
+	case rewrote:
+		d.log.Info("mesh peer unreachable at its roamed endpoint; re-applied the registered one", "node", node, "unreachable", dst, "registered", registered)
+	default:
+		d.log.Info("mesh peer unreachable at its registered endpoint; asking for a registry re-read", "node", node, "endpoint", dst)
+	}
+	if node != "" && d.cfg.onUnreachable != nil {
+		d.cfg.onUnreachable(node)
+	}
+}
+
+// reapplyRegistered is refreshUnreachable's device half, under mu: it finds the
+// peer sending to dst and, when its registered endpoint differs, writes that
+// endpoint with an incremental update. Only that peer's endpoint is re-stamped;
+// every other peer keeps the endpoint wireguard owns.
+func (d *WGDevice) reapplyRegistered(dst string) (node, registered string, rewrote bool, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.dev == nil || !d.planned {
+		return "", "", false, nil
+	}
+	key := ""
+	if peers, err := d.peerStatusLocked(); err == nil {
+		for _, p := range peers {
+			if p.Endpoint == dst {
+				key = p.PublicKeyHex
+				break
+			}
+		}
+	}
+	var pc *PeerConfig
+	for i := range d.lastPlan.Peers {
+		if p := &d.lastPlan.Peers[i]; p.PublicKeyHex == key || (key == "" && d.applied[p.PublicKeyHex] == dst) {
+			pc = p
+			break
+		}
+	}
+	if pc == nil {
+		return "", "", false, nil
+	}
+	if pc.Endpoint == "" || pc.Endpoint == dst {
+		return pc.NodeName, pc.Endpoint, false, nil
+	}
+	// Mark this one peer's endpoint as not yet written, so UAPIUpdate re-stamps
+	// it. The map keeps every other key, so the update stays incremental (an
+	// empty map would render the full replace and drop every live session).
+	prev := make(AppliedEndpoints, len(d.applied))
+	for k, v := range d.applied {
+		prev[k] = v
+	}
+	prev[pc.PublicKeyHex] = ""
+	uapi, next := d.lastPlan.UAPIUpdate(prev)
+	if err := d.dev.IpcSet(uapi); err != nil {
+		d.applied = nil
+		d.lastUAPI = ""
+		return pc.NodeName, pc.Endpoint, false, fmt.Errorf("apply wireguard peers: %w", err)
+	}
+	d.lastUAPI = uapi
+	d.applied = next
+	return pc.NodeName, pc.Endpoint, true, nil
 }
 
 // reconcileRoutes converges the kernel routing table on exactly want — one route
@@ -553,6 +760,10 @@ func (d *WGDevice) Down(ctx context.Context) error {
 		}
 		_ = d.run(ctx, "ifconfig", "lo0", "-alias", d.cfg.meshIP.String())
 	}
+	if d.stopRefresh != nil {
+		close(d.stopRefresh)
+		d.stopRefresh = nil
+	}
 	if d.dev != nil {
 		d.dev.Close()
 		d.dev = nil
@@ -562,6 +773,7 @@ func (d *WGDevice) Down(ctx context.Context) error {
 	// Apply re-programs every endpoint rather than suppressing them all.
 	d.applied = nil
 	d.lastUAPI = ""
+	d.planned = false
 	d.log.Info("mesh device down", "iface", d.iface)
 	return nil
 }

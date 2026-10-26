@@ -58,6 +58,11 @@ type Mesh struct {
 	mu      sync.Mutex
 	started bool
 	applied Plan
+
+	// refresh is a one-slot request for a registry re-read, armed by the direct
+	// wireguard device when a peer is unreachable (DeviceConfig.OnPeerUnreachable)
+	// and drained by the Watcher. A full slot already owes a re-read.
+	refresh chan struct{}
 }
 
 // Option configures a Mesh.
@@ -138,6 +143,7 @@ func New(self netip.Prefix, opts ...Option) (*Mesh, error) {
 		log:        slog.Default(),
 		utunName:   "utun",
 		listenPort: DefaultListenPort,
+		refresh:    make(chan struct{}, 1),
 	}
 	for _, o := range opts {
 		o(m)
@@ -153,11 +159,25 @@ func New(self netip.Prefix, opts ...Option) (*Mesh, error) {
 				LinkIP:        linkIP,
 				PrivateKeyB64: m.privateKeyB64,
 				ListenPort:    m.listenPort,
+
+				OnPeerUnreachable: m.requestRefresh,
 			}, m.log)
 		}
 	}
 	return m, nil
 }
+
+// requestRefresh asks the Watcher for a registry re-read without blocking. The
+// node name is not needed: a pass reads the whole MeshPeer snapshot.
+func (m *Mesh) requestRefresh(string) {
+	select {
+	case m.refresh <- struct{}{}:
+	default:
+	}
+}
+
+// refreshRequests is the channel the Watcher drains for requestRefresh.
+func (m *Mesh) refreshRequests() <-chan struct{} { return m.refresh }
 
 // CIDR returns the node's pod /24 (the single source of truth: == the podnet IPAM
 // CIDR == node.spec.podCIDR).

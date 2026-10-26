@@ -31,7 +31,13 @@ import (
 type fakeWG struct {
 	sets   []string
 	setErr error
+	// status is the UAPI "get" reply IpcGet returns: the device's own view of
+	// its peers (current endpoint, last handshake).
+	status string
+	getErr error
 }
+
+func (f *fakeWG) IpcGet() (string, error) { return f.status, f.getErr }
 
 func (f *fakeWG) IpcSet(uapi string) error {
 	f.sets = append(f.sets, uapi)

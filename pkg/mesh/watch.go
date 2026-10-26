@@ -203,6 +203,11 @@ func (w *Watcher) reconcileLoop(ctx context.Context, ticks <-chan time.Time) err
 			return ctx.Err()
 		case <-ticks:
 			w.trigger()
+		case <-w.mesh.refreshRequests():
+			// The device found a peer unreachable: re-read the registry now
+			// rather than at the next tick, so an endpoint the peer has already
+			// published is programmed at once.
+			w.trigger()
 		case <-w.kick:
 			w.resync(ctx)
 		}

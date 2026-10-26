@@ -71,10 +71,18 @@ limitations under the License.
 // handshake roams the endpoint to the real underlay source the peer's packets
 // arrive from, which is authenticated ground truth, while the MeshPeer CR endpoint
 // is only a hint for making first contact. So the reconcile programs the CR
-// endpoint exactly three times — when the peer is new to the device, when its
-// public key changed, and when the operator changed the CR endpoint itself — and
-// otherwise leaves it alone (Plan.UAPIUpdate), because re-stamping a stale CR
-// endpoint over a roamed one blackholes every reply until the peer re-handshakes.
+// endpoint in three cases — when the peer is new to the device, when its
+// public key changed, and when the CR endpoint itself changed (an operator, or
+// the node publishing its new address) — and otherwise leaves it alone
+// (Plan.UAPIUpdate), because re-stamping a stale CR endpoint over a roamed one
+// blackholes every reply until the peer re-handshakes.
+//
+// The one exception is a roamed endpoint that has gone dead. When a send to a
+// peer fails as host-down or no-route, the device (WGDevice) writes that peer's
+// CR endpoint back over the roamed one, at most once per
+// UnreachableRefreshInterval, and asks the MeshPeer watcher to re-read the
+// registry at once instead of at its next resync. Each peer's last-handshake
+// age is logged with every apply.
 //
 // # Scope
 //
