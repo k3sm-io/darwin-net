@@ -798,20 +798,21 @@ darwin-net product code.
 
 ## Next
 M1 code is in (`pkg/proxy` + `pkg/dns`, against `apis:M1.2`). To fully close the milestone: run the
-root-gated `integration` tests under `sudo` in macOS CI (lo0 alias idempotency + the real-alias VIP),
-land the cross-repo pod-under-Seatbelt shim e2e in the `runtimed` slice, and build the UDP datagram
-relay + idle-flow GC for `53/UDP` (noted in `pkg/proxy/doc.go`; the routing table is already
-protocol-keyed).
+root-gated `integration` tests under `sudo` in macOS CI (lo0 alias idempotency + the real-alias VIP)
+and land the cross-repo pod-under-Seatbelt shim e2e in the `runtimed` slice. The UDP datagram relay +
+idle-flow GC for ClusterIP Services is built (`pkg/proxy/udprelay.go`; `doc.go` `# UDP datagram
+relay`); only the UDP NodePort stays deferred, for the multi-homed source-selection reason `doc.go`
+`# NodePort` gives.
 
 **M2** is now decomposed for the reference-workload readiness work: IP-per-pod lo0 IPAM + the
 `PodNetwork` seam (`M2.1`) plus
 in-pod `kubernetes.default.svc` resolution under the confined runtime (`M2.2` — pin the exec-shim
 backend or add a DNS proxy, since `sandbox-exec` strips `DYLD_*`). **M3** is code-complete: the
-wireguard mesh (`M3.1`), NodePort `*:port` (TCP; UDP relay deferred — `M3.2`), and the **infra-VIP
+wireguard mesh (`M3.1`), NodePort `*:port` (TCP; UDP NodePort deferred — `M3.2`), and the **infra-VIP
 mesh exemption** (`M3.3` — per-node CoreDNS bound to `10.43.0.10` + the kube-dns VIP exemption from
 proxy ownership so the two never fight for `10.43.0.10:53`). The remaining M3 legs are out of
-darwin-net's hands: the `K3SM_LAB=1` two-Mac reachability/reconverge gate, the node-local `kubernetes`
-endpoint rewrite (`k3sm:M3.3`), and the `53/UDP` datagram relay. **M5** is in progress: the
+darwin-net's hands: the `K3SM_LAB=1` two-Mac reachability/reconverge gate and the node-local
+`kubernetes` endpoint rewrite (`k3sm:M3.3`). **M5** is in progress: the
 verifiable parts of the `vm` RuntimeClass guest networking are landed — the **path-selection fork**
 (`M5.1`: `podnet.Network.SetupGuest` selects the `VZNATNetworkDeviceAttachment` path with **no** lo0
 alias, since the lo0-alias / `IP_BOUND_IF` model is host-process-only) and the **guest resolv.conf
