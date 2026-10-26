@@ -50,8 +50,8 @@ const (
 	relistSyncTimeout = time.Minute
 )
 
-// liveLister reads Services and EndpointSlices straight from the API server,
-// bypassing every cache, and returns each list's resourceVersion (the snapshot
+// liveLister reads Services and EndpointSlices from the API server rather than
+// from this process's informer store, and returns each list's resourceVersion (the snapshot
 // the list was served at). The anti-entropy pass compares it against the
 // informer store; tests replace it.
 type liveLister interface {
@@ -60,8 +60,9 @@ type liveLister interface {
 }
 
 // clientLister is the production liveLister: paginated LISTs with
-// ResourceVersion "", which the API server serves as a quorum read rather than
-// from its watch cache.
+// ResourceVersion "", a consistent read at the latest resourceVersion (the API
+// server may serve it from its watch cache once that has caught up, under
+// ConsistentListFromCache).
 type clientLister struct {
 	client kubernetes.Interface
 }
@@ -87,7 +88,7 @@ func (l clientLister) listEndpointSlices(ctx context.Context) ([]discoveryv1.End
 }
 
 // listAll pages through one LIST and returns the items and the first page's
-// resourceVersion. The first page carries ResourceVersion "" (a quorum read);
+// resourceVersion. The first page carries ResourceVersion "" (a consistent read);
 // continuation pages are served from that same snapshot.
 func listAll[T any](ctx context.Context, page func(context.Context, metav1.ListOptions) ([]T, metav1.ListMeta, error)) ([]T, string, error) {
 	var (

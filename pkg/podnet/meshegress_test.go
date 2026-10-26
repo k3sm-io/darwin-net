@@ -26,7 +26,7 @@ import (
 // source address: the /32 is derived from the node podCIDR (it is the .1 first
 // host) AND it is excluded from the allocator — Allocate never hands it out, the
 // first pod IP is .2, and AllocateSpecific of the reserved address is rejected.
-// This is the load-bearing fix the re-plan calls out: the allocator used to hand
+// This is the load-bearing fix: the allocator used to hand
 // out .1 as the first pod IP; reserving it gives the wireguard mesh a stable
 // per-node egress source whose address is inside the node's own AllowedIPs.
 func TestMeshEgressSourceReserved(t *testing.T) {

@@ -43,10 +43,10 @@ const meshPeerResource = "meshpeers"
 // so without a periodic resync nothing re-issues ConfigureMesh until the next
 // unrelated MeshPeer change, and the cross-node mesh would stay DOWN indefinitely.
 // 30s bounds reconvergence to <=30s after a helper restart; the cost is negligible
-// because Device.Apply is an idempotent full-resync UAPI write, so a resync with no
-// change is a cheap re-assertion, not new state.
+// because Device.Apply is idempotent (an unchanged peer set writes nothing to wireguard
+// and the kernel routes are only re-verified), so a resync with no change is a cheap re-assertion, not new state.
 //
-// The period drives the WATCHER'S OWN ticker (Watcher.resyncLoop), not the informer's
+// The period drives the WATCHER'S OWN ticker (Watcher.reconcileLoop), not the informer's
 // resync. An informer resync re-delivers the whole cache through UpdateFunc, which
 // would fire one full Reconcile per cached MeshPeer — N ConfigureMesh RPCs to netd
 // per tick on an N-node cluster — for a single re-assertion of one full snapshot. The

@@ -155,8 +155,8 @@ func readBackendID(t *testing.T, l *fakeListener, n int) string {
 
 // TestNodePortBindsWildcard is the NodePort acceptance, run on in-memory listeners
 // and dialers: a NodePort Service yields a node-wide NodePort TCP listener bound to
-// the WILDCARD (address ":<NodePort>", so every interface and both address
-// families answer) that load-balances to the same ready backends as the ClusterIP,
+// the IPv4 wildcard (address ":<NodePort>" on network tcp4, so every interface
+// answers over IPv4) that load-balances to the same ready backends as the ClusterIP,
 // through the default (non-mesh) dialer. For UDP the ClusterIP datagram relay IS
 // built on the specific VIP, but the UDP NodePort stays deferred — nothing is bound
 // on the NodePort (a wildcard UDP reply would re-select its source on a

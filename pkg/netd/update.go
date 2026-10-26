@@ -808,7 +808,8 @@ func lockStaging(lockPath string) (*os.File, error) {
 // when this daemon was stopped under its installer (and an archive copy a
 // crash left before it was unlinked). It runs under the staging
 // lock, which a still-running installer holds, so a live directory is never
-// removed. Only real directories with the ApplyUpdate prefix are touched.
+// removed. Only real directories and regular files with the ApplyUpdate prefix are
+// touched; a symlink or any other type is left alone.
 func sweepUpdateDirs(root string, log *slog.Logger) {
 	entries, err := os.ReadDir(root)
 	if err != nil {

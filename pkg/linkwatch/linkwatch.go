@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 // Package linkwatch reports network-interface link changes: an interface coming
-// up, going down, or vanishing. Its consumer is k3sm's interconnect reporter,
-// which learns from it that a Thunderbolt cable was plugged or pulled without
-// waiting for its periodic resync.
+// up, going down, or vanishing. It is built for k3sm's interconnect reporter, so
+// that a plugged or pulled Thunderbolt cable can be seen without waiting for the
+// reporter's periodic resync; the reporter does not consume it yet.
 //
 // Two sources feed one stream. The PRIMARY, and the only mandatory one, is a
 // poll every 2 s (Poller) of net.Interfaces() flags plus each up interface's

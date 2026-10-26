@@ -113,7 +113,7 @@ func newPipeClient(d *pipeDaemon) *Client {
 	return c
 }
 
-// TestClientNeverSendsInterconnectVerbsToOldHelper is the BI3 client gate: an
+// TestClientNeverSendsInterconnectVerbsToOldHelper is the client-side interconnect gate: an
 // interconnect verb reaches a daemon only when that daemon reported minor >= 2
 // on the same connection. Against an older one the client writes the Hello probe
 // and nothing else, and returns ErrHelperTooOld; a version learned on an earlier

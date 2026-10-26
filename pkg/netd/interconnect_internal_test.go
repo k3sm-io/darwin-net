@@ -195,7 +195,7 @@ func slotAddr(t *testing.T, idx, slot int) string {
 	return a.String()
 }
 
-// TestInterconnectAliasPolicy is the BI3 netd gate: the daemon derives every
+// TestInterconnectAliasPolicy is the netd interconnect gate: the daemon derives every
 // interconnect alias itself from its adopted identity and the slot, puts it on
 // bridge0 only, with a /24 for slot 0 and /32 for slots 1..7 and no route, and
 // removes only what it owns, in /32-first order, at runtime and at start.

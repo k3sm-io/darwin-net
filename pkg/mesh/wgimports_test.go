@@ -18,8 +18,9 @@ package mesh
 
 // Regression-guard gate. The wireguard swap boundary is the pkg/mesh PACKAGE,
 // not a single file: the wireguard-go module (golang.zx2c4.com/wireguard/{conn,
-// device,tun}) is imported ONLY by pkg/mesh/device_wireguard.go, one of two Device
-// impls behind the wireguard-free Device interface (device.go). The second impl,
+// device,tun}) is imported ONLY inside pkg/mesh (device_wireguard.go, and refuse.go for the
+// tun.Device wrapper); device_wireguard.go is one of two
+// Device impls behind the wireguard-free Device interface (device.go). The second impl,
 // device_netd.go, drives the root daemon over pkg/netd/wire and pulls in no
 // wireguard type at all. The neutral swap-surface a fork re-implements is
 // PeerConfig (plan.go — a hex string + netip.Prefix + ints), NOT Plan.UAPI(), which
@@ -168,7 +169,7 @@ func TestWireguardImportsConfinedAndDeviceFaked(t *testing.T) {
 
 	// Subtest B: positive controls — prove the walk actually ran and actually saw
 	// the coupling, so a mis-rooted or zero-file walk cannot green subtest A
-	// vacuously. darwin-net has ~69 .go files; a >20 floor catches a mis-rooted
+	// vacuously. darwin-net has more than 200 .go files; a >20 floor catches a mis-rooted
 	// walk, and the genuine-importer control fires (via the SAME prefix predicate)
 	// if a fork swap changes wgModulePath but forgets device_wireguard.go.
 	t.Run("positive_controls", func(t *testing.T) {

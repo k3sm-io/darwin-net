@@ -35,8 +35,9 @@ import (
 
 // Watcher drives a Proxy from Kubernetes Service and EndpointSlice informers. It
 // is the production watch seam: on every Service or EndpointSlice event it
-// recomputes the affected Service's desired state and calls Proxy.Reconcile,
-// which routes each port to its single per-VIP worker. The informers' shared
+// recomputes the affected Service's desired state and hands each port, with the
+// Service's internalTrafficPolicy, ClientIP affinity and name, to
+// Proxy.reconcileServicePort, which routes it to its single per-VIP worker. The informers' shared
 // cache makes the recompute cheap; event ordering is irrelevant because every
 // recompute derives the FULL desired state from the caches rather than applying a
 // delta.
@@ -365,9 +366,9 @@ func (w *Watcher) onService(obj any) {
 // defense-in-depth for the independent darwin-net module, which must not assume the
 // k3sm control plane installed the VAP. It is not the sole surfacing.
 //
-// CONCURRENCY: called ONLY from onService / onServiceDelete (the single
-// Service-informer handler goroutine), so eTPLocalWarned needs no lock. Never call
-// this from reconcileService — the EndpointSlice informer drives that on a separate
+// CONCURRENCY: called only from onService (the single Service-informer handler
+// goroutine); eTPMu guards eTPLocalWarned anyway as defense-in-depth (see the
+// field doc). Never call this from reconcileService — the EndpointSlice informer drives that on a separate
 // goroutine.
 func (w *Watcher) warnExternalLocal(svc *corev1.Service) {
 	key := svc.Namespace + "/" + svc.Name

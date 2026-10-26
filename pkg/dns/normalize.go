@@ -38,7 +38,7 @@ import (
 // malformed. The cap is a PREFIX cut (not tail) so the cluster-first survivors —
 // MergeDNSConfig appends the cluster base first — are the ones kept.
 //
-// This is defense-in-depth: admission (k3sm's validatePodDNSConfig) already rejects
+// This is defense-in-depth: the apiserver's pod DNS-config validation already rejects
 // out-of-charset and over-cap lists (its IsDNS1123Subdomain charset [a-z0-9.-] is a
 // subset of this allowlist), so normalizeSearch is a no-op for every admission-valid
 // config and the live cluster-DNS keystone stays byte-identical. The returned slice
@@ -90,8 +90,8 @@ func sanitizeSearch(searches []string) []string {
 // CHARSET [a-zA-Z0-9.-]. It is a flat per-rune charset scan, NOT an RFC-1123 label
 // grammar check: it accepts structurally-invalid strings like "-foo",
 // "a..b", a trailing-dot FQDN, or uppercase — validating label length, hyphen
-// position, and non-empty labels is the apiserver's admission job (k3sm's
-// validatePodDNSConfig / IsDNS1123Subdomain). sanitizeSearch uses it only to DROP a
+// position, and non-empty labels is the apiserver's admission job (the
+// apiserver's pod DNS-config validation, IsDNS1123Subdomain). sanitizeSearch uses it only to DROP a
 // search entry that carries a byte outside that charset (a separator or injection
 // byte), never to assert domain structure. A non-ASCII or invalid-UTF-8 rune is
 // outside the charset and so causes a drop.

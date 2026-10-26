@@ -172,7 +172,7 @@ func (t *RoutingTable) PickStickyCluster(key PortKey, client netip.Addr, now tim
 // containment control.
 //
 // Cross-scope couplings of the shared table-level t.affinity[key] map. The ClusterIP
-// and *:NodePort listeners are opened with the same PortKey (proxy.go:562 and :577),
+// and *:NodePort listeners are opened with the same PortKey (both opened in Proxy.openListener),
 // so the binding sub-map for a port is shared across both scopes — the sub-map is
 // intentionally not namespaced by scope — with three self-correcting consequences:
 //

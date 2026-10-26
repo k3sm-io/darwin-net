@@ -114,7 +114,7 @@ func TestConfigToEnv(t *testing.T) {
 
 // TestConfigToEnvCapsAndSanitizes is the gate: it proves ConfigToEnv defends the
 // K3SM_DNS_SEARCH / K3SM_DNS_NDOTS wire values against a config that bypassed
-// admission (k3sm's validatePodDNSConfig). Every assertion here is a no-op for an
+// admission (the apiserver's pod DNS-config validation, IsDNS1123Subdomain). Every assertion here is a no-op for an
 // admission-valid config, so the live cluster-DNS keystone stays byte-identical; the
 // cases below use only INVALID inputs that admission would have rejected. On main
 // (no normalizeSearch, no ndots high-clamp) the interior-whitespace, over-cap, and

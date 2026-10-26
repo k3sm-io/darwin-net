@@ -39,8 +39,7 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 )
 
-// TestProxyConcurrentScopedDialsShareNoDialerState is the -race leg the plan's
-// gate paragraph requires: local- and remote-destination dials IN FLIGHT together
+// TestProxyConcurrentScopedDialsShareNoDialerState is the -race leg for this scoping: local- and remote-destination dials IN FLIGHT together
 // through one shared Proxy. The containment being proven is a per-connection
 // shared-state property — a sequential round trip cannot exercise it, and the
 // earlier shape (one dialer whose LocalAddr is written per destination) would

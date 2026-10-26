@@ -45,9 +45,10 @@ const dialTimeout = 5 * time.Second
 // udpFlowIdleTimeout reaps a UDP relay flow (a client 5-tuple bound to a
 // connected upstream socket and its picked backend) after this much two-way
 // silence, mirroring Linux conntrack-UDP (30s) and kube-proxy's userspace
-// udpIdleTimeout. Kept distinct from a future ClientIP sessionAffinity TTL,
-// which outlives many idle gaps: ClientIP session affinity needs its own IP-keyed affinity table,
-// not this 5-tuple flow map.
+// udpIdleTimeout. Kept distinct from the ClientIP sessionAffinity TTL
+// (affinityDefaultTimeout, 3h), which outlives many idle gaps: affinity is
+// TCP-only and lives in its own IP-keyed binding table (affinity.go), not in this
+// 5-tuple flow map.
 const udpFlowIdleTimeout = 30 * time.Second
 
 // Proxy is the userspace Service proxy: it owns one listening socket per bound
@@ -613,7 +614,7 @@ func (p *Proxy) shutdown() {
 // Reconcile delivers the desired state for one Service port to its dedicated
 // worker under the default internalTrafficPolicy: Cluster (round-robin over all
 // backends). It is ReconcilePolicy with trafficCluster; the production watch path
-// calls ReconcilePolicy to carry a Service's actual policy.
+// calls reconcileServicePort to carry a Service's actual policy.
 //
 // Reconcile is safe for concurrent callers (the informer event handlers).
 func (p *Proxy) Reconcile(clusterIP string, port *netv1.ServicePort, endpoints []netv1.Endpoint) error {

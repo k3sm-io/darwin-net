@@ -476,8 +476,8 @@ func NewRoutingTable(podCIDR netip.Prefix) *RoutingTable {
 
 // SetEndpoints replaces the backend set for key with the Ready endpoints in eps
 // under the default trafficCluster policy (round-robin over all backends). It is
-// SetEndpointsPolicy with internalTrafficPolicy: Cluster; the reconcile path calls
-// SetEndpointsPolicy directly to carry a Service's actual policy.
+// SetEndpointsPolicy with internalTrafficPolicy: Cluster; the reconcile path installs
+// through installEndpoints to carry a Service's actual policy and name.
 func (t *RoutingTable) SetEndpoints(key PortKey, eps []netv1.Endpoint) int {
 	return t.SetEndpointsPolicy(key, eps, trafficCluster, affinityConfig{})
 }

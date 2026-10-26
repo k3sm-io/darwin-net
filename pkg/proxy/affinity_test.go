@@ -76,7 +76,7 @@ func endpointIPSet(eps []netv1.Endpoint) map[string]bool {
 
 // TestSessionAffinityClientIPSticky is the gate: the userspace proxy's TCP path
 // honors ClientIP session affinity via RoutingTable.PickSticky. Each sub-case guards
-// a specific failure mode the pre-build critiques flagged:
+// a specific failure mode:
 //
 //  1. IP-only keying — the client key strips the ephemeral source port.
 //  2. Survives endpoint churn — the binding map is TABLE-level, not on the wiped
@@ -310,8 +310,7 @@ func TestSessionAffinityClientIPSticky(t *testing.T) {
 // honors ClientIP session affinity via RoutingTable.PickStickyCluster, over the CLUSTER
 // pool — externalTrafficPolicy:Cluster routes to ALL Ready backends and iTP:Local is
 // ignored (KEP-2086), so external stickiness is applied to the full Ready set and never
-// conflated with the east-west node-local filter. Each sub-case guards a failure mode
-// the pre-build critiques flagged:
+// conflated with the east-west node-local filter. Each sub-case guards a failure mode:
 //
 //  1. Sticky over a >=2-backend pool — non-vacuous: distinct clients spread across the
 //     pool (round-robin would otherwise rotate), yet one client sticks.
@@ -643,7 +642,7 @@ func TestAffinityAggregateBoundAndEviction(t *testing.T) {
 		}
 	})
 
-	// STALE-REFRESH CONSERVATION (the CRITICAL both post-build critiques caught): re-picking a
+	// STALE-REFRESH CONSERVATION: re-picking a
 	// client whose binding went STALE (idle past the timeout, or its backend left the pool)
 	// drops the stale binding then re-creates — net-zero to the map, so affinityCount must NOT
 	// drift up. The single-key stale-drop must route through dropBinding (decrement); an

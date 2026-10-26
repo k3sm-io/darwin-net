@@ -231,8 +231,8 @@ limitations under the License.
 // "a b" into two fabricated in-pod tokens, and a separator byte could inject into the
 // line-structured vm-guest resolv.conf; dropping is safer than fusing or splitting),
 // and prefix-caps at MaxSearchDomains. The allowlist is a flat charset scan, so a
-// trailing-dot FQDN survives. This is defense-in-depth behind k3sm's
-// validatePodDNSConfig admission gate (whose [a-z0-9.-] charset the allowlist is a
+// trailing-dot FQDN survives. This is defense-in-depth behind the
+// apiserver's pod DNS-config validation (IsDNS1123Subdomain; its [a-z0-9.-] charset the allowlist is a
 // superset of), so it is a no-op for every admission-valid config and the live
 // cluster-DNS keystone stays byte-identical; single-homing it is what keeps the four
 // views dropping the same domain and truncating at the same cap. ConfigToEnvChecked and
