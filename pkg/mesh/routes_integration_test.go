@@ -24,7 +24,6 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -33,6 +32,7 @@ import (
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/tun"
 
+	"k3sm.io/apis/k3smtest"
 	"k3sm.io/darwin-net/pkg/podnet"
 )
 
@@ -56,7 +56,7 @@ var (
 // It asserts both halves against the real kernel: addressless -> the routing
 // socket refuses the write with ENETUNREACH and the route is absent from the table
 // read-back; with the utun carrying podnet.MeshLinkIP -> the same request lands and
-// the read-back proves it. It is root-gated (t.Skip without root) and does NOT run
+// the read-back proves it. It is root-gated (k3smtest.SkipUnless on root) and does NOT run
 // in the unit pass.
 func TestKernelRoutesLandOnlyWithAUTUNAddress(t *testing.T) {
 	requireRoot(t)
@@ -302,12 +302,12 @@ func requireNoLiveMesh(t *testing.T, rt kernelRouteTable) {
 	}
 }
 
-// requireRoot skips a test that cannot run unprivileged.
+// requireRoot gates a test that cannot run unprivileged (it creates a utun, assigns
+// addresses and installs kernel routes) on the root capability: a skip on a laptop,
+// a failure when K3SM_CI_REQUIRE names root.
 func requireRoot(t *testing.T) {
 	t.Helper()
-	if os.Geteuid() != 0 {
-		t.Skip("requires root: creates a utun, assigns addresses, installs kernel routes")
-	}
+	k3smtest.SkipUnless(t, k3smtest.Root)
 }
 
 // newTestUTUN creates a real utun for the duration of the test and returns it with
