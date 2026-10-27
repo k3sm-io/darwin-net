@@ -58,8 +58,7 @@ func defaultScope() egressScope {
 
 // scopeCases is the shared decision table: the SAME cases drive the pure
 // predicate, the TCP dialer selection, and the UDP relay's per-flow source, so
-// the two protocols cannot be proven to different standards (it requires
-// identical scoping for both).
+// the two protocols cannot be proven to different standards.
 func scopeCases() []scopeCase {
 	return []scopeCase{
 		{
@@ -108,7 +107,7 @@ func scopeCases() []scopeCase {
 			dst:  netip.MustParseAddr("1.1.1.1"),
 		},
 		{
-			// R6: the zero/invalid node-podCIDR state fails to the kernel default,
+			// The zero/invalid node-podCIDR state fails to the kernel default,
 			// never to a bind — a node that cannot classify its own backends must
 			// not assert a source for them.
 			name: "unknown locality never binds even for a cluster pod IP",

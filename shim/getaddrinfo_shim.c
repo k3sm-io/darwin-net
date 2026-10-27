@@ -1625,8 +1625,9 @@ typedef struct {
     k3sm_cidr_t cidrs[K3SM_MAX_CLUSTER_CIDRS];
     /* The interconnect scope (see k3sm_interconnect_cfg_init). nic == 0 means
      * it is OFF — K3SM_INTERCONNECT_IP or K3SM_INTERCONNECT_CIDRS was unset,
-     * empty or unparseable, a CIDR lay outside 169.254.0.0/16, or the address
-     * lay outside every CIDR — and no dial is ever pinned to icip. */
+     * empty or unparseable, a CIDR lay outside 169.254.0.0/16, the address
+     * lay outside every CIDR, or it was the network or broadcast address of a CIDR
+     * containing it — and no dial is ever pinned to icip. */
     int nic;
     struct in_addr icip;            /* network byte order, ready to memcpy */
     char icip_s[INET_ADDRSTRLEN];   /* presentation form, for the trace only */
@@ -2091,14 +2092,14 @@ int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len) {
  * UNBOUND dial to another pod's /32 picks the DESTINATION's own address as the
  * source. Measured, not inferred: direct observation recorded a confined process
  * holding K3SM_POD_IP=100.64.99.8 dialling 100.64.99.7 and the ACCEPTING side
- * seeing peer=100.64.99.7 — the callee's own IP. Neither loopback (P1d.5 is a
- * separate case) nor the caller's alias (P1d.4) wins; the destination does, and
- * confinement (P1d.3) and language (P1d.2, a Go dialer) are not factors.
+ * seeing peer=100.64.99.7 — the callee's own IP. Neither loopback (a
+ * separate case) nor the caller's alias wins; the destination does, and
+ * confinement and language (a Go dialer) are not factors.
  *
  * The consequence is that every same-node pod-to-pod connection looks like it
  * came from the callee, so anything keyed on the peer address — ../pkg/proxy's
  * PolicyTable, an application allowlist, an access log — cannot tell caller A
- * from caller B. P1d.6 measured the fix: bind(podIP:0) BEFORE connect() makes
+ * from caller B. Measurement showed the fix: bind(podIP:0) BEFORE connect() makes
  * the accepting side see peer=100.64.99.8. This interpose is that bind, applied
  * automatically and ONLY where it is safe.
  *
@@ -2106,9 +2107,10 @@ int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len) {
  * correct for a dial that stays inside the cluster and WRONG for one that
  * leaves: binding a lo0 /32 as the source of an en0-routed dial to the internet
  * produces a socket whose replies can never come back. So the rewrite fires only
- * when the destination falls inside K3SM_CLUSTER_CIDRS. Unset or unparseable
- * means NO destination qualifies and every dial is passed through — the rung is
- * off by default and off on any doubt.
+ * when the destination falls inside K3SM_CLUSTER_CIDRS (pinned to the pod IP) or
+ * K3SM_INTERCONNECT_CIDRS (pinned to K3SM_INTERCONNECT_IP). Both unset or
+ * unparseable means NO destination qualifies and every dial is passed through —
+ * the rung is off by default and off on any doubt.
  *
  * THE DECISION ORDER IS LOAD-BEARING, and mirrors the bind rung's:
  *   1. family + addrlen, BEFORE any sockaddr cast. connect(2) is domain-generic;
@@ -2123,9 +2125,11 @@ int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len) {
  *      guard for a re-connect (a UDP socket redirected to a new peer, or a
  *      non-blocking connect retried after EINPROGRESS): those sockets are
  *      already bound, and binding again would fail.
- *   4. the DESTINATION must be in scope. This is the step that keeps external
- *      egress working.
- * Only then bind(podIP:0), and even that failing is not fatal — see below.
+ *   4. the DESTINATION must be in scope: the interconnect scope
+ *      (K3SM_INTERCONNECT_CIDRS, pinned to K3SM_INTERCONNECT_IP) is tested first,
+ *      then K3SM_CLUSTER_CIDRS (pinned to K3SM_POD_IP). This is the step that
+ *      keeps external egress working.
+ * Only then bind(<pin address>:0), and even that failing is not fatal — see below.
  *
  * TCP AND UDP ALIKE. Nothing here inspects SO_TYPE: a connected SOCK_DGRAM
  * socket has exactly the same source-selection problem and the same fix, and

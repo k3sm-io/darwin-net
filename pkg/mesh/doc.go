@@ -28,7 +28,7 @@ limitations under the License.
 // seam and run inside the netd daemon boundary in deployment. Everything that
 // decides WHAT to program is pure and table-tested without privilege: the route
 // set (RouteSet), the AllowedIPs==podCIDR equality check (AllowedIPsMatchCIDR),
-// the wireguard UAPI config (Plan.UAPI), the public-key encoding (publicKeyHex),
+// the wireguard UAPI config (Plan.UAPI), the public-key encoding (wgKeyHex),
 // and the MTU constants. BuildPlan turns a MeshPeer snapshot into a Plan; the
 // Device applies it.
 //

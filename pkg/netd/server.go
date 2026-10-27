@@ -226,10 +226,12 @@ type Server struct {
 // NewServer constructs a Server from cfg, filling defaults: the cluster aggregate
 // (podnet.ClusterPodCIDR), the request cap and per-connection cap, the uid
 // PeerVerifier (ServiceUID), and the production darwin Privileged executor. Its
-// only I/O is the identity restore (Config.IdentityPath), the production
-// executor's sweep of stale pod-address blackholes in the node /24, and, when a
-// caller supplied its own executor and the restore moved the identity, the one
-// call that re-points that executor; call Serve to start accepting.
+// I/O is the identity restore (Config.IdentityPath), the production executor's
+// sweep of stale pod-address blackholes in the node /24, when a caller supplied
+// its own executor and the restore moved the identity, the one call that
+// re-points that executor, the cluster CA read (Config.ClusterCAPath), and the
+// start-up interconnect reconcile (Config.InterconnectStatePath and bridge0; see
+// reconcileInterconnectAtStart); call Serve to start accepting.
 //
 // The CONSTRUCTION ORDER is the production fix, and it is load-bearing. The
 // executor derives the mesh-egress lo0 alias and the utun's own link address from

@@ -107,7 +107,9 @@ func WithUTUNName(name string) Option {
 // the one construction-time selection of the mesh backend — the direct wireguard
 // device (WithPrivateKey) remains for an explicit run-as-root mode. The base64
 // private key never crosses the socket; only privKeyRef does, which the daemon
-// resolves root-side. An empty socketPath uses the netd default socket.
+// resolves root-side. socketPath must be non-empty: an empty socketPath leaves the helper
+// unselected and New builds the direct wireguard device (WithPrivateKey). Pass
+// wire.DefaultSocketPath to use the default socket.
 func WithNetdHelper(socketPath, privKeyRef string) Option {
 	return func(m *Mesh) {
 		m.netdSocket = socketPath

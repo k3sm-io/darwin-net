@@ -141,8 +141,8 @@ func TestPolicyVMNetUnknownSourceFailsClosed(t *testing.T) {
 		pt, h := vmTable(t, vmnet)
 
 		// Upstream semantics: a backend no policy selects is allowed, whatever the
-		// source. The m11-core legs ride this row — a cluster with no NetworkPolicy at
-		// all must be unaffected by d3a.
+		// source. A cluster with no NetworkPolicy at
+		// all must be unaffected by the vm-source deny.
 		if !pt.Allow(guestLease, unselected, 8080) {
 			t.Fatalf("a vmnet source must reach a backend NO policy selects")
 		}
@@ -178,7 +178,7 @@ func TestPolicyVMNetUnknownSourceFailsClosed(t *testing.T) {
 		t.Parallel()
 		// Ladder order: the availability guardrails run before any attribution
 		// question, so an always-allowed address that happens to sit inside the vmnet
-		// segment (the NAT gateway is the realistic case) is never denied by d3a.
+		// segment (the NAT gateway is the realistic case) is never denied by the vm-source deny.
 		gateway := netip.MustParseAddr("192.168.64.1")
 		h := &captureHandler{}
 		pt := NewPolicyTableVMNet(vmnet, gateway)

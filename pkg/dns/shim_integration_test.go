@@ -25,8 +25,9 @@ limitations under the License.
 //	CGO_ENABLED=0 go test -tags integration -run TestGetaddrinfoShim ./pkg/dns/
 //
 // macOS / runtimed caveat (see doc.go): the shim only takes effect end-to-end in
-// a pod when runtimed spawns it via its NON-platform exec-shim, because Apple's
-// sandbox-exec strips DYLD_* from the environment. That true pod-under-Seatbelt
+// a pod while no restricted (platform, hardened, setuid or __RESTRICT) binary sits
+// in the pod's exec chain, because dyld strips DYLD_* at such an exec; see doc.go,
+// Layering. That true pod-under-Seatbelt
 // path is an integration test in the runtimed slice; here we prove the dylib's
 // interpose in isolation.
 package dns

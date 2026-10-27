@@ -115,10 +115,10 @@ limitations under the License.
 // exception is malformed_wrongid, where the stub deliberately answers with the
 // incoming ID XOR 0xFFFF, i.e. wrong relative to whatever each engine sent.
 //
-// SEVEN cases are INPUT-ONLY and deliberately have NO .golden.wire fixture — do
+// EIGHT cases are INPUT-ONLY and deliberately have NO .golden.wire fixture — do
 // not go looking for one: unencodable_label_gt63, unencodable_total_gt255,
-// unencodable_empty_label, unencodable_empty_name, boundary_over_max_name and
-// plain_over_boundary are rejected at query-encode time on BOTH engines, so no
+// unencodable_empty_label, unencodable_empty_name, boundary_over_max_name,
+// plain_over_boundary and absolute_first_over_boundary are rejected at query-encode time on BOTH engines, so no
 // response is ever served; search_suffix_over_boundary is rejected on its
 // SUFFIXED candidate only and its bare candidate is answered by the synthesized
 // NXDOMAIN below.
@@ -455,7 +455,7 @@ type diffCase struct {
 	tcpWire bool // a testdata/<name>.tcp.golden.wire also exists
 	wrongID bool
 	// probeService, when non-empty, is passed to the probe as its SERVICE argv —
-	// the getaddrinfo `service` argument. Empty (the 15 pre-existing rows) means
+	// the getaddrinfo `service` argument. Empty (the 16 pre-existing rows) means
 	// the probe is invoked with a name only, exactly as before.
 	probeService string
 	// multi, when non-nil, makes this an opt-in MULTI-CANDIDATE row: the probe
@@ -741,7 +741,7 @@ type traceLine struct {
 //
 // It is a deliberate SIBLING of shimVerdict, not a refactor of it. Giving
 // shimVerdict new parameters (a service argv, a search list, an ndots) would
-// re-route all 15 pre-existing single-candidate rows through zero-value
+// re-route all 16 pre-existing single-candidate rows through zero-value
 // defaults, and a zero-valued ndots is not a no-op — it is ndots 0, which
 // inverts the expansion order. The duplicated exec/parse body is the price of
 // leaving those rows on byte-identical behaviour; keep the two in step if the
@@ -803,7 +803,7 @@ func shimVerdictService(t *testing.T, dylib, probe string, stub *templateDNS, ho
 }
 
 // shimVerdictFor routes a SINGLE-CANDIDATE row to the right C-side reader: the
-// 15 pre-existing rows keep shimVerdict verbatim, and only a row that opts in
+// 16 pre-existing rows keep shimVerdict verbatim, and only a row that opts in
 // with a service argv takes the sibling.
 func shimVerdictFor(t *testing.T, dylib, probe string, stub *templateDNS, c diffCase) (wireVerdict, string) {
 	t.Helper()

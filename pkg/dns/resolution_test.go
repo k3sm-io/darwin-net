@@ -50,9 +50,9 @@ func podResolver(t *testing.T, ns string, stub *fakeDNS) *Resolver {
 // searched every namespace — would fail these cases.
 //
 // This is the darwin-net half of that criterion: the resolution logic itself. The full
-// in-pod path additionally requires runtimed's NON-platform exec-shim backend,
-// because Apple's sandbox-exec strips DYLD_* (so the getaddrinfo shim only loads
-// there) — see doc.go for that documented constraint.
+// in-pod path additionally requires that no restricted (platform, hardened,
+// setuid or __RESTRICT) binary sits in the pod's exec chain, because dyld strips
+// DYLD_* at such an exec — see doc.go, Layering.
 func TestInPodKubernetesAndCrossNamespaceResolution(t *testing.T) {
 	t.Parallel()
 

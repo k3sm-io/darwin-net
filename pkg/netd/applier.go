@@ -38,7 +38,7 @@ import (
 
 // Privileged is the root-only datapath the daemon drives AFTER it has
 // authenticated the peer and validated + rendered a request. It is the seam
-// between netd's pure policy core (peer-auth, CIDR/route/port validation, UAPI/pf
+// between netd's pure policy core (peer-auth, CIDR/route/port validation, UAPI
 // rendering — all unit-tested) and the irreducibly-privileged darwin operations.
 // NewServer uses the production darwin implementation when Config.Privileged is
 // nil; tests (and an alternate host) inject their own. The server never lets an
@@ -60,8 +60,8 @@ type Privileged interface {
 	// live; an executor that cannot serve the new CIDR returns an error and the
 	// adoption is refused.
 	SetNodePodCIDR(ctx context.Context, cidr netip.Prefix) error
-	// BindPort binds a listening socket on the specific addr (IPv4-only for an
-	// IPv4 addr) and returns it; the caller passes the fd to the client and
+	// BindPort binds a listening socket on addr (a specific address, or the wildcard
+	// on a privileged port the server has authorized; IPv4-only for an IPv4 addr) and returns it; the caller passes the fd to the client and
 	// closes this copy.
 	BindPort(ctx context.Context, network string, addr netip.AddrPort) (*os.File, error)
 	// InterconnectAddrs reads bridge0's IPv4 addresses with each one's prefix
@@ -176,9 +176,10 @@ func (l *localPods) remove(ip netip.Addr) {
 
 // darwinApplier is the production Privileged: it shells out to ifconfig and
 // binds sockets directly, and drives the real wireguard mesh device (pkg/mesh).
-// It runs as root inside the daemon; unit tests inject a fake Privileged instead,
-// so this code path is exercised only in the root-gated integration tier, apart
-// from the alias path, whose command runner and route seam a unit test replaces.
+// It runs as root inside the daemon. Its command runner, route, interface-address,
+// output and device seams are replaced by the unit tests, so the alias, utun-alias,
+// mesh and interconnect paths are unit-tested; the real ifconfig, socket binds and
+// wireguard device run only in the root-gated integration tier.
 //
 // A pod address of the node /24 (podnet.IsPodAddress) is blackholed on lo0 when
 // its alias is removed and un-blackholed just before it is aliased again, so a
