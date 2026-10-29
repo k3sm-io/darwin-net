@@ -23,10 +23,10 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"net/netip"
-	"os"
 	"testing"
 	"time"
 
+	"k3sm.io/apis/k3smtest"
 	netv1 "k3sm.io/apis/net/v1"
 )
 
@@ -45,17 +45,16 @@ func genWGKeyB64(t *testing.T) string {
 // TestMeshDeviceBringUpOnRealUTUN exercises the real, privileged datapath: it
 // creates a utun, runs wireguard over it, plumbs the mesh-egress lo0 alias,
 // installs a peer route, reconverges on an
-// endpoint change, and tears it all down leak-free. It is root-gated (t.Skip
-// without root) and does NOT run in the unit pass.
+// endpoint change, and tears it all down leak-free. It is root-gated (k3smtest.SkipUnless
+// on root) and does NOT run in the unit pass.
 //
 // It proves the LOCAL bring-up only. Cross-node reachability — two real Macs
 // reaching each other's pod IPs (iperf3 both directions), bounce-a-node ->
 // reconverge — is the two-Mac lab gate (K3SM_LAB=1), which a single host cannot
 // assert.
 func TestMeshDeviceBringUpOnRealUTUN(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("requires root: creates a utun, installs kernel routes")
-	}
+	// Creates a utun and installs kernel routes: root only.
+	k3smtest.SkipUnless(t, k3smtest.Root)
 
 	self := netip.MustParsePrefix("100.64.0.0/24")
 	m, err := New(self,

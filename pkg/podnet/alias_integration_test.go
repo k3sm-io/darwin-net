@@ -30,19 +30,20 @@ import (
 	"context"
 	"net"
 	"net/netip"
-	"os"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
+
+	"k3sm.io/apis/k3smtest"
 )
 
-// requireRoot skips the test when not effectively root (ifconfig alias needs it).
+// requireRoot gates the test on the root capability (ifconfig alias needs it): a skip
+// on a laptop, a failure when K3SM_CI_REQUIRE names root. Run under sudo with
+// -tags integration.
 func requireRoot(t *testing.T) {
 	t.Helper()
-	if os.Geteuid() != 0 {
-		t.Skip("requires root to manage lo0 aliases; run under sudo with -tags integration")
-	}
+	k3smtest.SkipUnless(t, k3smtest.Root)
 }
 
 // lo0HasAddr reports whether ip is currently present on lo0.

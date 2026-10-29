@@ -39,6 +39,17 @@ if [ -n "$go_pkgs" ]; then
 	# links every test binary under the tag and selects no test.
 	echo "==> [darwin-net] go vet -tags integration";  CGO_ENABLED=$CGO go vet -tags integration ./...
 	echo "==> [darwin-net] go test -tags integration (compile only)"; CGO_ENABLED=$CGO go test -tags integration -count=1 -run '^$' ./...
+	# A root check in an integration-tagged test routes through k3smtest.SkipUnless
+	# (k3sm.io/apis), so K3SM_CI_REQUIRE=root turns an absent root into a failure
+	# instead of a silent skip. A hand-rolled os.Geteuid() gate reintroduces the
+	# silent skip, so a match is RED, never a skip.
+	echo "==> [darwin-net] integration-tagged tests: root checks go through k3smtest"
+	raw_root=$(grep -rl --include='*_test.go' '^//go:build integration' pkg | xargs grep -n 'Geteuid' || true)
+	if [ -n "$raw_root" ]; then
+		echo "FAIL: [darwin-net] raw root check in an integration-tagged test; use k3smtest.SkipUnless(t, k3smtest.Root):" >&2
+		echo "$raw_root" >&2
+		exit 1
+	fi
 
 	# staticcheck, non-test code only. The test files are out of scope until a
 	# separate sweep covers them, so the run passes -tests=false. A finding is
