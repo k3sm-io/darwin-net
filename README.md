@@ -113,7 +113,10 @@ CGO_ENABLED=0 go test ./...
 go mod tidy                 # must produce no diff
 ```
 
-`hack/ci.sh` runs the same gate in one command, plus the license-header check:
+`hack/ci.sh` runs the same gate in one command. Beyond the commands above it checks the license
+headers, vets and compiles the `integration`-tagged tests, runs the pinned `staticcheck` (non-test
+code only, `-tests=false`), runs `hack/verify-deps.sh` (the dependency graph against
+`hack/deps.lock`, the cooldown and the malicious-package check), and runs the pinned `govulncheck`:
 
 ```sh
 hack/ci.sh
@@ -126,9 +129,12 @@ than the Go toolchain:
 hack/build-shim.sh
 ```
 
-A handful of tests are root-gated (`lo0` alias churn, live `utun` bring-up) and are tagged
-`integration`; they run under `sudo` with `-tags integration` and are skipped otherwise. Everything
-else runs as an ordinary unit test, with no network access and no privilege.
+The root-gated and live-datapath tests (`lo0` alias churn, a real `utun`, the mesh datapath) carry
+the `integration` build tag, so they are not part of `go test ./...`. `hack/ci.sh` vets and compiles
+them but does not run them; run them under `sudo` with `-tags integration`. A root check in such a
+test goes through `k3smtest.SkipUnless(t, k3smtest.Root)`, never a raw root check; `hack/ci.sh`
+fails on the latter. Everything else runs as an ordinary unit test, with no network access and no
+privilege.
 
 Shared types and CRDs used by this repo live in
 [`k3sm.io/apis`](https://github.com/k3sm-io/apis), not here.
