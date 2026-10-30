@@ -36,7 +36,13 @@ if [ -n "$go_pkgs" ]; then
 	# Every test runs under the race detector. The output is kept so that a red
 	# run ends with the failing tests, not only a long scroll.
 	echo "==> [darwin-net] go test -race"
-	if ! CGO_ENABLED=$CGO go test -race ./... 2>&1 | tee "$ci_tmp/gotest.log"; then
+	# Written to a file and then printed, not piped through tee, so the
+	# gate needs no tool beyond cat and grep and the exit status comes
+	# straight from go test, not a pipeline.
+	test_rc=0
+	CGO_ENABLED=$CGO go test -race ./... > "$ci_tmp/gotest.log" 2>&1 || test_rc=$?
+	cat "$ci_tmp/gotest.log"
+	if [ "$test_rc" -ne 0 ]; then
 		echo "==> [darwin-net] go test FAILED; failing tests:" >&2
 		grep -E '^[[:space:]]*--- FAIL:|^FAIL[[:space:]]|^panic:' "$ci_tmp/gotest.log" >&2 || echo "    (no FAIL line; read the output above)" >&2
 		races="$(grep -c 'WARNING: DATA RACE' "$ci_tmp/gotest.log" || true)"
