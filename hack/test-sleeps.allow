@@ -1,0 +1,57 @@
+# Wall-clock waits and fixed ports in tests that predate hack/verify-test-sleeps.sh.
+# One entry per file and symbol: <path>:<symbol> <reason> <deadline YYYY-MM-DD>.
+# The seeded deadlines are staggered by package, one package a week, so they do
+# not all expire together. Fixing a test means deleting its entry and lowering
+# the count; adding an entry means raising it, in the same reviewed change.
+# count: 51
+pkg/ingress/server_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
+pkg/ingress/server_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
+pkg/ingress/watch_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
+pkg/linkwatch/linkwatch_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-11
+pkg/mesh/refuse_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-18
+pkg/mesh/refuse_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-18
+pkg/mesh/routes_integration_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-18
+pkg/mesh/watch_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-18
+pkg/mesh/watch_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-18
+pkg/netbind/netbind_test.go:Listen seeded 2026-10-29, predates the lint 2027-01-25
+pkg/netd/clients_roundtrip_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-01
+pkg/netd/server_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-01
+pkg/netd/update_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-01
+pkg/netd/update_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-01
+pkg/netd/watchdog_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-01
+pkg/netd/watchdog_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-01
+pkg/netd/wire/update_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-08
+pkg/netd/wire/update_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-08
+pkg/podnet/alias_integration_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-15
+pkg/proxy/affinity_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/alias_integration_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/antientropy_guard_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/antientropy_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/antientropy_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/fakeudp_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/helpers_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/helpers_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/informergate_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/nodeport_bindfamily_integration_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/nodeport_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/nodeportaddrs_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/nodeportaddrs_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/nodeportset_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/podrelay_integration_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/podrelay_integration_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/podrelay_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/podrelay_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/policywatch_scope_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/policywatch_scope_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/policywatch_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/policywatch_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/proxy_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/proxy_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/realsocket_integration_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/routing_concurrency_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/synced_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/synced_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/udprelay_integration_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/udprelay_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-22
+pkg/proxy/watch_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-22
+pkg/tcpseg/tcpseg_integration_test.go:time.After seeded 2026-10-29, predates the lint 2027-03-01
