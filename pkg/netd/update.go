@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -128,6 +129,41 @@ type installedVersionFunc func(ctx context.Context, path string) (string, error)
 // errUpdateRefused is the base error every ApplyUpdate refusal wraps.
 var errUpdateRefused = errors.New("applyUpdate refused")
 
+// DefaultUpdaterPlist is the root updater's LaunchDaemon plist. Once it is
+// installed, updates go through the updater and ApplyUpdate refuses.
+const DefaultUpdaterPlist = "/Library/LaunchDaemons/io.k3sm.updater.plist"
+
+// ErrUpdaterInstalled is wrapped by every ApplyUpdate refusal made because the
+// root updater's LaunchDaemon plist is present. The verb stays only so a node
+// without the updater can still be reached; it never runs beside the updater.
+var ErrUpdaterInstalled = errors.New("the root updater is installed, so netd no longer applies updates")
+
+// checkUpdaterAbsent returns nil only when nothing exists at plist. A
+// regular file owned by rootUID is the installed updater. Anything else at
+// that path (a file another user owns, a symlink, a directory, a path that
+// cannot be examined) is present but untrusted, and refuses too: the verb
+// fails closed, so a planted or broken plist can never re-enable it.
+func checkUpdaterAbsent(plist string, rootUID uint32) error {
+	fi, err := os.Lstat(plist)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %w: %s cannot be examined (%w), so its absence is not shown", errUpdateRefused, ErrUpdaterInstalled, plist, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%w: %w: %s is present but not a regular file (%s); refusing anyway", errUpdateRefused, ErrUpdaterInstalled, plist, fi.Mode().Type())
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("%w: %w: %s is present but its owner cannot be read; refusing anyway", errUpdateRefused, ErrUpdaterInstalled, plist)
+	}
+	if st.Uid != rootUID {
+		return fmt.Errorf("%w: %w: %s is present but owned by uid %d, not the trusted owner uid %d; refusing anyway", errUpdateRefused, ErrUpdaterInstalled, plist, st.Uid, rootUID)
+	}
+	return fmt.Errorf("%w: %w: %s is installed; updates go through the root updater", errUpdateRefused, ErrUpdaterInstalled, plist)
+}
+
 // installerRun is the one exec ApplyUpdate makes.
 type installerRun struct {
 	// Argv is the staged k3sm and its install arguments.
@@ -170,7 +206,9 @@ func execInstaller(ctx context.Context, run installerRun) error {
 // each refusal is a Failed frame with the reason, and no step runs after a
 // refusal:
 //
-//  1. the caller is the service uid;
+//  1. the caller is the service uid, and the root updater's LaunchDaemon
+//     plist is absent (checkUpdaterAbsent): once it is present, in any form,
+//     updates go through the updater and this verb refuses;
 //  2. Verifying: the signer certificate chains to the cluster CA and names the
 //     update signer, the signature over the payload verifies, and the payload
 //     parses with a release tag;
@@ -195,6 +233,10 @@ func execInstaller(ctx context.Context, run installerRun) error {
 func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wire.ApplyUpdateArgs) wire.Response {
 	if err := s.authorizeUpdatePeer(st); err != nil {
 		s.log.Warn("netd: applyUpdate caller rejected", "err", err)
+		return s.updateFailed(err, "")
+	}
+	if err := checkUpdaterAbsent(s.updaterPlist, s.updaterPlistOwner); err != nil {
+		s.log.Warn("netd: applyUpdate refused because the root updater is installed", "plist", s.updaterPlist, "err", err)
 		return s.updateFailed(err, "")
 	}
 	if args == nil {

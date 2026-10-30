@@ -372,6 +372,8 @@ func newUpdateHarness(t *testing.T, serviceUID uint32, opts ...harnessOpt) *upda
 	s.runInstaller = h.inst.run
 	s.inspector = h.insp
 	s.installedK3sm = h.installed
+	// Absent unless a test writes it, so no test reads the host's plist.
+	s.updaterPlist = filepath.Join(dir, "io.k3sm.updater.plist")
 	s.installedVersion = func(_ context.Context, p string) (string, error) {
 		h.probes++
 		if p != h.installed {
