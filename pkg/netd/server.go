@@ -221,6 +221,12 @@ type Server struct {
 	installedVersion installedVersionFunc
 	// now is the clock the signer certificate's validity is checked against.
 	now func() time.Time
+	// updaterPlist is the root updater's LaunchDaemon plist whose presence
+	// retires ApplyUpdate (DefaultUpdaterPlist); tests replace it.
+	updaterPlist string
+	// updaterPlistOwner is the uid a trusted updater plist is owned by: root
+	// (0) in production; tests replace it to stand in for root.
+	updaterPlistOwner uint32
 }
 
 // NewServer constructs a Server from cfg, filling defaults: the cluster aggregate
@@ -330,6 +336,7 @@ func NewServer(cfg Config) *Server {
 		installedK3sm:     DefaultInstalledK3sm,
 		installedVersion:  probeInstalledVersion,
 		now:               time.Now,
+		updaterPlist:      DefaultUpdaterPlist,
 	}
 	s.clusterCA, s.clusterCAErr = loadClusterCA(cfg.ClusterCAPath)
 	if s.clusterCAErr != nil && cfg.ClusterCAPath != "" {
