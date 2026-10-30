@@ -21,8 +21,9 @@ hack/verify-boilerplate.sh
 # toolchain) is a HARD ERROR: the old `[ -n "$(go list ./... 2>/dev/null)" ]` could
 # not tell the two apart, so it silently skipped vet/build/test and still reported
 # green — a gate that cannot even enumerate its packages must go RED.
-golist_err="$(mktemp)"
-trap 'rm -f "$golist_err"' EXIT
+ci_tmp="$(mktemp -d)"
+trap 'rm -rf "$ci_tmp"' EXIT
+golist_err="$ci_tmp/golist.err"
 if ! go_pkgs="$(CGO_ENABLED=$CGO go list ./... 2>"$golist_err")"; then
 	echo "FAIL: [darwin-net] go list ./... failed — cannot enumerate packages; refusing to skip vet/build/test:" >&2
 	cat "$golist_err" >&2
@@ -32,7 +33,35 @@ fi
 if [ -n "$go_pkgs" ]; then
 	echo "==> [darwin-net] go vet";   CGO_ENABLED=$CGO go vet ./...
 	echo "==> [darwin-net] go build"; CGO_ENABLED=$CGO go build ./...
-	echo "==> [darwin-net] go test";  CGO_ENABLED=$CGO go test ./...
+	# Every test runs under the race detector. The output is kept so that a red
+	# run ends with the failing tests, not only a long scroll.
+	echo "==> [darwin-net] go test -race"
+	if ! CGO_ENABLED=$CGO go test -race ./... 2>&1 | tee "$ci_tmp/gotest.log"; then
+		echo "==> [darwin-net] go test FAILED; failing tests:" >&2
+		grep -E '^[[:space:]]*--- FAIL:|^FAIL[[:space:]]|^panic:' "$ci_tmp/gotest.log" >&2 || echo "    (no FAIL line; read the output above)" >&2
+		races="$(grep -c 'WARNING: DATA RACE' "$ci_tmp/gotest.log" || true)"
+		[ "$races" = 0 ] || echo "    data races reported: $races" >&2
+		exit 1
+	fi
+
+	# The race witness: a planted race that go test -race must catch. If the
+	# toolchain's race detector is not live, this goes red instead of the gate
+	# passing races silently.
+	echo "==> [darwin-net] race witness"
+	if CGO_ENABLED=$CGO go test -race -count=1 ./hack/testdata/racewitness > "$ci_tmp/witness.log" 2>&1; then
+		echo "FAIL: [darwin-net] the planted race in hack/testdata/racewitness passed; go test -race does not detect races" >&2
+		exit 1
+	fi
+	if ! grep -q 'WARNING: DATA RACE' "$ci_tmp/witness.log"; then
+		echo "FAIL: [darwin-net] the race witness failed without a race report:" >&2
+		cat "$ci_tmp/witness.log" >&2
+		exit 1
+	fi
+
+	# Wall-clock waits and fixed ports in tests, outside hack/test-sleeps.allow.
+	echo "==> [darwin-net] test-sleep lint"
+	hack/verify-test-sleeps.sh --self-test
+	hack/verify-test-sleeps.sh
 	# The integration-tagged tests (root, a real utun, a live datapath) never RUN here,
 	# but they must still COMPILE: a signature drift in a tagged file would otherwise
 	# go unnoticed until the next hand run. vet type-checks them; -run '^$' builds and
