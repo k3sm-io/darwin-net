@@ -346,7 +346,12 @@ type harnessOpt func(*Config)
 func newUpdateHarness(t *testing.T, serviceUID uint32, opts ...harnessOpt) *updateHarness {
 	t.Helper()
 	pki := newTestPKI(t)
-	dir := t.TempDir()
+	// The installed path is resolved before use, so the harness names it by
+	// its real path (the temp root itself is behind a symlink on macOS).
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	caPath := filepath.Join(dir, "cluster-ca.crt")
 	if err := os.WriteFile(caPath, pki.caPEM, 0o600); err != nil {
 		t.Fatal(err)
@@ -1378,4 +1383,253 @@ func TestCompareReleases(t *testing.T) {
 	if _, err := parseVersionOutput("something else\n"); err == nil {
 		t.Error("parseVersionOutput accepted a foreign first line")
 	}
+}
+
+func TestResolveInstalledK3sm(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	flat := filepath.Join(dir, "flat", "k3sm")
+	versioned := filepath.Join(dir, "versioned", "versions", "v0.3.0", "k3sm")
+	for _, p := range []string{flat, versioned} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(machO), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// versioned/current -> versions/v0.3.0, versioned/k3sm -> current/k3sm:
+	// the compat name reaches the binary through two links.
+	root := filepath.Join(dir, "versioned")
+	if err := os.Symlink(filepath.Join("versions", "v0.3.0"), filepath.Join(root, "current")); err != nil {
+		t.Fatal(err)
+	}
+	chain := filepath.Join(root, "k3sm")
+	if err := os.Symlink(filepath.Join("current", "k3sm"), chain); err != nil {
+		t.Fatal(err)
+	}
+	dangling := filepath.Join(dir, "dangling")
+	if err := os.Symlink(filepath.Join(dir, "versions", "v9.9.9", "k3sm"), dangling); err != nil {
+		t.Fatal(err)
+	}
+	loop := filepath.Join(dir, "loop")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Fatal(err)
+	}
+	outsideTarget := filepath.Join(dir, "elsewhere", "k3sm")
+	if err := os.MkdirAll(filepath.Dir(outsideTarget), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outsideTarget, []byte(machO), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	escapeRoot := filepath.Join(dir, "escape")
+	if err := os.MkdirAll(escapeRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(escapeRoot, "k3sm")
+	if err := os.Symlink(outsideTarget, outside); err != nil {
+		t.Fatal(err)
+	}
+	// A link inside the root, to a file that is not a version's k3sm.
+	otherName := filepath.Join(root, "versions", "v0.3.0", "k3sm-other")
+	if err := os.WriteFile(otherName, []byte(machO), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	renamed := filepath.Join(root, "renamed-k3sm")
+	if err := os.Symlink(otherName, renamed); err != nil {
+		t.Fatal(err)
+	}
+	wrongBase := filepath.Join(dir, "wrongbase")
+	if err := os.MkdirAll(wrongBase, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wrongBaseLink := filepath.Join(wrongBase, "k3sm")
+	if err := os.Symlink(otherName, wrongBaseLink); err != nil {
+		t.Fatal(err)
+	}
+	// A version directory whose name is not a version.
+	badVer := filepath.Join(root, "versions", "not-a-version", "k3sm")
+	if err := os.MkdirAll(filepath.Dir(badVer), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(badVer, []byte(machO), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	badVerRoot := filepath.Join(dir, "badver")
+	if err := os.MkdirAll(badVerRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	badVerLink := filepath.Join(badVerRoot, "k3sm")
+	if err := os.Symlink(filepath.Join(root, "versions", "not-a-version", "k3sm"), badVerLink); err != nil {
+		t.Fatal(err)
+	}
+	// A version two levels down.
+	deep := filepath.Join(root, "versions", "v0.3.0", "nested", "k3sm")
+	if err := os.MkdirAll(filepath.Dir(deep), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(deep, []byte(machO), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	deepRoot := filepath.Join(dir, "deep")
+	if err := os.MkdirAll(deepRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	deepLink := filepath.Join(deepRoot, "k3sm")
+	if err := os.Symlink(deep, deepLink); err != nil {
+		t.Fatal(err)
+	}
+	dirLink := filepath.Join(dir, "dirlink")
+	if err := os.Symlink(filepath.Join(root, "versions", "v0.3.0"), dirLink); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		path    string
+		want    string
+		wantErr bool
+		outside bool
+	}{
+		{name: "a flat file resolves to itself", path: flat, want: flat},
+		{name: "a symlink chain resolves into the versioned directory", path: chain, want: versioned},
+		{name: "a dangling link fails closed", path: dangling, wantErr: true},
+		{name: "a link loop fails closed", path: loop, wantErr: true},
+		{name: "a link to a directory fails closed", path: dirLink, wantErr: true},
+		{name: "a missing path fails closed", path: filepath.Join(dir, "absent"), wantErr: true},
+		{name: "a link to a k3sm outside the install root is refused", path: outside, wantErr: true, outside: true},
+		{name: "a link to another name inside a version is refused", path: renamed, wantErr: true, outside: true},
+		{name: "a k3sm link to a version's other binary is refused", path: wrongBaseLink, wantErr: true, outside: true},
+		{name: "a version directory that is not a version name is refused", path: badVerLink, wantErr: true, outside: true},
+		{name: "a binary nested below a version directory is refused", path: deepLink, wantErr: true, outside: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveInstalledK3sm(tc.path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("resolveInstalledK3sm(%s) = %s, want an error", tc.path, got)
+				}
+				if tc.outside && !errors.Is(err, errOutsideInstallTree) {
+					t.Fatalf("resolveInstalledK3sm(%s) = %v, want errOutsideInstallTree", tc.path, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveInstalledK3sm(%s): %v", tc.path, err)
+			}
+			if got != tc.want {
+				t.Fatalf("resolveInstalledK3sm(%s) = %s, want %s", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestApplyUpdateResolvesTheInstalledK3sm(t *testing.T) {
+	t.Run("a versioned install is inspected and probed at its real path", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		root := filepath.Dir(h.installed)
+		target := filepath.Join(root, "versions", "v0.1.9", "k3sm")
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(h.installed, target); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join("versions", "v0.1.9"), filepath.Join(root, "current")); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(root, "k3sm")
+		if err := os.Symlink(filepath.Join("current", "k3sm"), link); err != nil {
+			t.Fatal(err)
+		}
+		h.installed = target
+		h.s.installedK3sm = link
+		resp := h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "if-signed", false))
+		if !resp.OK || resp.Phase != wire.UpdatePhaseDone {
+			t.Fatalf("resp = %+v, want OK Done", resp)
+		}
+		if h.probes != 1 {
+			t.Fatalf("installed version probed %d times, want 1 (at %s)", h.probes, target)
+		}
+		if len(h.insp.paths) == 0 || h.insp.paths[0] != target {
+			t.Fatalf("first inspected path = %v, want the resolved %s", h.insp.paths, target)
+		}
+		if slices.Contains(h.insp.paths, link) {
+			t.Fatalf("inspected the link %s itself: %v", link, h.insp.paths)
+		}
+	})
+
+	t.Run("one resolution serves the signature read and the version probe", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		resolved := h.installed
+		// Each call after the first would answer a different file, as a flip
+		// of current between the two reads would.
+		flipped := filepath.Join(filepath.Dir(h.installed), "flipped-k3sm")
+		var calls int
+		h.s.resolveInstalled = func(p string) (string, error) {
+			calls++
+			if calls > 1 {
+				return flipped, nil
+			}
+			return resolved, nil
+		}
+		var probed []string
+		h.s.installedVersion = func(_ context.Context, p string) (string, error) {
+			probed = append(probed, p)
+			return h.version, nil
+		}
+		resp := h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "if-signed", false))
+		if !resp.OK || resp.Phase != wire.UpdatePhaseDone {
+			t.Fatalf("resp = %+v, want OK Done", resp)
+		}
+		if calls != 1 {
+			t.Fatalf("the installed k3sm was resolved %d times in one request, want 1", calls)
+		}
+		if len(h.insp.paths) == 0 || h.insp.paths[0] != resolved {
+			t.Fatalf("signature read %v, want %s first", h.insp.paths, resolved)
+		}
+		if !slices.Equal(probed, []string{resolved}) {
+			t.Fatalf("version probed at %v, want exactly %s", probed, resolved)
+		}
+	})
+
+	t.Run("a link out of the install root refuses the update before the install", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		elsewhere := filepath.Join(t.TempDir(), "k3sm")
+		if err := os.Rename(h.installed, elsewhere); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(filepath.Dir(h.installed), "k3sm")
+		if err := os.Symlink(elsewhere, link); err != nil {
+			t.Fatal(err)
+		}
+		h.s.installedK3sm = link
+		resp := h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "if-signed", false))
+		if resp.OK {
+			t.Fatalf("resp = %+v, want a refusal", resp)
+		}
+		if h.inst.calls != 0 || h.probes != 0 || h.insp.calls() != 0 {
+			t.Fatalf("installer ran %d times, probed %d, inspected %d, want none", h.inst.calls, h.probes, h.insp.calls())
+		}
+	})
+
+	t.Run("a dangling installed link refuses the update before the install", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		link := filepath.Join(filepath.Dir(h.installed), "dangling-k3sm")
+		if err := os.Symlink(filepath.Join(filepath.Dir(h.installed), "versions", "v0.1.9", "k3sm"), link); err != nil {
+			t.Fatal(err)
+		}
+		h.s.installedK3sm = link
+		resp := h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "if-signed", false))
+		if resp.OK {
+			t.Fatalf("resp = %+v, want a refusal", resp)
+		}
+		if h.inst.calls != 0 || h.probes != 0 {
+			t.Fatalf("installer ran %d times, version probed %d times, want neither", h.inst.calls, h.probes)
+		}
+	})
 }

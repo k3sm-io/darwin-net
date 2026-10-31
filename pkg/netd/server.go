@@ -216,6 +216,9 @@ type Server struct {
 	// installedK3sm is the installed binary the signing and downgrade policy
 	// compare against (DefaultInstalledK3sm).
 	installedK3sm string
+	// resolveInstalled turns installedK3sm into the file an apply request
+	// reads, once per request (resolveInstalledK3sm); tests replace it.
+	resolveInstalled func(string) (string, error)
 	// installedVersion reads installedK3sm's release (probeInstalledVersion);
 	// tests replace it.
 	installedVersion installedVersionFunc
@@ -334,6 +337,7 @@ func NewServer(cfg Config) *Server {
 		runInstaller:      execInstaller,
 		inspector:         codesignTool{},
 		installedK3sm:     DefaultInstalledK3sm,
+		resolveInstalled:  resolveInstalledK3sm,
 		installedVersion:  probeInstalledVersion,
 		now:               time.Now,
 		updaterPlist:      DefaultUpdaterPlist,
