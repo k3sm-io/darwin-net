@@ -68,8 +68,8 @@ const stagingLockSuffix = ".lock"
 // DefaultInstalledK3sm is the installed k3sm binary whose code signature and
 // version the update policy compares the staged build against. It is the entry
 // point only: the install tree may reach the binary through symlinks (a flat
-// compat name into a versioned directory), so every use resolves it first with
-// resolveInstalledK3sm.
+// compat name into a versioned directory), so an apply request resolves it once
+// with resolveInstalledK3sm and reads only the resolved file.
 const DefaultInstalledK3sm = "/Library/k3sm/k3sm"
 
 // Bounds on the request, the reply and the installed-version probe.
@@ -318,7 +318,11 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 	}
 	log.Info("netd: update set extracted", "members", set.Members, "macho", len(set.MachOs),
 		"markers-skipped", len(set.Markers), "markers", set.Markers)
-	installedPath, err := resolveInstalledK3sm(s.installedK3sm)
+	// One resolution serves both reads: the signature baseline below and the
+	// version probe in checkNotDowngrade name the same file, so a flip of the
+	// install tree between them cannot pair one version's signature with
+	// another's version.
+	installedPath, err := s.resolveInstalled(s.installedK3sm)
 	if err != nil {
 		log.Warn("netd: update code signing refused", "err", err)
 		return s.updateFailed(err, "")
@@ -336,7 +340,7 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 	if payload.AllowDowngrade {
 		log.Info("netd: update version compare skipped: the payload allows a downgrade")
 	} else {
-		installedVersion, err := s.checkNotDowngrade(ctx, payload.Version)
+		installedVersion, err := s.checkNotDowngrade(ctx, installedPath, payload.Version)
 		if err != nil {
 			log.Warn("netd: update refused as a downgrade", "err", err)
 			return s.updateFailed(err, "")
@@ -648,13 +652,10 @@ func copyVerifiedArchive(archive *os.File, root, want string) (*os.File, error) 
 // checkNotDowngrade refuses a version below the installed k3sm's, and refuses
 // when the two cannot be ordered (an installed dev build, say): without
 // allowDowngrade the daemon installs only what it can prove is not older. It
-// returns the installed version it compared against.
-func (s *Server) checkNotDowngrade(ctx context.Context, version string) (string, error) {
-	path, err := resolveInstalledK3sm(s.installedK3sm)
-	if err != nil {
-		return "", fmt.Errorf("%w: %w", errUpdateRefused, err)
-	}
-	installed, err := s.installedVersion(ctx, path)
+// returns the installed version it compared against. installedPath is the
+// already resolved installed k3sm, the same file the signature check read.
+func (s *Server) checkNotDowngrade(ctx context.Context, installedPath, version string) (string, error) {
+	installed, err := s.installedVersion(ctx, installedPath)
 	if err != nil {
 		return "", fmt.Errorf("%w: read the installed version: %w", errUpdateRefused, err)
 	}
@@ -669,10 +670,13 @@ func (s *Server) checkNotDowngrade(ctx context.Context, version string) (string,
 }
 
 // resolveInstalledK3sm follows every symlink in path and returns the real file
-// it names, so the signature baseline and the version probe read the Mach-O
-// itself rather than a link that could be repointed between the two reads. It
-// fails closed: a dangling link, a loop, or a target that is not a regular file
-// is an error.
+// it names. The target must stay inside the install tree: it is either path
+// itself (a flat install, no link involved) or <root>/versions/<v>/<base>,
+// where root is path's directory, <v> is one valid version name and <base> is
+// path's own basename. Anything else fails closed: a dangling link, a loop, a
+// target that is not a regular file, or a link that leads out of the tree or
+// to another name. The caller resolves once and reads only the returned path;
+// this function does not stop the tree from changing after it returns.
 func resolveInstalledK3sm(path string) (string, error) {
 	target, err := filepath.EvalSymlinks(path)
 	if err != nil {
@@ -685,7 +689,45 @@ func resolveInstalledK3sm(path string) (string, error) {
 	if !fi.Mode().IsRegular() {
 		return "", fmt.Errorf("resolve the installed %s: %s is not a regular file", path, target)
 	}
+	root, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return "", fmt.Errorf("resolve the install root of %s: %w", path, err)
+	}
+	if err := installedWithinRoot(target, root, filepath.Base(path)); err != nil {
+		return "", fmt.Errorf("resolve the installed %s: %w", path, err)
+	}
 	return target, nil
+}
+
+// errOutsideInstallTree reports an installed k3sm whose links lead anywhere
+// but the flat file or a version directory of its own install root.
+var errOutsideInstallTree = errors.New("the installed k3sm resolves outside its install tree")
+
+// installedWithinRoot accepts target when it is root/base or
+// root/versions/<v>/base with a valid version name <v>.
+func installedWithinRoot(target, root, base string) error {
+	target = filepath.Clean(target)
+	if target == filepath.Join(root, base) {
+		return nil
+	}
+	dir := filepath.Dir(target)
+	if filepath.Base(target) != base || filepath.Dir(dir) != filepath.Join(root, "versions") ||
+		!validInstalledVersion(filepath.Base(dir)) {
+		return fmt.Errorf("%w: %s (root %s)", errOutsideInstallTree, target, root)
+	}
+	return nil
+}
+
+// installedVersionDir matches a version directory name in the install tree: a
+// release version, or the name the flat-layout migration gives a set whose
+// version did not parse. It mirrors the installer's own rule.
+var installedVersionDir = regexp.MustCompile(`^(?:v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?|unknown-[0-9a-f]{12})$`)
+
+// maxInstalledVersionLen bounds a version directory name.
+const maxInstalledVersionLen = 128
+
+func validInstalledVersion(name string) bool {
+	return len(name) > 0 && len(name) <= maxInstalledVersionLen && installedVersionDir.MatchString(name)
 }
 
 // probeInstalledVersion is the production installedVersionFunc: it runs
