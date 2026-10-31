@@ -1,0 +1,2 @@
+go test fuzz v1
+string("last_handshake_time_sec=5\nlast_handshake_time_nsec=5\n")

@@ -1,0 +1,2 @@
+go test fuzz v1
+string("public_key=abababababababababababababababababababababababababababababababab\nlast_handshake_time_sec=-1\nlast_handshake_time_nsec=9999999999\n")

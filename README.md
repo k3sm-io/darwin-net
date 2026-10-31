@@ -56,8 +56,9 @@ daemon over a Unix socket when it needs a privileged operation.
 
 The protocol (`pkg/netd/wire`) is a closed, versioned set of verbs: `EnsureAlias`,
 `RemoveAlias`, `ConfigureMesh`, `RemoveMesh`, `BindPort`, `Hello`, `EnsureInterconnectAlias`,
-`RemoveInterconnectAlias` and `ApplyUpdate`. Each carries only typed scalars (an IP, a port, a
-slot, a typed peer list). It never accepts raw route, `pf`, or WireGuard configuration text.
+`RemoveInterconnectAlias`, `ApplyUpdate` and `MeshPeerStats`. Each carries only typed scalars (an
+IP, a port, a slot, a typed peer list). `MeshPeerStats` is read-only: it reports the last WireGuard
+handshake the mesh device completed with each peer. It never accepts raw route, `pf`, or WireGuard configuration text.
 `ApplyUpdate` is the one verb that names a filesystem path: the release archive the unprivileged
 agent downloaded. It installs only what the cluster's update signer authorised. The request
 carries the payload the update controller wrote on the Node (version, archive sha256, signing

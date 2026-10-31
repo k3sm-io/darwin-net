@@ -30,10 +30,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -66,6 +68,13 @@ type fakePriv struct {
 	bound       []netip.AddrPort
 	adopted     []netip.Prefix
 	bridge      map[netip.Addr]int // bridge0's interconnect aliases and their prefix lengths
+	handshakes  map[string]time.Time
+}
+
+func (f *fakePriv) MeshPeerHandshakes(context.Context) (map[string]time.Time, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return maps.Clone(f.handshakes), nil
 }
 
 func (f *fakePriv) InterconnectAddrs(context.Context) (map[netip.Addr]int, error) {
@@ -894,5 +903,52 @@ func TestServerReapsIdleConnection(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 4*time.Second {
 		t.Fatalf("idle connection reaped after %s, want ≈200ms", elapsed)
+	}
+}
+
+// TestServerMeshPeerStats drives the read-only minor-5 verb through a real
+// socket: the daemon reports its device's per-peer handshakes base64-keyed, and
+// the client hands them back unchanged.
+func TestServerMeshPeerStats(t *testing.T) {
+	fp := &fakePriv{}
+	var key [32]byte
+	key[0], key[31] = 0x42, 0x42
+	at := time.Date(2026, 10, 30, 12, 0, 5, 250, time.UTC)
+	fp.handshakes = map[string]time.Time{fmt.Sprintf("%x", key[:]): at}
+	sock, _ := startServer(t, netd.Config{Privileged: fp})
+	stats, err := wire.NewClient(sock).MeshPeerStats(context.Background())
+	if err != nil {
+		t.Fatalf("MeshPeerStats: %v", err)
+	}
+	want := wire.MeshPeerStat{PubKey: base64.StdEncoding.EncodeToString(key[:]), LastHandshakeUnixNano: at.UnixNano()}
+	if len(stats) != 1 || stats[0] != want {
+		t.Fatalf("MeshPeerStats = %+v, want [%+v]", stats, want)
+	}
+}
+
+// TestServerMeshPeerStatsLeaksNoSecrets feeds the daemon the parse of a UAPI
+// dump that carries a private_key and a preshared_key, and asserts neither
+// value, in any encoding, appears in the MeshPeerStats reply.
+func TestServerMeshPeerStatsLeaksNoSecrets(t *testing.T) {
+	priv, psk := strings.Repeat("5e", 32), strings.Repeat("c7", 32)
+	pub := strings.Repeat("42", 32)
+	dump := fmt.Sprintf("private_key=%s\nlisten_port=51820\npublic_key=%s\npreshared_key=%s\nlast_handshake_time_sec=100\nlast_handshake_time_nsec=0\nerrno=0\n", priv, pub, psk)
+	parsed, skipped, err := mesh.ParseHandshakes(dump)
+	if err != nil || skipped != 0 || len(parsed) != 1 {
+		t.Fatalf("ParseHandshakes = %v, skipped %d, err %v; want the one peer", parsed, skipped, err)
+	}
+	sock, _ := startServer(t, netd.Config{Privileged: &fakePriv{handshakes: parsed}})
+	resp, err := rawCall(t, sock, mustJSON(t, wire.Request{Version: wire.CurrentVersion(), Verb: wire.VerbMeshPeerStats}))
+	if err != nil || !resp.OK || len(resp.MeshPeerStats) != 1 {
+		t.Fatalf("MeshPeerStats reply = %+v, err %v; want one peer", resp, err)
+	}
+	reply := string(mustJSON(t, resp))
+	for _, h := range []string{priv, psk} {
+		raw, _ := hex.DecodeString(h)
+		for _, form := range []string{h, strings.ToUpper(h), base64.StdEncoding.EncodeToString(raw)} {
+			if strings.Contains(reply, form) {
+				t.Fatalf("secret %q leaked into the MeshPeerStats reply %s", form, reply)
+			}
+		}
 	}
 }

@@ -19,6 +19,8 @@ package netd
 import (
 	"context"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +30,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -625,6 +628,8 @@ func (s *Server) dispatch(ctx context.Context, st *connState, payload []byte) (w
 		return s.handleRemoveInterconnectAlias(ctx, req.RemoveInterconnectAlias), nil
 	case wire.VerbApplyUpdate:
 		return s.handleApplyUpdate(ctx, st, req.ApplyUpdate), nil
+	case wire.VerbMeshPeerStats:
+		return s.handleMeshPeerStats(ctx), nil
 	default:
 		return s.errResp(fmt.Sprintf("unknown verb %q", req.Verb)), nil
 	}
@@ -857,6 +862,32 @@ func (s *Server) handleRemoveMesh(ctx context.Context) wire.Response {
 	s.untrackMesh()
 	s.log.Info("netd: mesh removed")
 	return s.okResp()
+}
+
+// handleMeshPeerStats answers the read-only MeshPeerStats verb: the mesh
+// device's per-peer handshake times, base64-keyed as MeshPeerArg is, sorted by
+// key, and capped at wire.DefaultMaxPerConn entries (the client refuses a
+// longer list). It changes nothing.
+func (s *Server) handleMeshPeerStats(ctx context.Context) wire.Response {
+	seen, err := s.priv.MeshPeerHandshakes(ctx)
+	if err != nil {
+		return s.errResp(fmt.Sprintf("meshPeerStats: %v", err))
+	}
+	stats := make([]wire.MeshPeerStat, 0, len(seen))
+	for keyHex, at := range seen {
+		raw, err := hex.DecodeString(keyHex)
+		if err != nil || at.UnixNano() <= 0 {
+			continue
+		}
+		stats = append(stats, wire.MeshPeerStat{PubKey: base64.StdEncoding.EncodeToString(raw), LastHandshakeUnixNano: at.UnixNano()})
+	}
+	slices.SortFunc(stats, func(a, b wire.MeshPeerStat) int { return strings.Compare(a.PubKey, b.PubKey) })
+	if len(stats) > wire.DefaultMaxPerConn {
+		stats = stats[:wire.DefaultMaxPerConn]
+	}
+	resp := s.okResp()
+	resp.MeshPeerStats = stats
+	return resp
 }
 
 // handleBindPort validates the address and authorizes the port, then binds and

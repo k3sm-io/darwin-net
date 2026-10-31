@@ -1,0 +1,2 @@
+go test fuzz v1
+string("private_key=5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e\nlisten_port=51820\npublic_key=abababababababababababababababababababababababababababababababab\npreshared_key=c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7\nendpoint=192.0.2.2:51820\nlast_handshake_time_sec=1761825605\nlast_handshake_time_nsec=250000000\nallowed_ip=100.64.1.0/24\nerrno=0\n")

@@ -29,6 +29,7 @@ import (
 	"slices"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -53,6 +54,10 @@ type Privileged interface {
 	ConfigureMesh(ctx context.Context, privKeyB64 string, listenPort int, plan mesh.Plan) error
 	// RemoveMesh tears the wireguard mesh down (leak-free, idempotent).
 	RemoveMesh(ctx context.Context) error
+	// MeshPeerHandshakes reads the most recent completed wireguard handshake per
+	// mesh peer, keyed by hex public key. It changes nothing; with no mesh up it
+	// returns an empty map.
+	MeshPeerHandshakes(ctx context.Context) (map[string]time.Time, error)
 	// SetNodePodCIDR re-points the executor at cidr, re-deriving everything it
 	// derives from the node's pod /24 (the mesh-egress source and the utun link
 	// address) and retiring anything built from the old one. The server calls it
@@ -88,13 +93,14 @@ type blackholer interface {
 }
 
 // meshDevice is the slice of the wireguard device (*mesh.WGDevice in production)
-// the applier drives: bring-up, plan apply, teardown, and the resolved utun
-// name. It exists so the alias plumbing around the device is testable without a
+// the applier drives: bring-up, plan apply, teardown, the per-peer handshake
+// read, and the resolved utun name. It exists so the alias plumbing around the device is testable without a
 // utun.
 type meshDevice interface {
 	Up(ctx context.Context) error
 	Apply(ctx context.Context, plan mesh.Plan) error
 	Down(ctx context.Context) error
+	PeerHandshakes(ctx context.Context) (map[string]time.Time, error)
 	Interface() string
 }
 
@@ -631,6 +637,18 @@ func (a *darwinApplier) RemoveMesh(ctx context.Context) error {
 	}
 	a.meshUp = false
 	return nil
+}
+
+// MeshPeerHandshakes reads the mesh device's per-peer handshake times. It takes
+// only mu (it touches no alias state) and returns an empty map while the mesh
+// is down.
+func (a *darwinApplier) MeshPeerHandshakes(ctx context.Context) (map[string]time.Time, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.dev == nil || !a.meshUp {
+		return map[string]time.Time{}, nil
+	}
+	return a.dev.PeerHandshakes(ctx)
 }
 
 // BindPort binds a listening socket on addr and returns it as an *os.File so the
