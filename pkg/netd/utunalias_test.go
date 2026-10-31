@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"k3sm.io/darwin-net/pkg/mesh"
 )
@@ -140,6 +141,10 @@ func (d *fakeDevice) Down(context.Context) error {
 	d.up, d.h.utunUp = false, false
 	d.h.utun = map[netip.Addr]bool{}
 	return nil
+}
+
+func (d *fakeDevice) PeerHandshakes(context.Context) (map[string]time.Time, error) {
+	return nil, nil
 }
 
 func (d *fakeDevice) Interface() string {

@@ -58,10 +58,11 @@ const DefaultMaxPerConn = 253
 // decode strictly, so it would silently drop a field it does not know. Minor 3
 // added ApplyUpdate with Response.Phase and Response.Log. Minor 4 replaces the
 // ApplyUpdate request with a server-signed payload and the archive path
-// (ApplyUpdateArgs); a minor-3 request shape is no longer accepted.
+// (ApplyUpdateArgs); a minor-3 request shape is no longer accepted. Minor 5 adds
+// the read-only MeshPeerStats verb with Response.MeshPeerStats.
 const (
 	ProtocolVersionMajor = 1
-	ProtocolVersionMinor = 4
+	ProtocolVersionMinor = 5
 )
 
 // MinorInterconnect is the first minor version that understands Hello and the
@@ -72,6 +73,9 @@ const MinorInterconnect = 2
 // ApplyUpdate request. A minor-3 daemon speaks a withdrawn request shape, so a
 // client treats it as too old for the verb.
 const MinorApplyUpdate = 4
+
+// MinorMeshPeerStats is the first minor version that understands MeshPeerStats.
+const MinorMeshPeerStats = 5
 
 // UpdateInstallTimeout bounds the one installer run ApplyUpdate makes. The
 // daemon kills the installer's whole process group when it expires.
@@ -205,6 +209,12 @@ func (v Version) SupportsApplyUpdate() bool {
 	return v.Major == ProtocolVersionMajor && v.Minor >= MinorApplyUpdate
 }
 
+// SupportsMeshPeerStats reports whether a daemon reporting v understands
+// MeshPeerStats.
+func (v Version) SupportsMeshPeerStats() bool {
+	return v.Major == ProtocolVersionMajor && v.Minor >= MinorMeshPeerStats
+}
+
 // Compatible reports whether a peer speaking v can interoperate with this build:
 // the MAJOR must match (an incompatible-major skew is rejected); any MINOR is
 // accepted because minor revisions are additive/compatible.
@@ -258,6 +268,11 @@ const (
 	// acknowledges the Installing frame with a Hello request before the daemon
 	// runs the installer (see UpdatePhaseInstalling). Minor 4.
 	VerbApplyUpdate Verb = "ApplyUpdate"
+	// VerbMeshPeerStats carries no arguments and changes nothing; the reply lists,
+	// in Response.MeshPeerStats, the most recent wireguard handshake the daemon's
+	// mesh device completed with each peer that has one. A daemon with no mesh
+	// up answers with an empty list. Minor 5.
+	VerbMeshPeerStats Verb = "MeshPeerStats"
 )
 
 // UpdatePhase names one step of an ApplyUpdate, as the daemon reports it.
@@ -403,6 +418,17 @@ type Response struct {
 
 	Phase UpdatePhase `json:"phase,omitempty"`
 	Log   string      `json:"log,omitempty"`
+
+	MeshPeerStats []MeshPeerStat `json:"meshPeerStats,omitempty"`
+}
+
+// MeshPeerStat is one wireguard peer's handshake state in a MeshPeerStats reply.
+type MeshPeerStat struct {
+	// PubKey is the peer's wireguard public key, base64 (the MeshPeerArg form).
+	PubKey string `json:"pubKey"`
+	// LastHandshakeUnixNano is the peer's most recent completed handshake, in
+	// nanoseconds since the Unix epoch. A peer with no handshake is not listed.
+	LastHandshakeUnixNano int64 `json:"lastHandshakeUnixNano"`
 }
 
 // Frame returns payload prefixed with its 4-byte big-endian length. It is the

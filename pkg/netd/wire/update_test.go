@@ -203,11 +203,12 @@ func TestClientApplyUpdate(t *testing.T) {
 	}
 }
 
-// TestApplyUpdateIsMinorFour pins the 1.3 -> 1.4 bump (the signed request)
-// and that a reply to any other verb carries neither of the update fields.
+// TestApplyUpdateIsMinorFour pins the 1.3 -> 1.4 bump (the signed request),
+// that every later minor still supports it, and that a reply to any other verb
+// carries neither of the update fields.
 func TestApplyUpdateIsMinorFour(t *testing.T) {
-	if v := CurrentVersion(); v.Minor != 4 || MinorApplyUpdate != 4 || !v.SupportsApplyUpdate() || !v.SupportsInterconnect() {
-		t.Fatalf("CurrentVersion = %+v, want 1.4 supporting ApplyUpdate and the interconnect verbs", v)
+	if v := CurrentVersion(); v.Minor < 4 || MinorApplyUpdate != 4 || !v.SupportsApplyUpdate() || !v.SupportsInterconnect() {
+		t.Fatalf("CurrentVersion = %+v, want 1.4 or later supporting ApplyUpdate and the interconnect verbs", v)
 	}
 	if (Version{Major: 1, Minor: 3}).SupportsApplyUpdate() || (Version{Major: 2, Minor: 9}).SupportsApplyUpdate() {
 		t.Fatal("a 1.3 daemon (the withdrawn request shape) or another major must not be treated as supporting ApplyUpdate")

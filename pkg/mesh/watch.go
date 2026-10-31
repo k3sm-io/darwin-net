@@ -18,6 +18,8 @@ package mesh
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -26,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
@@ -79,6 +82,7 @@ const meshResyncPeriod = 30 * time.Second
 type Watcher struct {
 	mesh         *Mesh
 	informer     cache.SharedIndexInformer
+	client       rest.Interface
 	resyncPeriod time.Duration
 	log          *slog.Logger
 
@@ -86,6 +90,24 @@ type Watcher struct {
 	// receiver is reconcileLoop. A full slot means a pass is already owed, so a
 	// further send is dropped, not queued — that is the coalescing.
 	kick chan struct{}
+
+	// patchStatus, when set (WithHandshakeStatus), merge-patches a MeshPeer's
+	// status subresource; nil writes no status. It is a field so a test can
+	// record the writes with no apiserver.
+	patchStatus func(ctx context.Context, name string, patch []byte) error
+}
+
+// WatcherOption configures a Watcher.
+type WatcherOption func(*Watcher)
+
+// WithHandshakeStatus makes the watcher write each MeshPeer's
+// status.lastHandshakeTime from this node's own wireguard view after every
+// reconcile pass. Only the control-plane node sets it: the status is one value
+// per MeshPeer, so it records the server's view of each peer, and the server's
+// identity is the one that may write MeshPeers. A worker's watcher stays
+// read-only.
+func WithHandshakeStatus() WatcherOption {
+	return func(w *Watcher) { w.patchStatus = w.restPatchStatus }
 }
 
 // NewWatcher builds a Watcher over the cluster REST config for the given Mesh. It
@@ -96,7 +118,7 @@ type Watcher struct {
 // reconciles once per tick instead of once per cached peer. It does not start the
 // informer — call Run. The MeshPeer is cluster-scoped, so the informer watches all
 // namespaces.
-func NewWatcher(cfg *rest.Config, mesh *Mesh, log *slog.Logger) (*Watcher, error) {
+func NewWatcher(cfg *rest.Config, mesh *Mesh, log *slog.Logger, opts ...WatcherOption) (*Watcher, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -117,7 +139,22 @@ func NewWatcher(cfg *rest.Config, mesh *Mesh, log *slog.Logger) (*Watcher, error
 
 	lw := cache.NewListWatchFromClient(client, meshPeerResource, metav1.NamespaceAll, fields.Everything())
 	informer := cache.NewSharedIndexInformer(lw, &netv1.MeshPeer{}, 0, cache.Indexers{})
-	return &Watcher{mesh: mesh, informer: informer, resyncPeriod: meshResyncPeriod, log: log, kick: make(chan struct{}, 1)}, nil
+	w := &Watcher{mesh: mesh, informer: informer, client: client, resyncPeriod: meshResyncPeriod, log: log, kick: make(chan struct{}, 1)}
+	for _, o := range opts {
+		o(w)
+	}
+	return w, nil
+}
+
+// restPatchStatus merge-patches the named MeshPeer's status subresource.
+func (w *Watcher) restPatchStatus(ctx context.Context, name string, patch []byte) error {
+	return w.client.Patch(types.MergePatchType).
+		Resource(meshPeerResource).
+		Name(name).
+		SubResource("status").
+		Body(patch).
+		Do(ctx).
+		Error()
 }
 
 // Run starts the informer and blocks until ctx is cancelled. It registers an event
@@ -235,5 +272,61 @@ func (w *Watcher) resync(ctx context.Context) {
 	}
 	if err := w.mesh.Reconcile(ctx, specs); err != nil {
 		w.log.Error("reconcile mesh from watch", "peers", len(specs), "err", err)
+		return
 	}
+	if w.patchStatus != nil {
+		w.writeHandshakeStatus(ctx, store)
+	}
+}
+
+// writeHandshakeStatus writes status.lastHandshakeTime on every cached MeshPeer
+// whose handshake, as this node's wireguard device reports it, is newer than
+// the recorded one. The status field has second precision, so the comparison
+// is at whole seconds and an unchanged handshake writes nothing; a pass with no
+// new handshake makes no API call at all. Only a newer time is written, so two
+// writers (an HA control plane) converge on the latest handshake either saw
+// instead of overwriting each other. A peer with no handshake, this node's own
+// MeshPeer, and a failed device read write nothing. Each failed write is logged
+// and retried by the next pass.
+func (w *Watcher) writeHandshakeStatus(ctx context.Context, store []any) {
+	seen, err := w.mesh.PeerHandshakes(ctx)
+	if err != nil {
+		if errors.Is(err, ErrNoHandshakeReader) {
+			w.log.Debug("mesh device reports no handshakes; MeshPeer status not written", "err", err)
+		} else {
+			w.log.Warn("read mesh peer handshakes", "err", err)
+		}
+		return
+	}
+	for _, obj := range store {
+		mp, ok := obj.(*netv1.MeshPeer)
+		if !ok {
+			continue
+		}
+		t, ok := seen[mp.Spec.NodeName]
+		if !ok || t.IsZero() {
+			continue
+		}
+		at := t.UTC().Truncate(time.Second)
+		if cur := mp.Status.LastHandshakeTime; cur != nil && !at.After(cur.Time) {
+			continue
+		}
+		patch, err := handshakeStatusPatch(at)
+		if err != nil {
+			w.log.Error("encode MeshPeer status patch", "meshpeer", mp.Name, "err", err)
+			continue
+		}
+		if err := w.patchStatus(ctx, mp.Name, patch); err != nil {
+			w.log.Warn("write MeshPeer status.lastHandshakeTime", "meshpeer", mp.Name, "err", err)
+			continue
+		}
+		w.log.Debug("wrote MeshPeer status.lastHandshakeTime", "meshpeer", mp.Name, "lastHandshakeTime", at)
+	}
+}
+
+// handshakeStatusPatch is the merge patch that sets status.lastHandshakeTime
+// to at and touches no other status field.
+func handshakeStatusPatch(at time.Time) ([]byte, error) {
+	mt := metav1.NewTime(at)
+	return json.Marshal(map[string]any{"status": map[string]any{"lastHandshakeTime": &mt}})
 }

@@ -33,6 +33,7 @@ import (
 type helperClient interface {
 	ConfigureMesh(ctx context.Context, privKeyRef string, listenPort int, nodePodCIDR netip.Prefix, peers []wire.MeshPeerArg) error
 	RemoveMesh(ctx context.Context) error
+	MeshPeerStats(ctx context.Context) ([]wire.MeshPeerStat, error)
 }
 
 // netdDevice is the helper-backed Device: instead of creating a utun and driving

@@ -163,7 +163,7 @@ type WGDevice struct {
 }
 
 // wgControl is the slice of *device.Device the applier drives: the UAPI write,
-// the bring-up, and the close. It exists so the Apply path — in particular the
+// the UAPI read (PeerHandshakes), the bring-up, and the close. It exists so the Apply path — in particular the
 // decision to write or skip a peer update — is testable against a recorder with no
 // utun and no wireguard in play; Up always installs the real device.
 //
@@ -175,6 +175,7 @@ type WGDevice struct {
 // that isn't the applier's own.
 type wgControl interface {
 	IpcSet(uapi string) error
+	IpcGet() (string, error)
 	Up() error
 	Close()
 }

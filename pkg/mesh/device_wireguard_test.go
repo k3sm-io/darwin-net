@@ -31,14 +31,16 @@ import (
 type fakeWG struct {
 	sets   []string
 	setErr error
+	get    string // the UAPI get response IpcGet returns
 }
 
 func (f *fakeWG) IpcSet(uapi string) error {
 	f.sets = append(f.sets, uapi)
 	return f.setErr
 }
-func (f *fakeWG) Up() error { return nil }
-func (f *fakeWG) Close()    {}
+func (f *fakeWG) IpcGet() (string, error) { return f.get, nil }
+func (f *fakeWG) Up() error               { return nil }
+func (f *fakeWG) Close()                  {}
 
 // applierDevice returns a WGDevice that is "up" on a fake wireguard handle and a
 // fake kernel route table, so Apply can be driven end to end without privilege.

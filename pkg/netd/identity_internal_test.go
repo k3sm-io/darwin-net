@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"k3sm.io/darwin-net/pkg/mesh"
 )
@@ -55,6 +56,10 @@ func (p *recordingPriv) ConfigureMesh(context.Context, string, int, mesh.Plan) e
 }
 
 func (p *recordingPriv) RemoveMesh(context.Context) error { p.served = true; return nil }
+
+func (p *recordingPriv) MeshPeerHandshakes(context.Context) (map[string]time.Time, error) {
+	return nil, nil
+}
 
 func (p *recordingPriv) InterconnectAddrs(context.Context) (map[netip.Addr]int, error) {
 	return nil, nil

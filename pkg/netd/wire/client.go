@@ -421,6 +421,31 @@ func (c *Client) RemoveMesh(ctx context.Context) error {
 	return err
 }
 
+// MeshPeerStats asks the daemon for the most recent wireguard handshake its mesh
+// device completed with each peer. It changes nothing on the daemon. A daemon
+// older than minor 5 answers "unknown verb"; the client then returns an error
+// wrapping ErrHelperTooOld. A reply listing more than DefaultMaxPerConn peers, or
+// one with a non-positive handshake time, is refused whole.
+func (c *Client) MeshPeerStats(ctx context.Context) ([]MeshPeerStat, error) {
+	resp, err := c.roundTrip(ctx, Request{Version: CurrentVersion(), Verb: VerbMeshPeerStats})
+	if err != nil {
+		if resp.Version != (Version{}) && !resp.Version.SupportsMeshPeerStats() {
+			return nil, fmt.Errorf("%w: %s needs minor %d, the helper speaks %d.%d",
+				ErrHelperTooOld, VerbMeshPeerStats, MinorMeshPeerStats, resp.Version.Major, resp.Version.Minor)
+		}
+		return nil, err
+	}
+	if len(resp.MeshPeerStats) > DefaultMaxPerConn {
+		return nil, fmt.Errorf("netd %s: reply lists %d peers, more than the %d allowed", VerbMeshPeerStats, len(resp.MeshPeerStats), DefaultMaxPerConn)
+	}
+	for _, st := range resp.MeshPeerStats {
+		if st.PubKey == "" || st.LastHandshakeUnixNano <= 0 {
+			return nil, fmt.Errorf("netd %s: reply carries an unusable peer entry %+v", VerbMeshPeerStats, st)
+		}
+	}
+	return resp.MeshPeerStats, nil
+}
+
 // BindPort asks the daemon to bind a listening socket on the specific addr and
 // return it via SCM_RIGHTS. The returned *os.File owns the descriptor; wrap it with
 // net.FileListener (TCP) and close the *os.File afterward.

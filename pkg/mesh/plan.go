@@ -45,6 +45,9 @@ var (
 	// ErrPeerConfig is returned for a MeshPeer that cannot be programmed (bad key,
 	// malformed CIDR, or AllowedIPs that do not equal the peer podCIDR).
 	ErrPeerConfig = errors.New("mesh: invalid mesh peer config")
+	// ErrNoHandshakeReader is returned by Mesh.PeerHandshakes when the mesh's
+	// device cannot report per-peer handshake times.
+	ErrNoHandshakeReader = errors.New("mesh: device reports no peer handshakes")
 )
 
 // RouteSpec is one kernel route the plan wants: a peer's pod /24 on the utun
