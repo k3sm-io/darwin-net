@@ -424,8 +424,10 @@ func (c *Client) RemoveMesh(ctx context.Context) error {
 // MeshPeerStats asks the daemon for the most recent wireguard handshake its mesh
 // device completed with each peer. It changes nothing on the daemon. A daemon
 // older than minor 5 answers "unknown verb"; the client then returns an error
-// wrapping ErrHelperTooOld. A reply listing more than DefaultMaxPerConn peers, or
-// one with a non-positive handshake time, is refused whole.
+// wrapping ErrHelperTooOld. A reply listing more than DefaultMaxPerConn peers is
+// refused whole. An entry with an empty key or a non-positive handshake time is
+// skipped and the rest returned; only the number skipped is logged, never a
+// value from the entry.
 func (c *Client) MeshPeerStats(ctx context.Context) ([]MeshPeerStat, error) {
 	resp, err := c.roundTrip(ctx, Request{Version: CurrentVersion(), Verb: VerbMeshPeerStats})
 	if err != nil {
@@ -438,12 +440,17 @@ func (c *Client) MeshPeerStats(ctx context.Context) ([]MeshPeerStat, error) {
 	if len(resp.MeshPeerStats) > DefaultMaxPerConn {
 		return nil, fmt.Errorf("netd %s: reply lists %d peers, more than the %d allowed", VerbMeshPeerStats, len(resp.MeshPeerStats), DefaultMaxPerConn)
 	}
+	stats := make([]MeshPeerStat, 0, len(resp.MeshPeerStats))
 	for _, st := range resp.MeshPeerStats {
 		if st.PubKey == "" || st.LastHandshakeUnixNano <= 0 {
-			return nil, fmt.Errorf("netd %s: reply carries an unusable peer entry %+v", VerbMeshPeerStats, st)
+			continue
 		}
+		stats = append(stats, st)
 	}
-	return resp.MeshPeerStats, nil
+	if skipped := len(resp.MeshPeerStats) - len(stats); skipped > 0 {
+		c.logger().Warn("netd: unusable mesh peer stats skipped", "verb", VerbMeshPeerStats, "skipped", skipped, "read", len(stats))
+	}
+	return stats, nil
 }
 
 // BindPort asks the daemon to bind a listening socket on the specific addr and

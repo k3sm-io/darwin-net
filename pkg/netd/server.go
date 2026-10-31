@@ -867,7 +867,9 @@ func (s *Server) handleRemoveMesh(ctx context.Context) wire.Response {
 // handleMeshPeerStats answers the read-only MeshPeerStats verb: the mesh
 // device's per-peer handshake times, base64-keyed as MeshPeerArg is, sorted by
 // key, and capped at wire.DefaultMaxPerConn entries (the client refuses a
-// longer list). It changes nothing.
+// longer list). An entry with a key that is not hex or a non-positive time is
+// dropped; the dropped and truncated counts are logged once per call, never a
+// value from an entry. It changes nothing.
 func (s *Server) handleMeshPeerStats(ctx context.Context) wire.Response {
 	seen, err := s.priv.MeshPeerHandshakes(ctx)
 	if err != nil {
@@ -881,9 +883,15 @@ func (s *Server) handleMeshPeerStats(ctx context.Context) wire.Response {
 		}
 		stats = append(stats, wire.MeshPeerStat{PubKey: base64.StdEncoding.EncodeToString(raw), LastHandshakeUnixNano: at.UnixNano()})
 	}
+	dropped := len(seen) - len(stats)
 	slices.SortFunc(stats, func(a, b wire.MeshPeerStat) int { return strings.Compare(a.PubKey, b.PubKey) })
+	truncated := 0
 	if len(stats) > wire.DefaultMaxPerConn {
+		truncated = len(stats) - wire.DefaultMaxPerConn
 		stats = stats[:wire.DefaultMaxPerConn]
+	}
+	if dropped > 0 || truncated > 0 {
+		s.log.Warn("netd: meshPeerStats reply trimmed", "dropped", dropped, "truncated", truncated, "sent", len(stats))
 	}
 	resp := s.okResp()
 	resp.MeshPeerStats = stats

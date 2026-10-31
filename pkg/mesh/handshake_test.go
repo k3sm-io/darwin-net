@@ -398,3 +398,65 @@ func TestPeerHandshakesNeedsAReader(t *testing.T) {
 		t.Fatalf("PeerHandshakes err = %v, want ErrNoHandshakeReader", err)
 	}
 }
+
+// statsHelper is a helperClient whose MeshPeerStats returns a canned reply.
+type statsHelper struct{ stats []wire.MeshPeerStat }
+
+func (*statsHelper) ConfigureMesh(context.Context, string, int, netip.Prefix, []wire.MeshPeerArg) error {
+	return nil
+}
+func (*statsHelper) RemoveMesh(context.Context) error { return nil }
+func (h *statsHelper) MeshPeerStats(context.Context) ([]wire.MeshPeerStat, error) {
+	return h.stats, nil
+}
+
+// TestNetdPeerHandshakesSkipsMalformedEntry pins the helper path's skip
+// contract: a peer key that is not 32 bytes of base64 costs only that entry,
+// the good peers come back, and the log carries the count, never the value.
+func TestNetdPeerHandshakesSkipsMalformedEntry(t *testing.T) {
+	const at int64 = 1_700_000_000_000_000_000
+	good := wire.MeshPeerStat{PubKey: wgKeyB64(0x42), LastHandshakeUnixNano: at}
+	short := base64.StdEncoding.EncodeToString([]byte("short-key-sentinel"))
+	cases := []struct {
+		name    string
+		stats   []wire.MeshPeerStat
+		want    int
+		skipped string
+		leaks   []string
+	}{
+		{"not base64", []wire.MeshPeerStat{good, {PubKey: "!!not-base64-sentinel!!", LastHandshakeUnixNano: at}}, 1, "skipped=1", []string{"not-base64-sentinel"}},
+		{"short key", []wire.MeshPeerStat{{PubKey: short, LastHandshakeUnixNano: at}, good}, 1, "skipped=1", []string{short, hex.EncodeToString([]byte("short-key-sentinel"))}},
+		{"all bad", []wire.MeshPeerStat{{PubKey: short, LastHandshakeUnixNano: at}, {PubKey: "!!not-base64-sentinel!!", LastHandshakeUnixNano: at}}, 0, "skipped=2", []string{short, "not-base64-sentinel"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			d := &netdDevice{
+				client: &statsHelper{stats: tc.stats},
+				log:    slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+			}
+			got, err := d.PeerHandshakes(context.Background())
+			surfaces := logs.String()
+			if err != nil {
+				surfaces += "\n" + err.Error()
+				t.Errorf("PeerHandshakes err = %v, want nil", err)
+			}
+			if len(got) != tc.want {
+				t.Errorf("PeerHandshakes returned %d peers, want %d", len(got), tc.want)
+			}
+			if tc.want > 0 {
+				if ts, ok := got[keyHex(t, 0x42)]; !ok || !ts.Equal(time.Unix(0, at)) {
+					t.Errorf("PeerHandshakes = %v, want the good peer at %v", got, time.Unix(0, at).UTC())
+				}
+			}
+			if !strings.Contains(logs.String(), tc.skipped) {
+				t.Errorf("log does not report %s; logs:\n%s", tc.skipped, logs.String())
+			}
+			for _, leak := range tc.leaks {
+				if strings.Contains(surfaces, leak) {
+					t.Errorf("bad entry value %q leaked into the error or log:\n%s", leak, surfaces)
+				}
+			}
+		})
+	}
+}
