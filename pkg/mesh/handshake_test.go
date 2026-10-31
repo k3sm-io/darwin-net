@@ -64,6 +64,18 @@ func (r *statusRecorder) count() int {
 	return n
 }
 
+// resyncWithStatus runs one reconcile pass and then, on the test goroutine, the
+// status pass it armed, exactly as statusLoop would drain it: a test can then
+// read the writes without starting either loop.
+func resyncWithStatus(w *Watcher) {
+	w.resync(context.Background())
+	select {
+	case <-w.statusKick:
+		w.writeHandshakeStatus(context.Background())
+	default:
+	}
+}
+
 // TestApplyWritesPeerHandshakeTime is the gate for writing MeshPeer
 // status.lastHandshakeTime from the control-plane node's own wireguard view:
 // after a reconcile pass applies the plan, the watcher reads the device's
@@ -105,7 +117,7 @@ func TestApplyWritesPeerHandshakeTime(t *testing.T) {
 
 	t.Run("server writes the handshake of the peer that has one", func(t *testing.T) {
 		w, _, rec := build(t, WithHandshakeStatus())
-		w.resync(context.Background())
+		resyncWithStatus(w)
 		if got := rec.count(); got != 1 {
 			t.Fatalf("first pass wrote %d status patches (%v), want 1, for nodeB only", got, rec.patches)
 		}
@@ -144,7 +156,7 @@ func TestApplyWritesPeerHandshakeTime(t *testing.T) {
 		if err := w.informer.GetStore().Update(mp); err != nil {
 			t.Fatalf("update store: %v", err)
 		}
-		w.resync(context.Background())
+		resyncWithStatus(w)
 		if got := rec.count(); got != 0 {
 			t.Fatalf("a pass with the handshake already recorded wrote %d patches (%v), want 0", got, rec.patches)
 		}
@@ -156,6 +168,9 @@ func TestApplyWritesPeerHandshakeTime(t *testing.T) {
 			t.Fatal("a watcher built without WithHandshakeStatus has a status writer")
 		}
 		w.resync(context.Background())
+		if len(w.statusKick) != 0 {
+			t.Fatal("a worker's reconcile pass armed a status write")
+		}
 	})
 }
 
@@ -253,7 +268,7 @@ func TestHandshakeReadLeaksNoSecrets(t *testing.T) {
 	if err != nil || skipped != 1 || len(parsed) != 1 {
 		t.Fatalf("ParseHandshakes = %v, skipped %d, err %v; want one peer and one skipped", parsed, skipped, err)
 	}
-	w.resync(context.Background())
+	resyncWithStatus(w)
 	if rec.count() != 1 {
 		t.Fatalf("status patches = %v, want one for nodeB", rec.patches)
 	}
@@ -348,7 +363,7 @@ func TestWatcherLogsHelperTooOldOnce(t *testing.T) {
 	w.patchStatus = (&statusRecorder{}).patch
 	seedPeer(t, w, "nodeB", "100.64.1.0/24", "192.0.2.2:51820", 0x42, "1")
 	for range 3 {
-		w.resync(context.Background())
+		resyncWithStatus(w)
 	}
 	if n := strings.Count(logs.String(), "helper is too old to report"); n != 1 {
 		t.Fatalf("three passes against an old helper logged it %d times, want 1:\n%s", n, logs.String())
