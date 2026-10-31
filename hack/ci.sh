@@ -40,7 +40,7 @@ if [ -n "$go_pkgs" ]; then
 	# gate needs no tool beyond cat and grep and the exit status comes
 	# straight from go test, not a pipeline.
 	test_rc=0
-	CGO_ENABLED=$CGO go test -race ./... > "$ci_tmp/gotest.log" 2>&1 || test_rc=$?
+	CGO_ENABLED=$CGO go test -race -count=1 ./... > "$ci_tmp/gotest.log" 2>&1 || test_rc=$?
 	cat "$ci_tmp/gotest.log"
 	if [ "$test_rc" -ne 0 ]; then
 		echo "==> [darwin-net] go test FAILED; failing tests:" >&2
