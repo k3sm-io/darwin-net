@@ -66,7 +66,10 @@ const updateDirPrefix = "netd-update-"
 const stagingLockSuffix = ".lock"
 
 // DefaultInstalledK3sm is the installed k3sm binary whose code signature and
-// version the update policy compares the staged build against.
+// version the update policy compares the staged build against. It is the entry
+// point only: the install tree may reach the binary through symlinks (a flat
+// compat name into a versioned directory), so every use resolves it first with
+// resolveInstalledK3sm.
 const DefaultInstalledK3sm = "/Library/k3sm/k3sm"
 
 // Bounds on the request, the reply and the installed-version probe.
@@ -315,7 +318,12 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 	}
 	log.Info("netd: update set extracted", "members", set.Members, "macho", len(set.MachOs),
 		"markers-skipped", len(set.Markers), "markers", set.Markers)
-	installed, tree, err := inspectStagedTree(ctx, s.inspector, dir, set, s.installedK3sm)
+	installedPath, err := resolveInstalledK3sm(s.installedK3sm)
+	if err != nil {
+		log.Warn("netd: update code signing refused", "err", err)
+		return s.updateFailed(err, "")
+	}
+	installed, tree, err := inspectStagedTree(ctx, s.inspector, dir, set, installedPath)
 	if err == nil {
 		err = checkCodeSigning(installed, tree, payload.requireTeam())
 	}
@@ -642,7 +650,11 @@ func copyVerifiedArchive(archive *os.File, root, want string) (*os.File, error) 
 // allowDowngrade the daemon installs only what it can prove is not older. It
 // returns the installed version it compared against.
 func (s *Server) checkNotDowngrade(ctx context.Context, version string) (string, error) {
-	installed, err := s.installedVersion(ctx, s.installedK3sm)
+	path, err := resolveInstalledK3sm(s.installedK3sm)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", errUpdateRefused, err)
+	}
+	installed, err := s.installedVersion(ctx, path)
 	if err != nil {
 		return "", fmt.Errorf("%w: read the installed version: %w", errUpdateRefused, err)
 	}
@@ -654,6 +666,26 @@ func (s *Server) checkNotDowngrade(ctx context.Context, version string) (string,
 		return "", fmt.Errorf("%w: %s is below the installed %s and the payload does not allow a downgrade", errUpdateRefused, version, installed)
 	}
 	return installed, nil
+}
+
+// resolveInstalledK3sm follows every symlink in path and returns the real file
+// it names, so the signature baseline and the version probe read the Mach-O
+// itself rather than a link that could be repointed between the two reads. It
+// fails closed: a dangling link, a loop, or a target that is not a regular file
+// is an error.
+func resolveInstalledK3sm(path string) (string, error) {
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve the installed %s: %w", path, err)
+	}
+	fi, err := os.Lstat(target)
+	if err != nil {
+		return "", fmt.Errorf("resolve the installed %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("resolve the installed %s: %s is not a regular file", path, target)
+	}
+	return target, nil
 }
 
 // probeInstalledVersion is the production installedVersionFunc: it runs

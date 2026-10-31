@@ -346,7 +346,12 @@ type harnessOpt func(*Config)
 func newUpdateHarness(t *testing.T, serviceUID uint32, opts ...harnessOpt) *updateHarness {
 	t.Helper()
 	pki := newTestPKI(t)
-	dir := t.TempDir()
+	// The installed path is resolved before use, so the harness names it by
+	// its real path (the temp root itself is behind a symlink on macOS).
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	caPath := filepath.Join(dir, "cluster-ca.crt")
 	if err := os.WriteFile(caPath, pki.caPEM, 0o600); err != nil {
 		t.Fatal(err)
@@ -1378,4 +1383,115 @@ func TestCompareReleases(t *testing.T) {
 	if _, err := parseVersionOutput("something else\n"); err == nil {
 		t.Error("parseVersionOutput accepted a foreign first line")
 	}
+}
+
+func TestResolveInstalledK3sm(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	flat := filepath.Join(dir, "flat", "k3sm")
+	versioned := filepath.Join(dir, "versioned", "versions", "v0.3.0", "k3sm")
+	for _, p := range []string{flat, versioned} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(machO), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// versioned/current -> versions/v0.3.0, versioned/k3sm -> current/k3sm:
+	// the compat name reaches the binary through two links.
+	root := filepath.Join(dir, "versioned")
+	if err := os.Symlink(filepath.Join("versions", "v0.3.0"), filepath.Join(root, "current")); err != nil {
+		t.Fatal(err)
+	}
+	chain := filepath.Join(root, "k3sm")
+	if err := os.Symlink(filepath.Join("current", "k3sm"), chain); err != nil {
+		t.Fatal(err)
+	}
+	dangling := filepath.Join(dir, "dangling")
+	if err := os.Symlink(filepath.Join(dir, "versions", "v9.9.9", "k3sm"), dangling); err != nil {
+		t.Fatal(err)
+	}
+	loop := filepath.Join(dir, "loop")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Fatal(err)
+	}
+	dirLink := filepath.Join(dir, "dirlink")
+	if err := os.Symlink(filepath.Join(root, "versions", "v0.3.0"), dirLink); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		path    string
+		want    string
+		wantErr bool
+	}{
+		{name: "a flat file resolves to itself", path: flat, want: flat},
+		{name: "a symlink chain resolves into the versioned directory", path: chain, want: versioned},
+		{name: "a dangling link fails closed", path: dangling, wantErr: true},
+		{name: "a link loop fails closed", path: loop, wantErr: true},
+		{name: "a link to a directory fails closed", path: dirLink, wantErr: true},
+		{name: "a missing path fails closed", path: filepath.Join(dir, "absent"), wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveInstalledK3sm(tc.path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("resolveInstalledK3sm(%s) = %s, want an error", tc.path, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveInstalledK3sm(%s): %v", tc.path, err)
+			}
+			if got != tc.want {
+				t.Fatalf("resolveInstalledK3sm(%s) = %s, want %s", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestApplyUpdateResolvesTheInstalledK3sm(t *testing.T) {
+	t.Run("a versioned install is inspected and probed at its real path", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		target := h.installed
+		link := filepath.Join(filepath.Dir(target), "compat-k3sm")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		h.s.installedK3sm = link
+		resp := h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "if-signed", false))
+		if !resp.OK || resp.Phase != wire.UpdatePhaseDone {
+			t.Fatalf("resp = %+v, want OK Done", resp)
+		}
+		if h.probes != 1 {
+			t.Fatalf("installed version probed %d times, want 1 (at %s)", h.probes, target)
+		}
+		if len(h.insp.paths) == 0 || h.insp.paths[0] != target {
+			t.Fatalf("first inspected path = %v, want the resolved %s", h.insp.paths, target)
+		}
+		if slices.Contains(h.insp.paths, link) {
+			t.Fatalf("inspected the link %s itself: %v", link, h.insp.paths)
+		}
+	})
+
+	t.Run("a dangling installed link refuses the update before the install", func(t *testing.T) {
+		h := newUpdateHarness(t, selfUID())
+		link := filepath.Join(filepath.Dir(h.installed), "dangling-k3sm")
+		if err := os.Symlink(filepath.Join(filepath.Dir(h.installed), "versions", "v0.1.9", "k3sm"), link); err != nil {
+			t.Fatal(err)
+		}
+		h.s.installedK3sm = link
+		resp := h.apply(h.request(releaseMembers("ADHOC"), "v0.2.0", "if-signed", false))
+		if resp.OK {
+			t.Fatalf("resp = %+v, want a refusal", resp)
+		}
+		if h.inst.calls != 0 || h.probes != 0 {
+			t.Fatalf("installer ran %d times, version probed %d times, want neither", h.inst.calls, h.probes)
+		}
+	})
 }
