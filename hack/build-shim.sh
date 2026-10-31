@@ -33,7 +33,12 @@ mkdir -p "$OUT_DIR"
 # Asserted on the built Mach-O by pkg/dns TestShimIsUniversalBinary -- assert the
 # ARTIFACT, never these flags, since the flags are what drifted from this comment.
 # -fPIC and -dynamiclib for a shared library; -install_name keeps it relocatable.
-clang \
+# Apple clang's driver leaves one empty <source>-<hex> dir per arch in TMPDIR on a
+# multi-arch compile, so clang gets a private TMPDIR that the EXIT trap removes.
+# Asserted by pkg/dns TestShimBuildLeavesNoTempDirs.
+CLANG_TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$CLANG_TMPDIR"' EXIT
+TMPDIR="$CLANG_TMPDIR" clang \
   -arch arm64 \
   -arch arm64e \
   -arch x86_64 \
