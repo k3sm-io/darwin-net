@@ -17,7 +17,6 @@ limitations under the License.
 package mesh
 
 import (
-	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -25,6 +24,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"k3sm.io/darwin-net/pkg/netd/wire"
 )
 
 // handshakeReader is the optional Device capability the Mesh reads per-peer
@@ -38,49 +39,85 @@ type handshakeReader interface {
 	PeerHandshakes(ctx context.Context) (map[string]time.Time, error)
 }
 
+// maxUAPIGetBytes caps the UAPI get response ParseHandshakes reads. A response
+// for maxParsedPeers peers is a few tens of KiB; 1 MiB is a bound, not a budget.
+const maxUAPIGetBytes = 1 << 20
+
+// maxParsedPeers caps the peers ParseHandshakes returns: one node's worth of
+// per-connection state on the netd side (wire.DefaultMaxPerConn), far beyond
+// any real cluster.
+const maxParsedPeers = wire.DefaultMaxPerConn
+
+// handshakeReadTimeout bounds one per-peer handshake read, the netd round trip
+// included, so a wedged helper cannot hold a reconcile pass open.
+const handshakeReadTimeout = 5 * time.Second
+
 // ParseHandshakes reads the per-peer handshake times out of a wireguard UAPI
 // get response (wireguard-go's IpcGet output): every public_key= line opens a
 // peer, and its last_handshake_time_sec= and last_handshake_time_nsec= lines
 // give the time. A peer whose time is zero (never) is left out. The result is
-// keyed by the hex public key.
-func ParseHandshakes(uapi string) (map[string]time.Time, error) {
+// keyed by the lowercase hex public key.
+//
+// It fails closed per peer, never for the whole read: a peer whose public key
+// is not 32 bytes of hex, or whose time is not a valid non-negative number, is
+// dropped and counted in skipped, as is every peer past maxParsedPeers, and the
+// rest are returned. Only the keys it recognises are read; every other line
+// (private_key, preshared_key, endpoint, ...) is ignored, and no value from the
+// input is ever echoed in an error. A response larger than maxUAPIGetBytes is
+// refused whole.
+func ParseHandshakes(uapi string) (handshakes map[string]time.Time, skipped int, err error) {
+	if len(uapi) > maxUAPIGetBytes {
+		return nil, 0, fmt.Errorf("wireguard UAPI get response is %d bytes, more than the %d allowed", len(uapi), maxUAPIGetBytes)
+	}
 	out := make(map[string]time.Time)
-	var key string
-	var sec, nsec int64
+	var (
+		key       string
+		open, bad bool
+		sec, nsec int64
+	)
 	flush := func() {
-		if key != "" && (sec != 0 || nsec != 0) {
+		switch {
+		case !open:
+		case bad:
+			skipped++
+		case sec == 0 && nsec == 0:
+		case len(out) >= maxParsedPeers:
+			skipped++
+		default:
 			out[key] = time.Unix(sec, nsec).UTC()
 		}
-		key, sec, nsec = "", 0, 0
+		key, open, bad, sec, nsec = "", false, false, 0, 0
 	}
-	sc := bufio.NewScanner(strings.NewReader(uapi))
-	for sc.Scan() {
-		k, v, ok := strings.Cut(sc.Text(), "=")
+	for line := range strings.Lines(uapi) {
+		k, v, ok := strings.Cut(strings.TrimRight(line, "\r\n"), "=")
 		if !ok {
 			continue
 		}
-		var err error
 		switch k {
 		case "public_key":
 			flush()
-			if _, derr := hex.DecodeString(v); derr != nil || len(v) != 64 {
-				return nil, fmt.Errorf("parse wireguard peer public key %q: not a 32-byte hex key", v)
+			open = true
+			if raw, derr := hex.DecodeString(v); derr != nil || len(raw) != wgKeyBytes {
+				bad = true
+				continue
 			}
-			key = v
+			key = strings.ToLower(v)
 		case "last_handshake_time_sec":
-			sec, err = strconv.ParseInt(v, 10, 64)
+			n, perr := strconv.ParseInt(v, 10, 64)
+			if perr != nil || n < 0 {
+				bad = true
+			}
+			sec = n
 		case "last_handshake_time_nsec":
-			nsec, err = strconv.ParseInt(v, 10, 64)
+			n, perr := strconv.ParseInt(v, 10, 64)
+			if perr != nil || n < 0 || n >= int64(time.Second) {
+				bad = true
+			}
+			nsec = n
 		}
-		if err != nil {
-			return nil, fmt.Errorf("parse wireguard %s=%q: %w", k, v, err)
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("read wireguard UAPI get response: %w", err)
 	}
 	flush()
-	return out, nil
+	return out, skipped, nil
 }
 
 // PeerHandshakes reads the device's per-peer handshake times (wireguard's UAPI
@@ -95,7 +132,14 @@ func (d *WGDevice) PeerHandshakes(context.Context) (map[string]time.Time, error)
 	if err != nil {
 		return nil, fmt.Errorf("read wireguard peers: %w", err)
 	}
-	return ParseHandshakes(uapi)
+	out, skipped, err := ParseHandshakes(uapi)
+	if err != nil {
+		return nil, err
+	}
+	if skipped > 0 {
+		d.log.Warn("wireguard peers skipped while reading handshakes", "skipped", skipped, "read", len(out))
+	}
+	return out, nil
 }
 
 // PeerHandshakes asks the netd daemon for its mesh device's per-peer handshake
@@ -108,8 +152,8 @@ func (d *netdDevice) PeerHandshakes(ctx context.Context) (map[string]time.Time, 
 	out := make(map[string]time.Time, len(stats))
 	for _, st := range stats {
 		raw, err := base64.StdEncoding.DecodeString(st.PubKey)
-		if err != nil {
-			return nil, fmt.Errorf("decode netd peer public key %q: %w", st.PubKey, err)
+		if err != nil || len(raw) != wgKeyBytes {
+			return nil, fmt.Errorf("netd reported a peer public key that is not 32 bytes of base64")
 		}
 		out[hex.EncodeToString(raw)] = time.Unix(0, st.LastHandshakeUnixNano).UTC()
 	}
@@ -120,21 +164,32 @@ func (d *netdDevice) PeerHandshakes(ctx context.Context) (map[string]time.Time, 
 // handshake with each peer of the last applied plan, keyed by the peer's node
 // name. A peer with no completed handshake is absent. It returns an error
 // wrapping ErrNoHandshakeReader when the device cannot report handshakes.
+//
+// It holds mu only to snapshot the reader and the key-to-node map; the read
+// itself (a netd round trip in helper mode) runs unlocked, under
+// handshakeReadTimeout, so a slow helper never blocks Reconcile or Close.
 func (m *Mesh) PeerHandshakes(ctx context.Context) (map[string]time.Time, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	r, ok := m.dev.(handshakeReader)
-	if !ok {
-		return nil, fmt.Errorf("%w: %T", ErrNoHandshakeReader, m.dev)
+	nodeByKey := make(map[string]string, len(m.applied.Peers))
+	for _, p := range m.applied.Peers {
+		nodeByKey[strings.ToLower(p.PublicKeyHex)] = p.NodeName
 	}
+	dev := m.dev
+	m.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %T", ErrNoHandshakeReader, dev)
+	}
+	ctx, cancel := context.WithTimeout(ctx, handshakeReadTimeout)
+	defer cancel()
 	byKey, err := r.PeerHandshakes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("read peer handshakes: %w", err)
 	}
-	out := make(map[string]time.Time, len(m.applied.Peers))
-	for _, p := range m.applied.Peers {
-		if t, ok := byKey[strings.ToLower(p.PublicKeyHex)]; ok {
-			out[p.NodeName] = t
+	out := make(map[string]time.Time, len(nodeByKey))
+	for key, node := range nodeByKey {
+		if t, ok := byKey[key]; ok {
+			out[node] = t
 		}
 	}
 	return out, nil

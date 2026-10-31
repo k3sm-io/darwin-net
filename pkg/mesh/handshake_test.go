@@ -17,11 +17,16 @@ limitations under the License.
 package mesh
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +35,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/netd/wire"
 )
 
 // statusRecorder records the status patches a Watcher writes.
@@ -154,24 +160,231 @@ func TestApplyWritesPeerHandshakeTime(t *testing.T) {
 }
 
 // TestParseHandshakes pins the UAPI get parser: never-handshaken peers are left
-// out, nanoseconds are kept, and a malformed key or number fails the read.
+// out, nanoseconds are kept, keys are lowercased, and a peer with a malformed
+// key or time is dropped and counted while the others are still returned.
 func TestParseHandshakes(t *testing.T) {
-	k := keyHex(t, 0x42)
-	got, err := ParseHandshakes(fmt.Sprintf("public_key=%s\nlast_handshake_time_sec=10\nlast_handshake_time_nsec=7\n", k))
+	good, other := keyHex(t, 0x42), keyHex(t, 0x43)
+	peer := func(key, sec, nsec string) string {
+		return fmt.Sprintf("public_key=%s\nlast_handshake_time_sec=%s\nlast_handshake_time_nsec=%s\n", key, sec, nsec)
+	}
+	cases := []struct {
+		name    string
+		in      string
+		want    map[string]time.Time
+		skipped int
+	}{
+		{"one peer", peer(good, "10", "7"), map[string]time.Time{good: time.Unix(10, 7).UTC()}, 0},
+		{"uppercase key", peer(strings.ToUpper(good), "10", "0"), map[string]time.Time{good: time.Unix(10, 0).UTC()}, 0},
+		{"never handshaken", peer(good, "0", "0"), map[string]time.Time{}, 0},
+		{"bad key is skipped", peer("zz", "10", "0") + peer(other, "11", "0"), map[string]time.Time{other: time.Unix(11, 0).UTC()}, 1},
+		{"short key is skipped", peer("abcd", "10", "0") + peer(other, "11", "0"), map[string]time.Time{other: time.Unix(11, 0).UTC()}, 1},
+		{"bad seconds are skipped", peer(good, "x", "0") + peer(other, "11", "0"), map[string]time.Time{other: time.Unix(11, 0).UTC()}, 1},
+		{"negative seconds are skipped", peer(good, "-1", "0") + peer(other, "11", "0"), map[string]time.Time{other: time.Unix(11, 0).UTC()}, 1},
+		{"nanoseconds out of range are skipped", peer(good, "10", "1000000000") + peer(other, "11", "0"), map[string]time.Time{other: time.Unix(11, 0).UTC()}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, skipped, err := ParseHandshakes(tc.in)
+			if err != nil {
+				t.Fatalf("ParseHandshakes: %v", err)
+			}
+			if skipped != tc.skipped || len(got) != len(tc.want) {
+				t.Fatalf("ParseHandshakes = %v (skipped %d), want %v (skipped %d)", got, skipped, tc.want, tc.skipped)
+			}
+			for k, w := range tc.want {
+				if !got[k].Equal(w) {
+					t.Fatalf("ParseHandshakes[%s] = %s, want %s", k, got[k], w)
+				}
+			}
+		})
+	}
+	if _, _, err := ParseHandshakes(strings.Repeat("x", maxUAPIGetBytes+1)); err == nil {
+		t.Fatal("an oversized UAPI response was read, want it refused")
+	}
+}
+
+// The secret values a UAPI dump carries. They are distinctive so a leak into
+// any output is found by substring.
+var (
+	secretPrivateHex   = strings.Repeat("5e", 32)
+	secretPresharedHex = strings.Repeat("c7", 32)
+)
+
+// secretForms returns every encoding of the two secrets a leak could take.
+func secretForms(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	for _, h := range []string{secretPrivateHex, secretPresharedHex} {
+		raw, err := hex.DecodeString(h)
+		if err != nil {
+			t.Fatalf("decode secret: %v", err)
+		}
+		out = append(out, h, strings.ToUpper(h), base64.StdEncoding.EncodeToString(raw))
+	}
+	return out
+}
+
+// TestHandshakeReadLeaksNoSecrets feeds a UAPI dump carrying a private_key and
+// a preshared_key (and a malformed peer, so the skip path logs) through the
+// device read, the mesh, and the status writer, and asserts neither secret
+// appears in the parsed result, a status patch, or any log line.
+func TestHandshakeReadLeaksNoSecrets(t *testing.T) {
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	dev, wg, _ := applierDevice(t)
+	dev.log = log
+	m, err := New(netip.MustParsePrefix("100.64.0.0/24"), withDevice(dev), WithLogger(log))
 	if err != nil {
-		t.Fatalf("ParseHandshakes: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if want := time.Unix(10, 7).UTC(); !got[k].Equal(want) || len(got) != 1 {
-		t.Fatalf("ParseHandshakes = %v, want %s for %s", got, want, k)
+	w, err := NewWatcher(&rest.Config{Host: "https://127.0.0.1:1"}, m, log, WithHandshakeStatus())
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
 	}
-	for _, bad := range []string{
-		"public_key=zz\n",
-		fmt.Sprintf("public_key=%s\nlast_handshake_time_sec=x\n", k),
-	} {
-		if _, err := ParseHandshakes(bad); err == nil {
-			t.Errorf("ParseHandshakes(%q) succeeded, want an error", bad)
+	rec := &statusRecorder{}
+	w.patchStatus = rec.patch
+	seedPeer(t, w, "nodeB", "100.64.1.0/24", "192.0.2.2:51820", 0x42, "1")
+	wg.get = fmt.Sprintf("private_key=%s\nlisten_port=51820\n"+
+		"public_key=%s\npreshared_key=%s\nlast_handshake_time_sec=100\nlast_handshake_time_nsec=0\n"+
+		"public_key=%s\nlast_handshake_time_sec=100\n"+
+		"errno=0\n", secretPrivateHex, keyHex(t, 0x42), secretPresharedHex, secretPrivateHex[:10])
+
+	parsed, skipped, err := ParseHandshakes(wg.get)
+	if err != nil || skipped != 1 || len(parsed) != 1 {
+		t.Fatalf("ParseHandshakes = %v, skipped %d, err %v; want one peer and one skipped", parsed, skipped, err)
+	}
+	w.resync(context.Background())
+	if rec.count() != 1 {
+		t.Fatalf("status patches = %v, want one for nodeB", rec.patches)
+	}
+	if !strings.Contains(logs.String(), "skipped=1") {
+		t.Fatalf("the skipped peer was not logged; logs:\n%s", logs.String())
+	}
+	var surfaces []string
+	for k, v := range parsed {
+		surfaces = append(surfaces, k, v.String())
+	}
+	for _, ps := range rec.patches {
+		surfaces = append(surfaces, ps...)
+	}
+	surfaces = append(surfaces, logs.String())
+	all := strings.Join(surfaces, "\n")
+	for _, secret := range secretForms(t) {
+		if strings.Contains(all, secret) {
+			t.Fatalf("secret %q leaked into the parsed result, a patch, or the logs:\n%s", secret, all)
 		}
 	}
+}
+
+// blockingReader is a Device whose handshake read blocks until released or
+// its context ends, recording whether that context carried a deadline.
+type blockingReader struct {
+	fakeDevice
+	entered     chan struct{}
+	release     chan struct{}
+	hadDeadline bool
+}
+
+func (b *blockingReader) PeerHandshakes(ctx context.Context) (map[string]time.Time, error) {
+	_, b.hadDeadline = ctx.Deadline()
+	close(b.entered)
+	select {
+	case <-b.release:
+		return map[string]time.Time{}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// TestPeerHandshakesDoesNotHoldMeshLock pins that the handshake read (a netd
+// round trip in helper mode) runs without the mesh's lock and under a
+// deadline: while a reader blocks, the lock Reconcile and Close take is free.
+func TestPeerHandshakesDoesNotHoldMeshLock(t *testing.T) {
+	dev := &blockingReader{entered: make(chan struct{}), release: make(chan struct{})}
+	m, err := New(netip.MustParsePrefix("100.64.0.0/24"), withDevice(dev), WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.PeerHandshakes(context.Background())
+		done <- err
+	}()
+	<-dev.entered
+	if !m.mu.TryLock() {
+		close(dev.release)
+		t.Fatal("Mesh.PeerHandshakes holds the mesh lock across the device read")
+	}
+	m.mu.Unlock()
+	close(dev.release)
+	if err := <-done; err != nil {
+		t.Fatalf("PeerHandshakes: %v", err)
+	}
+	if !dev.hadDeadline {
+		t.Fatal("the device read ran with no deadline")
+	}
+}
+
+// tooOldReader is a Device whose handshake read always reports an old helper.
+type tooOldReader struct{ fakeDevice }
+
+func (*tooOldReader) PeerHandshakes(context.Context) (map[string]time.Time, error) {
+	return nil, fmt.Errorf("%w: test", wire.ErrHelperTooOld)
+}
+
+// TestWatcherLogsHelperTooOldOnce pins that an old netd helper is reported once,
+// not on every resync pass.
+func TestWatcherLogsHelperTooOldOnce(t *testing.T) {
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	m, err := New(netip.MustParsePrefix("100.64.0.0/24"), withDevice(&tooOldReader{}), WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	w, err := NewWatcher(&rest.Config{Host: "https://127.0.0.1:1"}, m, log, WithHandshakeStatus())
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	w.patchStatus = (&statusRecorder{}).patch
+	seedPeer(t, w, "nodeB", "100.64.1.0/24", "192.0.2.2:51820", 0x42, "1")
+	for range 3 {
+		w.resync(context.Background())
+	}
+	if n := strings.Count(logs.String(), "helper is too old to report"); n != 1 {
+		t.Fatalf("three passes against an old helper logged it %d times, want 1:\n%s", n, logs.String())
+	}
+}
+
+// FuzzParseHandshakes checks the UAPI get parser on arbitrary input: it never
+// panics, every key it returns is a lowercase 32-byte hex key that the input
+// named on a public_key line, no returned time is zero, and it never returns
+// more than maxParsedPeers peers. Seeds live in testdata/fuzz.
+func FuzzParseHandshakes(f *testing.F) {
+	f.Add("public_key=" + strings.Repeat("ab", 32) + "\nlast_handshake_time_sec=10\nlast_handshake_time_nsec=5\n")
+	f.Fuzz(func(t *testing.T, in string) {
+		got, skipped, err := ParseHandshakes(in)
+		if err != nil {
+			if len(in) <= maxUAPIGetBytes {
+				t.Fatalf("ParseHandshakes failed on %d bytes: %v", len(in), err)
+			}
+			return
+		}
+		if skipped < 0 || len(got) > maxParsedPeers {
+			t.Fatalf("ParseHandshakes returned %d peers, skipped %d", len(got), skipped)
+		}
+		lower := strings.ToLower(in)
+		for k, v := range got {
+			if raw, derr := hex.DecodeString(k); derr != nil || len(raw) != wgKeyBytes || k != strings.ToLower(k) {
+				t.Fatalf("returned key %q is not a lowercase 32-byte hex key", k)
+			}
+			if !strings.Contains(lower, "public_key="+k) {
+				t.Fatalf("returned key %q was not named on a public_key line", k)
+			}
+			if v.IsZero() || v.Equal(time.Unix(0, 0)) {
+				t.Fatalf("returned a zero handshake time for %q", k)
+			}
+		}
+	})
 }
 
 // TestPeerHandshakesNeedsAReader pins that a device that cannot report

@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/netd/wire"
 )
 
 // meshPeerResource is the MeshPeer CRD resource name within net.k3sm.io/v1.
@@ -95,6 +96,11 @@ type Watcher struct {
 	// status subresource; nil writes no status. It is a field so a test can
 	// record the writes with no apiserver.
 	patchStatus func(ctx context.Context, name string, patch []byte) error
+	// helperTooOldLogged records that the "netd helper too old" outcome has
+	// been logged, so it is reported once per episode instead of every pass. It
+	// is touched only on reconcileLoop's goroutine (via resync), so it needs no
+	// lock; a successful read clears it.
+	helperTooOldLogged bool
 }
 
 // WatcherOption configures a Watcher.
@@ -290,12 +296,20 @@ func (w *Watcher) resync(ctx context.Context) {
 // and retried by the next pass.
 func (w *Watcher) writeHandshakeStatus(ctx context.Context, store []any) {
 	seen, err := w.mesh.PeerHandshakes(ctx)
-	if err != nil {
-		if errors.Is(err, ErrNoHandshakeReader) {
-			w.log.Debug("mesh device reports no handshakes; MeshPeer status not written", "err", err)
-		} else {
-			w.log.Warn("read mesh peer handshakes", "err", err)
+	switch {
+	case err == nil:
+		w.helperTooOldLogged = false
+	case errors.Is(err, ErrNoHandshakeReader):
+		w.log.Debug("mesh device reports no handshakes; MeshPeer status not written", "err", err)
+		return
+	case errors.Is(err, wire.ErrHelperTooOld):
+		if !w.helperTooOldLogged {
+			w.log.Warn("the netd helper is too old to report mesh handshakes; MeshPeer status is not written until it is upgraded", "err", err)
+			w.helperTooOldLogged = true
 		}
+		return
+	default:
+		w.log.Warn("read mesh peer handshakes", "err", err)
 		return
 	}
 	for _, obj := range store {
