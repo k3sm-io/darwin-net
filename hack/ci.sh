@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
 CGO=0   # darwin-net is pure Go (utun/pf/lo0 via golang.org/x/sys/unix)
-STATICCHECK_VERSION=2026.2.1   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
+STATICCHECK_VERSION=2026.2.2   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
 GOVULNCHECK_VERSION=v1.9.0   # the govulncheck the gate requires; keep equal across the k3sm repos and the k3sm repository's hack/etcd-wrapper.sh
 
 echo "==> [darwin-net] gofmt"
@@ -94,13 +94,20 @@ if [ -n "$go_pkgs" ]; then
 	# the verdict would otherwise depend on the host. Bump STATICCHECK_VERSION
 	# together with the Go toolchain and docs/GO-STANDARDS.md, and keep it in
 	# step with the other k3sm repos. It runs after vet/build/test so a
-	# mismatched host tool never stops those from running.
+	# mismatched host tool never stops those from running. Candidates, in order:
+	# $(go env GOPATH)/bin/staticcheck-<pin> (the versioned name, so two pins can
+	# be installed side by side while the repos switch), then staticcheck on PATH,
+	# then $(go env GOPATH)/bin/staticcheck; the first reporting the pin wins.
 	sc=""; sc_seen=""
 	sc_cands=()
+	sc_gopath="$(go env GOPATH)"
+	sc_hint="go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}; or, beside another pin: GOBIN=<tmp> go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} && mv <tmp>/staticcheck ${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}"
+	sc_versioned="${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}"
+	[ -x "$sc_versioned" ] && sc_cands+=("$sc_versioned")
 	if sc_path="$(command -v staticcheck 2>/dev/null)" && [ -n "$sc_path" ]; then
 		sc_cands+=("$sc_path")
 	fi
-	sc_gobin="$(go env GOPATH)/bin/staticcheck"
+	sc_gobin="${sc_gopath}/bin/staticcheck"
 	[ -x "$sc_gobin" ] && sc_cands+=("$sc_gobin")
 	for c in ${sc_cands[@]+"${sc_cands[@]}"}; do
 		sc_out="$("$c" -version 2>/dev/null)" || true
@@ -110,11 +117,11 @@ if [ -n "$go_pkgs" ]; then
 	done
 	if [ -z "$sc" ]; then
 		if [ ${#sc_cands[@]} -eq 0 ]; then
-			echo "==> [darwin-net] staticcheck: not installed; the gate needs ${STATICCHECK_VERSION} (go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION})" >&2
+			echo "==> [darwin-net] staticcheck: not installed; the gate needs ${STATICCHECK_VERSION} (${sc_hint})" >&2
 		else
 			echo "==> [darwin-net] staticcheck: the gate needs ${STATICCHECK_VERSION}, found:" >&2
 			printf '%s' "$sc_seen" >&2
-			echo "    install: go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}" >&2
+			echo "    install: ${sc_hint}" >&2
 		fi
 		exit 1
 	fi
