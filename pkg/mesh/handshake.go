@@ -52,6 +52,13 @@ const maxParsedPeers = wire.DefaultMaxPerConn
 // included, so a wedged helper cannot hold a reconcile pass open.
 const handshakeReadTimeout = 5 * time.Second
 
+// statusWriteTimeout bounds one MeshPeer status PATCH to the apiserver, so a
+// slow or unreachable apiserver holds one write, not the status pass behind
+// it. The writes run on their own goroutine (Watcher.statusLoop), off the
+// reconcile path, so this bound protects the next status write; it is not
+// what keeps a peer-set reconcile moving.
+const statusWriteTimeout = 5 * time.Second
+
 // ParseHandshakes reads the per-peer handshake times out of a wireguard UAPI
 // get response (wireguard-go's IpcGet output): every public_key= line opens a
 // peer, and its last_handshake_time_sec= and last_handshake_time_nsec= lines

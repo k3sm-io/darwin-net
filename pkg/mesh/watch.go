@@ -91,6 +91,11 @@ type Watcher struct {
 	// receiver is reconcileLoop. A full slot means a pass is already owed, so a
 	// further send is dropped, not queued — that is the coalescing.
 	kick chan struct{}
+	// statusKick is the status writer's one-slot edge trigger, armed by every
+	// successful reconcile pass when patchStatus is set and drained only by
+	// statusLoop. It coalesces exactly like kick: a pass that lands while a
+	// status pass runs owes one further status pass, never a queue of them.
+	statusKick chan struct{}
 
 	// patchStatus, when set (WithHandshakeStatus), merge-patches a MeshPeer's
 	// status subresource; nil writes no status. It is a field so a test can
@@ -98,8 +103,8 @@ type Watcher struct {
 	patchStatus func(ctx context.Context, name string, patch []byte) error
 	// helperTooOldLogged records that the "netd helper too old" outcome has
 	// been logged, so it is reported once per episode instead of every pass. It
-	// is touched only on reconcileLoop's goroutine (via resync), so it needs no
-	// lock; a successful read clears it.
+	// is touched only on statusLoop's goroutine (via writeHandshakeStatus), so
+	// it needs no lock; a successful read clears it.
 	helperTooOldLogged bool
 }
 
@@ -145,7 +150,7 @@ func NewWatcher(cfg *rest.Config, mesh *Mesh, log *slog.Logger, opts ...WatcherO
 
 	lw := cache.NewListWatchFromClient(client, meshPeerResource, metav1.NamespaceAll, fields.Everything())
 	informer := cache.NewSharedIndexInformer(lw, &netv1.MeshPeer{}, 0, cache.Indexers{})
-	w := &Watcher{mesh: mesh, informer: informer, client: client, resyncPeriod: meshResyncPeriod, log: log, kick: make(chan struct{}, 1)}
+	w := &Watcher{mesh: mesh, informer: informer, client: client, resyncPeriod: meshResyncPeriod, log: log, kick: make(chan struct{}, 1), statusKick: make(chan struct{}, 1)}
 	for _, o := range opts {
 		o(w)
 	}
@@ -239,7 +244,20 @@ func meshPeerChanged(oldObj, newObj any) bool {
 // cached. The receive from kick happens before resync reads the informer cache,
 // which is what makes a drop in trigger safe. ticks is a parameter so the loop is
 // drivable in a test without waiting a real period.
+//
+// When the watcher writes status (WithHandshakeStatus), the loop also owns the
+// status writer's goroutine, statusLoop: it starts it, and on ctx cancellation
+// it waits for it to exit before returning, so no status write outlives the
+// watch.
 func (w *Watcher) reconcileLoop(ctx context.Context, ticks <-chan time.Time) error {
+	if w.patchStatus != nil {
+		statusDone := make(chan struct{})
+		go func() {
+			defer close(statusDone)
+			w.statusLoop(ctx)
+		}()
+		defer func() { <-statusDone }()
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -266,6 +284,10 @@ func (w *Watcher) reconcileLoop(ctx context.Context, ticks <-chan time.Time) err
 // have been N. The periodic tick is the floor either way, so the worst-case
 // time to reconverge after a failure is unchanged; re-arming on failure without
 // a backoff would instead turn a persistent error into a hot loop.
+//
+// A successful pass does not write MeshPeer status itself: it arms statusKick
+// and returns, so the next peer-set change is reconciled without waiting on
+// the apiserver.
 func (w *Watcher) resync(ctx context.Context) {
 	store := w.informer.GetStore().List()
 	specs := make([]netv1.MeshPeerSpec, 0, len(store))
@@ -281,7 +303,32 @@ func (w *Watcher) resync(ctx context.Context) {
 		return
 	}
 	if w.patchStatus != nil {
-		w.writeHandshakeStatus(ctx, store)
+		w.triggerStatus()
+	}
+}
+
+// triggerStatus arms the status writer's one-slot trigger without blocking. A
+// full slot means a status pass is already owed and will read the informer
+// cache after this call returns, so dropping the send loses nothing.
+func (w *Watcher) triggerStatus() {
+	select {
+	case w.statusKick <- struct{}{}:
+	default:
+	}
+}
+
+// statusLoop is the single consumer of statusKick: it runs one status pass per
+// drain until ctx is cancelled. It is the status writes' own goroutine, so the
+// reconcile loop never waits on the apiserver: a peer-set change is reconciled,
+// and its AllowedIPs programmed, while a slow status write is still pending.
+func (w *Watcher) statusLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-w.statusKick:
+			w.writeHandshakeStatus(ctx)
+		}
 	}
 }
 
@@ -292,9 +339,11 @@ func (w *Watcher) resync(ctx context.Context) {
 // new handshake makes no API call at all. Only a newer time is written, so two
 // writers (an HA control plane) converge on the latest handshake either saw
 // instead of overwriting each other. A peer with no handshake, this node's own
-// MeshPeer, and a failed device read write nothing. Each failed write is logged
-// and retried by the next pass.
-func (w *Watcher) writeHandshakeStatus(ctx context.Context, store []any) {
+// MeshPeer, and a failed device read write nothing. Each write runs under its
+// own statusWriteTimeout, and each failed write is logged and retried by the
+// next pass. It runs on statusLoop's goroutine and reads the informer cache
+// itself, so it always writes against the latest MeshPeers.
+func (w *Watcher) writeHandshakeStatus(ctx context.Context) {
 	seen, err := w.mesh.PeerHandshakes(ctx)
 	switch {
 	case err == nil:
@@ -312,7 +361,7 @@ func (w *Watcher) writeHandshakeStatus(ctx context.Context, store []any) {
 		w.log.Warn("read mesh peer handshakes", "err", err)
 		return
 	}
-	for _, obj := range store {
+	for _, obj := range w.informer.GetStore().List() {
 		mp, ok := obj.(*netv1.MeshPeer)
 		if !ok {
 			continue
@@ -330,12 +379,20 @@ func (w *Watcher) writeHandshakeStatus(ctx context.Context, store []any) {
 			w.log.Error("encode MeshPeer status patch", "meshpeer", mp.Name, "err", err)
 			continue
 		}
-		if err := w.patchStatus(ctx, mp.Name, patch); err != nil {
+		if err := w.patchOneStatus(ctx, mp.Name, patch); err != nil {
 			w.log.Warn("write MeshPeer status.lastHandshakeTime", "meshpeer", mp.Name, "err", err)
 			continue
 		}
 		w.log.Debug("wrote MeshPeer status.lastHandshakeTime", "meshpeer", mp.Name, "lastHandshakeTime", at)
 	}
+}
+
+// patchOneStatus writes one MeshPeer status patch under statusWriteTimeout,
+// so a slow apiserver delays only that write, never the rest of the pass.
+func (w *Watcher) patchOneStatus(ctx context.Context, name string, patch []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, statusWriteTimeout)
+	defer cancel()
+	return w.patchStatus(ctx, name, patch)
 }
 
 // handshakeStatusPatch is the merge patch that sets status.lastHandshakeTime
