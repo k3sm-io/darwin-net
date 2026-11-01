@@ -1,0 +1,28 @@
+# Installed version directory names and the verdict of the installer's rule.
+# Derived from ValidateVersion in k3sm pkg/updater/layout (releaseVersion,
+# unknownVersion, maxVersionLen = 128). Format: <name> <valid|invalid>.
+# Blank lines and lines starting with # are ignored.
+v0.3.0 valid
+0.3.0 valid
+v1.2.3-rc.1 valid
+v1.2.3-rc.1+build.5 valid
+v1.2.3+build.7 valid
+v1.2.3- invalid
+v1.2.3-rc..1 invalid
+v invalid
+v1 invalid
+v1.2 invalid
+v01.2.3 invalid
+V1.2.3 invalid
+unknown-0123456789ab valid
+unknown-0123456789a invalid
+unknown-0123456789abc invalid
+unknown-0123456789AB invalid
+unknown- invalid
+unknown-0123456789abx invalid
+. invalid
+.. invalid
+v1.2.3/x invalid
+v1.0.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa valid
+v1.0.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa valid
+v1.0.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa invalid
