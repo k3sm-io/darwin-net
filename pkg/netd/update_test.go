@@ -1631,5 +1631,12 @@ func TestApplyUpdateResolvesTheInstalledK3sm(t *testing.T) {
 		if h.inst.calls != 0 || h.probes != 0 {
 			t.Fatalf("installer ran %d times, version probed %d times, want neither", h.inst.calls, h.probes)
 		}
+		if resp.Phase != wire.UpdatePhaseFailed {
+			t.Fatalf("phase = %q, want %q", resp.Phase, wire.UpdatePhaseFailed)
+		}
+		wantText := "resolve the installed " + link + ": "
+		if !strings.Contains(resp.Error, wantText) || !strings.Contains(resp.Error, "no such file or directory") {
+			t.Fatalf("error = %q, want it to contain %q and the missing-file cause", resp.Error, wantText)
+		}
 	})
 }

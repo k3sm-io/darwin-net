@@ -320,8 +320,9 @@ func (s *Server) handleApplyUpdate(ctx context.Context, st *connState, args *wir
 		"markers-skipped", len(set.Markers), "markers", set.Markers)
 	// One resolution serves both reads: the signature baseline below and the
 	// version probe in checkNotDowngrade name the same file, so a flip of the
-	// install tree between them cannot pair one version's signature with
-	// another's version.
+	// current link between them cannot pair one version's signature with
+	// another's version. That closes the link-flip window only; it does not
+	// stop the content of the resolved directory changing in place.
 	installedPath, err := s.resolveInstalled(s.installedK3sm)
 	if err != nil {
 		log.Warn("netd: update code signing refused", "err", err)
