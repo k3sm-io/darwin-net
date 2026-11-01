@@ -360,3 +360,33 @@ func TestMeshWatcherCoalescesEvents(t *testing.T) {
 		}
 	})
 }
+
+// TestWatcherWritesHandshakeStatus pins that WritesHandshakeStatus reports
+// exactly whether the watcher was built with WithHandshakeStatus, and that
+// asking does not change the answer.
+func TestWatcherWritesHandshakeStatus(t *testing.T) {
+	noop := WatcherOption(func(*Watcher) {})
+	cases := []struct {
+		name string
+		opts []WatcherOption
+		want bool
+	}{
+		{name: "no option", want: false},
+		{name: "an unrelated option", opts: []WatcherOption{noop}, want: false},
+		{name: "WithHandshakeStatus", opts: []WatcherOption{WithHandshakeStatus()}, want: true},
+		{name: "WithHandshakeStatus beside another option", opts: []WatcherOption{noop, WithHandshakeStatus()}, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := NewWatcher(&rest.Config{Host: "https://127.0.0.1:1"}, nil, discardLogger(), tc.opts...)
+			if err != nil {
+				t.Fatalf("NewWatcher: %v", err)
+			}
+			for i := range 2 {
+				if got := w.WritesHandshakeStatus(); got != tc.want {
+					t.Fatalf("WritesHandshakeStatus() call %d = %v, want %v", i+1, got, tc.want)
+				}
+			}
+		})
+	}
+}

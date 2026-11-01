@@ -121,6 +121,11 @@ func WithHandshakeStatus() WatcherOption {
 	return func(w *Watcher) { w.patchStatus = w.restPatchStatus }
 }
 
+// WritesHandshakeStatus reports whether the watcher writes MeshPeer
+// status.lastHandshakeTime, that is, whether it was built with
+// WithHandshakeStatus. It only reads the configuration and changes nothing.
+func (w *Watcher) WritesHandshakeStatus() bool { return w.patchStatus != nil }
+
 // NewWatcher builds a Watcher over the cluster REST config for the given Mesh. It
 // registers the net.k3sm.io/v1 types (netv1.AddToScheme) into a private scheme,
 // builds a typed REST client for the MeshPeer GVK, and wires a shared informer
