@@ -255,7 +255,7 @@ else
 fi
 
 # ==== b216.5 — the Go<->C drift guards =====================================
-if (cd "$ROOT" && GOARCH=arm64 CGO_ENABLED=0 go test ./pkg/podnet/ \
+if (cd "$ROOT" && GOARCH=arm64 CGO_ENABLED=0 go test -count=1 ./pkg/podnet/ \
 	-run 'TestBindDisciplineEnv|TestShimBindEnvNamesMatchC|TestShimMinRewritablePortMatchesC' \
 	>"$WORK/gotest.log" 2>&1); then
 	ladder ok "b216.5 the pkg/podnet bind-ABI drift guards pass"
