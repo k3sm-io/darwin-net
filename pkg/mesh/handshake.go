@@ -151,18 +151,26 @@ func (d *WGDevice) PeerHandshakes(context.Context) (map[string]time.Time, error)
 
 // PeerHandshakes asks the netd daemon for its mesh device's per-peer handshake
 // times (the read-only MeshPeerStats verb) and re-keys them by hex public key.
+// As ParseHandshakes does on the in-process path, an entry whose key is not 32
+// bytes of base64 is skipped, not fatal: the other peers are still returned and
+// only the number skipped is logged, never a value from the entry.
 func (d *netdDevice) PeerHandshakes(ctx context.Context) (map[string]time.Time, error) {
 	stats, err := d.client.MeshPeerStats(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out := make(map[string]time.Time, len(stats))
+	skipped := 0
 	for _, st := range stats {
 		raw, err := base64.StdEncoding.DecodeString(st.PubKey)
 		if err != nil || len(raw) != wgKeyBytes {
-			return nil, fmt.Errorf("netd reported a peer public key that is not 32 bytes of base64")
+			skipped++
+			continue
 		}
 		out[hex.EncodeToString(raw)] = time.Unix(0, st.LastHandshakeUnixNano).UTC()
+	}
+	if skipped > 0 {
+		d.log.Warn("netd peer stats skipped while reading handshakes", "skipped", skipped, "read", len(out))
 	}
 	return out, nil
 }
