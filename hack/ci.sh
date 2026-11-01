@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
 CGO=0   # darwin-net is pure Go (utun/pf/lo0 via golang.org/x/sys/unix)
-STATICCHECK_VERSION=2026.2.1   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
+STATICCHECK_VERSION=2026.2.2   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
 GOVULNCHECK_VERSION=v1.9.0   # the govulncheck the gate requires; keep equal across the k3sm repos and the k3sm repository's hack/etcd-wrapper.sh
 
 echo "==> [darwin-net] gofmt"
