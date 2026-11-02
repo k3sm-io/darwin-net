@@ -25,6 +25,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -65,8 +67,8 @@ func TestMain(m *testing.M) {
 }
 
 const (
-	pkg   = "k3sm.io/darwin-net/pkg/dns"
-	other = "k3sm.io/darwin-net/pkg/proxy"
+	pkg   = "k3sm.io/apis/net/v1"
+	other = "k3sm.io/apis/storage/v1"
 	sig   = "read udp 127.0.0.1: i/o timeout"
 	today = "2026-10-30"
 )
@@ -126,14 +128,37 @@ var (
 		ev("pass", pkg, "TestParent/a", ""),
 		ev("fail", pkg, "TestParent", ""),
 		ev("fail", pkg, "", ""))
+	parentOwnFail = stream(
+		ev("run", pkg, "TestParent", ""),
+		ev("output", pkg, "TestParent", "=== RUN   TestParent\n"),
+		ev("output", pkg, "TestParent", "    x_test.go:12: parent setup broke\n"),
+		ev("run", pkg, "TestParent/a", ""),
+		ev("output", pkg, "TestParent/a", "=== RUN   TestParent/a\n"),
+		ev("output", pkg, "TestParent/a", sig+"\n"),
+		ev("output", pkg, "TestParent/a", "    --- FAIL: TestParent/a (0.00s)\n"),
+		ev("fail", pkg, "TestParent/a", ""),
+		ev("output", pkg, "TestParent", "--- FAIL: TestParent (0.01s)\n"),
+		ev("fail", pkg, "TestParent", ""),
+		ev("fail", pkg, "", ""))
+	parentFramingOnly = stream(
+		ev("run", pkg, "TestParent", ""),
+		ev("output", pkg, "TestParent", "=== RUN   TestParent\n"),
+		ev("run", pkg, "TestParent/a", ""),
+		ev("output", pkg, "TestParent/a", "=== RUN   TestParent/a\n"),
+		ev("output", pkg, "TestParent/a", sig+"\n"),
+		ev("output", pkg, "TestParent/a", "    --- FAIL: TestParent/a (0.00s)\n"),
+		ev("fail", pkg, "TestParent/a", ""),
+		ev("output", pkg, "TestParent", "--- FAIL: TestParent (0.01s)\n"),
+		ev("fail", pkg, "TestParent", ""),
+		ev("fail", pkg, "", ""))
 	pkgFail = stream(
 		ev("output", pkg, "", "panic: init\n"),
 		ev("fail", pkg, "", ""))
 	noResult = stream(
 		ev("run", pkg, "TestHang", ""),
 		ev("output", pkg, "TestHang", "=== RUN TestHang\n"))
-	buildFail = `{"ImportPath":"k3sm.io/darwin-net/pkg/dns [k3sm.io/darwin-net/pkg/dns.test]","Action":"build-output","Output":"x.go:1: syntax error\n"}` + "\n" +
-		`{"ImportPath":"k3sm.io/darwin-net/pkg/dns [k3sm.io/darwin-net/pkg/dns.test]","Action":"build-fail"}` + "\n" +
+	buildFail = `{"ImportPath":"k3sm.io/apis/net/v1 [k3sm.io/apis/net/v1.test]","Action":"build-output","Output":"x.go:1: syntax error\n"}` + "\n" +
+		`{"ImportPath":"k3sm.io/apis/net/v1 [k3sm.io/apis/net/v1.test]","Action":"build-fail"}` + "\n" +
 		ev("fail", pkg, "", "") + "\n"
 )
 
@@ -175,6 +200,20 @@ func TestTestResults(t *testing.T) {
 		{name: "a listed parent covers no subtest", registry: entryFor(pkg + "::TestParent"), input: subFlake, args: []string{"-tier", "fast"}, want: 1, wantOut: "RED " + pkg + "::TestParent/a: failed"},
 		{name: "a parent failing with no failing subtest reds", registry: entryFor(pkg + "::TestParent/a"), input: parentOnly, args: []string{"-tier", "fast"}, want: 1, wantOut: "RED " + pkg + "::TestParent: failed"},
 		{name: "parent rule does not apply in the full tier", registry: entryFor(pkg + "::TestParent/a"), input: subFlake, args: []string{"-tier", "full"}, want: 1},
+		{name: "an unlisted parent with its own failure line reds", registry: entryFor(pkg + "::TestParent/a"), input: parentOwnFail, args: []string{"-tier", "fast"}, want: 1, wantOut: "RED " + pkg + "::TestParent: failed"},
+		{name: "an unlisted parent with only harness framing is excused", registry: entryFor(pkg + "::TestParent/a"), input: parentFramingOnly, args: []string{"-tier", "fast"}, want: 3, wantOut: "failed only through quarantined subtests"},
+		{name: "a parent whose output repeats its subtest's lines is excused", registry: entryFor(pkg + "::TestParent/a"), input: strings.Replace(parentFramingOnly,
+			ev("output", pkg, "TestParent", "--- FAIL: TestParent (0.01s)\n"),
+			ev("output", pkg, "TestParent", sig+"\n")+"\n"+ev("output", pkg, "TestParent", "--- FAIL: TestParent (0.01s)\n"), 1), args: []string{"-tier", "fast"}, want: 3},
+		{name: "an unlisted parent with a race report of its own reds", registry: entryFor(pkg + "::TestParent/a"), input: strings.Replace(parentFramingOnly,
+			ev("output", pkg, "TestParent", "--- FAIL: TestParent (0.01s)\n"),
+			ev("output", pkg, "TestParent", "WARNING: DATA RACE\n")+"\n"+ev("output", pkg, "TestParent", "--- FAIL: TestParent (0.01s)\n"), 1), args: []string{"-tier", "fast"}, want: 1, wantOut: "race or sanitizer report"},
+		{name: "a sig naming a different test is accepted", registry: strings.Replace(entryFor(pkg+"::TestX"), sig, "--- FAIL: TestOtherThing", 1), input: green, args: []string{"-tier", "fast"}, want: 0},
+		{name: "a sig equal to the test id is refused", registry: strings.Replace(entryFor(pkg+"::TestFlake"), sig, pkg+"::TestFlake", 1), input: green, args: []string{"-tier", "fast"}, want: 1, wantOut: "harness"},
+		{name: "a sig inside the test id is refused", registry: strings.Replace(entryFor(pkg+"::TestFlakeOverLoopback"), sig, "TestFlakeOverLoop", 1), input: green, args: []string{"-tier", "fast"}, want: 1, wantOut: "harness"},
+		{name: "a sig that is the RUN line is refused", registry: strings.Replace(entryFor(pkg+"::TestFlake"), sig, "=== RUN   TestFlake", 1), input: green, args: []string{"-tier", "fast"}, want: 1, wantOut: "harness"},
+		{name: "a sig that is the FAIL line is refused", registry: strings.Replace(entryFor(pkg+"::TestFlake"), sig, "--- FAIL: TestFlake (0.01s)", 1), input: green, args: []string{"-tier", "fast"}, want: 1, wantOut: "harness"},
+		{name: "a sig that is a subtest FAIL line is refused", registry: strings.Replace(entryFor(pkg+"::TestParent/a"), sig, "--- FAIL: TestParent/a", 1), input: green, args: []string{"-tier", "fast"}, want: 1, wantOut: "harness"},
 		{name: "package failure outside a test reds", input: pkgFail, args: []string{"-tier", "fast"}, want: 1, wantOut: pkg + "::(package)"},
 		{name: "a build failure reds", input: buildFail, args: []string{"-tier", "fast"}, want: 1, wantOut: "::(build)"},
 		{name: "a test with no result reds", input: noResult, args: []string{"-tier", "fast"}, want: 1, wantOut: "no result"},
@@ -184,34 +223,75 @@ func TestTestResults(t *testing.T) {
 		{name: "an unknown tier is a usage error", input: green, args: []string{"-tier", "medium"}, want: 2},
 	}
 	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { runCase(t, bin, tc.registry, tc.input, tc.args, tc.want, tc.wantOut) })
+	}
+}
+
+// TestQuarantineNeverExcusesAPackageRace pins that a race or sanitizer report in a
+// package's output outside any test reds, whatever the registry excuses.
+func TestQuarantineNeverExcusesAPackageRace(t *testing.T) {
+	bin := binary(t)
+	pkgRace := func(pkgAction string) string {
+		return stream(
+			ev("run", pkg, "TestFlake", ""),
+			ev("output", pkg, "TestFlake", "    x_test.go:9: "+sig+"\n"),
+			ev("output", pkg, "TestFlake", "--- FAIL: TestFlake (0.01s)\n"),
+			ev("fail", pkg, "TestFlake", ""),
+			ev("output", pkg, "", "==================\nWARNING: DATA RACE\nWrite at 0x00c000 by goroutine 7:\n"),
+			ev("output", pkg, "", "FAIL\t"+pkg+"\t0.1s\n"),
+			ev(pkgAction, pkg, "", ""))
+	}
+	cases := []struct {
+		name, registry, input string
+		want                  int
+		wantOut               string
+	}{
+		{name: "a package race beside a quarantined failure reds", registry: entryFor(pkg + "::TestFlake"), input: pkgRace("fail"), want: 1, wantOut: pkg + "::(package)"},
+		{name: "the red names the race", registry: entryFor(pkg + "::TestFlake"), input: pkgRace("fail"), want: 1, wantOut: "race or sanitizer report"},
+		{name: "a package race reds even when the package passes", registry: entryFor(pkg + "::TestFlake"), input: pkgRace("pass"), want: 1, wantOut: pkg + "::(package)"},
+		{name: "a sanitizer report in package output reds", registry: entryFor(pkg + "::TestFlake"), input: strings.Replace(pkgRace("fail"), "WARNING: DATA RACE", "ERROR: AddressSanitizer: heap-use-after-free", 1), want: 1, wantOut: pkg + "::(package)"},
+		{name: "a package race with every test passing reds", registry: "", input: stream(
+			ev("run", pkg, "TestOK", ""),
+			ev("pass", pkg, "TestOK", ""),
+			ev("output", pkg, "", "WARNING: DATA RACE\n"),
+			ev("pass", pkg, "", "")), want: 1, wantOut: pkg + "::(package)"},
+	}
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			reg := filepath.Join(dir, "quarantine.txt")
-			if tc.registry != "-" {
-				if err := os.WriteFile(reg, []byte(tc.registry), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			args := append([]string{"-registry", reg, "-today", today}, tc.args...)
-			cmd := exec.Command(bin, args...)
-			cmd.Stdin = strings.NewReader(tc.input)
-			var out bytes.Buffer
-			cmd.Stdout, cmd.Stderr = &out, &out
-			got := 0
-			if err := cmd.Run(); err != nil {
-				var ee *exec.ExitError
-				if !errors.As(err, &ee) {
-					t.Fatalf("run: %v", err)
-				}
-				got = ee.ExitCode()
-			}
-			if got != tc.want {
-				t.Fatalf("exit %d, want %d\n%s", got, tc.want, out.String())
-			}
-			if tc.wantOut != "" && !strings.Contains(out.String(), tc.wantOut) {
-				t.Fatalf("output lacks %q\n%s", tc.wantOut, out.String())
-			}
+			runCase(t, bin, tc.registry, tc.input, []string{"-tier", "fast"}, tc.want, tc.wantOut)
 		})
+	}
+}
+
+// runCase writes the registry ("-" writes none), runs the binary over input, and
+// checks the exit status and an output substring.
+func runCase(t *testing.T, bin, registry, input string, extra []string, want int, wantOut string) {
+	t.Helper()
+	dir := t.TempDir()
+	reg := filepath.Join(dir, "quarantine.txt")
+	if registry != "-" {
+		if err := os.WriteFile(reg, []byte(registry), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := append([]string{"-registry", reg, "-today", today}, extra...)
+	cmd := exec.Command(bin, args...)
+	cmd.Stdin = strings.NewReader(input)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	got := 0
+	if err := cmd.Run(); err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("run: %v", err)
+		}
+		got = ee.ExitCode()
+	}
+	if got != want {
+		t.Fatalf("exit %d, want %d\n%s", got, want, out.String())
+	}
+	if wantOut != "" && !strings.Contains(out.String(), wantOut) {
+		t.Fatalf("output lacks %q\n%s", wantOut, out.String())
 	}
 }
 
@@ -230,5 +310,132 @@ func TestCommittedRegistryIsValid(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("committed registry: %v\n%s", err, out)
+	}
+}
+
+// corpusDir is the quarantine corpus shared with the other copy of these rules:
+// each case is a go test -json stream, a registry, and the expected verdicts.
+const corpusDir = "testdata/quarantine-corpus"
+
+// corpusCase is one case's expected.json.
+type corpusCase struct {
+	Description string            `json:"description"`
+	Tier        string            `json:"tier"`
+	Today       string            `json:"today"`
+	Edited      []string          `json:"edited"`
+	Tests       map[string]string `json:"tests"`
+	Verdict     string            `json:"verdict"`
+	// Diverges records, per implementation ("go" or "python"), a known
+	// disagreement listed in DISAGREEMENTS.md: that implementation's actual
+	// verdicts, which its test pins until the disagreement is resolved.
+	Diverges map[string]struct {
+		Verdict string            `json:"verdict"`
+		Tests   map[string]string `json:"tests"`
+		Note    string            `json:"note"`
+	} `json:"diverges"`
+}
+
+// resultLineRE matches a per-result report line: RED or QUARANTINED, the test
+// id (which may hold a space in a build ImportPath), then the reason.
+var resultLineRE = regexp.MustCompile(`^(RED|QUARANTINED) (.+?::\S*): (.*)$`)
+
+// corpusVerdicts reads the report: the per-test verdicts for every test named in
+// a result line. An expired entry's line is about the registry, not a result.
+func corpusVerdicts(out string) map[string]string {
+	got := map[string]string{}
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "RED registry:") || strings.HasPrefix(l, "RED test stream:") {
+			continue
+		}
+		m := resultLineRE.FindStringSubmatch(l)
+		if m == nil || strings.HasPrefix(m[3], "quarantine expired") {
+			continue
+		}
+		v := "failed"
+		if m[1] == "QUARANTINED" {
+			v = "excused"
+		}
+		got[m[2]] = v
+	}
+	return got
+}
+
+// TestQuarantineCorpusParity runs every shared corpus case through this copy of
+// the rules and checks the overall verdict and each test's verdict.
+func TestQuarantineCorpusParity(t *testing.T) {
+	bin := binary(t)
+	dirs, err := os.ReadDir(corpusDir)
+	if err != nil {
+		t.Fatalf("read corpus: %v", err)
+	}
+	n := 0
+	for _, d := range dirs {
+		if !d.IsDir() {
+			continue
+		}
+		n++
+		dir := filepath.Join(corpusDir, d.Name())
+		t.Run(d.Name(), func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join(dir, "expected.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var c corpusCase
+			if err := json.Unmarshal(raw, &c); err != nil {
+				t.Fatalf("expected.json: %v", err)
+			}
+			wantVerdict, wantTests := c.Verdict, c.Tests
+			if dv, ok := c.Diverges["go"]; ok {
+				t.Logf("known disagreement (DISAGREEMENTS.md): %s", dv.Note)
+				wantVerdict, wantTests = dv.Verdict, dv.Tests
+			}
+			stream, err := os.Open(filepath.Join(dir, "stream.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stream.Close()
+			args := append([]string{"-registry", filepath.Join(dir, "quarantine.txt"), "-tier", c.Tier, "-today", c.Today}, c.Edited...)
+			cmd := exec.Command(bin, args...)
+			cmd.Stdin = stream
+			var out bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &out, &out
+			code := 0
+			if err := cmd.Run(); err != nil {
+				var ee *exec.ExitError
+				if !errors.As(err, &ee) {
+					t.Fatalf("run: %v", err)
+				}
+				code = ee.ExitCode()
+			}
+			verdict := map[int]string{0: "green", 1: "red", 3: "excused"}[code]
+			if verdict != wantVerdict {
+				t.Errorf("verdict %q (exit %d), want %q\n%s", verdict, code, wantVerdict, out.String())
+			}
+			got := corpusVerdicts(out.String())
+			ids := make([]string, 0, len(wantTests))
+			for id := range wantTests {
+				ids = append(ids, id)
+			}
+			sort.Strings(ids)
+			for _, id := range ids {
+				g := got[id]
+				if g == "" {
+					g = "passed"
+				}
+				if g != wantTests[id] {
+					t.Errorf("%s: %s, want %s", id, g, wantTests[id])
+				}
+				delete(got, id)
+			}
+			for id, v := range got {
+				t.Errorf("%s: %s, but expected.json does not name it", id, v)
+			}
+			if t.Failed() {
+				t.Logf("report:\n%s", out.String())
+			}
+		})
+	}
+	if n < 7 {
+		t.Fatalf("corpus holds %d cases; at least 7 are required", n)
 	}
 }

@@ -20,6 +20,8 @@ limitations under the License.
 // `go test -json` stream. It is a sanctioned copy of the shared k3sm quarantine
 // rules: every k3sm repository carries its own copy so a lone clone can gate
 // itself, and a change to the rules updates every copy in the same change.
+// Every copy runs the shared cases in hack/lib/testdata/quarantine-corpus (see its
+// README.md and DISAGREEMENTS.md); here TestQuarantineCorpusParity runs them.
 //
 // Usage:
 //
@@ -31,8 +33,11 @@ limitations under the License.
 // package is not an edited one, its output carries the recorded signature and no
 // race or sanitizer report, and its entry is not past its deadline. A failing parent
 // of a Go subtest that is not listed itself is excused only when it has a failing
-// subtest and every failing subtest below it is excused. The full tier reds on every
-// failure.
+// subtest, every failing subtest below it is excused, and its own output carries
+// nothing but the harness's framing lines for it and its subtests. A race or
+// sanitizer report in a package's output outside any test reds, whatever the
+// registry lists. A registry sig that occurs in the test id or in the harness's
+// RUN or FAIL line for that test is refused. The full tier reds on every failure.
 //
 // Exit status: 0 green with no failing test; 3 green because every failure was
 // excused by the registry (so go test itself exited 1); 1 red; 2 usage.
@@ -86,7 +91,56 @@ var (
 	goIDRE    = regexp.MustCompile(`^([A-Za-z0-9._~\-]+(?:/[A-Za-z0-9._~\-]+)*)::(Test[A-Za-z0-9_]*|Example[A-Za-z0-9_]*|Fuzz[A-Za-z0-9_]*)((?:/\S+)?)$`)
 	swiftIDRE = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)/([A-Za-z_][A-Za-z0-9_]*)/(\S+)$`)
 	keyRE     = regexp.MustCompile(`(?s)^([a-z]+)=(.*)$`)
+	// framingRE matches a line the test harness itself writes for a test: the
+	// RUN/PAUSE/CONT/NAME markers and the PASS/FAIL/SKIP verdicts. Group 1 is the
+	// test name it names.
+	framingRE  = regexp.MustCompile(`^\s*(?:=== (?:RUN|PAUSE|CONT|NAME)|--- (?:PASS|FAIL|SKIP):)\s+(\S+)`)
+	durationRE = regexp.MustCompile(`\(\d+(?:\.\d+)?s\)?\s*$`)
+	spaceRE    = regexp.MustCompile(`\s+`)
 )
+
+// harnessReason reports why sig would match the harness's own lines for the test
+// rather than its failure: it occurs in the test id, or in the RUN or FAIL line the
+// harness writes for the test. Whitespace runs compare as one space and a trailing
+// duration is ignored.
+func harnessReason(test, name, sig string) string {
+	norm := func(s string) string { return strings.TrimSpace(spaceRE.ReplaceAllString(s, " ")) }
+	s := norm(durationRE.ReplaceAllString(sig, "("))
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(test, s) || strings.Contains(test, norm(sig)) {
+		return "the test id"
+	}
+	for _, h := range []string{"=== RUN " + name, "--- FAIL: " + name + " ("} {
+		if strings.Contains(h, s) {
+			return "the harness line " + strings.TrimSuffix(h, " (")
+		}
+	}
+	return ""
+}
+
+// ownFailure returns the first line of a parent test's own output that is neither
+// blank, nor harness framing for the parent or one of its subtests, nor a line of a
+// subtest's output. Any such line may be a failure the parent reported itself.
+func ownFailure(name, output string, kidOutputs []string) string {
+	kidLines := map[string]bool{}
+	for _, o := range kidOutputs {
+		for _, l := range strings.Split(o, "\n") {
+			kidLines[l] = true
+		}
+	}
+	for _, l := range strings.Split(output, "\n") {
+		if strings.TrimSpace(l) == "" || kidLines[l] {
+			continue
+		}
+		if m := framingRE.FindStringSubmatch(l); m != nil && (m[1] == name || strings.HasPrefix(m[1], name+"/")) {
+			continue
+		}
+		return l
+	}
+	return ""
+}
 
 type entry struct {
 	line          int
@@ -323,6 +377,10 @@ func parseRegistry(text string) ([]entry, []string) {
 			errs = append(errs, fmt.Sprintf("%s: refused, a race or sanitizer report is never quarantinable (sig carries %q)", where, rm))
 			continue
 		}
+		if hr := harnessReason(test, name, fields["sig"]); hr != "" {
+			errs = append(errs, fmt.Sprintf("%s: sig occurs in %s, so it matches the harness's own lines, not a failure (harness)", where, hr))
+			continue
+		}
 		if pr := protectedReason(pkg, name); pr != "" {
 			errs = append(errs, fmt.Sprintf("%s: refused, %s can never be quarantined (%s)", where, test, pr))
 			continue
@@ -381,6 +439,7 @@ func evaluate(registry string, results []result, tier string, edited []string, t
 	var unlisted []pending
 	unlistedIDs := map[string]bool{}
 	var failing []string
+	outputs := map[string]string{}
 	for _, r := range results {
 		switch r.status {
 		case "pass", "skip":
@@ -395,6 +454,7 @@ func evaluate(registry string, results []result, tier string, edited []string, t
 			continue
 		}
 		failing = append(failing, r.test)
+		outputs[r.test] = r.output
 		e, listed := byID[r.test]
 		if !listed {
 			unlisted = append(unlisted, pending{len(out), r.test})
@@ -425,9 +485,20 @@ func evaluate(registry string, results []result, tier string, edited []string, t
 	// A failing Go subtest fails every parent above it, so an unlisted failing parent
 	// is covered when it has a failing subtest and each failing subtest is quarantined,
 	// or is itself an unlisted parent with a failing subtest below it. Never the
-	// reverse: a listed parent covers no subtest, and a parent failing with no failing
-	// subtest stays red.
+	// reverse: a listed parent covers no subtest, a parent failing with no failing
+	// subtest stays red, and so does a parent whose own output carries any line
+	// besides the harness's framing (it may have failed on its own as well), or a race
+	// or sanitizer report. go test attributes each output line to the test it belongs
+	// to (the Test field), so a parent's own t.Error lands in its output even after its
+	// subtests ran. The blind spot: a parent that fails through t.Fail or t.FailNow with
+	// no output line, or whose only line repeats a subtest's line verbatim, leaves
+	// nothing to attribute and reads as covered.
 	for _, u := range unlisted {
+		if rm := raceMarker(outputs[u.test]); rm != "" {
+			out[u.idx] = fmt.Sprintf("RED %s: failed with a race or sanitizer report (%q); quarantine never applies", u.test, rm)
+			red = true
+			continue
+		}
 		var kids []string
 		for _, c := range failing {
 			if strings.HasPrefix(c, u.test+"/") {
@@ -453,7 +524,19 @@ func evaluate(registry string, results []result, tier string, edited []string, t
 				break
 			}
 		}
+		own := ""
 		if covered {
+			var kidOut []string
+			for _, c := range kids {
+				kidOut = append(kidOut, outputs[c])
+			}
+			_, name, _ := strings.Cut(u.test, "::")
+			own = ownFailure(name, outputs[u.test], kidOut)
+		}
+		if covered && own != "" {
+			out[u.idx] = fmt.Sprintf("RED %s: failed; its own output carries %q beside its quarantined subtests", u.test, strings.TrimSpace(own))
+			red = true
+		} else if covered {
 			var q []string
 			for _, c := range kids {
 				if quarantined[c] {
@@ -489,12 +572,14 @@ type collector struct {
 	pkgFail    map[string]bool
 	pkgHasFail map[string]bool
 	pkgOrder   []string
+	pkgText    map[string]string // each package's output outside any test
+	pkgSeen    []string          // packages in the order their output appeared
 	buildFail  []string
 	text       []string // every output line, for the summary
 }
 
 func newCollector(w io.Writer) *collector {
-	return &collector{w: w, tests: map[string]*result{}, pkgFail: map[string]bool{}, pkgHasFail: map[string]bool{}}
+	return &collector{w: w, tests: map[string]*result{}, pkgFail: map[string]bool{}, pkgHasFail: map[string]bool{}, pkgText: map[string]string{}}
 }
 
 func (c *collector) line(n int, raw string) {
@@ -521,6 +606,10 @@ func (c *collector) line(n int, raw string) {
 	}
 	if ev.Test == "" {
 		if ev.Action == "output" {
+			if _, ok := c.pkgText[ev.Package]; !ok {
+				c.pkgSeen = append(c.pkgSeen, ev.Package)
+			}
+			c.pkgText[ev.Package] += ev.Output
 			c.text = append(c.text, ev.Output)
 			if ev.Output != "PASS\n" { // -json implies -v; a plain go test omits it
 				fmt.Fprint(c.w, ev.Output)
@@ -546,7 +635,11 @@ func (c *collector) line(n int, raw string) {
 		t.output += ev.Output
 		c.text = append(c.text, ev.Output)
 	case "pass", "skip":
-		t.status = ev.Action
+		// A fail is sticky per test id: with -count>1 or a rerun, a later pass or
+		// skip of the same id never turns an earlier failure green.
+		if t.status != "fail" {
+			t.status = ev.Action
+		}
 	case "fail":
 		t.status = "fail"
 		c.pkgHasFail[ev.Package] = true
@@ -559,8 +652,17 @@ func (c *collector) results() []result {
 	for _, id := range c.order {
 		rs = append(rs, *c.tests[id])
 	}
+	// A race or sanitizer report outside any test reds its package whatever else
+	// failed in it, so a quarantined failure beside it never excuses it.
+	raced := map[string]bool{}
+	for _, p := range c.pkgSeen {
+		if rm := raceMarker(c.pkgText[p]); rm != "" {
+			raced[p] = true
+			rs = append(rs, result{test: p + "::(package)", status: "fail", output: "package output carries a race or sanitizer report outside any test: " + rm})
+		}
+	}
 	for _, p := range c.pkgOrder {
-		if !c.pkgHasFail[p] {
+		if !c.pkgHasFail[p] && !raced[p] {
 			rs = append(rs, result{test: p + "::(package)", status: "fail", output: "package failed outside any test"})
 		}
 	}
