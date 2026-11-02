@@ -1,8 +1,33 @@
 #!/usr/bin/env bash
 # darwin-net local CI — the docs/GO-STANDARDS.md commit gate in one command.
 # The standard CI / pre-commit gate for this repo. Run from anywhere.
+#
+#   hack/ci.sh [--tier fast|full] [--edited <file>]
+#
+# --tier picks how the test stage applies hack/quarantine.txt: full (the default)
+# reds on every failing test; fast excuses a listed flake outside the packages the
+# change edits. --edited names a file with one edited import path per line.
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
+
+test_tier=full
+edited_file=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--tier) [ $# -ge 2 ] || { echo "usage: hack/ci.sh [--tier fast|full] [--edited <file>]" >&2; exit 2; }; test_tier="$2"; shift 2 ;;
+		--edited) [ $# -ge 2 ] || { echo "usage: hack/ci.sh [--tier fast|full] [--edited <file>]" >&2; exit 2; }; edited_file="$2"; shift 2 ;;
+		*) echo "usage: hack/ci.sh [--tier fast|full] [--edited <file>]" >&2; exit 2 ;;
+	esac
+done
+case "$test_tier" in fast|full) ;; *) echo "hack/ci.sh: --tier must be fast or full" >&2; exit 2 ;; esac
+edited_pkgs=()
+if [ -n "$edited_file" ]; then
+	[ -r "$edited_file" ] || { echo "hack/ci.sh: --edited $edited_file is not readable" >&2; exit 2; }
+	while IFS= read -r p; do
+		case "$p" in ''|'#'*) continue ;; esac
+		edited_pkgs+=("$p")
+	done < "$edited_file"
+fi
 
 CGO=0   # darwin-net is pure Go (utun/pf/lo0 via golang.org/x/sys/unix)
 STATICCHECK_VERSION=2026.2.2   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
@@ -33,22 +58,31 @@ fi
 if [ -n "$go_pkgs" ]; then
 	echo "==> [darwin-net] go vet";   CGO_ENABLED=$CGO go vet ./...
 	echo "==> [darwin-net] go build"; CGO_ENABLED=$CGO go build ./...
-	# Every test runs under the race detector. The output is kept so that a red
-	# run ends with the failing tests, not only a long scroll.
-	echo "==> [darwin-net] go test -race"
-	# Written to a file and then printed, not piped through tee, so the
-	# gate needs no tool beyond cat and grep and the exit status comes
-	# straight from go test, not a pipeline.
-	test_rc=0
-	CGO_ENABLED=$CGO go test -race -count=1 ./... > "$ci_tmp/gotest.log" 2>&1 || test_rc=$?
-	cat "$ci_tmp/gotest.log"
-	if [ "$test_rc" -ne 0 ]; then
-		echo "==> [darwin-net] go test FAILED; failing tests:" >&2
-		grep -E '^[[:space:]]*--- FAIL:|^FAIL[[:space:]]|^panic:' "$ci_tmp/gotest.log" >&2 || echo "    (no FAIL line; read the output above)" >&2
-		races="$(grep -c 'WARNING: DATA RACE' "$ci_tmp/gotest.log" || true)"
-		[ "$races" = 0 ] || echo "    data races reported: $races" >&2
-		exit 1
+	# Every test runs under the race detector, as a go test -json stream piped
+	# through hack/lib/testresults.go, which validates hack/quarantine.txt and applies
+	# it for the tier. It echoes the output a plain go test prints and ends with the
+	# failing tests. Its exit status says whether go test itself should have failed
+	# (0: no failure, 3: only registry-excused failures), so the two statuses are
+	# checked against each other: neither can turn the other green.
+	echo "==> [darwin-net] go test -race (quarantine tier: $test_tier)"
+	CGO_ENABLED=$CGO go build -o "$ci_tmp/testresults" hack/lib/testresults.go
+	set +e
+	CGO_ENABLED=$CGO go test -race -count=1 -json ./... 2>"$ci_tmp/gotest.err" \
+		| "$ci_tmp/testresults" -registry hack/quarantine.txt -tier "$test_tier" ${edited_pkgs[@]+"${edited_pkgs[@]}"}
+	st=("${PIPESTATUS[@]}")
+	set -e
+	go_rc="${st[0]}" tr_rc="${st[1]}"
+	if [ -s "$ci_tmp/gotest.err" ]; then
+		echo "==> [darwin-net] go test stderr:" >&2
+		cat "$ci_tmp/gotest.err" >&2
 	fi
+	case "$go_rc:$tr_rc" in
+		0:0) ;;
+		1:3) echo "==> [darwin-net] go test failed only on quarantined tests (see QUARANTINED above)" ;;
+		*:1) echo "==> [darwin-net] test stage RED (go test exit $go_rc); the RED lines above say why" >&2; exit 1 ;;
+		*:0) echo "FAIL: [darwin-net] go test exited $go_rc but its stream holds no failure; read the stderr above" >&2; exit 1 ;;
+		*) echo "FAIL: [darwin-net] go test exit $go_rc and testresults exit $tr_rc disagree" >&2; exit 1 ;;
+	esac
 
 	# The race witness: a planted race that go test -race must catch. If the
 	# toolchain's race detector is not live, this goes red instead of the gate
