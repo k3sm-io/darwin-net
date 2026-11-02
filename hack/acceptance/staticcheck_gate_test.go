@@ -50,11 +50,6 @@ func ciCandidateLoop(t *testing.T) string {
 // candidate at the pin is a named red. The fakes only print a version line.
 func TestStaticcheckCandidateOrder(t *testing.T) {
 	loop := ciCandidateLoop(t)
-	// The real home: go env writes telemetry under it, which a temp dir cannot clean.
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatal(err)
-	}
 	pinned := "staticcheck " + pin + " (0.8.1)"
 	other := "staticcheck 2025.1 (0.6.0)"
 
@@ -110,7 +105,7 @@ func TestStaticcheckCandidateOrder(t *testing.T) {
 				"GOFLAGS=",
 				"GOTOOLCHAIN=local",
 				"GOWORK=off",
-				"HOME=" + home,
+				"HOME=" + telemetryOffHome(t),
 			}
 			outb, err := cmd.CombinedOutput()
 			out := string(outb)
@@ -139,4 +134,38 @@ func TestStaticcheckCandidateOrder(t *testing.T) {
 			}
 		})
 	}
+}
+
+// telemetryOffHome returns a temp HOME whose Go telemetry mode is off, for a
+// child that runs go. In the default local mode every go invocation under a
+// fresh HOME starts a telemetry sidecar in its own session (setsid, so the test
+// cannot wait for it) that keeps writing under HOME/Library/Application
+// Support/go after go exits, and t.TempDir cleanup then races it ("directory
+// not empty"). GOTELEMETRY is read-only in the environment; the mode file is the
+// switch, and with it off go opens no counter file and starts no sidecar.
+func telemetryOffHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	dir := filepath.Join(home, "Library", "Application Support", "go", "telemetry")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mode"), []byte("off\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// Registered after t.TempDir, so it runs before the removal: anything
+		// beside the mode file means go ignored it and a late writer may exist.
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			t.Errorf("read telemetry dir: %v", err)
+			return
+		}
+		for _, e := range ents {
+			if e.Name() != "mode" {
+				t.Errorf("go wrote telemetry %s despite mode off", e.Name())
+			}
+		}
+	})
+	return home
 }
