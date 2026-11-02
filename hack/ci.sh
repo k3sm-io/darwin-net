@@ -98,6 +98,11 @@ if [ -n "$go_pkgs" ]; then
 		exit 1
 	fi
 
+	# The getaddrinfo shim build tests skip without an x86_64-capable clang, and a
+	# skip is invisible in the run above; on a host that can run them, they must pass.
+	echo "==> [darwin-net] shim build tests ran"
+	hack/verify-shim-not-skipped.sh
+
 	# Wall-clock waits and fixed ports in tests, outside hack/test-sleeps.allow.
 	echo "==> [darwin-net] test-sleep lint"
 	hack/verify-test-sleeps.sh --self-test
