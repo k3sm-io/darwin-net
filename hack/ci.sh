@@ -16,8 +16,10 @@
 #                      A missing, unreadable, malformed or unknown-version file, or an
 #                      @full line for darwin-net, runs the full gate. A list holding no darwin-net
 #                      package is red when the diff against --base (default: the merge
-#                      base with origin/main) holds a .go file, skips vet and test when
-#                      it holds none, and runs the full gate when the base does not resolve.
+#                      base with origin/main) holds a .go file, runs the full gate when it
+#                      holds any other non-doc file (the gate cannot map it to a package)
+#                      or the base does not resolve, and skips vet and test when only doc
+#                      files (*.md, docs/, LICENSE, NOTICE, DCO) changed.
 #   --affected <base>  compute the list with hack/affected.sh against <base>, then as
 #                      --packages; a clone without that selector runs the full gate.
 # --dry-run resolves the mode, prints the plan (mode, reason, vet and test sets) and
@@ -70,12 +72,14 @@ trap 'rm -rf "$ci_tmp"' EXIT
 # k3sm-affected/v1; then sorted, unique import paths; then `@full <repo> <reason>`
 # lines; then `@check <repo> <name> [<arg>]` lines with <name> from the closed set;
 # the last line is exactly @end, followed by a final newline. No blank lines, no
-# comments. Any deviation sets pf_reason and returns 1 (the caller runs full).
+# comments. Fields are separated by exactly one space, as the writer emits them,
+# and the file is UTF-8 with no NUL byte. Any deviation sets pf_reason and returns 1
+# (the caller runs full).
 # On success: pf_pkgs (every package line), pf_full (the @full reason for darwin-net, or
 # empty), pf_checks (the @check lines for darwin-net).
 pf_pkgs=() pf_checks=() pf_full="" pf_reason=""
 read_packages() {
-	local f="$1" line n=0 phase=0 prev="" seen_end=0 name LC_ALL=C
+	local f="$1" line n=0 phase=0 prev="" seen_end=0 name rest LC_ALL=C
 	local -a w
 	pf_pkgs=() pf_checks=() pf_full="" pf_reason=""
 	[ -e "$f" ] || { pf_reason="$f does not exist"; return 1; }
@@ -83,6 +87,10 @@ read_packages() {
 	if [ ! -s "$f" ] || [ "$(tail -c 1 "$f" | od -An -c | tr -d ' ')" != '\n' ]; then
 		pf_reason="$f is empty or does not end with a newline"; return 1
 	fi
+	# read drops a NUL byte and the line regexes never see an invalid byte in a
+	# reason, so both are refused here, as the workspace reader refuses them.
+	[ "$(tr -d '\000' < "$f" | wc -c)" -eq "$(wc -c < "$f")" ] || { pf_reason="$f holds a NUL byte"; return 1; }
+	iconv -f UTF-8 -t UTF-8 "$f" >/dev/null 2>&1 || { pf_reason="$f is not UTF-8"; return 1; }
 	while IFS= read -r line; do
 		n=$((n + 1))
 		[ "$seen_end" = 0 ] || { pf_reason="line $n: text after @end"; return 1; }
@@ -95,17 +103,28 @@ read_packages() {
 			"@full "*)
 				[ "$phase" -le 1 ] || { pf_reason="line $n: @full after @check"; return 1; }
 				phase=1
-				read -r -a w <<< "$line"
-				[ ${#w[@]} -ge 3 ] && [[ "${w[1]}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { pf_reason="line $n: bad @full"; return 1; }
-				if [ "${w[1]}" = darwin-net ]; then pf_full="${line#@full darwin-net }"; fi
+				# @full <repo> <reason>: the repo ends at the next single space, and the
+				# reason is the rest, which must hold a non-space character.
+				rest="${line#@full }" name="${rest%% *}"
+				[ "$name" != "$rest" ] && [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && [[ "${rest#* }" =~ [^[:space:]] ]] \
+					|| { pf_reason="line $n: bad @full"; return 1; }
+				if [ "$name" = darwin-net ]; then pf_full="${rest#* }"; fi
 				;;
 			"@check "*)
 				phase=2
-				read -r -a w <<< "$line"
-				{ [ ${#w[@]} = 3 ] || [ ${#w[@]} = 4 ]; } && [[ "${w[1]}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { pf_reason="line $n: bad @check"; return 1; }
-				name="${w[2]}"
+				# @check <repo> <name> [<arg>]: split on every single space, keeping empty
+				# fields, so a doubled space or a tab is refused, not collapsed.
+				rest="${line#@check }" w=()
+				while :; do
+					case "$rest" in
+						*" "*) w+=("${rest%% *}"); rest="${rest#* }" ;;
+						*) w+=("$rest"); break ;;
+					esac
+				done
+				{ [ ${#w[@]} = 2 ] || [ ${#w[@]} = 3 ]; } && [[ "${w[0]}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { pf_reason="line $n: bad @check"; return 1; }
+				name="${w[1]}"
 				case "$name" in buf|verify-deps|govulncheck|tidy|gofmt|boilerplate|vet-tags|script) ;; *) pf_reason="line $n: unknown @check $name"; return 1 ;; esac
-				if [ "${w[1]}" = darwin-net ]; then pf_checks+=("${line#@check darwin-net }"); fi
+				if [ "${w[0]}" = darwin-net ]; then pf_checks+=("${line#@check darwin-net }"); fi
 				;;
 			*)
 				[[ "$line" =~ ^[A-Za-z0-9][A-Za-z0-9._~/-]*$ ]] || { pf_reason="line $n: unrecognised line"; return 1; }
@@ -160,8 +179,16 @@ if [ "$pkg_file_set" = 1 ]; then
 					echo "    the selector cannot legitimately answer that; refusing a silent green" >&2
 					exit 1
 				fi
-				mode=packages mode_reason="--packages: no $module package listed and no Go change against $base; vet and test skipped"
-				vet_set=() test_set=()
+				# Only a doc file is known to reach no package. Any other change (a cgo or
+				# assembly source, an embed asset, testdata, go.mod, go.sum) can, and an
+				# empty list cannot say which, so it runs the full gate.
+				unmapped="$(printf '%s\n' "$changed" | grep -v -e '^$' -e '\.md$' -e '^docs/' -e '^LICENSE$' -e '^NOTICE$' -e '^DCO$' || true)"
+				if [ -n "$unmapped" ]; then
+					mode_reason="--packages: no $module package listed and the diff against $base changes a non-doc file the gate cannot map ($(printf '%s\n' "$unmapped" | head -1)); full gate"
+				else
+					mode=packages mode_reason="--packages: no $module package listed and only doc files changed against $base; vet and test skipped"
+					vet_set=() test_set=()
+				fi
 			else
 				mode_reason="--packages: git diff against $base failed; full gate"
 			fi
