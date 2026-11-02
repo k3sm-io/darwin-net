@@ -69,8 +69,9 @@ func TestStaticcheckCandidateOrder(t *testing.T) {
 		{name: "versioned_binary_wins", path: pinned, versioned: pinned, plain: pinned, want: "versioned"},
 		{name: "versioned_wrong_version_falls_back", path: pinned, versioned: other, want: "path"},
 		{name: "path_before_plain_gopath", path: pinned, plain: pinned, want: "path"},
-		{name: "plain_gopath_last_resort", path: other, plain: pinned, want: "plain"},
-		{name: "absent_is_red", wantOut: []string{"not installed", "staticcheck@" + pin, "staticcheck-" + pin}},
+		{name: "plain_gopath_last_resort", plain: pinned, want: "plain"},
+		{name: "path_wrong_version_falls_back_to_plain", path: other, plain: pinned, want: "plain"},
+		{name: "no_candidate_is_red", wantOut: []string{"not installed", "staticcheck@" + pin, "staticcheck-" + pin}},
 		{name: "no_candidate_at_pin_is_red", path: other, versioned: other, wantOut: []string{"the gate needs " + pin, "2025.1"}},
 	}
 	for _, tc := range cases {
