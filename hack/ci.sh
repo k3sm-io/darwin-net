@@ -115,10 +115,114 @@ if [ -n "$go_pkgs" ]; then
 	echo "==> [darwin-net] go test -tags integration (compile only)"; CGO_ENABLED=$CGO go test -tags integration -count=1 -run '^$' ./...
 	# A root check in an integration-tagged test routes through k3smtest.SkipUnless
 	# (k3sm.io/apis), so K3SM_CI_REQUIRE=root turns an absent root into a failure
-	# instead of a silent skip. A hand-rolled os.Geteuid() gate reintroduces the
-	# silent skip, so a match is RED, never a skip.
+	# instead of a silent skip. A hand-rolled os.Geteuid() reintroduces the silent
+	# skip, so ANY Geteuid call in such a file is RED on the bare identifier, same
+	# as before this lint grew a second case — including an assign-then-compare
+	# dodge (`euid := os.Geteuid()` then `if euid != 0`), which the bare match
+	# catches without caring what happens to the value afterward. Getuid is
+	# narrower: it is matched only in comparison against 0, because pkg/netd
+	# carries several sites that call os.Getuid() purely as data (ServiceUID in
+	# a test's netd.Config), never to decide whether to skip, and a bare match
+	# there would be a false positive. The build-line match covers any build
+	# line naming integration, not only the exact lone tag, so a combined line
+	# like "//go:build darwin && integration" is not missed.
+	echo "==> [darwin-net] integration-tagged tests: root checks go through k3smtest (self-test)"
+	root_lint_check() { grep -rlE --include='*_test.go' '^//go:build.*integration' "$1" | xargs grep -HnE 'Geteuid\(\)|Getuid\(\)[[:space:]]*(==|!=)[[:space:]]*0' || true; }
+	lintwork="$ci_tmp/rootlint"   # under the gate's temp dir, so the EXIT trap removes it on any early exit
+	mkdir -p "$lintwork/caught_getuid" "$lintwork/caught_combined_tag" "$lintwork/caught_assign_then_compare" "$lintwork/clean" "$lintwork/clean_data_use"
+	cat >"$lintwork/caught_getuid/fixture_integration_test.go" <<-'EOF'
+	//go:build integration
+
+	package fixture
+
+	import (
+		"os"
+		"testing"
+	)
+
+	func TestFixtureRawGetuid(t *testing.T) {
+		if os.Getuid() != 0 {
+			t.Skip("needs root")
+		}
+	}
+	EOF
+	cat >"$lintwork/caught_combined_tag/fixture_integration_test.go" <<-'EOF'
+	//go:build darwin && integration
+
+	package fixture
+
+	import (
+		"os"
+		"testing"
+	)
+
+	func TestFixtureRawGeteuidCombinedTag(t *testing.T) {
+		if os.Geteuid() != 0 {
+			t.Skip("needs root")
+		}
+	}
+	EOF
+	cat >"$lintwork/caught_assign_then_compare/fixture_integration_test.go" <<-'EOF'
+	//go:build integration
+
+	package fixture
+
+	import (
+		"os"
+		"testing"
+	)
+
+	func TestFixtureGeteuidAssignThenCompare(t *testing.T) {
+		euid := os.Geteuid()
+		if euid != 0 {
+			t.Skip("needs root")
+		}
+	}
+	EOF
+	cat >"$lintwork/clean/fixture_integration_test.go" <<-'EOF'
+	//go:build integration
+
+	package fixture
+
+	import (
+		"testing"
+
+		"k3sm.io/apis/k3smtest"
+	)
+
+	func TestFixtureSkipUnless(t *testing.T) {
+		k3smtest.SkipUnless(t, k3smtest.Root)
+	}
+	EOF
+	cat >"$lintwork/clean_data_use/fixture_integration_test.go" <<-'EOF'
+	//go:build integration
+
+	package fixture
+
+	import (
+		"os"
+		"testing"
+	)
+
+	// Uses the uid as data for a peer-credential check, never as a root gate;
+	// pkg/netd carries several real sites shaped exactly like this one.
+	func TestFixtureGetuidAsData(t *testing.T) {
+		serviceUID := uint32(os.Getuid())
+		if serviceUID == 0 {
+			t.Fatalf("test fixture: unexpectedly running as root")
+		}
+	}
+	EOF
+	[ -n "$(root_lint_check "$lintwork/caught_getuid")" ] || { echo "FAIL: [darwin-net] lint self-test: a raw os.Getuid() fixture was not caught" >&2; exit 1; }
+	[ -n "$(root_lint_check "$lintwork/caught_combined_tag")" ] || { echo "FAIL: [darwin-net] lint self-test: a combined build-tag Geteuid fixture was not caught" >&2; exit 1; }
+	[ -n "$(root_lint_check "$lintwork/caught_assign_then_compare")" ] || { echo "FAIL: [darwin-net] lint self-test: an assign-then-compare Geteuid fixture was not caught" >&2; exit 1; }
+	[ -z "$(root_lint_check "$lintwork/clean")" ] || { echo "FAIL: [darwin-net] lint self-test: a clean k3smtest.SkipUnless fixture was wrongly flagged" >&2; exit 1; }
+	[ -z "$(root_lint_check "$lintwork/clean_data_use")" ] || { echo "FAIL: [darwin-net] lint self-test: a Getuid-as-data fixture (no root gate) was wrongly flagged" >&2; exit 1; }
+	rm -rf "$lintwork"
+	echo "    self-test ok: caught a raw Getuid gate, a combined-build-tag Geteuid gate and an assign-then-compare Geteuid gate, cleared k3smtest.SkipUnless and a Getuid-as-data use"
+
 	echo "==> [darwin-net] integration-tagged tests: root checks go through k3smtest"
-	raw_root=$(grep -rl --include='*_test.go' '^//go:build integration' pkg | xargs grep -n 'Geteuid' || true)
+	raw_root="$(root_lint_check pkg)"
 	if [ -n "$raw_root" ]; then
 		echo "FAIL: [darwin-net] raw root check in an integration-tagged test; use k3smtest.SkipUnless(t, k3smtest.Root):" >&2
 		echo "$raw_root" >&2
