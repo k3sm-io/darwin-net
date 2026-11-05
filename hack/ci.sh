@@ -307,9 +307,9 @@ if [ -n "$go_pkgs" ]; then
 	# line naming integration, not only the exact lone tag, so a combined line
 	# like "//go:build darwin && integration" is not missed.
 	echo "==> [darwin-net] integration-tagged tests: root checks go through k3smtest (self-test)"
-	root_lint_check() { grep -rlE --include='*_test.go' '^//go:build.*integration' "$1" | xargs grep -HnE 'Geteuid\(\)|Getuid\(\)[[:space:]]*(==|!=)[[:space:]]*0' || true; }
+	root_lint_check() { grep -rlE --include='*_test.go' '^//go:build.*integration' "$1" | xargs grep -HnE 'Geteuid|Getuid\(\)[[:space:]]*(==|!=)[[:space:]]*0' || true; }
 	lintwork="$ci_tmp/rootlint"   # under the gate's temp dir, so the EXIT trap removes it on any early exit
-	mkdir -p "$lintwork/caught_getuid" "$lintwork/caught_combined_tag" "$lintwork/caught_assign_then_compare" "$lintwork/clean" "$lintwork/clean_data_use"
+	mkdir -p "$lintwork/caught_getuid" "$lintwork/caught_combined_tag" "$lintwork/caught_assign_then_compare" "$lintwork/caught_func_value" "$lintwork/clean" "$lintwork/clean_data_use"
 	cat >"$lintwork/caught_getuid/fixture_integration_test.go" <<-'EOF'
 	//go:build integration
 
@@ -359,6 +359,23 @@ if [ -n "$go_pkgs" ]; then
 		}
 	}
 	EOF
+	cat >"$lintwork/caught_func_value/fixture_integration_test.go" <<-'EOF'
+	//go:build integration
+
+	package fixture
+
+	import (
+		"os"
+		"testing"
+	)
+
+	func TestFixtureGeteuidFuncValue(t *testing.T) {
+		euid := os.Geteuid
+		if euid() != 0 {
+			t.Skip("needs root")
+		}
+	}
+	EOF
 	cat >"$lintwork/clean/fixture_integration_test.go" <<-'EOF'
 	//go:build integration
 
@@ -396,10 +413,11 @@ if [ -n "$go_pkgs" ]; then
 	[ -n "$(root_lint_check "$lintwork/caught_getuid")" ] || { echo "FAIL: [darwin-net] lint self-test: a raw os.Getuid() fixture was not caught" >&2; exit 1; }
 	[ -n "$(root_lint_check "$lintwork/caught_combined_tag")" ] || { echo "FAIL: [darwin-net] lint self-test: a combined build-tag Geteuid fixture was not caught" >&2; exit 1; }
 	[ -n "$(root_lint_check "$lintwork/caught_assign_then_compare")" ] || { echo "FAIL: [darwin-net] lint self-test: an assign-then-compare Geteuid fixture was not caught" >&2; exit 1; }
+	[ -n "$(root_lint_check "$lintwork/caught_func_value")" ] || { echo "FAIL: [darwin-net] lint self-test: a Geteuid function-value fixture was not caught" >&2; exit 1; }
 	[ -z "$(root_lint_check "$lintwork/clean")" ] || { echo "FAIL: [darwin-net] lint self-test: a clean k3smtest.SkipUnless fixture was wrongly flagged" >&2; exit 1; }
 	[ -z "$(root_lint_check "$lintwork/clean_data_use")" ] || { echo "FAIL: [darwin-net] lint self-test: a Getuid-as-data fixture (no root gate) was wrongly flagged" >&2; exit 1; }
 	rm -rf "$lintwork"
-	echo "    self-test ok: caught a raw Getuid gate, a combined-build-tag Geteuid gate and an assign-then-compare Geteuid gate, cleared k3smtest.SkipUnless and a Getuid-as-data use"
+	echo "    self-test ok: caught a raw Getuid gate, a combined-build-tag Geteuid gate, an assign-then-compare Geteuid gate and a Geteuid function value, cleared k3smtest.SkipUnless and a Getuid-as-data use"
 
 	echo "==> [darwin-net] integration-tagged tests: root checks go through k3smtest"
 	raw_root="$(root_lint_check pkg)"
