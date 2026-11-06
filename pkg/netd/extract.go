@@ -49,9 +49,11 @@ var updateSetFiles = []string{
 }
 
 // updateSkippedFiles are release archive members that are not part of the
-// build set (the legal files and the k3sm-netd copy of the binary, which
-// install never copies). They are read past, counted, and never written.
-var updateSkippedFiles = []string{"LICENSE", "NOTICE", "k3sm-netd"}
+// build set: the legal files, the k3sm-netd copy of the binary, which install
+// never copies, and the two digest files a published tarball carries at its
+// top level, which nothing on the update path reads. They are read past,
+// counted, and never written, so the code-signing check never meets them.
+var updateSkippedFiles = []string{"LICENSE", "NOTICE", "k3sm-netd", "PAYLOAD-SHA256", "UPSTREAM-DIGESTS"}
 
 // maxUpdateArchiveDepth bounds the directory depth below cp-payload.
 const maxUpdateArchiveDepth = 16
