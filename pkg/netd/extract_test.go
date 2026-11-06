@@ -19,7 +19,10 @@ package netd
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -132,5 +135,155 @@ func TestExtractRefusesWhatOnlyLooksLikeASkippedDigestFile(t *testing.T) {
 				t.Fatalf("got %v, want a refusal naming %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// extractedFiles is the sorted list of regular files below dir.
+func extractedFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	got := []string{}
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(dir, p)
+		got = append(got, rel)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(got)
+	return got
+}
+
+// TestExtractReadsPastRepeatedAndDotSlashSkippedNames pins that a skipped name
+// is skipped every time it appears, also with a leading "./", and that none of
+// the copies is written.
+func TestExtractReadsPastRepeatedAndDotSlashSkippedNames(t *testing.T) {
+	extra := []tarMember{
+		{name: "PAYLOAD-SHA256", body: "again\n", mode: 0o644},
+		{name: "./PAYLOAD-SHA256", body: "dot slash\n", mode: 0o644},
+		{name: "LICENSE", body: "again\n", mode: 0o644},
+		{name: "LICENSE", body: "and again\n", mode: 0o644},
+	}
+	dir := t.TempDir()
+	members := append(publishedMembers(), extra...)
+	if err := extractUpdateArchive(bytes.NewReader(buildArchive(t, members)), dir); err != nil {
+		t.Fatalf("repeated skipped names were refused: %v", err)
+	}
+	want := []string{
+		"cp-payload/kine",
+		"cp-payload/kine.version",
+		"k3sm",
+		"k3sm-execshim",
+		"k3sm-vmhost",
+		"libk3sm_getaddrinfo_shim.dylib",
+		"libk3sm_pathrebase_shim.dylib",
+	}
+	if got := extractedFiles(t, dir); !slices.Equal(got, want) {
+		t.Fatalf("extracted %q, want %q", got, want)
+	}
+}
+
+// TestExtractRefusesASkippedNameBesideAMissingRequiredMember pins that a
+// skipped file does not stand in for a required one.
+func TestExtractRefusesASkippedNameBesideAMissingRequiredMember(t *testing.T) {
+	var members []tarMember
+	for _, m := range publishedMembers() {
+		if m.name != "k3sm-vmhost" {
+			members = append(members, m)
+		}
+	}
+	err := extractUpdateArchive(bytes.NewReader(buildArchive(t, members)), t.TempDir())
+	if !errors.Is(err, errUpdateRefused) || !strings.Contains(err.Error(), "does not carry k3sm-vmhost") {
+		t.Fatalf("got %v, want a refusal naming the missing k3sm-vmhost", err)
+	}
+}
+
+// TestExtractCountsEverySkippedCopyAgainstTheSizeBound streams repeated copies
+// of a skipped name whose sizes sum past wire.MaxUpdateSetBytes. The earlier
+// copies carry real (zero) bytes, the last claims its size in the header only,
+// so the refusal must come from the running total.
+func TestExtractCountsEverySkippedCopyAgainstTheSizeBound(t *testing.T) {
+	if testing.Short() {
+		t.Skip("streams 128 MiB of zeros")
+	}
+	const copies = 4
+	const each = 32 << 20 // copies*each is what the last claim must not fit beside
+	pr, pw := io.Pipe()
+	go func() {
+		zw, _ := gzip.NewWriterLevel(pw, gzip.BestSpeed)
+		tw := tar.NewWriter(zw)
+		zeros := make([]byte, 1<<20)
+		for i := 0; i < copies; i++ {
+			name := "PAYLOAD-SHA256"
+			if i%2 == 1 {
+				name = "LICENSE"
+			}
+			if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Typeflag: tar.TypeReg, Size: each}); err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+			for left := int64(each); left > 0; {
+				n := min(left, int64(len(zeros)))
+				if _, err := tw.Write(zeros[:n]); err != nil {
+					pw.CloseWithError(err)
+					return
+				}
+				left -= n
+			}
+		}
+		// The last copy tips the total over; its body is never sent.
+		_ = tw.WriteHeader(&tar.Header{Name: "PAYLOAD-SHA256", Mode: 0o644, Typeflag: tar.TypeReg, Size: wire.MaxUpdateSetBytes - copies*each + 1})
+		_ = tw.Flush()
+		_ = zw.Close()
+		pw.Close()
+	}()
+	dir := t.TempDir()
+	err := extractUpdateArchive(pr, dir)
+	pr.Close()
+	if !errors.Is(err, errUpdateRefused) || !strings.Contains(err.Error(), "unpacks to more than") {
+		t.Fatalf("got %v, want the size-bound refusal", err)
+	}
+	if got := extractedFiles(t, dir); len(got) != 0 {
+		t.Fatalf("wrote %q, want nothing", got)
+	}
+}
+
+// TestExtractRefusesARegularFileWithADirectoryName pins that "PAYLOAD-SHA256/"
+// typed as a regular file is no skipped name. tar.Writer will not encode such a
+// header, so the name is patched into the raw block and its checksum redone.
+func TestExtractRefusesARegularFileWithADirectoryName(t *testing.T) {
+	var raw bytes.Buffer
+	tw := tar.NewWriter(&raw)
+	if err := tw.WriteHeader(&tar.Header{Name: "PAYLOAD-SHA256X", Mode: 0o644, Typeflag: tar.TypeReg, Size: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b := raw.Bytes()
+	b[len("PAYLOAD-SHA256")] = '/'
+	for i := 148; i < 156; i++ {
+		b[i] = ' '
+	}
+	var sum int
+	for _, c := range b[:512] {
+		sum += int(c)
+	}
+	copy(b[148:156], fmt.Sprintf("%06o\x00 ", sum))
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	_, _ = zw.Write(b)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err := extractUpdateArchive(bytes.NewReader(gz.Bytes()), t.TempDir())
+	if !errors.Is(err, errUpdateRefused) || !strings.Contains(err.Error(), "not a clean relative path") {
+		t.Fatalf("got %v, want a refusal naming the unclean path", err)
 	}
 }
