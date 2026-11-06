@@ -106,13 +106,15 @@ type Config struct {
 	// handleConfigureMesh). Read it through Server.nodeCIDR, never from cfg.
 	NodePodCIDR netip.Prefix
 	// IdentityPath, when non-empty, is the file the daemon persists an ADOPTED node
-	// pod CIDR to (temp-and-rename, 0600) and re-reads at start, so an identity the
-	// join handed over survives a helper restart the agent did not drive — a crash
-	// plus launchd KeepAlive, say, which would otherwise revert the daemon to
-	// NodePodCIDR while the kernel still holds the node's pod aliases and make it
-	// reject every one of them until the mesh's next resync. The caller chooses the
-	// path and owns its directory, which must be root-only (k3sm passes a path under
-	// its mesh key dir). Optional: empty disables persistence, and an unreadable or
+	// pod CIDR to (temp-and-rename, 0600) and re-reads at start: a ConfigureMesh that
+	// moved the identity, or one that confirmed the identity already in force (a
+	// server's seeded NodePodCIDR). So an identity the join handed over survives a
+	// helper restart the agent did not drive — a crash plus launchd KeepAlive, say,
+	// which would otherwise revert the daemon to NodePodCIDR while the kernel still
+	// holds the node's pod aliases and make it reject every one of them until the
+	// mesh's next resync. The file wins over NodePodCIDR at start. The caller chooses
+	// the path and owns its directory, which must be root-only (k3sm passes a path
+	// under its mesh key dir). Optional: empty disables persistence, and an unreadable or
 	// malformed file is logged and ignored (the daemon falls back to NodePodCIDR).
 	IdentityPath string
 	// InterconnectStatePath, when non-empty, is the file the daemon persists the
@@ -408,6 +410,22 @@ func (s *Server) persistIdentity(cidr netip.Prefix) {
 		s.log.Error("netd: persisting the adopted node pod CIDR failed (a helper restart will fall back to the configured one)",
 			"path", s.cfg.IdentityPath, "nodePodCIDR", cidr.String(), "err", err)
 	}
+}
+
+// recordConfirmedIdentity persists an identity a ConfigureMesh confirmed without
+// moving it, which is how a server's seeded range gets recorded at all. The mesh
+// resync confirms every 30 s, so it writes only when a restart would not read cidr
+// back from the file (restoreIdentity is the one definition of what the file says):
+// the file is absent, unusable or names another range. That makes the next resync
+// the retry for a write that failed.
+func (s *Server) recordConfirmedIdentity(cidr netip.Prefix) {
+	if s.cfg.IdentityPath == "" {
+		return
+	}
+	if recorded, ok := restoreIdentity(s.cfg.IdentityPath, s.cfg.ClusterAggregate, s.log); ok && recorded == cidr {
+		return
+	}
+	s.persistIdentity(cidr)
 }
 
 // writeIdentityFile writes cidr to path atomically: a 0600 temp file in the same
@@ -748,10 +766,11 @@ func (s *Server) handleConfigureMesh(ctx context.Context, st *connState, args *w
 //
 // The rules, in order: an omitted CIDR changes nothing (an older client); a
 // malformed one, or one outside the pinned cluster aggregate, is refused; the
-// identity already in force is a no-op; and a DIFFERENT identity is refused
-// outright once anything is live — a POD alias under the current identity, a mesh
-// route, or a mesh device that is up — because moving the policy boundary under
-// running pods would orphan the aliases already plumbed under the old /24.
+// identity already in force is confirmed and recorded (recordConfirmedIdentity) and
+// changes nothing else; and a DIFFERENT identity is refused outright once anything
+// is live — a POD alias under the current identity, a mesh route, or a mesh device
+// that is up — because moving the policy boundary under running pods would orphan
+// the aliases already plumbed under the old /24.
 // Otherwise the daemon adopts it, re-points the executor (whose mesh-egress and
 // utun link addresses derive from it), and persists it for a restart.
 //
@@ -764,7 +783,9 @@ func (s *Server) handleConfigureMesh(ctx context.Context, st *connState, args *w
 // re-pointing cannot interleave with a concurrent adoption. That is the one place
 // mu is held across a Privileged call; it is bounded (the mesh is by definition not
 // up, so the executor only re-derives two addresses and closes a never-upped
-// device) and happens at most once per daemon lifetime.
+// device) and happens at most once per daemon lifetime. The identity file is
+// written under the same locks on both paths, so a confirmation cannot overwrite
+// the record of an adoption that followed it.
 func (s *Server) adoptNodePodCIDR(ctx context.Context, arg string) error {
 	if arg == "" {
 		return nil
@@ -786,6 +807,7 @@ func (s *Server) adoptNodePodCIDR(ctx context.Context, arg string) error {
 	if s.nodePodCIDR == want {
 		s.log.Debug("netd: configureMesh node pod CIDR unchanged", "nodePodCIDR", want.String())
 		s.identityConfirmed = true
+		s.recordConfirmedIdentity(want)
 		return nil
 	}
 	if pods := s.livePodAliasesLocked(); pods > 0 || s.meshRoutes > 0 || s.meshUp || len(s.icOwned) > 0 {
