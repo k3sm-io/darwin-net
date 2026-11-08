@@ -30,8 +30,11 @@ limitations under the License.
 // The positional arguments are the import paths the change edits directly. The
 // registry is validated on every run. A failing test is excused only in the fast
 // tier (`affected` is accepted as its other name), only when it is listed, its
-// package is not an edited one, its output carries the recorded signature and no
-// race or sanitizer report, and its entry is not past its deadline. A failing parent
+// package is not an edited one, every run of it that failed carries the recorded
+// signature, its output carries no race or sanitizer report, and its entry is not
+// past its deadline. A test id repeated by -count>1 holds one run per result event;
+// a passing run's output never satisfies the signature, and a run that started and
+// never reported a result reds the id whatever its other runs did. A failing parent
 // of a Go subtest that is not listed itself is excused only when it has a failing
 // subtest, every failing subtest below it is excused, and its own output carries
 // nothing but the harness's framing lines for it and its subtests. A race or
@@ -151,9 +154,23 @@ type entry struct {
 }
 
 type result struct {
-	test   string
-	status string // pass, fail, skip, or "" for no result
-	output string
+	test       string
+	status     string   // pass, fail, skip, or "" for no result
+	output     string   // every run's output
+	failedRuns []string // the output of each run that failed, one element per run
+	run        string   // the output of the run in progress
+	open       bool     // a run has started and has not reported a result
+}
+
+// carriedByEveryRun reports whether every failed run's output holds sig. No failed
+// run means no recorded failure to match, so it reports false.
+func carriedByEveryRun(runs []string, sig string) bool {
+	for _, r := range runs {
+		if !strings.Contains(r, sig) {
+			return false
+		}
+	}
+	return len(runs) > 0
 }
 
 func parseDate(s string) (time.Time, bool) {
@@ -472,7 +489,7 @@ func evaluate(registry string, results []result, tier string, edited []string, t
 		case editedSet[e.pkg]:
 			out = append(out, fmt.Sprintf("RED %s: quarantined, but the change edits %s directly", r.test, e.pkg))
 			red = true
-		case !strings.Contains(r.output, e.sig):
+		case !carriedByEveryRun(r.failedRuns, e.sig):
 			out = append(out, fmt.Sprintf("RED %s: quarantined, but the failure does not match the recorded signature", r.test))
 			red = true
 		default:
@@ -631,8 +648,12 @@ func (c *collector) line(n int, raw string) {
 		c.order = append(c.order, id)
 	}
 	switch ev.Action {
+	case "run":
+		t.open = true
 	case "output":
 		t.output += ev.Output
+		t.run += ev.Output
+		t.open = true
 		c.text = append(c.text, ev.Output)
 	case "pass", "skip":
 		// A fail is sticky per test id: with -count>1 or a rerun, a later pass or
@@ -640,17 +661,24 @@ func (c *collector) line(n int, raw string) {
 		if t.status != "fail" {
 			t.status = ev.Action
 		}
+		t.run, t.open = "", false
 	case "fail":
 		t.status = "fail"
+		t.failedRuns = append(t.failedRuns, t.run)
 		c.pkgHasFail[ev.Package] = true
-		fmt.Fprint(c.w, t.output)
+		fmt.Fprint(c.w, t.run)
+		t.run, t.open = "", false
 	}
 }
 
 func (c *collector) results() []result {
 	var rs []result
 	for _, id := range c.order {
-		rs = append(rs, *c.tests[id])
+		r := *c.tests[id]
+		if r.open { // the last run never reported, so this id has no result
+			r.status = ""
+		}
+		rs = append(rs, r)
 	}
 	// A race or sanitizer report outside any test reds its package whatever else
 	// failed in it, so a quarantined failure beside it never excuses it.

@@ -360,6 +360,43 @@ func corpusVerdicts(out string) map[string]string {
 	return got
 }
 
+// TestFailEchoesOnlyTheFailingRun pins the echo under -count=2: a repeated failure
+// prints each run's output once, so the first run's lines do not appear again.
+func TestFailEchoesOnlyTheFailingRun(t *testing.T) {
+	input := stream(
+		ev("run", pkg, "TestFlake", ""),
+		ev("output", pkg, "TestFlake", "first run line\n"),
+		ev("fail", pkg, "TestFlake", ""),
+		ev("run", pkg, "TestFlake", ""),
+		ev("output", pkg, "TestFlake", "second run line\n"),
+		ev("fail", pkg, "TestFlake", ""),
+		ev("fail", pkg, "", ""))
+	cmd := exec.Command(binary(t), "-registry", filepath.Join(t.TempDir(), "absent"), "-tier", "full", "-today", today)
+	cmd.Stdin = strings.NewReader(input)
+	out, err := cmd.CombinedOutput()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 1 {
+		t.Fatalf("run: %v, want exit 1\n%s", err, out)
+	}
+	for _, line := range []string{"first run line\n", "second run line\n"} {
+		if n := bytes.Count(out, []byte(line)); n != 1 {
+			t.Errorf("%q printed %d times, want once\n%s", line, n, out)
+		}
+	}
+}
+
+// TestGeneratedCorpusStreams keeps the generated corpus streams honest: it reruns
+// the generator under testdata/gen against real go test -json and reds when a
+// committed stream.jsonl differs from what the generator writes.
+func TestGeneratedCorpusStreams(t *testing.T) {
+	cmd := exec.Command("go", "run", "./testdata/gen", "-check")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("generated corpus streams drifted (%v):\n%s", err, out)
+	}
+}
+
 // TestQuarantineCorpusParity runs every shared corpus case through this copy of
 // the rules and checks the overall verdict and each test's verdict.
 func TestQuarantineCorpusParity(t *testing.T) {
