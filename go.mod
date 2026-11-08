@@ -8,7 +8,7 @@ require (
 	// a root-created utun (pkg/mesh). It publishes no semver tags, so it is pinned to
 	// a commit pseudo-version (never @latest); it transitively pulls the pure-Go
 	// golang.org/x/crypto (AEAD/curve25519). Builds CGO_ENABLED=0 on darwin/arm64.
-	golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f
+	golang.zx2c4.com/wireguard v0.0.0-20261024220952-b3bc704ef0ee
 	k3sm.io/apis v0.0.0-00010101000000-000000000000
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1
