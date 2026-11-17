@@ -6,7 +6,9 @@
  * interposer and now owns THREE interposes in ONE dylib: the
  * cluster-DNS getaddrinfo() below, the per-pod bind() discipline, and the
  * destination-scoped connect() source pinning — the last two at the bottom of
- * the file, sharing one config and one pthread_once. They share nothing else but
+ * the file, sharing one config and one pthread_once. The loopback rung (a
+ * connect() or sendto() to 127.0.0.0/8 or ::1 reaching the pod's OWN listener)
+ * rides the same config; sendto() is interposed for it alone. They share nothing else but
  * the __DATA,__interpose table and the environment-configured,
  * transparent-passthrough idiom; each reads its own K3SM_* env and is
  * independently inert when that env is absent. The artifact is still named
@@ -65,6 +67,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <os/log.h>
@@ -104,12 +107,15 @@ int k3sm_getaddrinfo(const char *node, const char *service,
                      const struct addrinfo *hints, struct addrinfo **res);
 int k3sm_bind(int fd, const struct sockaddr *addr, socklen_t len);
 int k3sm_connect(int fd, const struct sockaddr *addr, socklen_t len);
+ssize_t k3sm_sendto(int fd, const void *buf, size_t n, int flags, const struct sockaddr *addr,
+                    socklen_t len);
 
 __attribute__((used)) static const interpose_t k3sm_interposers[]
     __attribute__((section("__DATA,__interpose"))) = {
         {(const void *)k3sm_getaddrinfo, (const void *)getaddrinfo},
         {(const void *)k3sm_bind, (const void *)bind},
         {(const void *)k3sm_connect, (const void *)connect},
+        {(const void *)k3sm_sendto, (const void *)sendto},
 };
 
 /* -------- config from environment -------- */
@@ -2168,14 +2174,262 @@ static void k3sm_interconnect_pin_failed(int err) {
                  k3sm_bind_cfg.icip_s, err);
 }
 
+/* ==================================================================== */
+/* ===== loopback rung — 127.0.0.1 inside a pod reaches the pod itself ===== */
+/* ==================================================================== */
+
 /*
- * The interposed connect(). Every path returns the REAL connect()'s result, and
- * every trace is emitted BEFORE that call, so the caller sees the kernel's errno
- * untouched (a trace after the call would clobber it).
+ * WHY. A native pod has no network namespace, and the bind rung moves a
+ * wildcard listener (port K3SM_BIND_MIN_PORT and up) onto the pod's /32. So a
+ * process that dials 127.0.0.1:<port> for its OWN server, the way an app, a
+ * sidecar or a health check does on Linux, reaches the host's loopback instead
+ * and is refused. 127.0.0.0/8 is one address range shared by every pod and the
+ * host, so loopback cannot be given to each pod; this rung moves the DIAL
+ * instead: a connect() or sendto() to 127.0.0.0/8 (or ::1, or a v4-mapped
+ * ::ffff:127.x) is sent to K3SM_POD_IP at the same port.
+ *
+ * WHEN, which is the whole design. The dial is moved ONLY when a socket of the
+ * same type is bound to exactly <pod ip>:<port> right now, which is the
+ * observable fact "this pod has a listener on that port". Anything else is
+ * passed through, so a pod's dial reaches what it reached before this rung:
+ *   - a pod listener bound explicitly to 127.0.0.1 (a "localhost only"
+ *     server, which the bind rung leaves alone) is still reached through loopback;
+ *   - a host service on 127.0.0.1, and a host wildcard listener, are reached
+ *     exactly as before. The rung never makes a host loopback service
+ *     reachable that was not, and the Seatbelt per-port denies (rendered as
+ *     "localhost:<port>", which matches every address the host owns, the pod
+ *     aliases included) apply to the moved dial as they did to the original;
+ *   - ports below K3SM_BIND_MIN_PORT, where the bind rung never moves a
+ *     listener, so a pod's low-port wildcard listener already answers on
+ *     127.0.0.1.
+ * When the pod does hold the port, its own listener wins over a host service on
+ * the same loopback port, which is what 127.0.0.1 means in a Linux pod.
+ *
+ * "The pod holds the port" is really "SOME socket is bound to <pod ip>:<port>":
+ * the probe cannot see who holds it. Every pod on a node shares one uid, and
+ * the profile cannot scope network-bind to a pod's own /32, so another pod can
+ * bind this pod's address and then receive the loopback dials this rung moves.
+ * Before the rung, a pod could not take over a host service's 127.0.0.1 port.
+ * This is the shared same-node trust domain (DESIGN §3), not a new boundary to
+ * rely on; untrusted neighbours belong on the vm RuntimeClass. Likewise, for a
+ * non-root pod, XNU refuses a specific bind on a port that another uid holds
+ * as a wildcard, so such a host listener also reads as held. The moved dial
+ * then reaches that same wildcard listener, which 127.0.0.1 reached as well.
+ *
+ * THE PROBE. "Bound to exactly <pod ip>:<port>" is read by binding a throwaway
+ * socket of the caller's SO_TYPE to that address WITH SO_REUSEADDR and
+ * closing it. Measured on Darwin: with SO_REUSEADDR the probe bind fails with
+ * EADDRINUSE against a socket bound to that exact address (TCP and UDP alike,
+ * with or without the holder's own SO_REUSEADDR), and succeeds against a
+ * wildcard listener on the port, against the port's TIME_WAIT, and against a
+ * socket of the other type. A v4-mapped AF_INET6 holder (the Go dual-stack
+ * listener the bind rung rewrites to ::ffff:<pod ip>) is checked with a second,
+ * AF_INET6 probe. Any probe failure other than EADDRINUSE (a pod without the
+ * network grant gets EPERM) answers "not held", so the dial passes through.
+ * The probe holds the address for the length of one bind() and close(). A
+ * server binding that exact address in that window gets EADDRINUSE, whether
+ * or not it sets SO_REUSEADDR (the exact-address refusal is symmetric). The
+ * window is microseconds, but a sidecar polling localhost while its server
+ * starts can hit it. The probe socket is close-on-exec, so a fork and exec on
+ * another thread cannot carry it into a child.
+ *
+ * A moved TCP dial is source-pinned to the pod address (the pinning rung
+ * below), so a host service it reaches sees the pod IP as the peer, not
+ * 127.0.0.1, and a service that trusts a loopback source no longer sees one.
+ *
+ * NOT A BOUNDARY. The rung only produces a destination the pod could dial
+ * itself; it opens nothing. A process without the shim (a platform or static
+ * binary) keeps the old behaviour. The rung follows the bind rung's switch:
+ * K3SM_POD_IP unset or unparseable means passthrough.
+ *
+ * NOT COVERED: sendmsg() and connectx(), and a UDP reply's source address (a
+ * client that sent to 127.0.0.1 with sendto() and compares the reply's
+ * source sees the pod address; a connected UDP socket is matched by the kernel
+ * and is unaffected).
+ */
+
+/* k3sm_probe_bound reports whether a socket of type is bound to exactly sa.
+ * errno is preserved, so a caller's later trace and real call see their own. */
+static int k3sm_probe_bound(int type, const struct sockaddr *sa, socklen_t salen) {
+    int saved = errno;
+    int held = 0;
+    int p = socket(sa->sa_family, type, 0);
+    if (p >= 0) {
+        (void)fcntl(p, F_SETFD, FD_CLOEXEC);
+        int one = 1;
+        (void)setsockopt(p, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        if (sa->sa_family == AF_INET6) {
+            int zero = 0;
+            (void)setsockopt(p, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
+        }
+        if (bind(p, sa, salen) != 0 && errno == EADDRINUSE) {
+            held = 1;
+        }
+        close(p);
+    }
+    errno = saved;
+    return held;
+}
+
+/* k3sm_pod_holds_port reports whether this pod has a socket of fd's type bound
+ * to <pod ip>:port, as a v4 socket or as a v4-mapped v6 one. */
+static int k3sm_pod_holds_port(int fd, unsigned port) {
+    int type = 0;
+    socklen_t tl = (socklen_t)sizeof type;
+    int saved = errno;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) != 0 ||
+        (type != SOCK_STREAM && type != SOCK_DGRAM)) {
+        errno = saved;
+        return 0;
+    }
+    errno = saved;
+    struct sockaddr_in in4;
+    memset(&in4, 0, sizeof in4);
+    in4.sin_family = AF_INET;
+    in4.sin_len = (unsigned char)sizeof in4;
+    in4.sin_port = htons((uint16_t)port);
+    in4.sin_addr = k3sm_bind_cfg.podip;
+    if (k3sm_probe_bound(type, (const struct sockaddr *)&in4, (socklen_t)sizeof in4)) {
+        return 1;
+    }
+    struct sockaddr_in6 in6;
+    memset(&in6, 0, sizeof in6);
+    in6.sin6_family = AF_INET6;
+    in6.sin6_len = (unsigned char)sizeof in6;
+    in6.sin6_port = htons((uint16_t)port);
+    in6.sin6_addr.s6_addr[10] = 0xff;
+    in6.sin6_addr.s6_addr[11] = 0xff;
+    memcpy(&in6.sin6_addr.s6_addr[12], &k3sm_bind_cfg.podip, sizeof k3sm_bind_cfg.podip);
+    return k3sm_probe_bound(type, (const struct sockaddr *)&in6, (socklen_t)sizeof in6);
+}
+
+/* k3sm_is_loopback6 reports ::1 and ::ffff:127.0.0.0/104. */
+static int k3sm_is_loopback6(const struct in6_addr *a) {
+    if (IN6_IS_ADDR_LOOPBACK(a)) {
+        return 1;
+    }
+    return IN6_IS_ADDR_V4MAPPED(a) && a->s6_addr[12] == 127;
+}
+
+/*
+ * k3sm_loopback_rewrite decides the loopback rung for one dial. It returns 1
+ * and fills *out / *outlen when the destination is moved to the pod address,
+ * and 0 when addr is to be used unchanged. op names the call in the trace.
+ */
+static int k3sm_loopback_rewrite(int fd, const struct sockaddr *addr, socklen_t len,
+                                 struct sockaddr_storage *out, socklen_t *outlen,
+                                 const char *op) {
+    if (addr == NULL || !k3sm_bind_cfg.enabled) {
+        return 0;
+    }
+    if (addr->sa_family == AF_INET && len >= (socklen_t)sizeof(struct sockaddr_in)) {
+        struct sockaddr_in in;
+        memcpy(&in, addr, sizeof in);
+        if ((ntohl(in.sin_addr.s_addr) >> 24) != 127) {
+            return 0;
+        }
+        char dbuf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &in.sin_addr, dbuf, sizeof dbuf);
+        unsigned port = (unsigned)ntohs(in.sin_port);
+        if (port < K3SM_BIND_MIN_PORT) {
+            k3sm_bind_trace("%s fd=%d dst %s:%u -> LOOPBACK-PASSTHROUGH-LOWPORT", op, fd, dbuf, port);
+            return 0;
+        }
+        if (!k3sm_pod_holds_port(fd, port)) {
+            k3sm_bind_trace("%s fd=%d dst %s:%u -> LOOPBACK-PASSTHROUGH (no pod socket on %s:%u)", op,
+                            fd, dbuf, port, k3sm_bind_cfg.podip_s, port);
+            return 0;
+        }
+        in.sin_addr = k3sm_bind_cfg.podip;
+        memset(out, 0, sizeof *out);
+        memcpy(out, &in, sizeof in);
+        *outlen = (socklen_t)sizeof in;
+        k3sm_bind_trace("%s fd=%d dst %s:%u -> LOOPBACK-OWN %s:%u", op, fd, dbuf, port,
+                        k3sm_bind_cfg.podip_s, port);
+        return 1;
+    }
+    if (addr->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
+        struct sockaddr_in6 in6;
+        memcpy(&in6, addr, sizeof in6);
+        if (!k3sm_is_loopback6(&in6.sin6_addr)) {
+            return 0;
+        }
+        unsigned port = (unsigned)ntohs(in6.sin6_port);
+        if (port < K3SM_BIND_MIN_PORT) {
+            k3sm_bind_trace("%s fd=%d dst [loopback6]:%u -> LOOPBACK-PASSTHROUGH-LOWPORT", op, fd, port);
+            return 0;
+        }
+        /* The pod address is v4; a v6-only socket cannot reach ::ffff:<pod ip>,
+         * so it keeps its own loopback. A getsockopt failure is "do not touch". */
+        int v6only = -1;
+        socklen_t olen = (socklen_t)sizeof v6only;
+        int saved = errno;
+        if (getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &olen) != 0 || v6only != 0) {
+            errno = saved;
+            k3sm_bind_trace("%s fd=%d dst [loopback6]:%u -> LOOPBACK-PASSTHROUGH-V6ONLY", op, fd, port);
+            return 0;
+        }
+        errno = saved;
+        if (!k3sm_pod_holds_port(fd, port)) {
+            k3sm_bind_trace("%s fd=%d dst [loopback6]:%u -> LOOPBACK-PASSTHROUGH (no pod socket on %s:%u)",
+                            op, fd, port, k3sm_bind_cfg.podip_s, port);
+            return 0;
+        }
+        memset(&in6.sin6_addr, 0, sizeof in6.sin6_addr);
+        in6.sin6_addr.s6_addr[10] = 0xff;
+        in6.sin6_addr.s6_addr[11] = 0xff;
+        memcpy(&in6.sin6_addr.s6_addr[12], &k3sm_bind_cfg.podip, sizeof k3sm_bind_cfg.podip);
+        in6.sin6_scope_id = 0;
+        memset(out, 0, sizeof *out);
+        memcpy(out, &in6, sizeof in6);
+        *outlen = (socklen_t)sizeof in6;
+        k3sm_bind_trace("%s fd=%d dst [loopback6]:%u -> LOOPBACK-OWN [::ffff:%s]:%u", op, fd, port,
+                        k3sm_bind_cfg.podip_s, port);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * The interposed sendto(), for the loopback rung only: an unconnected datagram
+ * to loopback is moved exactly as a connect() would be. Every other call, and
+ * a NULL destination (a connected socket), reaches the real sendto() as given.
+ */
+ssize_t k3sm_sendto(int fd, const void *buf, size_t n, int flags, const struct sockaddr *addr,
+                    socklen_t len) {
+    pthread_once(&k3sm_bind_once, k3sm_bind_cfg_init);
+    struct sockaddr_storage moved;
+    socklen_t movedlen = 0;
+    if (k3sm_loopback_rewrite(fd, addr, len, &moved, &movedlen, "sendto")) {
+        return sendto(fd, buf, n, flags, (const struct sockaddr *)&moved, movedlen);
+    }
+    return sendto(fd, buf, n, flags, addr, len);
+}
+
+static int k3sm_connect_pinned(int fd, const struct sockaddr *addr, socklen_t len);
+
+/*
+ * The interposed connect(): the loopback rung first, then the source-pinning
+ * rung on whatever destination results (a moved dial lands on the pod's own
+ * address, which is inside the cluster scope, so it is pinned to the pod IP,
+ * the address it is dialling).
  */
 int k3sm_connect(int fd, const struct sockaddr *addr, socklen_t len) {
     pthread_once(&k3sm_bind_once, k3sm_bind_cfg_init);
+    struct sockaddr_storage moved;
+    socklen_t movedlen = 0;
+    if (k3sm_loopback_rewrite(fd, addr, len, &moved, &movedlen, "connect")) {
+        return k3sm_connect_pinned(fd, (const struct sockaddr *)&moved, movedlen);
+    }
+    return k3sm_connect_pinned(fd, addr, len);
+}
 
+/*
+ * The source-pinning rung. Every path returns the REAL connect()'s result, and
+ * every trace is emitted BEFORE that call, so the caller sees the kernel's errno
+ * untouched (a trace after the call would clobber it).
+ */
+static int k3sm_connect_pinned(int fd, const struct sockaddr *addr, socklen_t len) {
     if (addr == NULL) {
         /* A NULL sockaddr is the kernel's EFAULT/EINVAL to report, not ours. */
         return connect(fd, addr, len);
