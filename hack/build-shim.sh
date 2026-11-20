@@ -33,6 +33,13 @@ mkdir -p "$OUT_DIR"
 # Asserted on the built Mach-O by pkg/dns TestShimIsUniversalBinary -- assert the
 # ARTIFACT, never these flags, since the flags are what drifted from this comment.
 # -fPIC and -dynamiclib for a shared library; -install_name keeps it relocatable.
+# The x86_64 slice is deliberate and stays. It is a compatibility slice in a shipped
+# library, not an x86 build of anything k3sm runs for itself, so the arm64-only
+# rule for our own builds, images and runners does not apply to it. The operator
+# confirmed this on 2026-11-20 ("Keep the slice"). Do not remove it to satisfy
+# that rule: without it dyld kills every Intel binary a pod starts, and the
+# k3sm.io/rosetta node label would advertise what can no longer run.
+#
 # Apple clang's driver leaves one empty <source>-<hex> dir per arch in TMPDIR on a
 # multi-arch compile, so clang gets a private TMPDIR that the EXIT trap removes.
 # Asserted by pkg/dns TestShimBuildLeavesNoTempDirs.
