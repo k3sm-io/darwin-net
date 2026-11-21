@@ -1,5 +1,12 @@
 # darwin-net — k3sm pod networking
 
+@.claude/rules/native-builds.md
+
+Use the `yurei build` queue via the runtime's executable absolute `YUREI_BIN`; verify native pod placement.
+Preserve BypassGuard and every real human gate; this policy never widens credential, money, release or irreversible authority.
+
+All build and test examples below run through the approved native Darwin pod route; older host exceptions are superseded.
+
 Module **`k3sm.io/darwin-net`** (≈ flannel + kube-proxy + CNI): `netd` (lo0 alias IPAM, `utun`; the
 uninstall-time flush of a legacy `pf` anchor is its only pf touch), a userspace Service proxy, a `wireguard-go` mesh, a `getaddrinfo` DNS shim, and the
 `PodNetwork` interface the runtime calls during pod setup.
